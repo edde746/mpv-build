@@ -15,9 +15,9 @@
 #      baked into the cross-compiler wrappers. winbuild's
 #      cmake/download_externalproject.cmake curls its patched Kitware
 #      ExternalProject module at first configure, so configure needs network.
-#   4. toolchain bootstrap: ninja llvm, ninja rustup, ninja llvm-clang --
-#      skipped entirely when the per-arch tree's marker says the restored CI
-#      cache already holds this generation + winbuild pin
+#   4. toolchain targets: ninja llvm, ninja rustup, ninja llvm-clang --
+#      stamp-driven no-ops on a clean restored CI cache, targeted rebuilds
+#      when a pin moved
 #   5. ninja mpv, after fullcleaning any restored mpv state -- meson
 #      -Dlibmpv=true is hard-coded upstream, so this builds libmpv-2.dll
 #      alongside mpv.exe and its copy-binary step assembles
@@ -61,21 +61,14 @@ export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-# The winbuild and mingw-w64 pins, override-aware for the windows group.
-# mingw-w64 is part of the toolchain state: its pin moving must re-drive the
-# toolchain targets (headers/CRT rebuild), which the marker below gates.
-read -r WINBUILD_URL WINBUILD_COMMIT MINGW_COMMIT < <(python3 - "$ROOT/versions.json" <<'PY'
+# The winbuild pin, override-aware for the windows group.
+read -r WINBUILD_URL WINBUILD_COMMIT < <(python3 - "$ROOT/versions.json" <<'PY'
 import json, sys
-components = json.load(open(sys.argv[1]))["components"]
-def resolved(name, *fields):
-    entry = components[name]
-    pins = {f: entry[f] for f in fields if f in entry}
-    pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
-                 if f in fields})
-    return pins
-winbuild = resolved("mpv-winbuild-cmake", "url", "commit")
-mingw = resolved("mingw-w64", "commit")
-print(winbuild["url"], winbuild["commit"], mingw["commit"])
+entry = json.load(open(sys.argv[1]))["components"]["mpv-winbuild-cmake"]
+pins = {f: entry[f] for f in ("url", "commit") if f in entry}
+pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
+             if f in ("url", "commit")})
+print(pins["url"], pins["commit"])
 PY
 )
 
@@ -146,36 +139,27 @@ dump_step_logs() {
 touch "$BUILD/.run-started"
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then dump_step_logs; fi; exit $rc' EXIT
 
-# CI restores the whole build state (per-arch tree + shared src + rustup) as
-# cache entries. The toolchain is fully described by the generation in
-# toolchain/windows.txt plus the winbuild commit, so when the marker written
-# after the last successful bootstrap matches both, skip the three targets
-# outright: driving them on a warm tree re-runs upstream's always-dirty
-# check-git steps and, worst case, re-drives llvm. On a mismatch (a tree
-# restored across a winbuild bump) the targets run and converge
-# incrementally: unchanged steps are stamp-clean, changed recipes are dirtied
-# by their new command lines.
-TOOLCHAIN_MARKER="$BUILD/.toolchain-bootstrapped"
-TOOLCHAIN_STATE="$(grep -E '^generation=' "$ROOT/toolchain/windows.txt") winbuild=$WINBUILD_COMMIT mingw=$MINGW_COMMIT"
-if [[ "$(cat "$TOOLCHAIN_MARKER" 2> /dev/null)" == "$TOOLCHAIN_STATE" ]]; then
-  echo "==> toolchain already bootstrapped for this generation+winbuild+mingw pins; skipping"
-  # rustup travels in its own cache path and can be evicted independently of
-  # the per-arch stamps that claim it was installed; when the binary is gone,
-  # fullclean the package so it reinstalls instead of every rust-built
-  # dependency failing later with a missing cargo.
-  if [[ ! -x "$WORK/rustup/.cargo/bin/cargo" ]]; then
-    echo "==> rustup missing from the shared cache; reinstalling"
-    ninja -C "$BUILD" rustup-fullclean
-    ninja -C "$BUILD" rustup
-  fi
-else
-  echo "==> bootstrapping toolchain (llvm, rustup, llvm-clang)"
-  rm -f "$TOOLCHAIN_MARKER"
-  ninja -C "$BUILD" llvm
-  ninja -C "$BUILD" rustup
-  ninja -C "$BUILD" llvm-clang
-  printf '%s\n' "$TOOLCHAIN_STATE" > "$TOOLCHAIN_MARKER"
+# The three toolchain targets run unconditionally. On a clean warm tree they
+# are stamp-driven no-ops (observed: ~50ms total, once pin_packages.py has
+# suppressed the check-git cascade); a moved pin re-drives exactly the dirty
+# subgraph, because pin moves reach the graph through GIT_TAG in
+# <pkg>-gitinfo.txt and through changed step command lines. Do NOT add a
+# skip-if-bootstrapped marker here: an earlier one recorded intent instead
+# of reality and kept serving stale mingw-w64 headers from the cache after
+# the pin moved.
+#
+# rustup travels in its own cache path and can be evicted independently of
+# the per-arch stamps that claim it was installed; when the binary is gone,
+# fullclean the package so it reinstalls instead of every rust-built
+# dependency failing later with a missing cargo.
+if [[ ! -x "$WORK/rustup/.cargo/bin/cargo" ]]; then
+  ninja -C "$BUILD" rustup-fullclean 2> /dev/null || true
 fi
+echo "==> toolchain targets (llvm, rustup, llvm-clang; no-ops when clean)"
+rm -f "$BUILD/.toolchain-bootstrapped"
+ninja -C "$BUILD" llvm
+ninja -C "$BUILD" rustup
+ninja -C "$BUILD" llvm-clang
 
 # mpv is rebuilt from scratch on every run. A restored tree may carry clean
 # mpv stamps whose build directory upstream's postremovebuild step already

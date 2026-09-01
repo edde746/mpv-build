@@ -39,13 +39,12 @@ those.
 
 `mingw-w64` is the exception: winbuild clones its master tip at
 toolchain-bootstrap time, and it defines the target ABI (headers + CRT), so
-`pin_packages.py` pins it like the payload packages and `build.sh` folds its
-commit into the toolchain bootstrap marker (a bump re-drives the toolchain
-targets). The pin exists because the 2026-08-29 secure-API header
-restructure on mingw-w64 master broke libvpl's MinGW compat macros mid-day;
-llvm's `release/22.x` branch is the remaining live-fetch in the toolchain
-and freezes only inside a warm cache -- pin it the same way if it ever
-bites.
+`pin_packages.py` pins it like the payload packages; a bump re-drives the
+dirty toolchain subgraph through the always-run toolchain targets. The pin
+exists because the 2026-08-29 secure-API header restructure on mingw-w64
+master broke libvpl's MinGW compat macros mid-day; llvm's `release/22.x`
+branch is the remaining live-fetch in the toolchain and freezes only inside
+a warm cache -- pin it the same way if it ever bites.
 
 ## CI build-state caching
 
@@ -83,10 +82,11 @@ Why reusing a restored tree is sound:
 - packages that track a branch tip upstream are frozen by their stamps on a
   warm tree -- tighter, not looser, than a cold rebuild that would fetch the
   tip of the day;
-- the toolchain is never re-driven on a warm tree: `build.sh` skips
-  `ninja llvm/rustup/llvm-clang` while its bootstrap marker matches the
-  toolchain generation + winbuild pin, and re-drives them (incrementally)
-  when it does not;
+- the toolchain targets (`ninja llvm/rustup/llvm-clang`) run on every
+  build; on a clean warm tree they are stamp-driven no-ops (~50ms), and a
+  moved pin re-drives exactly its dirty subgraph. There is deliberately no
+  skip-if-bootstrapped marker: one existed and recorded intent instead of
+  reality, serving stale mingw-w64 headers after a pin move;
 - `build.sh` fullcleans and rebuilds mpv on every run: upstream's packaging
   steps embed `BUILDDATE` in their command lines and `postremovebuild`
   deletes build trees after install, so a date rollover would otherwise

@@ -686,12 +686,11 @@ jobs:
       # which dirties exactly those packages; build.sh fullcleans mpv every
       # run (upstream's BUILDDATE naming dirties its packaging steps daily,
       # and libmpv must relink against whatever changed underneath it anyway)
-      # and re-drives the toolchain targets when its bootstrap marker
-      # disagrees with the generation + winbuild pin, which makes the
-      # last, pin-free restore tier safe across winbuild bumps. The pins
-      # tier prefers a completed state over an older one; the run_id suffix
-      # keeps every run's save unique so failed bootstraps still checkpoint
-      # their progress.
+      # and always runs the toolchain targets -- no-ops when clean -- which
+      # makes the last, pin-free restore tier safe across winbuild bumps.
+      # The pins tier prefers a completed state over an older one; the run_id
+      # suffix keeps every run's save unique so failed bootstraps still
+      # checkpoint their progress.
       - name: Restore build state cache
         uses: actions/cache/restore@v4
         with:
