@@ -1,81 +1,143 @@
 {
   "platforms": {
+    "android": {
+      "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
+      "libraries": {
+        "libmpv-android": {
+          "key": "b9385f350e3e",
+          "prebuilt": {
+            "arm64-v8a": {
+              "asset": "libmpv-android-b9385f350e3e-arm64-v8a.tar.gz",
+              "checksum": "e2509a635de9fb58df4ac2dee0eec97e7602d236a945b74d1e0c7adda192dc3f"
+            },
+            "armeabi-v7a": {
+              "asset": "libmpv-android-b9385f350e3e-armeabi-v7a.tar.gz",
+              "checksum": "c04f20edd3541163ed43f594b4b8cb94fd51ee76c112c0a8be20130ecc16b5f0"
+            },
+            "x86": {
+              "asset": "libmpv-android-b9385f350e3e-x86.tar.gz",
+              "checksum": "d059406ea7907b853884068e1c12a599413e0b6c0668a85c591c2db6c13c2d54"
+            },
+            "x86_64": {
+              "asset": "libmpv-android-b9385f350e3e-x86_64.tar.gz",
+              "checksum": "f8c95640f7e15884a1457c3bf2581c0d729f25fbd8f635a6d37128f1179e0879"
+            }
+          }
+        }
+      }
+    },
     "apple": {
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-apple",
       "libraries": {
         "FFmpeg": {
           "frameworks": {
             "Libavcodec": {
-              "asset": "Libavcodec-f8c1946dae1b.xcframework.zip",
-              "checksum": "7e62bd44bacf1b83ec622a2d12bf926e8d3d208c4a00e5ac5130d9c1b25f3dca"
+              "asset": "Libavcodec-0fd20bbe707c.xcframework.zip",
+              "checksum": "f78d05031acc6a0f5c1bc8f7cc75e501019dcad9ece297dd21f2fca2e26411ed"
             },
             "Libavdevice": {
-              "asset": "Libavdevice-f8c1946dae1b.xcframework.zip",
-              "checksum": "ead5fc7f3300404a4f77ea27114a3e364643d7c3537ea080e2a9a2b46f31147b"
+              "asset": "Libavdevice-0fd20bbe707c.xcframework.zip",
+              "checksum": "48525f34095ec30c18f7dc780a189259f89519a79059a332d0e115f5448f0db0"
             },
             "Libavfilter": {
-              "asset": "Libavfilter-f8c1946dae1b.xcframework.zip",
-              "checksum": "bc61cf25c93e771922c63a447010f4b19457a21df0ed0773747ad52e304ef795"
+              "asset": "Libavfilter-0fd20bbe707c.xcframework.zip",
+              "checksum": "905e5658a9e4c99cd8a3f9b132aa3008b139140784f04f16e935dd90cd7f5817"
             },
             "Libavformat": {
-              "asset": "Libavformat-f8c1946dae1b.xcframework.zip",
-              "checksum": "4e6af2c46735801fb0c15281572324abc2ad3136fea9c483b6be3cac89aed6d4"
+              "asset": "Libavformat-0fd20bbe707c.xcframework.zip",
+              "checksum": "754c3397a42a667b8d25a29b4be7599ce07a3ebbf57ed6bedce9f2c4094a92ef"
             },
             "Libavutil": {
-              "asset": "Libavutil-f8c1946dae1b.xcframework.zip",
-              "checksum": "d369c3d81911ecc4efd231801a7e7cabac00f0855ec72f77c4a00307d45afacb"
+              "asset": "Libavutil-0fd20bbe707c.xcframework.zip",
+              "checksum": "f47aa6145a74e880d416df9a30477638ccf89ae0331d15ece34c4773cbda1d09"
             },
             "Libswresample": {
-              "asset": "Libswresample-f8c1946dae1b.xcframework.zip",
-              "checksum": "e197375ab6625aef953923a0f69df3064e4b0c365c0bcbb77223b367e1f7dfc6"
+              "asset": "Libswresample-0fd20bbe707c.xcframework.zip",
+              "checksum": "c2ccd0fb3adea0998d3fb9ed2cc395ceee7dbf3a739859f8163a1fa1fd301fc8"
             },
             "Libswscale": {
-              "asset": "Libswscale-f8c1946dae1b.xcframework.zip",
-              "checksum": "57e9e57c0f77e0e16e649bddb07dc42fda442bf24826d5758cc4d445acd91ffe"
+              "asset": "Libswscale-0fd20bbe707c.xcframework.zip",
+              "checksum": "9de4b5378b6a1fc81006ad1ff3c43e2ba5a6bded365a43ea8cb749d7180eeac7"
             }
           },
-          "key": "f8c1946dae1b",
+          "key": "0fd20bbe707c",
           "prebuilt": {
-            "ios": "FFmpeg-all-f8c1946dae1b-ios.zip",
-            "isimulator": "FFmpeg-all-f8c1946dae1b-isimulator.zip",
-            "maccatalyst": "FFmpeg-all-f8c1946dae1b-maccatalyst.zip",
-            "macos": "FFmpeg-all-f8c1946dae1b-macos.zip",
-            "tvos": "FFmpeg-all-f8c1946dae1b-tvos.zip",
-            "tvsimulator": "FFmpeg-all-f8c1946dae1b-tvsimulator.zip"
+            "ios": "FFmpeg-all-0fd20bbe707c-ios.zip",
+            "isimulator": "FFmpeg-all-0fd20bbe707c-isimulator.zip",
+            "maccatalyst": "FFmpeg-all-0fd20bbe707c-maccatalyst.zip",
+            "macos": "FFmpeg-all-0fd20bbe707c-macos.zip",
+            "tvos": "FFmpeg-all-0fd20bbe707c-tvos.zip",
+            "tvsimulator": "FFmpeg-all-0fd20bbe707c-tvsimulator.zip"
           }
         },
         "libass": {
           "frameworks": {
             "Libass": {
-              "asset": "Libass-c11de6f8ef26.xcframework.zip",
-              "checksum": "6b9ee816bc1a66acf117f562036ccbbf8939edc8989941c0d49ab853454956ea"
+              "asset": "Libass-13e80b538048.xcframework.zip",
+              "checksum": "54b7e830be36f5e80435462e7ec0ff5fe6631dac4558324698334f2efffd597a"
             }
           },
-          "key": "c11de6f8ef26",
+          "key": "13e80b538048",
           "prebuilt": {
-            "ios": "libass-all-c11de6f8ef26-ios.zip",
-            "isimulator": "libass-all-c11de6f8ef26-isimulator.zip",
-            "maccatalyst": "libass-all-c11de6f8ef26-maccatalyst.zip",
-            "macos": "libass-all-c11de6f8ef26-macos.zip",
-            "tvos": "libass-all-c11de6f8ef26-tvos.zip",
-            "tvsimulator": "libass-all-c11de6f8ef26-tvsimulator.zip"
+            "ios": "libass-all-13e80b538048-ios.zip",
+            "isimulator": "libass-all-13e80b538048-isimulator.zip",
+            "maccatalyst": "libass-all-13e80b538048-maccatalyst.zip",
+            "macos": "libass-all-13e80b538048-macos.zip",
+            "tvos": "libass-all-13e80b538048-tvos.zip",
+            "tvsimulator": "libass-all-13e80b538048-tvsimulator.zip"
           }
         },
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-e73a34ad67f2.xcframework.zip",
-              "checksum": "3f98bf45b798453383680d3b4017a008fbfe2af4c91e03c64dae2de02d2ef9fb"
+              "asset": "Libmpv-8c2ec89d5db1.xcframework.zip",
+              "checksum": "ba9e8198d3623914f02c41a018ce5a16b4256f44dc940a0213d8c074a0976a16"
             }
           },
-          "key": "e73a34ad67f2",
+          "key": "8c2ec89d5db1",
           "prebuilt": {
-            "ios": "libmpv-all-e73a34ad67f2-ios.zip",
-            "isimulator": "libmpv-all-e73a34ad67f2-isimulator.zip",
-            "maccatalyst": "libmpv-all-e73a34ad67f2-maccatalyst.zip",
-            "macos": "libmpv-all-e73a34ad67f2-macos.zip",
-            "tvos": "libmpv-all-e73a34ad67f2-tvos.zip",
-            "tvsimulator": "libmpv-all-e73a34ad67f2-tvsimulator.zip"
+            "ios": "libmpv-all-8c2ec89d5db1-ios.zip",
+            "isimulator": "libmpv-all-8c2ec89d5db1-isimulator.zip",
+            "maccatalyst": "libmpv-all-8c2ec89d5db1-maccatalyst.zip",
+            "macos": "libmpv-all-8c2ec89d5db1-macos.zip",
+            "tvos": "libmpv-all-8c2ec89d5db1-tvos.zip",
+            "tvsimulator": "libmpv-all-8c2ec89d5db1-tvsimulator.zip"
+          }
+        }
+      }
+    },
+    "linux": {
+      "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-linux",
+      "libraries": {
+        "libmpv-linux": {
+          "key": "d2625fc5e2b2",
+          "prebuilt": {
+            "aarch64": {
+              "asset": "libmpv-linux-d2625fc5e2b2-aarch64.tar.zst",
+              "checksum": "1b388e839fa121bc6257aa148c14be5c7145c75157ad12bce629642f5358845e"
+            },
+            "x86_64": {
+              "asset": "libmpv-linux-d2625fc5e2b2-x86_64.tar.zst",
+              "checksum": "689331aab313923b53227297f6b95091328a08a50fecc1f6b43d7fff1113cc64"
+            }
+          }
+        }
+      }
+    },
+    "windows": {
+      "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-windows",
+      "libraries": {
+        "libmpv-windows": {
+          "key": "df879b0d685c",
+          "prebuilt": {
+            "aarch64": {
+              "asset": "libmpv-windows-df879b0d685c-aarch64.zip",
+              "checksum": "0f188bb7fbe025e07f062eca2ff959d186b285071b2e68c1fcbd6af598f500f3"
+            },
+            "x86_64": {
+              "asset": "libmpv-windows-df879b0d685c-x86_64.zip",
+              "checksum": "fa9c49488a9ca9636a69051d9b545c0f726bb17b1cdce1dda37713b00625b7b9"
+            }
           }
         }
       }
