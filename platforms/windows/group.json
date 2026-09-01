@@ -13,7 +13,8 @@
         "ffmpeg",
         "libass",
         "mpv-winbuild-cmake",
-        "mingw-w64"
+        "mingw-w64",
+        "llvm"
       ],
       "variants": [
         "x86_64",

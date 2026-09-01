@@ -42,6 +42,12 @@ PINS = {
         "ref": "master",
         "commit": "ca4cc40bdcda1aa3e9df68d5443c7ceaf1f212f9",
     },
+    "llvm": {
+        "version": "release-22.x-2026-06-15",
+        "url": "https://github.com/llvm/llvm-project",
+        "ref": "release/22.x",
+        "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
+    },
 }
 
 PATCH = """diff --git a/a.c b/a.c
@@ -198,6 +204,29 @@ class PinPackagesTest(unittest.TestCase):
         self.assertNotIn("PATCH_COMMAND", pinned)
         # Idempotent like the payload rewrites.
         self.assertEqual(pin_packages.rewrite(pinned, "mingw-w64", pins, False), pinned)
+
+    def test_llvm_branch_tag_is_replaced_by_the_pin(self):
+        # llvm's pristine file carries upstream's own GIT_REMOTE_NAME and a
+        # moving-branch GIT_TAG (release/22.x); the strip-before-inject
+        # rewrite must replace them with the resolved commit, not stack a
+        # second block next to them.
+        text = (TESTDATA / "llvm.cmake").read_text()
+        self.assertIn("    GIT_TAG release/22.x\n", text)
+        pins = PINS["llvm"]
+        pinned = pin_packages.rewrite(text, "llvm", pins, False)
+        self.assertNotIn("GIT_TAG release/22.x", pinned)
+        self.assertEqual(pinned.count("GIT_TAG "), 1)
+        self.assertEqual(pinned.count("GIT_REMOTE_NAME "), 1)
+        self.assertIn(
+            '    UPDATE_COMMAND ""\n'
+            "    GIT_REMOTE_NAME origin\n"
+            f"    GIT_TAG {pins['commit']}\n"
+            f"    GIT_RESET {pins['commit']} # {pins['ref']} {pins['version']}\n",
+            pinned,
+        )
+        # The sparse-checkout clone flags must survive the rewrite.
+        self.assertIn('GIT_CLONE_FLAGS "--sparse --filter=tree:0"', pinned)
+        self.assertEqual(pin_packages.rewrite(pinned, "llvm", pins, False), pinned)
 
     def test_check_git_fixture_matches_audited_idiom(self):
         # neutralize_check_git string-matches the exact upstream injection

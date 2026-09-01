@@ -96,6 +96,18 @@
       ],
       "overrides": {}
     },
+    "llvm": {
+      "kind": "git",
+      "version": "release-22.x-2026-06-15",
+      "url": "https://github.com/llvm/llvm-project",
+      "ref": "release/22.x",
+      "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
+      "provenance": "Host clang/lld cross-toolchain sources; winbuild clones the release/22.x branch tip at bootstrap time, the last live-fetch in the toolchain after the mingw-w64 pin. Pinned to the current branch tip (unmoved since 2026-06-15, and the same tip upstream's own 2026-08-05 toolchain build used), resolved 2026-09-01 with the GitHub commits API for release/22.x and frozen by commit.",
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
     "dav1d": {
       "kind": "git",
       "version": "1.5.3",

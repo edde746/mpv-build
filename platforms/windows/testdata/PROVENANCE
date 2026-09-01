@@ -8,8 +8,9 @@
 #         2026-09-01 via `git ls-remote ... refs/heads/master`; the same
 #         commit versions.json pins as component mpv-winbuild-cmake)
 # Fetched: 2026-09-01, raw.githubusercontent.com/<repo>/<commit>/packages/<f>
-# (custom_steps.cmake and mingw-w64.cmake: same commit, cmake/ and toolchain/
-# respectively, copied from a verified local checkout at the pin 2026-09-01)
+# (custom_steps.cmake, mingw-w64.cmake and llvm.cmake: same commit, cmake/,
+# toolchain/ and toolchain/llvm/ respectively, copied from a verified local
+# checkout at the pin 2026-09-01)
 #
 # sha256 of each fixture as fetched:
 #   359c9c7da360f57d3a438e6fe117af6169cbd9aa3672751fd2bfc31e02be8fff  ffmpeg.cmake
@@ -18,16 +19,19 @@
 #   cfb9b0fbaaf6013069fe3eeda7e9e9644546f09cd772dbd549f8eb7fa21c7122  mpv.cmake
 #   b5dc88003f81d95e9a86c4befe1bac1472a4ec15c6d9a56a8bfd9c5fabf698a2  custom_steps.cmake
 #   55f2a2bb49ef17de05985beb0395c7a1acb44d613c50e048fce1e5a2c2fab8a3  mingw-w64.cmake
+#   a1168b87c9ef663c40ce08f666219e3f668efb328429e4cea8704741b8cb31db  llvm.cmake
 #
 # mpv/ffmpeg/libass are the files pin_packages.py rewrites (pristine upstream:
 # no GIT_TAG, no GIT_RESET, no PATCH_COMMAND -- they track master).
-# mingw-w64.cmake is the toolchain source package pin_packages.py pins the
-# same way (pristine upstream: no GIT_TAG at all -- an implicit master tip).
+# mingw-w64.cmake and llvm.cmake are the toolchain source packages
+# pin_packages.py pins the same way (mingw-w64 pristine has no GIT_TAG at
+# all; llvm pristine carries upstream's own moving-branch GIT_TAG, which the
+# rewrite replaces).
 # mbedtls.cmake is upstream's own pinning idiom and is the reference the tests
 # compare the injected block's shape against; it is never rewritten.
 # custom_steps.cmake carries the check-git step whose injection
 # pin_packages.neutralize_check_git suppresses for warm-cache correctness; the
 # tests assert the audited idiom still matches and that the rewrite converges.
 #
-# When bumping the mpv-winbuild-cmake pin in versions.json, refresh these six
-# fixtures from the new commit and update the hashes above.
+# When bumping the mpv-winbuild-cmake pin in versions.json, refresh these
+# seven fixtures from the new commit and update the hashes above.

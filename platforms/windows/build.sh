@@ -157,12 +157,13 @@ drop_stamps() {
   # step logs (nonzero size); stamps are the 0-byte files.
   find "$1" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
 }
-# Invalidate every package that builds out of the component's source tree:
-# drop their stamps AND delete their build directories. A build dir restored
-# from the cache was configured against the previous source state; re-running
-# steps inside it against a reset source fails or, worse, silently builds a
-# mix (observed: mingw-w64-headers' autotools build dir kept Makefile rules
-# for header files that only exist in the newer source).
+# Invalidate every package affected by a component's source moving: drop
+# their stamps AND delete their build directories. A build dir restored from
+# the cache was configured against the previous state; re-running steps
+# inside it fails or, worse, silently builds a mix (observed twice:
+# mingw-w64-headers' autotools build dir kept Makefile rules for header
+# files only the newer source has, and llvm-libcxx's build dir regenerated a
+# broken include/c++/v1 tree after the sysroot underneath it changed).
 purge_component() {
   local member
   for member in $1; do
@@ -172,12 +173,34 @@ purge_component() {
     find "$BUILD" -type d -name "$member-build" -prune -exec rm -rf {} + 2> /dev/null || true
   done
 }
+# mingw-w64 defines the target ABI: headers and CRT that every runtime and
+# every dependency compiles against. When its pin moves, the honest blast
+# radius is the whole target sysroot and everything built into it. Keep only
+# the mingw-independent, genuinely expensive state: the host llvm/clang, the
+# wrapper scripts and rustup.
+purge_sysroot_world() {
+  echo "==> mingw-w64 moved: purging the target sysroot and everything built against it"
+  rm -rf "$BUILD/install/$ARCH-w64-mingw32"
+  find "$BUILD" -type d -name '*-stamp' 2> /dev/null | while read -r d; do
+    case "$(basename "$d")" in
+      llvm-stamp | llvm-wrapper-stamp | rustup-stamp) ;;
+      *) drop_stamps "$d" ;;
+    esac
+  done
+  find "$BUILD" -type d -name '*-build' -prune 2> /dev/null | while read -r d; do
+    case "$(basename "$d")" in
+      llvm-build | llvm-wrapper-build | rustup-build) ;;
+      *) rm -rf "$d" ;;
+    esac
+  done
+}
 invalidate_stale_pins() {
   python3 - "$ROOT/versions.json" <<'PY' | while read -r component source_name pinned; do
 import json, sys
 components = json.load(open(sys.argv[1]))["components"]
 for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
-                               ("libass", "libass"), ("mingw-w64", "mingw-w64")):
+                               ("libass", "libass"), ("llvm", "llvm"),
+                               ("mingw-w64", "mingw-w64")):
     entry = components[component]
     pins = {"commit": entry["commit"]}
     pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
@@ -186,15 +209,16 @@ for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
 PY
     local src="$WORK/src/$source_name" family
     case "$component" in
-      # Everything that configures/builds out of the shared mingw-w64 source.
-      mingw-w64) family="mingw-w64 mingw-w64-headers mingw-w64-crt winpthreads gendef widl" ;;
+      mingw-w64) family="__sysroot_world__" ;;
+      # Everything that builds out of the shared llvm-project source.
+      llvm) family="llvm llvm-wrapper llvm-clang llvm-compiler-rt-builtin llvm-compiler-rt llvm-libcxx llvm-openmp" ;;
       *) family="$component" ;;
     esac
     if [[ -d "$src/.git" ]]; then
       local head
       head="$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)"
       if [[ "$head" != "$pinned" ]]; then
-        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; resetting source, purging: $family"
+        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; resetting source"
         git -C "$src" am --abort 2> /dev/null || true
         # The filtered clone fetches missing objects lazily; fetch the pin
         # explicitly in case the cached clone predates it.
@@ -202,11 +226,21 @@ PY
           || git -C "$src" fetch -q origin "$pinned"
         git -C "$src" reset --hard -q "$pinned"
         git -C "$src" clean -qdf
-        purge_component "$family"
+        if [[ "$family" == "__sysroot_world__" ]]; then
+          purge_sysroot_world
+        else
+          echo "==> purging: $family"
+          purge_component "$family"
+        fi
       fi
     elif find "$BUILD" -type d -name "$component-stamp" 2> /dev/null | grep -q .; then
-      echo "==> $component stamps present without a source; purging: $family"
-      purge_component "$family"
+      if [[ "$family" == "__sysroot_world__" ]]; then
+        echo "==> $component stamps present without a source"
+        purge_sysroot_world
+      else
+        echo "==> $component stamps present without a source; purging: $family"
+        purge_component "$family"
+      fi
     fi
   done
 }

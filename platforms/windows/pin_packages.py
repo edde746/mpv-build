@@ -71,7 +71,14 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 # restructure (2026-08-29 secure-API header merge) has already broken the
 # dependency graph once. No patch-series support here: the staged-patch glob
 # is anchored to packages/, and toolchain sources have no pool.
-TOOLCHAIN_COMPONENTS = ("mingw-w64",)
+# Toolchain component -> cmake file inside the winbuild checkout. llvm's
+# pristine file carries upstream's own GIT_REMOTE_NAME/GIT_TAG (a moving
+# release branch); the strip-before-inject rewrite replaces them with the
+# resolved commit.
+TOOLCHAIN_COMPONENTS = {
+    "mingw-w64": "toolchain/mingw-w64.cmake",
+    "llvm": "toolchain/llvm/llvm.cmake",
+}
 GROUP = "windows"
 
 # Keywords this script owns inside the three package files. Stripped before
@@ -267,9 +274,9 @@ def main(argv):
         patched = f", {len(staged)} patch(es) staged" if staged else ""
         print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{patched}")
 
-    for component in TOOLCHAIN_COMPONENTS:
+    for component, relpath in TOOLCHAIN_COMPONENTS.items():
         pins = resolved_pins(versions, component)
-        toolchain_file = winbuild / "toolchain" / f"{component}.cmake"
+        toolchain_file = winbuild / relpath
         if not toolchain_file.is_file():
             fail(f"{toolchain_file}: missing")
         text = toolchain_file.read_text(encoding="utf-8")
