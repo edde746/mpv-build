@@ -120,6 +120,18 @@
       ],
       "overrides": {}
     },
+    "nv-codec-headers": {
+      "kind": "git",
+      "version": "n13.0.19.1",
+      "url": "https://github.com/FFmpeg/nv-codec-headers",
+      "ref": "n13.0.19.1",
+      "commit": "88fee5c37318c991a8762d423530f91681e32e3a",
+      "provenance": "NVIDIA codec headers for the windows ffmpeg. winbuild builds the master tip (13.1 in-dev), which follows ffmpeg master; 13.1 reshapes NV_ENC_CLOCK_TIMESTAMP_SET, whose countingType member the pinned ffmpeg n8.0.1 nvenc wrapper still uses, so the tip cannot build with a release ffmpeg. n13.0.19.1 is the newest 13.0-series release. Resolved 2026-09-01 from the GitHub commits API for the tag and frozen by commit.",
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
     "dav1d": {
       "kind": "git",
       "version": "1.5.3",

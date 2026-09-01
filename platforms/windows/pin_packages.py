@@ -77,10 +77,13 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 #   svt-av1: follows ffmpeg master; SVT-AV1 4.0 removed a field the pinned
 #     release ffmpeg still sets unguarded, so the master tip cannot build
 #     with a release ffmpeg.
+#   nv-codec-headers: same shape; the 13.1 in-dev tip reshapes
+#     NV_ENC_CLOCK_TIMESTAMP_SET, which n8.0.1's nvenc wrapper still uses.
 EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
     "svt-av1": "packages/svtav1.cmake",
+    "nv-codec-headers": "packages/nvcodec-headers.cmake",
 }
 GROUP = "windows"
 

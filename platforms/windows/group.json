@@ -15,7 +15,8 @@
         "mpv-winbuild-cmake",
         "mingw-w64",
         "llvm",
-        "svt-av1"
+        "svt-av1",
+        "nv-codec-headers"
       ],
       "variants": [
         "x86_64",

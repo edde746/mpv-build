@@ -200,6 +200,7 @@ import json, sys
 components = json.load(open(sys.argv[1]))["components"]
 for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
                                ("libass", "libass"), ("svt-av1", "svtav1"),
+                               ("nv-codec-headers", "nvcodec-headers"),
                                ("llvm", "llvm"), ("mingw-w64", "mingw-w64")):
     entry = components[component]
     pins = {"commit": entry["commit"]}

@@ -54,6 +54,12 @@ PINS = {
         "ref": "v3.1.2",
         "commit": "b33dcc56cc64fcb3b3569094af8ab1d0d81ab4c1",
     },
+    "nv-codec-headers": {
+        "version": "n13.0.19.1",
+        "url": "https://github.com/FFmpeg/nv-codec-headers",
+        "ref": "n13.0.19.1",
+        "commit": "88fee5c37318c991a8762d423530f91681e32e3a",
+    },
 }
 
 PATCH = """diff --git a/a.c b/a.c
@@ -256,6 +262,22 @@ class PinPackagesTest(unittest.TestCase):
             pinned,
         )
         self.assertEqual(pin_packages.rewrite(pinned, "svt-av1", pins, False), pinned)
+
+    def test_nvcodec_pin_matches_idiom(self):
+        # nv-codec-headers pins to the 13.0 series: the 13.1 in-dev tip
+        # reshapes NV_ENC_CLOCK_TIMESTAMP_SET, which n8.0.1's nvenc wrapper
+        # still uses.
+        text = (TESTDATA / "nvcodec-headers.cmake").read_text()
+        pins = PINS["nv-codec-headers"]
+        pinned = pin_packages.rewrite(text, "nv-codec-headers", pins, False)
+        self.assertIn(
+            '    UPDATE_COMMAND ""\n'
+            "    GIT_REMOTE_NAME origin\n"
+            f"    GIT_TAG {pins['commit']}\n"
+            f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
+            pinned,
+        )
+        self.assertEqual(pin_packages.rewrite(pinned, "nv-codec-headers", pins, False), pinned)
 
     def test_ffmpeg_cuda_is_arch_gated(self):
         # The pinned release ffmpeg's ffnvcodec probe fails on
