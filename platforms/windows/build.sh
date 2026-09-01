@@ -49,6 +49,15 @@ elif [[ -n "${2:-}" ]]; then
   usage
 fi
 
+# winbuild's own patch steps run `git am` (spirv-cross, fontconfig, ...),
+# which hard-fails without a committer identity -- upstream's CI configures
+# one globally as its first step. Scope ours to this process instead of
+# mutating the host's git config.
+export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-mpv-build}"
+export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-mpv-build@localhost}"
+export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_AUTHOR_NAME}"
+export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
