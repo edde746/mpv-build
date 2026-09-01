@@ -1,0 +1,14 @@
+# Toolchain generation for content-addressed binaries.
+#
+# Content keys are derived from sources only, so they are reproducible on any
+# machine. The compiler is deliberately NOT sampled from the environment: a key
+# that changed with the local Xcode would make `binary_keys.py verify` fail for
+# everyone who is not on the CI image, and would silently invalidate every
+# published asset whenever GitHub refreshes its runner.
+#
+# The cost of that choice is that a new Xcode or SDK does not invalidate
+# anything by itself. Bump the generation below to force a rebuild of every
+# self-built library when the toolchain that produces the binaries changes in a
+# way that matters (SDK requirements for App Store submission, a codegen fix, a
+# miscompile).
+generation=1

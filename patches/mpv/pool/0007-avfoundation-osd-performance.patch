@@ -1,0 +1,740 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 9b7b4e1..e585f7d 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -18,6 +18,10 @@
+ #include <math.h>
+ #include <stdlib.h>
+ #include <stdatomic.h>
++#include <limits.h>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_videotoolbox.h>
+ #include "common/common.h"
+@@ -81,6 +85,8 @@
+     bool pip_composite_osd;
+     int queue_lead_ms;
+     int presentation;
++    int osd_max_height;
++    bool osd_video_res;
+ };
+ 
+ struct priv {
+@@ -111,6 +117,34 @@
+     int osd_pool_w, osd_pool_h;
+     bool osd_needs_enqueue;
+ 
++    // Per-IOSurface dirty-rect tracking for partial OSD buffer clears. Pool
++    // buffers are recycled with their previous contents intact and this code
++    // is their only writer, so remembering what was last drawn into each
++    // backing surface lets the clear touch just those rows instead of the
++    // whole display-sized buffer. The CFRetain on the surface pins its
++    // pointer so an entry can never alias a different (recycled) surface.
++    struct osd_buf_state {
++        IOSurfaceRef surf;     // CFRetained
++        struct mp_rect dirty;  // drawn region from the surface's last use
++        int64_t last_used_ns;
++    } osd_buf_states[4];
++    int osd_buf_state_count;
++
++    // OSD performance counters; accumulation is unconditional (cheap),
++    // formatted output is gated on -v.
++    struct {
++        int renders, skipped, empty, frames;
++        int64_t total_ns, max_ns;
++        int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
++        int64_t enqueue_ns, video_sample_ns, wait_ns;
++        // Scheduling margin of enqueued OSD samples: sample PTS minus the
++        // timebase position at enqueue. Negative/small lead means the
++        // presentation deadline was already missed on the CPU side.
++        int enq_count, enq_drops;
++        int64_t lead_sum_ns, lead_min_ns;
++        int64_t last_spike_ns;
++    } perf;
++
+     // Compositing mode support
+     __strong id<MTLDevice> mtlDevice;
+     __strong CIContext *ciContext;
+@@ -681,6 +715,8 @@ static void update_avfoundation_options(struct vo *vo)
+     bool old_composite_osd = p->opts->composite_osd;
+     bool old_pip_composite_osd = p->opts->pip_composite_osd;
+     int old_queue_lead_ms = p->opts->queue_lead_ms;
++    int old_osd_max_height = p->opts->osd_max_height;
++    bool old_osd_video_res = p->opts->osd_video_res;
+ 
+     if (!m_config_cache_update(p->opts_cache))
+         return;
+@@ -688,17 +724,29 @@ static void update_avfoundation_options(struct vo *vo)
+     if (old_queue_lead_ms != p->opts->queue_lead_ms)
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+ 
+-    if (old_composite_osd == p->opts->composite_osd &&
+-        old_pip_composite_osd == p->opts->pip_composite_osd)
++    bool composite_changed =
++        old_composite_osd != p->opts->composite_osd ||
++        old_pip_composite_osd != p->opts->pip_composite_osd;
++    bool osd_scale_changed = old_osd_max_height != p->opts->osd_max_height ||
++        old_osd_video_res != p->opts->osd_video_res;
++
++    if (!composite_changed && !osd_scale_changed)
+         return;
+ 
+-    MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
+-               "pip_composite_osd: %s\n",
+-               p->opts->composite_osd ? "yes" : "no",
+-               p->opts->pip_composite_osd ? "yes" : "no");
++    if (composite_changed) {
++        MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
++                   "pip_composite_osd: %s\n",
++                   p->opts->composite_osd ? "yes" : "no",
++                   p->opts->pip_composite_osd ? "yes" : "no");
++    }
++    if (osd_scale_changed) {
++        MP_VERBOSE(vo, "OSD scaling updated: max_height: %d, video_res: %s\n",
++                   p->opts->osd_max_height,
++                   p->opts->osd_video_res ? "yes" : "no");
++    }
+ 
+     clear_subtitle_cache(p);
+-    if (!should_composite_into_video(p))
++    if (composite_changed && !should_composite_into_video(p))
+         release_ci_compositor(p);
+     if (p->osdLayer)
+         sample_buffer_renderer_flush(p->osdLayer, true);
+@@ -1072,36 +1120,31 @@ static int clip_u10(double value)
+     return MPCLAMP((int)(value + 0.5), 0, 1023);
+ }
+ 
+-static void update_subtitle_bounds(struct priv *p, CVPixelBufferRef subtitle)
++// Union of the part destination rects, clamped to the OSD buffer. Both draw
++// paths only write inside these rects, so this bounds everything non-blank
++// without scanning the rendered pixels.
++static void update_subtitle_bounds_from_parts(struct priv *p,
++                                              struct sub_bitmaps *imgs)
+ {
+     p->subtitle_x0 = p->osd_w;
+     p->subtitle_y0 = p->osd_h;
+     p->subtitle_x1 = 0;
+     p->subtitle_y1 = 0;
+ 
+-    if (!subtitle || p->osd_w <= 0 || p->osd_h <= 0)
+-        return;
+-
+-    if (CVPixelBufferLockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
++    if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
+         return;
+ 
+-    uint8_t *base = CVPixelBufferGetBaseAddress(subtitle);
+-    size_t stride = CVPixelBufferGetBytesPerRow(subtitle);
+-    if (base && stride) {
+-        for (int y = 0; y < p->osd_h; y++) {
+-            uint8_t *row = base + (size_t)y * stride;
+-            for (int x = 0; x < p->osd_w; x++) {
+-                if (row[(size_t)x * 4 + 3]) {
+-                    p->subtitle_x0 = MPMIN(p->subtitle_x0, x);
+-                    p->subtitle_y0 = MPMIN(p->subtitle_y0, y);
+-                    p->subtitle_x1 = MPMAX(p->subtitle_x1, x + 1);
+-                    p->subtitle_y1 = MPMAX(p->subtitle_y1, y + 1);
+-                }
+-            }
+-        }
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++        int dw = sb->dw > 0 ? sb->dw : sb->w;
++        int dh = sb->dh > 0 ? sb->dh : sb->h;
++        p->subtitle_x0 = MPMIN(p->subtitle_x0, MPCLAMP(sb->x, 0, p->osd_w));
++        p->subtitle_y0 = MPMIN(p->subtitle_y0, MPCLAMP(sb->y, 0, p->osd_h));
++        p->subtitle_x1 = MPMAX(p->subtitle_x1, MPCLAMP(sb->x + dw, 0, p->osd_w));
++        p->subtitle_y1 = MPMAX(p->subtitle_y1, MPCLAMP(sb->y + dh, 0, p->osd_h));
+     }
+-
+-    CVPixelBufferUnlockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly);
+ }
+ 
+ // Map mpv image format to CVPixelBuffer format
+@@ -1127,9 +1170,85 @@ static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
+         &p->sw_pool_h, &p->sw_pool_format, w, h, format, "software upload");
+ }
+ 
++static void reset_osd_buf_states(struct priv *p)
++{
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        if (p->osd_buf_states[i].surf)
++            CFRelease(p->osd_buf_states[i].surf);
++    }
++    p->osd_buf_state_count = 0;
++}
++
++// Entries pin their IOSurface only briefly past the pool's own lifetime;
++// drop ones the pool has likely aged out so they don't hold memory.
++static void prune_osd_buf_states(struct priv *p, int64_t now)
++{
++    for (int i = 0; i < p->osd_buf_state_count;) {
++        if (now - p->osd_buf_states[i].last_used_ns > MP_TIME_MS_TO_NS(2000)) {
++            CFRelease(p->osd_buf_states[i].surf);
++            p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
++        } else {
++            i++;
++        }
++    }
++}
++
++static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
++                                                   CVPixelBufferRef buf)
++{
++    IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
++    if (!surf)
++        return NULL;
++
++    int64_t now = mp_time_ns();
++    struct osd_buf_state *oldest = NULL;
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        struct osd_buf_state *st = &p->osd_buf_states[i];
++        if (st->surf == surf) {
++            st->last_used_ns = now;
++            return st;
++        }
++        if (!oldest || st->last_used_ns < oldest->last_used_ns)
++            oldest = st;
++    }
++
++    struct osd_buf_state *st;
++    if (p->osd_buf_state_count < (int)MP_ARRAY_SIZE(p->osd_buf_states)) {
++        st = &p->osd_buf_states[p->osd_buf_state_count++];
++    } else {
++        st = oldest;
++        CFRelease(st->surf);
++    }
++    *st = (struct osd_buf_state){
++        .surf = (IOSurfaceRef)CFRetain(surf),
++        // Contents unknown until this code has drawn into it: clear fully.
++        .dirty = {0, 0, INT_MAX, INT_MAX},
++        .last_used_ns = now,
++    };
++    return st;
++}
++
++static void osd_buf_record_dirty(struct priv *p, CVPixelBufferRef buf,
++                                 struct mp_rect dirty)
++{
++    IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
++    if (!surf)
++        return;
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        if (p->osd_buf_states[i].surf == surf) {
++            p->osd_buf_states[i].dirty = dirty;
++            return;
++        }
++    }
++}
++
+ static bool create_osd_pool(struct vo *vo, int w, int h)
+ {
+     struct priv *p = vo->priv;
++    // The pool is about to be recreated: its buffers (and their recorded
++    // dirty state) are going away.
++    if (p->osdPool && (p->osd_pool_w != w || p->osd_pool_h != h))
++        reset_osd_buf_states(p);
+     return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
+         &p->osd_pool_h, NULL, w, h, kCVPixelFormatType_32BGRA, "OSD overlay");
+ }
+@@ -1302,9 +1421,9 @@ static int get_direct_osd_draw_path(struct sub_bitmaps *imgs)
+     return path;
+ }
+ 
+-static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
+-                              uint8_t *src, int src_stride,
+-                              int w, int h, uint32_t color)
++static void blend_libass_bgra_scalar(uint8_t *dst, size_t dst_stride,
++                                     uint8_t *src, int src_stride,
++                                     int w, int h, uint32_t color)
+ {
+     const unsigned int r = (color >> 24) & 0xff;
+     const unsigned int g = (color >> 16) & 0xff;
+@@ -1340,9 +1459,9 @@ static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
+     }
+ }
+ 
+-static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
+-                                 uint8_t *src, int src_stride,
+-                                 int w, int h)
++static void blend_bgra_over_bgra_scalar(uint8_t *dst, size_t dst_stride,
++                                        uint8_t *src, int src_stride,
++                                        int w, int h)
+ {
+     for (int y = 0; y < h; y++) {
+         uint32_t *srcrow = (uint32_t *)src;
+@@ -1378,6 +1497,153 @@ static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
+     }
+ }
+ 
++#if defined(__aarch64__)
++
++// NEON versions of the two scalar blends above, bit-exact with them: both
++// divisions are folded into exact floor-by-255 stages (floor(x/65025) ==
++// floor(floor(x/255)/255)).
++
++// Exact floor(x/255) for u16 lanes.
++static inline uint16x8_t div255_u16_neon(uint16x8_t x)
++{
++    return vshrq_n_u16(
++        vaddq_u16(vaddq_u16(x, vdupq_n_u16(1)), vshrq_n_u16(x, 8)), 8);
++}
++
++// Exact floor(x/255) for u32 lanes (canonical magic-multiply), narrowed to
++// u16; every reachable numerator here is < 2^24 so the result fits.
++static inline uint16x4_t div255_u32_to_u16_neon(uint32x4_t x)
++{
++    const uint32x2_t magic = vdup_n_u32(0x80808081u);
++    uint64x2_t lo = vmull_u32(vget_low_u32(x), magic);
++    uint64x2_t hi = vmull_u32(vget_high_u32(x), magic);
++    uint32x2_t l = vmovn_u64(vshrq_n_u64(lo, 39));
++    uint32x2_t h = vmovn_u64(vshrq_n_u64(hi, 39));
++    return vmovn_u32(vcombine_u32(l, h));
++}
++
++// One channel of the libass blend: (aa*c + inv*dst + 32512) / 65025.
++static inline uint8x8_t blend_libass_channel_neon(uint16x8_t aa, uint16x8_t inv,
++                                                  uint8_t c, uint8x8_t dst)
++{
++    uint16x8_t d16 = vmovl_u8(dst);
++    uint32x4_t lo = vmull_n_u16(vget_low_u16(aa), c);
++    uint32x4_t hi = vmull_n_u16(vget_high_u16(aa), c);
++    lo = vmlal_u16(lo, vget_low_u16(inv), vget_low_u16(d16));
++    hi = vmlal_u16(hi, vget_high_u16(inv), vget_high_u16(d16));
++    lo = vaddq_u32(lo, vdupq_n_u32(32512));
++    hi = vaddq_u32(hi, vdupq_n_u32(32512));
++    uint16x8_t y = vcombine_u16(div255_u32_to_u16_neon(lo),
++                                div255_u32_to_u16_neon(hi));
++    return vmovn_u16(div255_u16_neon(y));
++}
++
++// Requires w % 8 == 0; the dispatcher routes the tail through the scalar path.
++// Mask lanes of 0 come out as dst exactly ((dst*65025 + 32512)/65025 == dst),
++// so no per-lane select is needed; the vmaxv skip is purely an optimization.
++static void blend_libass_bgra_neon(uint8_t *dst, size_t dst_stride,
++                                   uint8_t *src, int src_stride,
++                                   int w, int h, uint32_t color)
++{
++    const uint8_t r = (color >> 24) & 0xff;
++    const uint8_t g = (color >> 16) & 0xff;
++    const uint8_t b = (color >>  8) & 0xff;
++    const uint8_t a = 0xff - (color & 0xff);
++    const uint8x8_t va = vdup_n_u8(a);
++    const uint16x8_t full = vdupq_n_u16(255 * 255);
++
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x += 8) {
++            uint8x8_t m = vld1_u8(src + x);
++            if (!vmaxv_u8(m))
++                continue;
++
++            uint16x8_t aa = vmull_u8(m, va);
++            uint16x8_t inv = vsubq_u16(full, aa);
++            uint8x8x4_t d = vld4_u8(dst + (size_t)x * 4);
++            d.val[0] = blend_libass_channel_neon(aa, inv, b, d.val[0]);
++            d.val[1] = blend_libass_channel_neon(aa, inv, g, d.val[1]);
++            d.val[2] = blend_libass_channel_neon(aa, inv, r, d.val[2]);
++            d.val[3] = blend_libass_channel_neon(aa, inv, 255, d.val[3]);
++            vst4_u8(dst + (size_t)x * 4, d);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++// One channel of src-over: min(0xff, src + (dst*inv + 127)/255). The scalar
++// srca==0xff and dst==0 shortcuts produce the same result as this formula,
++// so only srca==0 lanes need to keep dst (selected by the caller).
++static inline uint8x8_t blend_over_channel_neon(uint8x8_t srcc, uint8x8_t dstc,
++                                                uint8x8_t inv)
++{
++    uint16x8_t t = vaddq_u16(vmull_u8(dstc, inv), vdupq_n_u16(127));
++    return vqadd_u8(srcc, vmovn_u16(div255_u16_neon(t)));
++}
++
++// Requires w % 8 == 0; tail goes through the scalar path.
++static void blend_bgra_over_bgra_neon(uint8_t *dst, size_t dst_stride,
++                                      uint8_t *src, int src_stride,
++                                      int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x += 8) {
++            uint8x8x4_t s = vld4_u8(src + (size_t)x * 4);
++            if (!vmaxv_u8(s.val[3]))
++                continue;
++
++            uint8x8x4_t d = vld4_u8(dst + (size_t)x * 4);
++            uint8x8_t inv = vmvn_u8(s.val[3]);
++            uint8x8_t keep = vceqz_u8(s.val[3]);
++            for (int c = 0; c < 4; c++) {
++                d.val[c] = vbsl_u8(keep, d.val[c],
++                    blend_over_channel_neon(s.val[c], d.val[c], inv));
++            }
++            vst4_u8(dst + (size_t)x * 4, d);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++#endif // __aarch64__
++
++static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
++                              uint8_t *src, int src_stride,
++                              int w, int h, uint32_t color)
++{
++    if (!(0xff - (color & 0xff)))
++        return;
++#if defined(__aarch64__)
++    int w8 = w & ~7;
++    if (w8 > 0)
++        blend_libass_bgra_neon(dst, dst_stride, src, src_stride, w8, h, color);
++    if (w > w8)
++        blend_libass_bgra_scalar(dst + (size_t)w8 * 4, dst_stride,
++                                 src + w8, src_stride, w - w8, h, color);
++#else
++    blend_libass_bgra_scalar(dst, dst_stride, src, src_stride, w, h, color);
++#endif
++}
++
++static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
++                                 uint8_t *src, int src_stride,
++                                 int w, int h)
++{
++#if defined(__aarch64__)
++    int w8 = w & ~7;
++    if (w8 > 0)
++        blend_bgra_over_bgra_neon(dst, dst_stride, src, src_stride, w8, h);
++    if (w > w8)
++        blend_bgra_over_bgra_scalar(dst + (size_t)w8 * 4, dst_stride,
++                                    src + (size_t)w8 * 4, src_stride,
++                                    w - w8, h);
++#else
++    blend_bgra_over_bgra_scalar(dst, dst_stride, src, src_stride, w, h);
++#endif
++}
++
+ static void draw_direct_libass_bitmap(uint8_t *base, size_t stride,
+                                       int w, int h, struct sub_bitmap *sb)
+ {
+@@ -1500,7 +1766,26 @@ static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
+         CVPixelBufferRelease(pixbuf);
+         return NULL;
+     }
+-    memset(base, 0, stride * h);
++
++    int64_t t = mp_time_ns();
++    struct osd_buf_state *st = osd_buf_state_acquire(p, pixbuf);
++    struct mp_rect dirty = st ? st->dirty : (struct mp_rect){0, 0, w, h};
++    dirty.x0 = MPCLAMP(dirty.x0, 0, w);
++    dirty.y0 = MPCLAMP(dirty.y0, 0, h);
++    dirty.x1 = MPCLAMP(dirty.x1, 0, w);
++    dirty.y1 = MPCLAMP(dirty.y1, 0, h);
++    if (dirty.x1 > dirty.x0 && dirty.y1 > dirty.y0) {
++        size_t span = (size_t)(dirty.x1 - dirty.x0) * 4;
++        uint8_t *row = (uint8_t *)base + (size_t)dirty.y0 * stride +
++                       (size_t)dirty.x0 * 4;
++        for (int y = dirty.y0; y < dirty.y1; y++) {
++            memset(row, 0, span);
++            row += stride;
++        }
++    }
++    if (st)
++        st->dirty = (struct mp_rect){0, 0, 0, 0};
++    p->perf.clear_ns += mp_time_ns() - t;
+ 
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+     return pixbuf;
+@@ -1529,7 +1814,9 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
+         return NULL;
+     }
+ 
++    int64_t t = mp_time_ns();
+     if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++        p->perf.blend_ns += mp_time_ns() - t;
+         CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+         return pixbuf;
+     }
+@@ -1551,6 +1838,7 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
+ 
+     draw_subtitle_bitmaps(context, imgs, h);
+     CGContextRelease(context);
++    p->perf.cg_ns += mp_time_ns() - t;
+ 
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+     return pixbuf;
+@@ -1639,6 +1927,7 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+     // Clear subtitles when there are none
+     if (!imgs || imgs->num_parts == 0) {
+         if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
++            p->perf.empty++;
+             p->has_subtitle = false;
+             p->osd_change_id = 0;  // Reset change_id so next subtitle renders
+             if (p->cachedSubtitleImage) {
+@@ -1663,9 +1952,11 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+         (!need_buffer || p->cachedSubtitleBuffer);
+     if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
+         p->has_subtitle && has_cached_subtitle) {
++        p->perf.skipped++;
+         return;
+     }
+ 
++    int64_t t_render = mp_time_ns();
+     bool rendered = false;
+     if (need_image) {
+         CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
+@@ -1686,7 +1977,12 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+             if (p->cachedSubtitleBuffer)
+                 CVPixelBufferRelease(p->cachedSubtitleBuffer);
+             p->cachedSubtitleBuffer = subtitleBuffer;
+-            update_subtitle_bounds(p, subtitleBuffer);
++            int64_t t_bounds = mp_time_ns();
++            update_subtitle_bounds_from_parts(p, imgs);
++            osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
++                p->subtitle_x0, p->subtitle_y0,
++                p->subtitle_x1, p->subtitle_y1});
++            p->perf.bounds_ns += mp_time_ns() - t_bounds;
+             rendered = true;
+         }
+     }
+@@ -1694,6 +1990,19 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+     if (!rendered)
+         return;
+ 
++    int64_t render_ns = mp_time_ns() - t_render;
++    p->perf.renders++;
++    p->perf.total_ns += render_ns;
++    p->perf.max_ns = MPMAX(p->perf.max_ns, render_ns);
++    if (render_ns > MP_TIME_MS_TO_NS(8) && mp_msg_test(vo->log, MSGL_V)) {
++        int64_t now = mp_time_ns();
++        if (now - p->perf.last_spike_ns > MP_TIME_MS_TO_NS(1000)) {
++            p->perf.last_spike_ns = now;
++            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d)\n",
++                       render_ns / 1e6, imgs->num_parts, p->osd_w, p->osd_h);
++        }
++    }
++
+     p->osd_change_id = imgs->change_id;
+     p->has_subtitle = true;
+     if (should_use_inline_osd_layer(p))
+@@ -1702,7 +2011,8 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+ 
+ // Render OSD/subtitles for an already computed geometry.
+ static bool render_osd_with_geometry(struct vo *vo, double pts,
+-                                     struct avf_render_geometry geometry)
++                                     struct avf_render_geometry geometry,
++                                     int frame_h)
+ {
+     struct priv *p = vo->priv;
+ 
+@@ -1718,12 +2028,45 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
+     if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
+         return false;
+ 
++    int osd_w = geometry.w;
++    int osd_h = geometry.h;
++
++    // Optionally rasterize the OSD below display resolution; the OSD layer
++    // upscales (videoGravity resize). Inline mode only: the composite paths
++    // do pixel math that assumes the buffer matches the display geometry.
++    double scale = 1.0;
++    if (should_use_inline_osd_layer(p) && p->opts) {
++        // Video-resolution mode: match the OSD pixel density to the video's
++        // upscale factor, so the canvas maps 1:1 onto video pixels over the
++        // on-screen video rect.
++        if (p->opts->osd_video_res) {
++            if (frame_h <= 0)
++                frame_h = vo->params ? vo->params->h : 0;
++            int dst_h = geometry.dst.y1 - geometry.dst.y0;
++            if (frame_h > 0 && dst_h > frame_h)
++                scale = (double)frame_h / dst_h;
++        }
++        int max_h = p->opts->osd_max_height;
++        if (max_h > 0 && osd_res.h * scale > max_h)
++            scale = (double)max_h / osd_res.h;
++    }
++    if (scale < 1.0) {
++        osd_res.w = MPMAX(1, (int)(osd_res.w * scale + 0.5));
++        osd_res.h = MPMAX(1, (int)(osd_res.h * scale + 0.5));
++        osd_res.ml = (int)(osd_res.ml * scale + 0.5);
++        osd_res.mt = (int)(osd_res.mt * scale + 0.5);
++        osd_res.mr = (int)(osd_res.mr * scale + 0.5);
++        osd_res.mb = (int)(osd_res.mb * scale + 0.5);
++        osd_w = osd_res.w;
++        osd_h = osd_res.h;
++    }
++
+     if (!osd_res_equals(p->osd_res, osd_res)) {
+         p->osd_res = osd_res;
+         p->osd_change_id = 0;
+     }
+-    p->osd_w = geometry.w;
+-    p->osd_h = geometry.h;
++    p->osd_w = osd_w;
++    p->osd_h = osd_h;
+ 
+     static const bool formats[SUBBITMAP_COUNT] = {
+         [SUBBITMAP_BGRA] = true,
+@@ -1763,7 +2106,7 @@ static void render_osd(struct vo *vo, double pts)
+     int frame_h = p->next_image ? p->next_image->h : 0;
+     struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
+ 
+-    render_osd_with_geometry(vo, pts, geometry);
++    render_osd_with_geometry(vo, pts, geometry, frame_h);
+ }
+ 
+ static bool ensure_ci_compositor(struct vo *vo)
+@@ -2472,6 +2815,42 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+     return true;
+ }
+ 
++// OSD perf summary; counters always accumulate, formatting is gated on -v.
++static void report_osd_perf(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->perf.renders <= 0)
++        return;
++
++    if (mp_msg_test(vo->log, MSGL_V)) {
++        double n = p->perf.renders;
++        double nf = MPMAX(p->perf.frames, 1);
++        double ne = MPMAX(p->perf.enq_count, 1);
++        MP_VERBOSE(vo,
++            "osd-perf: n=%d avg=%.2fms max=%.2fms "
++            "[clear %.2f blend %.2f cg %.2f bounds %.2f] enq %.2f | "
++            "vid %.3f wait %.3f (/frame) | "
++            "margin avg=%.1f min=%.1fms drops=%d | "
++            "skip=%d empty=%d osd=%dx%d\n",
++            p->perf.renders,
++            p->perf.total_ns / n / 1e6,
++            p->perf.max_ns / 1e6,
++            p->perf.clear_ns / n / 1e6,
++            p->perf.blend_ns / n / 1e6,
++            p->perf.cg_ns / n / 1e6,
++            p->perf.bounds_ns / n / 1e6,
++            p->perf.enqueue_ns / n / 1e6,
++            p->perf.video_sample_ns / nf / 1e6,
++            p->perf.wait_ns / nf / 1e6,
++            p->perf.lead_sum_ns / ne / 1e6,
++            p->perf.enq_count ? p->perf.lead_min_ns / 1e6 : 0.0,
++            p->perf.enq_drops,
++            p->perf.skipped, p->perf.empty, p->osd_w, p->osd_h);
++    }
++    memset(&p->perf, 0, sizeof(p->perf));
++}
++
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -2483,23 +2862,47 @@ static void flip_page(struct vo *vo)
+         CMSampleBufferRef osd_buf = NULL;
+         bool osd_needed = false;
+ 
++        // The OSD is rendered and enqueued before the video sample on
++        // purpose: the adjacent enqueues are what keep subtitle changes
++        // presenting on the exact frame they belong to. A slow subtitle
++        // render delays the video enqueue with it rather than letting the
++        // video run ahead of the subtitles.
+         render_osd(vo, p->next_pts);
+ 
+-        osd_buf = create_osd_sample_buffer(vo,
+-            sample_presentation_pts_ns(p), &osd_needed);
++        int64_t osd_pts_ns = sample_presentation_pts_ns(p);
++        osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
+ 
++        int64_t t = mp_time_ns();
+         CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
++        p->perf.video_sample_ns += mp_time_ns() - t;
+ 
+         bool osd_enqueued = !osd_needed;
+ 
+-        if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
++        t = mp_time_ns();
++        bool video_ready = video_buf &&
++            wait_until_ready_for_more_media_data(vo, p->next_present_host_ns);
++        p->perf.wait_ns += mp_time_ns() - t;
++
++        if (video_ready) {
+             if (!p->presentation_host)
+                 update_media_timebase_for_frame(vo);
+ 
+             if (osd_buf) {
++                t = mp_time_ns();
+                 osd_enqueued = enqueue_osd_sample(vo, osd_buf);
+-                if (osd_enqueued)
++                p->perf.enqueue_ns += mp_time_ns() - t;
++                if (osd_enqueued) {
+                     p->osd_needs_enqueue = false;
++                    // Margin between the OSD/video enqueue pair and the
++                    // frame's intended presentation time (same clock).
++                    int64_t lead = p->next_present_host_ns - mp_time_ns();
++                    if (!p->perf.enq_count || lead < p->perf.lead_min_ns)
++                        p->perf.lead_min_ns = lead;
++                    p->perf.lead_sum_ns += lead;
++                    p->perf.enq_count++;
++                } else {
++                    p->perf.enq_drops++;
++                }
+             }
+ 
+             enqueue_video_sample(vo, video_buf);
+@@ -2512,6 +2915,8 @@ static void flip_page(struct vo *vo)
+             CFRelease(osd_buf);
+         if (video_buf)
+             CFRelease(video_buf);
++
++        p->perf.frames++;
+     }
+ 
+     // Flush excess buffers every ~60 frames to prevent memory growth
+@@ -2524,8 +2929,14 @@ static void flip_page(struct vo *vo)
+             CVPixelBufferPoolFlush(p->osdPool, kCVPixelBufferPoolFlushExcessBuffers);
+         if (p->swUploadPool)
+             CVPixelBufferPoolFlush(p->swUploadPool, kCVPixelBufferPoolFlushExcessBuffers);
++        prune_osd_buf_states(p, mp_time_ns());
+     }
+ 
++    // Report often enough that short capture sessions still carry data.
++    if (p->perf.renders >= 32 ||
++        (p->perf.renders > 0 && p->perf.frames >= 300))
++        report_osd_perf(vo);
++
+     mp_image_unrefp(&p->next_image);
+ }
+ 
+@@ -2622,6 +3033,8 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    report_osd_perf(vo);
++
+ #if TARGET_OS_IPHONE
+     if (p->app_resign_observer || p->app_active_observer) {
+         dispatch_main_sync_safe(^{
+@@ -2676,6 +3089,7 @@ static void uninit(struct vo *vo)
+         CVPixelBufferPoolRelease(p->osdPool);
+         p->osdPool = NULL;
+     }
++    reset_osd_buf_states(p);
+ 
+     if (p->swUploadPool) {
+         CVPixelBufferPoolRelease(p->swUploadPool);
+@@ -2784,6 +3198,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     {"presentation", OPT_CHOICE(presentation,
+         {"media", AVF_PRESENTATION_MEDIA},
+         {"host", AVF_PRESENTATION_HOST})},
++    // Cap the OSD/subtitle rasterization height (0 = display resolution).
++    // Inline OSD layer mode only; the layer upscales the result.
++    {"osd-max-height", OPT_INT(osd_max_height), M_RANGE(0, 4320)},
++    // Rasterize the OSD at the video's pixel density instead of the
++    // display's (1:1 over the on-screen video rect).
++    {"osd-video-res", OPT_BOOL(osd_video_res)},
+     {0},
+ };
+ 

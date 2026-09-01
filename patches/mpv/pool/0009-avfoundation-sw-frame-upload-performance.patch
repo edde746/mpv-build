@@ -1,0 +1,310 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index a5056ca..fe16972 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -24,11 +24,13 @@
+ #endif
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_videotoolbox.h>
++#include <libavutil/pixfmt.h>
+ #include "common/common.h"
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+ #include "osdep/timer.h"
+ #include "vo.h"
++#include "video/fmt-conversion.h"
+ #include "video/mp_image.h"
+ #include "video/hwdec.h"
+ #include "sub/osd.h"
+@@ -161,6 +163,10 @@
+     int sw_pool_w, sw_pool_h;
+     OSType sw_pool_format;
+ 
++    // Cached video format description; recreated only when the incoming
++    // image buffer stops matching (dimensions/format/attachments).
++    CMVideoFormatDescriptionRef video_format_desc;
++
+     // Frame counter for periodic maintenance
+     int frame_count;
+     int not_ready_drop_count;
+@@ -254,6 +260,19 @@ static bool is_full_range_yuv_format(OSType format)
+            format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+ }
+ 
++// Planar 10/12-bit 4:2:0 (what dav1d/FFmpeg emit for 10/12-bit AV1/HEVC
++// software decode) has no named IMGFMT_* constant; resolve it through the
++// generic FFmpeg mapping (same approach as vo_drm.c).
++static int imgfmt_420p10(void)
++{
++    return pixfmt2imgfmt(AV_PIX_FMT_YUV420P10);
++}
++
++static int imgfmt_420p12(void)
++{
++    return pixfmt2imgfmt(AV_PIX_FMT_YUV420P12);
++}
++
+ static id<AVQueuedSampleBufferRendering> active_sample_buffer_renderer(
+     AVSampleBufferDisplayLayer *displayLayer)
+ {
+@@ -1161,19 +1180,20 @@ static void update_subtitle_bounds_from_parts(struct priv *p,
+     }
+ }
+ 
+-// Map mpv image format to CVPixelBuffer format
++// Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
++// Everything lands in a biplanar format: the display pipeline only handles
++// NV12/P010-family surfaces reliably (tri-planar 'y420' is not used by any
++// shipping AVSampleBufferDisplayLayer client and would also fall off the fast
++// biplanar subtitle blend path). Planar sources are interleaved during the
++// upload copy itself.
+ static OSType get_cv_pixel_format(int imgfmt)
+ {
+-    switch (imgfmt) {
+-        case IMGFMT_NV12:
+-            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+-        case IMGFMT_420P:
+-            return kCVPixelFormatType_420YpCbCr8Planar;
+-        case IMGFMT_P010:
+-            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+-        default:
+-            return 0;
+-    }
++    if (imgfmt == IMGFMT_NV12 || imgfmt == IMGFMT_420P)
++        return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++    if (imgfmt == IMGFMT_P010 || imgfmt == imgfmt_420p10() ||
++        imgfmt == imgfmt_420p12())
++        return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++    return 0;
+ }
+ 
+ // Create software upload pool
+@@ -1267,6 +1287,117 @@ static bool create_osd_pool(struct vo *vo, int w, int h)
+         &p->osd_pool_h, NULL, w, h, kCVPixelFormatType_32BGRA, "OSD overlay");
+ }
+ 
++// Row kernels for the software-frame upload. Planar sources are fused
++// (interleave, and for 10/12-bit the MSB-align shift) into the biplanar
++// destination during the one unavoidable copy, so no separate conversion
++// pass runs anywhere.
++
++// 16-bit row copy with LSB->MSB alignment shift (yuv420p10/12 -> P010 layout).
++static void copy_shift_u16_row(uint16_t *dst, const uint16_t *src, size_t n,
++                               int shift)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    int16x8_t vshift = vdupq_n_s16(shift);
++    for (; x + 8 <= n; x += 8)
++        vst1q_u16(dst + x, vshlq_u16(vld1q_u16(src + x), vshift));
++#endif
++    for (; x < n; x++)
++        dst[x] = src[x] << shift;
++}
++
++// Interleave 16-bit U and V rows with the alignment shift
++// (libyuv I010ToP010 semantics).
++static void interleave_shift_uv_row_u16(uint16_t *dst, const uint16_t *u,
++                                        const uint16_t *v, size_t n, int shift)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    int16x8_t vshift = vdupq_n_s16(shift);
++    for (; x + 8 <= n; x += 8) {
++        uint16x8x2_t uv = {{
++            vshlq_u16(vld1q_u16(u + x), vshift),
++            vshlq_u16(vld1q_u16(v + x), vshift),
++        }};
++        vst2q_u16(dst + 2 * x, uv);
++    }
++#endif
++    for (; x < n; x++) {
++        dst[2 * x + 0] = u[x] << shift;
++        dst[2 * x + 1] = v[x] << shift;
++    }
++}
++
++// Interleave 8-bit U and V rows (yuv420p -> NV12).
++static void interleave_uv_row_u8(uint8_t *dst, const uint8_t *u,
++                                 const uint8_t *v, size_t n)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    for (; x + 16 <= n; x += 16) {
++        uint8x16x2_t uv = {{ vld1q_u8(u + x), vld1q_u8(v + x) }};
++        vst2q_u8(dst + 2 * x, uv);
++    }
++#endif
++    for (; x < n; x++) {
++        dst[2 * x + 0] = u[x];
++        dst[2 * x + 1] = v[x];
++    }
++}
++
++// yuv420p10/12 (LSB-aligned planar) -> locked P010-layout ('x420') buffer.
++static void upload_420p1x_to_p010(struct mp_image *mpi, CVPixelBufferRef pixbuf,
++                                  int shift)
++{
++    int w = mpi->w, h = mpi->h;
++    int cw = (w + 1) / 2, ch = (h + 1) / 2;
++
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 0);
++    size_t dst_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 0);
++    for (int y = 0; y < h; y++) {
++        copy_shift_u16_row((uint16_t *)(dst_y + y * dst_y_stride),
++                           (const uint16_t *)(mpi->planes[0] + y * mpi->stride[0]),
++                           w, shift);
++    }
++
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 1);
++    size_t dst_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 1);
++    for (int y = 0; y < ch; y++) {
++        interleave_shift_uv_row_u16(
++            (uint16_t *)(dst_uv + y * dst_uv_stride),
++            (const uint16_t *)(mpi->planes[1] + y * mpi->stride[1]),
++            (const uint16_t *)(mpi->planes[2] + y * mpi->stride[2]),
++            cw, shift);
++    }
++}
++
++// yuv420p (planar) -> locked NV12 ('420v') buffer.
++static void upload_420p_to_nv12(struct mp_image *mpi, CVPixelBufferRef pixbuf)
++{
++    int w = mpi->w, h = mpi->h;
++    int cw = (w + 1) / 2, ch = (h + 1) / 2;
++
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 0);
++    size_t dst_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 0);
++    if (dst_y_stride == (size_t)mpi->stride[0]) {
++        memcpy(dst_y, mpi->planes[0], dst_y_stride * h);
++    } else {
++        for (int y = 0; y < h; y++) {
++            memcpy(dst_y + y * dst_y_stride,
++                   mpi->planes[0] + y * mpi->stride[0], w);
++        }
++    }
++
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 1);
++    size_t dst_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 1);
++    for (int y = 0; y < ch; y++) {
++        interleave_uv_row_u8(dst_uv + y * dst_uv_stride,
++                             mpi->planes[1] + y * mpi->stride[1],
++                             mpi->planes[2] + y * mpi->stride[2],
++                             cw);
++    }
++}
++
+ // Upload a software-decoded frame to CVPixelBuffer
+ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mpi)
+ {
+@@ -1297,7 +1428,15 @@ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mp
+ 
+     size_t planeCount = CVPixelBufferGetPlaneCount(pixbuf);
+ 
+-    if (planeCount == 0) {
++    if (mpi->imgfmt == IMGFMT_420P) {
++        upload_420p_to_nv12(mpi, pixbuf);
++    } else if (mpi->imgfmt == imgfmt_420p10()) {
++        upload_420p1x_to_p010(mpi, pixbuf, 6);
++    } else if (mpi->imgfmt == imgfmt_420p12()) {
++        // P010 layout keeps 2 extra significant low bits; harmless, they sit
++        // below the display's 10-bit quantization (libyuv does the same).
++        upload_420p1x_to_p010(mpi, pixbuf, 4);
++    } else if (planeCount == 0) {
+         // Non-planar format
+         void *dst = CVPixelBufferGetBaseAddress(pixbuf);
+         size_t dstStride = CVPixelBufferGetBytesPerRow(pixbuf);
+@@ -1315,7 +1454,7 @@ static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mp
+             }
+         }
+     } else {
+-        // Planar format (NV12, YUV420P, P010)
++        // Source plane layout matches the destination (NV12, P010)
+         for (size_t plane = 0; plane < planeCount && plane < MP_MAX_PLANES; plane++) {
+             void *dst = CVPixelBufferGetBaseAddressOfPlane(pixbuf, plane);
+             size_t dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, plane);
+@@ -2781,20 +2920,32 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+         // ratio; AVSampleBufferDisplayLayer only honors it via a buffer attachment.
+         tag_pixel_buffer_pixel_aspect(vo, finalBuffer);
+ 
+-        CMSampleBufferRef buf = NULL;
+-        CMFormatDescriptionRef format = NULL;
+-        OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, finalBuffer, &format);
+-        if (err != noErr || !format) {
+-            MP_ERR(vo, "Failed to create format description: %d\n", (int)err);
+-            if (needsRelease)
+-                CVPixelBufferRelease(finalBuffer);
+-            if (pixbufNeedsRelease)
+-                CVPixelBufferRelease(pixbuf);
+-            return NULL;
++        // The format description is stable across frames from the same pool;
++        // CMVideoFormatDescriptionMatchesImageBuffer compares dimensions,
++        // pixel format and the relevant attachments, so any real change
++        // (reconfig, geometry/composite output, color tags) invalidates the
++        // cache automatically.
++        CMVideoFormatDescriptionRef format = p->video_format_desc;
++        if (!format || !CMVideoFormatDescriptionMatchesImageBuffer(format, finalBuffer)) {
++            CMVideoFormatDescriptionRef new_format = NULL;
++            OSStatus desc_err = CMVideoFormatDescriptionCreateForImageBuffer(
++                NULL, finalBuffer, &new_format);
++            if (desc_err != noErr || !new_format) {
++                MP_ERR(vo, "Failed to create format description: %d\n", (int)desc_err);
++                if (needsRelease)
++                    CVPixelBufferRelease(finalBuffer);
++                if (pixbufNeedsRelease)
++                    CVPixelBufferRelease(pixbuf);
++                return NULL;
++            }
++            if (p->video_format_desc)
++                CFRelease(p->video_format_desc);
++            p->video_format_desc = new_format;
++            format = new_format;
+         }
+ 
+-        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, finalBuffer, format, &info, &buf);
+-        CFRelease(format);
++        CMSampleBufferRef buf = NULL;
++        OSStatus err = CMSampleBufferCreateReadyWithImageBuffer(NULL, finalBuffer, format, &info, &buf);
+ 
+         if (err != noErr || !buf) {
+             MP_ERR(vo, "Failed to create sample buffer: %d\n", (int)err);
+@@ -2986,15 +3137,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ 
+ static int query_format(struct vo *vo, int format)
+ {
+-    switch (format) {
+-        case IMGFMT_VIDEOTOOLBOX:  // Hardware decoded (zero-copy)
+-        case IMGFMT_NV12:          // Software decoded (common)
+-        case IMGFMT_420P:          // YUV420P (very common)
+-        case IMGFMT_P010:          // 10-bit (HDR software decode)
+-            return 1;
+-        default:
+-            return 0;
+-    }
++    // Accepting the planar 10/12-bit decoder output formats directly matters
++    // for performance: it keeps mpv's autoconvert filter (scalar libswscale
++    // pass on the decode thread) out of the chain, and the upload fuses the
++    // biplanar conversion into the one unavoidable copy.
++    if (format == IMGFMT_VIDEOTOOLBOX ||   // Hardware decoded (zero-copy)
++        format == IMGFMT_NV12 ||           // Software decoded (common)
++        format == IMGFMT_420P ||           // YUV420P (very common)
++        format == IMGFMT_P010 ||           // 10-bit biplanar
++        format == imgfmt_420p10() ||       // 10-bit planar (AV1/HEVC SW decode)
++        format == imgfmt_420p12())         // 12-bit planar
++        return 1;
++    return 0;
+ }
+ 
+ static void clear_subtitle_cache(struct priv *p)
+@@ -3110,6 +3264,11 @@ static void uninit(struct vo *vo)
+         p->swUploadPool = NULL;
+     }
+ 
++    if (p->video_format_desc) {
++        CFRelease(p->video_format_desc);
++        p->video_format_desc = NULL;
++    }
++
+     AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
+     p->osdLayer = nil;
+     if (osdLayer) {

@@ -1,0 +1,26 @@
+From 5a0cb61527f948e5b3df15b5ff1dcf88f313f772 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Fri, 8 May 2026 00:05:00 +0200
+Subject: [PATCH] hevc: downlevel duplicate Dolby Vision RPU log
+
+Dolby Vision streams can produce duplicate RPU messages for many frames.
+Keep the parser behavior unchanged, but avoid warning-level log spam during
+normal playback.
+---
+ libavcodec/hevc/hevcdec.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3743,7 +3743,7 @@ static int hevc_frame_start(HEVCContext *s)
+         H2645NAL *nal = &s->pkt.nals[s->pkt.nb_nals - 1];
+         if (s->rpu_buf) {
+             av_buffer_unref(&s->rpu_buf);
+-            av_log(s->avctx, AV_LOG_WARNING, "Multiple Dolby Vision RPUs found in one AU. Skipping previous.\n");
++            av_log(s->avctx, AV_LOG_VERBOSE, "Multiple Dolby Vision RPUs found in one AU. Skipping previous.\n");
+         }
+ 
+         s->rpu_buf = av_buffer_alloc(nal->raw_size - 2);
+-- 
+2.50.1 (Apple Git-155)

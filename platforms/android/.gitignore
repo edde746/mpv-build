@@ -1,0 +1,5 @@
+# Fetched sources, per-ABI install prefixes and the bootstrapped SDK are all
+# reproducible from versions.json + toolchain/android.txt; never commit them.
+/deps/
+/prefix/
+/sdk/

@@ -1,0 +1,932 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 2a83027..78da5e1 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -25,6 +25,9 @@
+ #include "osdep/timer.h"
+ #include "ta/ta_talloc.h"
+ 
++#include <stdatomic.h>
++#include <errno.h>
++
+ #import <AVFoundation/AVFoundation.h>
+ #import <Foundation/Foundation.h>
+ #import <CoreAudioTypes/CoreAudioTypes.h>
+@@ -38,15 +41,115 @@ @interface AVObserver : NSObject {
+ - (void)handleRestartNotification:(NSNotification*)notification;
+ @end
+ 
++@interface AVPLoader : NSObject <AVAssetResourceLoaderDelegate> {
++    struct ao *ao;
++@public
++    NSMutableArray<AVAssetResourceLoadingRequest *> *requests;
++}
++- (instancetype)initWithAO:(struct ao*)_ao;
++- (void)invalidate;
++@end
++
+ struct priv {
++    // PCM sink
+     AVSampleBufferAudioRenderer *renderer;
+     AVSampleBufferRenderSynchronizer *synchronizer;
+     dispatch_queue_t queue;
+     CMAudioFormatDescriptionRef format_description;
+     AVObserver *observer;
+     int64_t end_time_av;
++
++    // Compressed AC3/EAC3 sink. The raw elementary stream is served to an
++    // AVPlayer through an AVAssetResourceLoader; the system's own Dolby
++    // pipeline decodes it and, on Atmos-capable routes, renders the JOC
++    // object audio (Dolby MAT over HDMI on tvOS). This is the only
++    // Atmos-capable output path on tvOS: feeding compressed sample buffers
++    // to AVSampleBufferAudioRenderer decodes only the channel bed.
++    bool spdif;
++    int spdif_rate;              // audio rate of the elementary stream
++    int spdif_burst_size;        // IEC 61937 burst repetition period, bytes
++    int spdif_data_type;         // IEC 61937 Pc data type for this format
++    const char *spdif_uti;       // UTI declared to AVPlayer
++    const char *spdif_ext;       // fake stream file extension
++    bool spdif_reload_requested;
++    uint8_t *stash;              // carries partial IEC bursts between pulls
++    int stash_len;
++    int stash_size;
++
++    AVPlayer *player;
++    AVPlayerItem *item;
++    AVURLAsset *asset;
++    AVPLoader *loader;
++    // Periodic driver for the compressed sink: pulls from mpv, serves the
++    // loader, and applies transport state. Created once, idle at
++    // DISPATCH_TIME_FOREVER when not streaming; releasing a suspended
++    // source traps, so it stays resumed for its whole life.
++    dispatch_source_t avp_timer;
++    // Elementary-stream window served to AVPlayer, indexed by stream byte
++    // offset. Bytes behind the loader's read position are retained
++    // (bounded) so a player-initiated restart from offset 0 can be served.
++    uint8_t *es_buf;
++    int es_size;
++    int es_len;
++    int64_t es_head;             // stream offset of es_buf[0]
++    int64_t es_pts;              // ns of audio appended since the item epoch
++    // Last complete access unit, kept to satisfy far-offset probes: the
++    // system estimates duration/bitrate by reading near the end of the fake
++    // endless resource, and refusing those reads parks preroll forever.
++    // Probe offsets are never reached by playback, which starts at zero, so
++    // any valid access units satisfy them.
++    uint8_t *au_buf;
++    int au_len;
++    bool avp_playing;            // desired transport state
++    bool avp_rate_applied;       // rate 1 has been handed to AVPlayer
++    bool avp_start_seeked;       // seek-to-start workaround already tried
++    bool avp_eof;
++    int64_t avp_start_deadline;  // mp_time_ns() deadline; -1 = healthy
++    int avp_last_item_status;    // last logged AVPlayerItemStatus
++    int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
++    int avp_heartbeat;           // verbose position log divider
+ };
+ 
++#define IEC61937_HEADER_SIZE 8
++#define IEC61937_AC3  0x01
++#define IEC61937_EAC3 0x15
++
++// One IEC 61937 burst carries 1536 samples of audio at the base rate.
++#define SPDIF_FRAMES_PER_BURST 1536
++
++#define AVP_TICK_NS         MP_TIME_MS_TO_NS(50)
++// How far ahead of the playhead the elementary stream is fed. Bounds both
++// memory and how much stale audio a teardown throws away.
++#define AVP_LEAD_NS         MP_TIME_S_TO_NS(2)
++// Startup allowance while the playhead has not moved yet: preroll consumes
++// several seconds before the transport engages, and capping it at the
++// steady-state lead deadlocks the start against a frozen playhead.
++#define AVP_START_LEAD_NS   MP_TIME_S_TO_NS(4)
++// Minimum priming before the transport is started.
++#define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
++// Deadline for the item to become ready once primed.
++#define AVP_READY_GRACE_NS  MP_TIME_S_TO_NS(5)
++// Deadline for the playhead to move once the rate is applied.
++#define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
++// History kept behind the loader's read position for offset-0 restarts.
++#define AVP_ES_HISTORY_BYTES (2 * 1024 * 1024)
++// Total window: history + the time-bounded lead (~1.5 MB at the highest
++// legal EAC3 rate) + slack.
++#define AVP_ES_RING_BYTES    (6 * 1024 * 1024)
++
++// A failed compressed AO must reject its immediate reload so mpv can decode
++// to PCM. A later successful PCM initialization clears this process-local
++// handoff, allowing another track or playback session to try native audio.
++static _Atomic bool spdif_format_latch[2];
++static char avfoundation_queue_key;
++
++static int spdif_latch_index(int format)
++{
++    return format == AF_FORMAT_S_EAC3;
++}
++
++static void feed_avp(struct ao *ao);
++
+ static int64_t CMTimeGetNanoseconds(CMTime time)
+ {
+     time = CMTimeConvertScale(time, 1000000000, kCMTimeRoundingMethod_Default);
+@@ -58,6 +161,418 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+     return CMTimeMake(time, 1000000000);
+ }
+ 
++static void avp_timer_idle(struct priv *p)
++{
++    dispatch_source_set_timer(p->avp_timer, DISPATCH_TIME_FOREVER,
++                              DISPATCH_TIME_FOREVER, 0);
++}
++
++static void avp_timer_arm(struct priv *p)
++{
++    dispatch_source_set_timer(
++        p->avp_timer,
++        dispatch_time(DISPATCH_TIME_NOW, AVP_TICK_NS),
++        AVP_TICK_NS, AVP_TICK_NS / 2);
++}
++
++// Latch the failing format and force a reinit; init() will then reject the
++// format and the player core falls back to PCM decoding.
++static void spdif_reload(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (p->spdif_reload_requested)
++        return;
++    p->spdif_reload_requested = true;
++    atomic_store(&spdif_format_latch[spdif_latch_index(ao->format)], true);
++    [p->player setRate:0];
++    avp_timer_idle(p);
++    ao_request_reload(ao);
++}
++
++// Playhead position on the elementary-stream timeline. AVPlayerItem's
++// currentTime can update in chunks when a custom resource loader backs
++// compressed audio; reading the item's public timebase instead follows its
++// audio-device clock correlation continuously, without feeding that chunk
++// jitter into mpv's delay estimate. Clamp to the written range: an idle item
++// reports 0, and nothing can play past the write head.
++static int64_t avp_current_time_ns(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->item)
++        return 0;
++    CMTime t = kCMTimeInvalid;
++    CMTimebaseRef timebase = p->item.timebase;
++    if (timebase)
++        t = CMTimebaseGetTime(timebase);
++    if (!CMTIME_IS_NUMERIC(t))
++        t = [p->item currentTime];
++    if (!CMTIME_IS_NUMERIC(t))
++        return 0;
++    return MPCLAMP(CMTimeGetNanoseconds(t), 0, p->es_pts);
++}
++
++// Most-advanced playhead estimate, used only to pace the feed. The item's
++// timebase and its chunk-updated currentTime can disagree by a constant
++// offset on some HDMI routes; pacing the 2s feed lead against the laggier
++// reading silently thins AVPlayer's real buffer by that offset until
++// playback reaches the write head and audibly stalls on a seconds-scale
++// cadence. Feeding against the most-advanced reading can only add bounded
++// extra lead, which the ES window already absorbs.
++static int64_t avp_feed_position_ns(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->item)
++        return 0;
++    int64_t pos = avp_current_time_ns(ao);
++    CMTime t = [p->item currentTime];
++    if (CMTIME_IS_NUMERIC(t))
++        pos = MPMAX(pos, CMTimeGetNanoseconds(t));
++    return MPCLAMP(pos, 0, p->es_pts);
++}
++
++// Append one burst payload (byte-swapped back to the raw bitstream) to the
++// elementary-stream window.
++static void avp_append_es(struct ao *ao, const uint8_t *payload, int payload_len)
++{
++    struct priv *p = ao->priv;
++
++    if (payload_len & 1) {
++        // (E-)AC-3 frame sizes are counted in 16-bit words
++        MP_WARN(ao, "discarding burst with odd payload length\n");
++        return;
++    }
++    if (p->es_len + payload_len > p->es_size) {
++        // cannot happen while the lead and history bounds hold
++        MP_ERR(ao, "elementary stream window overflow; falling back to PCM\n");
++        spdif_reload(ao);
++        return;
++    }
++    uint8_t *dst = p->es_buf + p->es_len;
++    // the spdif muxer emits 16-bit LE words; swap back to the raw bitstream
++    for (int i = 0; i < payload_len; i += 2) {
++        dst[i]     = payload[i + 1];
++        dst[i + 1] = payload[i];
++    }
++    if (dst[0] != 0x0b || dst[1] != 0x77) {
++        MP_WARN(ao, "discarding burst without syncframe\n");
++        return;
++    }
++    memcpy(p->au_buf, dst, payload_len);
++    p->au_len = payload_len;
++    p->es_len += payload_len;
++    p->es_pts += CMTimeGetNanoseconds(
++        CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
++}
++
++// One read/unwrap pass: pull IEC 61937 data from mpv and append every
++// complete burst's payload to the elementary stream. Returns false when out
++// of data, at EOF, or reloading.
++static bool avp_pull(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    int samplerate = ao->samplerate;
++    int sstride = ao->sstride;
++    bool eof = false;
++
++    int request_sample_count = samplerate / 10;
++    if ((p->stash_size - p->stash_len) / sstride < request_sample_count)
++        request_sample_count = (p->stash_size - p->stash_len) / sstride;
++    if (request_sample_count <= 0)
++        return false;
++
++    int64_t cur_time_av = avp_current_time_ns(ao);
++    int64_t cur_time_mp = mp_time_ns();
++    int64_t time_delta = CMTimeGetNanoseconds(CMTimeMake(request_sample_count, samplerate));
++    void *data[] = {p->stash + p->stash_len};
++    int real_sample_count = ao_read_data(ao, data, request_sample_count,
++        p->es_pts - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
++    if (eof) {
++        p->avp_eof = true;
++        ao_stop_streaming(ao);
++    }
++    if (real_sample_count == 0)
++        return false;
++    p->stash_len += real_sample_count * sstride;
++
++    // extract every complete IEC 61937 burst
++    int pos = 0;
++    while (true) {
++        while (pos + IEC61937_HEADER_SIZE <= p->stash_len &&
++               !(p->stash[pos] == 0x72 && p->stash[pos + 1] == 0xf8 &&
++                 p->stash[pos + 2] == 0x1f && p->stash[pos + 3] == 0x4e))
++            pos++;
++        if (pos + IEC61937_HEADER_SIZE > p->stash_len)
++            break;
++        int data_type = p->stash[pos + 4] & 0x7f;
++        int pd = p->stash[pos + 6] | (p->stash[pos + 7] << 8);
++        if (data_type != p->spdif_data_type) {
++            MP_WARN(ao, "skipping unexpected IEC 61937 data type 0x%x\n", data_type);
++            pos++;
++            continue;
++        }
++        // Pd is the payload length in bits for AC3 and in bytes for EAC3
++        int payload_len = data_type == IEC61937_AC3 ? pd / 8 : pd;
++        if (payload_len < 8 || payload_len > p->spdif_burst_size - IEC61937_HEADER_SIZE) {
++            MP_WARN(ao, "skipping burst with invalid payload length %d\n", payload_len);
++            pos++;
++            continue;
++        }
++        if (pos + IEC61937_HEADER_SIZE + MP_ALIGN_UP(payload_len, 2) > p->stash_len)
++            break; // incomplete burst; wait for more data
++        avp_append_es(ao, p->stash + pos + IEC61937_HEADER_SIZE, payload_len);
++        if (p->spdif_reload_requested)
++            return false;
++        pos += IEC61937_HEADER_SIZE + MP_ALIGN_UP(payload_len, 2);
++    }
++    if (pos > 0) {
++        memmove(p->stash, p->stash + pos, p->stash_len - pos);
++        p->stash_len -= pos;
++    }
++    if (p->stash_len > p->spdif_burst_size * 3) {
++        MP_ERR(ao, "no IEC 61937 sync found in %d bytes; falling back to PCM\n",
++               p->stash_len);
++        p->stash_len = 0;
++        spdif_reload(ao);
++        return false;
++    }
++    return !eof;
++}
++
++// Serve the pending loading requests from the elementary-stream window and
++// trim history the loader has moved past.
++static void avp_serve_requests(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    NSMutableArray<AVAssetResourceLoadingRequest *> *reqs = p->loader->requests;
++
++    for (NSUInteger i = 0; i < reqs.count; ) {
++        AVAssetResourceLoadingRequest *req = reqs[i];
++        AVAssetResourceLoadingDataRequest *dr = req.dataRequest;
++        int64_t off = dr.currentOffset;
++        if (off < p->es_head) {
++            // trimmed past; the item will fail and the poll falls back to PCM
++            MP_ERR(ao, "loader requested offset %lld below the retained "
++                   "window at %lld\n", (long long)off, (long long)p->es_head);
++            [req finishLoadingWithError:
++                [NSError errorWithDomain:NSPOSIXErrorDomain code:ESPIPE userInfo:nil]];
++            [reqs removeObjectAtIndex:i];
++            continue;
++        }
++        int64_t req_end = dr.requestsAllDataToEndOfResource
++            ? INT64_MAX
++            : dr.requestedOffset + (int64_t)dr.requestedLength;
++        int64_t write_head = p->es_head + p->es_len;
++        if (off < write_head) {
++            // real stream data
++            int64_t n = MPMIN(write_head - off, req_end - off);
++            NSData *chunk = [NSData dataWithBytes:p->es_buf + (off - p->es_head)
++                                           length:n];
++            [dr respondWithData:chunk];
++            MP_TRACE(ao, "served %lld bytes at offset %lld\n",
++                     (long long)n, (long long)off);
++        } else if (off > write_head && p->au_len > 0) {
++            // Far-offset probe past the write head: duration/bitrate
++            // estimation reading near the "end" of the endless resource.
++            // Satisfy it with copies of the latest access unit; playback
++            // starts at zero and never reaches these offsets.
++            int64_t n = MPMIN(req_end - off, 256 * 1024);
++            NSMutableData *chunk = [NSMutableData dataWithCapacity:n];
++            while ((int64_t)chunk.length + p->au_len <= n)
++                [chunk appendBytes:p->au_buf length:p->au_len];
++            if (chunk.length == 0)
++                [chunk appendBytes:p->au_buf length:MPMIN(p->au_len, n)];
++            if (chunk.length > n)
++                [chunk setLength:n];
++            [dr respondWithData:chunk];
++            MP_VERBOSE(ao, "synthesized %lu probe bytes at offset %lld\n",
++                       (unsigned long)chunk.length, (long long)off);
++        }
++        if (!dr.requestsAllDataToEndOfResource &&
++            dr.currentOffset >= dr.requestedOffset + (int64_t)dr.requestedLength) {
++            [req finishLoading];
++            [reqs removeObjectAtIndex:i];
++            continue;
++        }
++        i++;
++    }
++
++    // drop history beyond the retention bound
++    int64_t low = p->es_head + p->es_len;
++    for (AVAssetResourceLoadingRequest *req in reqs)
++        low = MPMIN(low, req.dataRequest.currentOffset);
++    int64_t drop = (low - AVP_ES_HISTORY_BYTES) - p->es_head;
++    if (drop > 0) {
++        memmove(p->es_buf, p->es_buf + drop, p->es_len - drop);
++        p->es_head += drop;
++        p->es_len -= drop;
++    }
++}
++
++// Apply the desired transport state, with the startup workaround: prime the
++// player, and when the playhead refuses to move, first seek to the stream
++// start, then give up and fall back to PCM.
++static void avp_update_transport(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->avp_playing || !p->item || p->spdif_reload_requested)
++        return;
++    int64_t now = mp_time_ns();
++    if (!p->avp_rate_applied) {
++        bool primed = p->es_pts >= AVP_START_MIN_NS || p->avp_eof;
++        if (!primed) {
++            // the startup clock starts once the stream is primed
++            p->avp_start_deadline = now + AVP_START_GRACE_NS;
++            return;
++        }
++        // Not gated on the item becoming ready: while prerolling, the
++        // system may park on a far-offset probe of the fake endless
++        // resource that can never be served, and only the seek-to-start
++        // workaround below can break that; readiness follows the seek.
++        [p->player setRate:1];
++        p->avp_rate_applied = true;
++        p->avp_start_deadline = now + AVP_START_GRACE_NS;
++        return;
++    }
++    if (p->avp_start_deadline < 0)
++        return;
++    if (avp_current_time_ns(ao) > 0) {
++        p->avp_start_deadline = -1; // playing; nothing left to supervise
++        return;
++    }
++    if (now < p->avp_start_deadline)
++        return;
++    if (!p->avp_start_seeked) {
++        MP_WARN(ao, "playback did not engage; seeking to the stream start\n");
++        p->avp_start_seeked = true;
++        p->avp_start_deadline = now + AVP_START_GRACE_NS;
++        [p->item seekToTime:kCMTimeZero completionHandler:nil];
++        [p->player setRate:1];
++        return;
++    }
++    MP_ERR(ao, "native compressed playback did not start; falling back to PCM\n");
++    spdif_reload(ao);
++}
++
++// Main driver for the compressed sink; runs on p->queue (timer tick or a
++// new loading request).
++static void feed_avp(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (p->spdif_reload_requested || !p->item)
++        return;
++
++    // surface player/item state transitions while diagnosing startup
++    int item_status = (int)[p->item status];
++    int tcs = (int)[p->player timeControlStatus];
++    if (item_status != p->avp_last_item_status || tcs != p->avp_last_tcs) {
++        MP_VERBOSE(ao, "item status %d -> %d, time control %d -> %d, "
++                   "pos %.3fs, fed %.3fs\n",
++                   p->avp_last_item_status, item_status,
++                   p->avp_last_tcs, tcs,
++                   avp_current_time_ns(ao) / 1e9, p->es_pts / 1e9);
++        p->avp_last_item_status = item_status;
++        p->avp_last_tcs = tcs;
++    }
++    if (++p->avp_heartbeat % 100 == 0) {
++        CMTime t = [p->item currentTime];
++        MP_VERBOSE(ao, "heartbeat: raw pos %.3fs, clamped %.3fs, fed %.3fs, "
++                   "status %d, tc %d\n",
++                   CMTIME_IS_NUMERIC(t) ? CMTimeGetNanoseconds(t) / 1e9 : -1.0,
++                   avp_current_time_ns(ao) / 1e9, p->es_pts / 1e9,
++                   item_status, tcs);
++    }
++    if ([p->item status] == AVPlayerItemStatusFailed || [p->player error]) {
++        NSError *error = [p->item error] ? [p->item error] : [p->player error];
++        MP_ERR(ao, "player rejected the compressed stream: %s (%s:%ld)\n",
++               error ? error.localizedDescription.UTF8String : "unknown",
++               error ? error.domain.UTF8String : "-",
++               error ? (long)error.code : 0);
++        MP_ERR(ao, "falling back to PCM\n");
++        spdif_reload(ao);
++        return;
++    }
++
++    for (int guard = 0; guard < 64 && !p->avp_eof; guard++) {
++        int64_t cur = avp_feed_position_ns(ao);
++        if (p->es_pts - cur >= (cur > 0 ? AVP_LEAD_NS : AVP_START_LEAD_NS))
++            break;
++        // One pull can extract every burst buffered in the stash, so demand
++        // room for a full stash's worth of payload before pulling.
++        if (p->es_size - p->es_len < p->stash_size)
++            break; // backpressure; serving will trim the window
++        if (!avp_pull(ao))
++            break;
++    }
++    if (p->spdif_reload_requested)
++        return;
++    avp_serve_requests(ao);
++    avp_update_transport(ao);
++}
++
++// Build a fresh asset/item pair. An elementary stream cannot signal
++// discontinuities, so every stream restart (seek, track change) starts a
++// new item at offset 0 / time 0.
++static void avp_create_item(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    NSString *urlstr = [NSString stringWithFormat:@"mpv-passthrough://stream/audio.%s",
++                        p->spdif_ext];
++    NSURL *url = [NSURL URLWithString:urlstr];
++    p->asset = [[AVURLAsset alloc] initWithURL:url options:nil];
++    [p->asset.resourceLoader setDelegate:p->loader queue:p->queue];
++    p->item = [[AVPlayerItem alloc] initWithAsset:p->asset];
++    p->item.canUseNetworkResourcesForLiveStreamingWhilePaused = YES;
++    [p->player replaceCurrentItemWithPlayerItem:p->item];
++
++    p->stash_len = 0;
++    p->es_len = 0;
++    p->es_head = 0;
++    p->es_pts = 0;
++    p->avp_eof = false;
++    p->avp_rate_applied = false;
++    p->avp_start_seeked = false;
++    p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
++    p->au_len = 0;
++    p->avp_last_item_status = -1;
++    p->avp_last_tcs = -1;
++}
++
++static void avp_teardown_item(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->item)
++        return;
++    [p->player setRate:0];
++    for (AVAssetResourceLoadingRequest *req in p->loader->requests) {
++        if (!req.finished && !req.cancelled)
++            [req finishLoadingWithError:
++                [NSError errorWithDomain:NSURLErrorDomain
++                                    code:NSURLErrorCancelled userInfo:nil]];
++    }
++    [p->loader->requests removeAllObjects];
++    [p->asset.resourceLoader setDelegate:nil queue:nil];
++    [p->player replaceCurrentItemWithPlayerItem:nil];
++    [p->item release];
++    p->item = nil;
++    [p->asset release];
++    p->asset = nil;
++    p->stash_len = 0;
++    p->es_len = 0;
++    p->es_head = 0;
++    p->es_pts = 0;
++    p->avp_eof = false;
++    p->avp_rate_applied = false;
++    p->avp_start_seeked = false;
++    p->au_len = 0;
++}
++
+ static void feed(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -144,6 +659,23 @@ static void start(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
++    if (p->spdif) {
++        void (^start_block)(void) = ^{
++            p->avp_playing = true;
++            if (!p->item)
++                avp_create_item(ao);
++            else if (p->avp_rate_applied)
++                [p->player setRate:1];
++            avp_timer_arm(p);
++            feed_avp(ao);
++        };
++        if (dispatch_get_specific(&avfoundation_queue_key) == p)
++            start_block();
++        else
++            dispatch_sync(p->queue, start_block);
++        return;
++    }
++
+     p->end_time_av = -1;
+     [p->synchronizer setRate:1];
+     [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+@@ -155,17 +687,53 @@ static void stop(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
+-    dispatch_sync(p->queue, ^{
++    void (^stop_block)(void) = ^{
++        if (p->spdif) {
++            p->avp_playing = false;
++            avp_timer_idle(p);
++            avp_teardown_item(ao);
++            return;
++        }
+         [p->renderer stopRequestingMediaData];
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
+-    });
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        stop_block();
++    else
++        dispatch_sync(p->queue, stop_block);
+ }
+ 
+ static bool set_pause(struct ao *ao, bool paused)
+ {
+     struct priv *p = ao->priv;
+ 
++    if (p->spdif) {
++        void (^pause_block)(void) = ^{
++            p->avp_playing = !paused;
++            if (paused) {
++                avp_timer_idle(p);
++                [p->player setRate:0];
++            } else {
++                if (p->avp_rate_applied) {
++                    [p->player setRate:1];
++                    if (p->avp_start_deadline >= 0)
++                        p->avp_start_deadline = mp_time_ns() + AVP_START_GRACE_NS;
++                } else {
++                    // priming/readiness supervision resumes from now
++                    p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
++                }
++                avp_timer_arm(p);
++                feed_avp(ao);
++            }
++        };
++        if (dispatch_get_specific(&avfoundation_queue_key) == p)
++            pause_block();
++        else
++            dispatch_sync(p->queue, pause_block);
++        return true;
++    }
++
+     if (paused) {
+         [p->synchronizer setRate:0];
+     } else {
+@@ -179,6 +747,25 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+ {
+     struct priv *p = ao->priv;
+ 
++    if (p->spdif) {
++        switch (cmd) {
++        case AOCONTROL_GET_MUTE:
++            *(bool*)arg = [p->player isMuted];
++            return CONTROL_OK;
++        case AOCONTROL_GET_VOLUME:
++            *(float*)arg = [p->player volume] * 100;
++            return CONTROL_OK;
++        case AOCONTROL_SET_MUTE:
++            [p->player setMuted:*(bool*)arg];
++            return CONTROL_OK;
++        case AOCONTROL_SET_VOLUME:
++            [p->player setVolume:*(float*)arg / 100];
++            return CONTROL_OK;
++        default:
++            return CONTROL_UNKNOWN;
++        }
++    }
++
+     switch (cmd) {
+     case AOCONTROL_GET_MUTE:
+         *(bool*)arg = [p->renderer isMuted];
+@@ -215,21 +802,183 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+ }
+ @end
+ 
++@implementation AVPLoader
++- (instancetype)initWithAO:(struct ao*)_ao {
++    self = [super init];
++    if (self) {
++        ao = _ao;
++        requests = [[NSMutableArray alloc] init];
++    }
++    return self;
++}
++// Called on p->queue (the delegate queue), like the feed timer, so no state
++// here needs further locking.
++- (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader
++    shouldWaitForLoadingOfRequestedResource:(AVAssetResourceLoadingRequest *)request {
++    @synchronized(self) {
++        if (!ao)
++            return NO;
++        struct priv *p = ao->priv;
++        AVAssetResourceLoadingContentInformationRequest *info =
++            request.contentInformationRequest;
++        if (info) {
++            // Declaring the UTI is what routes the stream into the system's
++            // own (E-)AC-3 parser and Dolby decode path. The stream is
++            // endless and strictly sequential.
++            info.contentType = [NSString stringWithUTF8String:p->spdif_uti];
++            info.contentLength = INT32_MAX;
++            info.byteRangeAccessSupported = NO;
++        }
++        AVAssetResourceLoadingDataRequest *dr = request.dataRequest;
++        MP_VERBOSE(ao, "loading request: info=%d data=%d offset=%lld "
++                   "length=%ld allToEnd=%d\n", !!info, !!dr,
++                   dr ? (long long)dr.requestedOffset : -1,
++                   dr ? (long)dr.requestedLength : -1,
++                   dr ? dr.requestsAllDataToEndOfResource : 0);
++        if (dr) {
++            [requests addObject:request];
++            feed_avp(ao);
++        } else {
++            [request finishLoading];
++        }
++        return YES;
++    }
++}
++- (void)resourceLoader:(AVAssetResourceLoader *)resourceLoader
++    didCancelLoadingRequest:(AVAssetResourceLoadingRequest *)request {
++    @synchronized(self) {
++        [requests removeObjectIdenticalTo:request];
++        if (ao)
++            MP_VERBOSE((struct ao *)ao, "loading request cancelled\n");
++    }
++}
++- (void)invalidate {
++    @synchronized(self) {
++        ao = NULL;
++        [requests removeAllObjects];
++    }
++}
++- (void)dealloc {
++    [requests release];
++    [super dealloc];
++}
++@end
++
+ static int init(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+     AudioChannelLayout *layout = NULL;
++    bool spdif = af_fmt_is_spdif(ao->format);
++
++    if (!spdif) {
++        atomic_store(&spdif_format_latch[0], false);
++        atomic_store(&spdif_format_latch[1], false);
++    }
+ 
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+-    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
+-    NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
+     [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+     [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
++#if HAVE_MACOS_12_FEATURES
++    if (@available(tvOS 15.0, iOS 15.0, *)) {
++        if (spdif || ao->channels.num > 2)
++            [instance setSupportsMultichannelContent:YES error:nil];
++    }
++#endif
+     [instance setActive:YES error:nil];
+-    [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    NSInteger maxChannels = instance.maximumOutputNumberOfChannels;
++    if (spdif) {
++        AVAudioSessionPortDescription *port = instance.currentRoute.outputs.firstObject;
++        MP_INFO(ao, "compressed audio route: %s, %ld maximum output channels\n",
++                port ? port.portType.UTF8String : "none", (long)maxChannels);
++    } else {
++        NSInteger prefChannels = MIN(maxChannels, ao->channels.num);
++        [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
++    }
+ #endif
+ 
++    if ((p->queue = dispatch_queue_create(
++        "avfoundation event",
++        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)
++    )) == NULL) {
++        MP_FATAL(ao, "failed to create dispatch queue\n");
++        MP_VERBOSE(ao, "dispatch_queue_create failed\n");
++        goto error;
++    }
++    dispatch_queue_set_specific(p->queue, &avfoundation_queue_key, p, NULL);
++
++    if (spdif) {
++        // Hand the raw elementary stream to AVPlayer, whose pipeline is the
++        // one place the system decodes E-AC-3 JOC (Dolby Atmos) and renders
++        // it to the active route. Works identically for plain DD/DD+, so it
++        // is used unconditionally; genuine failures fall back to PCM.
++        switch (ao->format) {
++        case AF_FORMAT_S_AC3:
++            p->spdif_data_type = IEC61937_AC3;
++            // ad_spdif emits AC3 as a 1x rate IEC 61937 stream
++            p->spdif_rate = ao->samplerate;
++            p->spdif_burst_size = 6144;
++            p->spdif_uti = "public.ac3-audio";
++            p->spdif_ext = "ac3";
++            break;
++        case AF_FORMAT_S_EAC3:
++            p->spdif_data_type = IEC61937_EAC3;
++            // ad_spdif emits EAC3 as a 4x rate IEC 61937 stream
++            p->spdif_rate = ao->samplerate / 4;
++            p->spdif_burst_size = 24576;
++            p->spdif_uti = "public.enhanced-ac3-audio";
++            p->spdif_ext = "eac3";
++            break;
++        default:
++            MP_FATAL(ao, "avfoundation only supports AC3 and EAC3 passthrough\n");
++#if HAVE_COREAUDIO
++            MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
++#endif
++            goto error;
++        }
++        if (atomic_load(&spdif_format_latch[spdif_latch_index(ao->format)])) {
++            MP_FATAL(ao, "%s passthrough disabled after an earlier player failure\n",
++                     af_fmt_to_str(ao->format));
++            goto error;
++        }
++        p->spdif = true;
++
++        if ((p->player = [[AVPlayer alloc] init]) == nil) {
++            MP_FATAL(ao, "failed to create AVPlayer\n");
++            goto error;
++        }
++        // Transport is supervised here (priming, start workaround); the
++        // player must not second-guess it against a fake endless resource.
++        p->player.automaticallyWaitsToMinimizeStalling = NO;
++        p->player.allowsExternalPlayback = NO;
++        p->loader = [[AVPLoader alloc] initWithAO:ao];
++        if ((p->avp_timer = dispatch_source_create(
++                DISPATCH_SOURCE_TYPE_TIMER, 0, 0, p->queue)) == NULL) {
++            MP_FATAL(ao, "failed to create feed timer\n");
++            goto error;
++        }
++        dispatch_source_set_event_handler(p->avp_timer, ^{
++            feed_avp(ao);
++        });
++        avp_timer_idle(p);
++        // Left resumed for its whole life: releasing a suspended source
++        // traps, and an idle timer costs nothing.
++        dispatch_resume(p->avp_timer);
++
++        // 100ms of IEC data per pull plus room for carried-over bursts
++        p->stash_size = (ao->samplerate / 10) * af_fmt_to_bytes(ao->format) *
++                        ao->channels.num + p->spdif_burst_size * 4;
++        p->stash = talloc_size(ao, p->stash_size);
++        p->es_size = AVP_ES_RING_BYTES;
++        p->es_buf = talloc_size(ao, p->es_size);
++        p->au_buf = talloc_size(ao, p->spdif_burst_size);
++
++        // the lead bound is what actually paces the stream
++        ao->device_buffer = ao->samplerate * 2;
++
++        return CONTROL_OK;
++    }
++
+     if ((p->renderer = [[AVSampleBufferAudioRenderer alloc] init]) == nil) {
+         MP_FATAL(ao, "failed to create audio renderer\n");
+         MP_VERBOSE(ao, "AVSampleBufferAudioRenderer failed to initialize\n");
+@@ -240,14 +989,6 @@ static int init(struct ao *ao)
+         MP_VERBOSE(ao, "AVSampleBufferRenderSynchronizer failed to initialize\n");
+         goto error;
+     }
+-    if ((p->queue = dispatch_queue_create(
+-        "avfoundation event",
+-        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)
+-    )) == NULL) {
+-        MP_FATAL(ao, "failed to create dispatch queue\n");
+-        MP_VERBOSE(ao, "dispatch_queue_create failed\n");
+-        goto error;
+-    }
+ 
+     if (ao->device && ao->device[0]) {
+ #if TARGET_OS_OSX
+@@ -262,14 +1003,6 @@ static int init(struct ao *ao)
+     }
+ #endif
+ 
+-    if (af_fmt_is_spdif(ao->format)) {
+-        MP_FATAL(ao, "avfoundation does not support SPDIF\n");
+-#if HAVE_COREAUDIO
+-        MP_FATAL(ao, "please use coreaudio_exclusive instead\n");
+-#endif
+-        goto error;
+-    }
+-
+     // AVSampleBufferAudioRenderer only supports interleaved formats
+     ao->format = af_fmt_from_planar(ao->format);
+     if (af_fmt_is_planar(ao->format)) {
+@@ -316,6 +1049,16 @@ static int init(struct ao *ao)
+ 
+ error:
+     talloc_free(layout);
++    if (p->avp_timer) {
++        dispatch_source_cancel(p->avp_timer);
++        dispatch_release(p->avp_timer);
++        p->avp_timer = NULL;
++    }
++    if (p->loader) {
++        [p->loader invalidate];
++        [p->loader release];
++    }
++    if (p->player) [p->player release];
+     if (p->renderer) [p->renderer release];
+     if (p->synchronizer) [p->synchronizer release];
+     if (p->queue) dispatch_release(p->queue);
+@@ -337,13 +1080,27 @@ static void uninit(struct ao *ao)
+ 
+     stop(ao);
+ 
+-    [p->renderer release];
+-    [p->synchronizer release];
+-    dispatch_release(p->queue);
+-    CFRelease(p->format_description);
++    if (p->spdif) {
++        // The timer handler dereferences the AO, and ao_uninit() frees it as
++        // soon as this returns. Cancelling on p->queue means no handler is
++        // mid-flight and none can start afterwards.
++        dispatch_sync(p->queue, ^{
++            dispatch_source_cancel(p->avp_timer);
++            [p->loader invalidate];
++        });
++        dispatch_release(p->avp_timer);
++        [p->loader release];
++        [p->player release];
++        dispatch_release(p->queue);
++    } else {
++        [p->renderer release];
++        [p->synchronizer release];
++        dispatch_release(p->queue);
++        CFRelease(p->format_description);
+ 
+-    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+-    [p->observer release];
++        [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
++        [p->observer release];
++    }
+ 
+ #if TARGET_OS_IPHONE
+     [AVAudioSession.sharedInstance setActive:NO
+@@ -356,7 +1113,7 @@ static void uninit(struct ao *ao)
+ #define OPT_BASE_STRUCT struct priv
+ 
+ const struct ao_driver audio_out_avfoundation = {
+-    .description    = "AVFoundation AVSampleBufferAudioRenderer",
++    .description    = "AVFoundation AVSampleBufferAudioRenderer / AVPlayer",
+     .name           = "avfoundation",
+     .uninit         = uninit,
+     .init           = init,

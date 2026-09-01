@@ -1,0 +1,19 @@
+diff --git forkSrcPrefix/osdep/mac/meson.build forkDstPrefix/osdep/mac/meson.build
+index 16605288419c54cb9d89680a6fafd6a2f315487e..a154dea05ea77243f760a05067ead7f32623b991 100644
+--- forkSrcPrefix/osdep/mac/meson.build
++++ forkDstPrefix/osdep/mac/meson.build
+@@ -6,12 +6,12 @@ swift_flags = ['-c', '-emit-library', '-static', '-sdk', macos_sdk_path,
+                '-emit-objc-header', '-parse-as-library']
+ 
+ # fallback to old swift frontend build
+-if swift_ver.version_compare('<5.8')
++#if swift_ver.version_compare('<5.8')
+     message('Falling back to old swift frontend build')
+     swift_prog = find_program(run_command(xcrun, '-find', 'swift', check: true).stdout().strip())
+     swift_flags = ['-frontend', '-c', '-sdk', macos_sdk_path,
+                    '-enable-objc-interop', '-emit-objc-header', '-parse-as-library']
+-endif
++#endif
+ 
+ if swift_ver.version_compare('>=6.0')
+     swift_flags += ['-swift-version', '5']

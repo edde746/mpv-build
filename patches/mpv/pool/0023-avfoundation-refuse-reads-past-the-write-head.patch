@@ -1,0 +1,106 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 46e8afb..2bd1392 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -96,13 +96,6 @@ - (void)invalidate;
+     int64_t es_pts;              // ns of audio appended since the item epoch
+     int64_t pulled_samples;      // IEC samples handed over by ao_read_data
+     int64_t es_dropped_ns;       // AU periods pulled but never appended
+-    // Last complete access unit, kept to satisfy far-offset probes: the
+-    // system estimates duration/bitrate by reading near the end of the fake
+-    // endless resource, and refusing those reads parks preroll forever.
+-    // Probe offsets are never reached by playback, which starts at zero, so
+-    // any valid access units satisfy them.
+-    uint8_t *au_buf;
+-    int au_len;
+     bool avp_playing;            // desired transport state
+     bool avp_rate_applied;       // rate 1 has been handed to AVPlayer
+     bool avp_start_seeked;       // seek-to-start workaround already tried
+@@ -306,8 +299,6 @@ static void avp_append_es(struct ao *ao, const uint8_t *payload, int payload_len
+             CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
+         return;
+     }
+-    memcpy(p->au_buf, dst, payload_len);
+-    p->au_len = payload_len;
+     p->es_len += payload_len;
+     p->es_pts += CMTimeGetNanoseconds(
+         CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
+@@ -429,22 +420,24 @@ static void avp_serve_requests(struct ao *ao)
+             [dr respondWithData:chunk];
+             MP_TRACE(ao, "served %lld bytes at offset %lld\n",
+                      (long long)n, (long long)off);
+-        } else if (off > write_head && p->au_len > 0) {
+-            // Far-offset probe past the write head: duration/bitrate
+-            // estimation reading near the "end" of the endless resource.
+-            // Satisfy it with copies of the latest access unit; playback
+-            // starts at zero and never reaches these offsets.
+-            int64_t n = MPMIN(req_end - off, 256 * 1024);
+-            NSMutableData *chunk = [NSMutableData dataWithCapacity:n];
+-            while ((int64_t)chunk.length + p->au_len <= n)
+-                [chunk appendBytes:p->au_buf length:p->au_len];
+-            if (chunk.length == 0)
+-                [chunk appendBytes:p->au_buf length:MPMIN(p->au_len, n)];
+-            if (chunk.length > n)
+-                [chunk setLength:n];
+-            [dr respondWithData:chunk];
+-            MP_VERBOSE(ao, "synthesized %lu probe bytes at offset %lld\n",
+-                       (unsigned long)chunk.length, (long long)off);
++        } else if (off > write_head) {
++            // Read past the write head: the duration/bitrate probe the
++            // system issues against the fake endless resource during
++            // preroll (a fixed ~183 MiB offset, independent of the declared
++            // contentLength). Never fabricate bytes for it: the system
++            // caches whatever is served here by stream offset, plans its
++            // sequential reads around the cached range, and once playback
++            // reaches that byte offset (~30-40 min at DD+ rates) it plays
++            // the fabricated frames and then reads on past the write head,
++            // turning the audio into a repeating stale access unit
++            // (plezy#1776). Refusing makes the system fall back to plain
++            // sequential reads from the write head instead.
++            MP_VERBOSE(ao, "refusing read at %lld past the write head %lld\n",
++                       (long long)off, (long long)write_head);
++            [req finishLoadingWithError:
++                [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOTSUP userInfo:nil]];
++            [reqs removeObjectAtIndex:i];
++            continue;
+         }
+         if (!dr.requestsAllDataToEndOfResource &&
+             dr.currentOffset >= dr.requestedOffset + (int64_t)dr.requestedLength) {
+@@ -485,9 +478,9 @@ static void avp_update_transport(struct ao *ao)
+             return;
+         }
+         // Not gated on the item becoming ready: while prerolling, the
+-        // system may park on a far-offset probe of the fake endless
+-        // resource that can never be served, and only the seek-to-start
+-        // workaround below can break that; readiness follows the seek.
++        // system may still be waiting on reads (refused probes, a fresh
++        // sequential request) and readiness can lag; the seek-to-start
++        // workaround below breaks any residual park.
+         [p->player setRate:1];
+         p->avp_rate_applied = true;
+         p->avp_start_deadline = now + AVP_START_GRACE_NS;
+@@ -620,7 +613,6 @@ static void avp_create_item(struct ao *ao)
+     p->avp_start_seeked = false;
+     p->avp_primed_pts = 0;
+     p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
+-    p->au_len = 0;
+     p->avp_last_item_status = -1;
+     p->avp_last_tcs = -1;
+ }
+@@ -655,7 +647,6 @@ static void avp_teardown_item(struct ao *ao)
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;
+     p->avp_primed_pts = 0;
+-    p->au_len = 0;
+ }
+ 
+ #if TARGET_OS_OSX
+@@ -1171,8 +1162,6 @@ static int init(struct ao *ao)
+         p->es_size = AVP_ES_HISTORY_BYTES + 1024 * 1024 +
+                      (int)(2 * p->opt_compressed_lead * AVP_ES_LEAD_BYTES_PER_S);
+         p->es_buf = talloc_size(ao, p->es_size);
+-        p->au_buf = talloc_size(ao, p->spdif_burst_size);
+-
+         // the lead bound is what actually paces the stream
+         ao->device_buffer = ao->samplerate * 2;
+ 

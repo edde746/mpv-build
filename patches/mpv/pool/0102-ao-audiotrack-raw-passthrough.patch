@@ -1,0 +1,455 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -50,6 +50,19 @@
+     uint32_t playhead_offset;
+     bool reset_pending;
+ 
++    // Raw bitstream passthrough: the IEC 61937 stream from ad_spdif is
++    // unwrapped and fed to an AudioTrack opened with the codec's own
++    // encoding (ENCODING_AC3/E_AC3/DTS) - the transport ExoPlayer and Kodi
++    // use. An IEC 61937 track bypasses the platform's Dolby/DTS decoder, so
++    // on routes whose sink cannot decode the codec itself (a Shield in
++    // front of a Dolby-Digital-only receiver) it drains into silence.
++    bool raw_passthrough;
++    int raw_rate_mult;    // IEC carrier rate / raw track rate (4 for E-AC3)
++    int raw_state;        // IEC burst parser state (RAW_*)
++    int raw_data_type;    // Pc data type of the burst being unwrapped
++    int raw_payload_left; // payload bytes still to emit for this burst
++    void *rawbuf;         // unwrapped payload, chunk-sized
++
+     void *chunk;
+     int chunksize;
+     jbyteArray bytearray;
+@@ -58,6 +71,7 @@
+     jobject bbuf;
+ 
+     bool cfg_pcm_float;
++    bool cfg_raw_passthrough;
+     int cfg_session_id;
+ 
+     bool thread_terminate;
+@@ -99,6 +113,7 @@
+     jmethodID getTimestamp;
+     jmethodID getLatency;
+     jmethodID getMinBufferSize;
++    jmethodID isDirectPlaybackSupported;
+     jmethodID getNativeOutputSampleRate;
+     jint STATE_INITIALIZED;
+     jint PLAYSTATE_STOPPED;
+@@ -132,6 +147,7 @@
+     {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
+     {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
+     {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
++    {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
+     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
+     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
+     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
+@@ -187,6 +203,9 @@
+     jint ENCODING_PCM_16BIT;
+     jint ENCODING_PCM_FLOAT;
+     jint ENCODING_IEC61937;
++    jint ENCODING_AC3;
++    jint ENCODING_E_AC3;
++    jint ENCODING_DTS;
+     jint CHANNEL_OUT_MONO;
+     jint CHANNEL_OUT_STEREO;
+     jint CHANNEL_OUT_FRONT_CENTER;
+@@ -202,6 +221,9 @@
+     {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
+     {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
+     {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
++    {"ENCODING_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_AC3), 0},
++    {"ENCODING_E_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_E_AC3), 0},
++    {"ENCODING_DTS", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS), 0},
+     {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
+     {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
+     {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
+@@ -352,7 +374,9 @@
+         return -1;
+     }
+ 
+-    if (AudioTrack.getBufferSizeInFramesV23) {
++    // For raw encodings getBufferSizeInFrames answers in bitstream bytes
++    // (frame size 1), not mpv sample units; keep the size init computed.
++    if (!p->raw_passthrough && AudioTrack.getBufferSizeInFramesV23) {
+         int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
+         if (bufferSize > 0) {
+             MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
+@@ -392,7 +416,8 @@
+     int stable_count = 20;
+     int64_t wait = p->timestamp_stable < stable_count ? 50000000 : 3000000000;
+ 
+-    if (state == AudioTrack.PLAYSTATE_PLAYING && p->format != AudioFormat.ENCODING_IEC61937 &&
++    if (state == AudioTrack.PLAYSTATE_PLAYING &&
++        p->format != AudioFormat.ENCODING_IEC61937 && !p->raw_passthrough &&
+         (p->timestamp_fetched == 0 || now - p->timestamp_fetched >= wait)) {
+         if (!p->timestamp_fetched)
+             p->timestamp_stable = 0;
+@@ -432,7 +457,7 @@
+     }
+ 
+ 
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
++    if (p->format == AudioFormat.ENCODING_IEC61937 || p->raw_passthrough) {
+         if (p->reset_pending) {
+             // after a flush(), playbackHeadPosition will not reset to 0 right away.
+             // sometimes, it will never reset at all.
+@@ -462,7 +487,9 @@
+     }
+ 
+     p->playhead_pos = pos;
+-    return p->playhead_pos - p->playhead_offset;
++    // A raw track advances at the codec frame rate; scale back to the IEC
++    // carrier rate the rest of the accounting uses (uint32 rollover-safe).
++    return (p->playhead_pos - p->playhead_offset) * (uint32_t)p->raw_rate_mult;
+ }
+ 
+ static double AudioTrack_getLatency(struct ao *ao)
+@@ -476,7 +503,7 @@
+     uint32_t diff = p->written_frames - playhead;
+     double delay = diff / (double)(ao->samplerate);
+     if (!p->timestamp_set &&
+-        p->format != AudioFormat.ENCODING_IEC61937)
++        p->format != AudioFormat.ENCODING_IEC61937 && !p->raw_passthrough)
+         delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
+     if (delay > 2.0) {
+         //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
+@@ -484,8 +511,169 @@
+         return 0;
+     }
+     return MPCLAMP(delay, 0.0, 2.0);
++}
++
++// IEC 61937 burst parser states
++enum {
++    RAW_SYNC_PA = 0,
++    RAW_SYNC_PB,
++    RAW_PC,
++    RAW_PD,
++    RAW_PAYLOAD,
++};
++
++// IEC 61937-2 data types carried by the stereo bursts we unwrap.
++#define IEC61937_AC3  0x01
++#define IEC61937_DTS1 0x0b
++#define IEC61937_DTS2 0x0c
++#define IEC61937_DTS3 0x0d
++#define IEC61937_EAC3 0x15
++
++static jint raw_encoding_for_format(int format, int *rate_mult)
++{
++    *rate_mult = 1;
++    switch (format) {
++    case AF_FORMAT_S_AC3:
++        return AudioFormat.ENCODING_AC3;
++    case AF_FORMAT_S_EAC3:
++        // ad_spdif opens E-AC3 at the 192 kHz IEC carrier rate; the raw
++        // track runs at the codec's 48 kHz frame rate.
++        *rate_mult = 4;
++        return AudioFormat.ENCODING_E_AC3;
++    case AF_FORMAT_S_DTS:
++        return AudioFormat.ENCODING_DTS;
++    default:
++        // TrueHD (MAT) and DTS-HD MA keep the 8-channel IEC 61937 carrier:
++        // their raw forms are not trivially recoverable from the bursts.
++        return 0;
++    }
+ }
+ 
++// Whether the current route takes a direct AudioTrack of this exact raw
++// tuple. getMinBufferSize alone can size formats the route cannot actually
++// play, and a lying HAL then opens a raw track that renders silence - the
++// failure class the raw path exists to fix. media3 gates its raw
++// passthrough on the same probe. Below API 29 the probe does not exist;
++// answering true there leaves the getMinBufferSize/init-failure fallbacks
++// in charge, which is also media3's pre-29 behavior.
++static bool AudioTrack_rawRouteSupported(struct ao *ao, jint format,
++                                         jint samplerate, jint channel_config)
++{
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (!AudioTrack.isDirectPlaybackSupported ||
++        !AudioFormatBuilder.clazz || !AudioAttributesBuilder.clazz)
++        return true;
++
++    jobject tmp = NULL;
++
++    jobject format_builder = MP_JNI_NEW(AudioFormatBuilder.clazz, AudioFormatBuilder.ctor);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !format_builder)
++        return true;
++    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setEncoding, format);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setSampleRate, samplerate);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setChannelMask, channel_config);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    jobject afmt = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.build);
++    MP_JNI_LOCAL_FREEP(&format_builder);
++
++    jobject attr_builder = MP_JNI_NEW(AudioAttributesBuilder.clazz, AudioAttributesBuilder.ctor);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !attr_builder) {
++        MP_JNI_LOCAL_FREEP(&afmt);
++        return true;
++    }
++    tmp = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.setUsage, AudioAttributes.USAGE_MEDIA);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.setContentType, AudioAttributes.CONTENT_TYPE_MOVIE);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    jobject attr = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.build);
++    MP_JNI_LOCAL_FREEP(&attr_builder);
++
++    bool supported = true;
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !afmt || !attr)
++        goto done; // a malfunctioning probe is not a "no"
++
++    supported = MP_JNI_DO(CallStaticBooleanMethod, AudioTrack.clazz,
++                          AudioTrack.isDirectPlaybackSupported, afmt, attr);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        supported = true;
++
++done:
++    MP_JNI_LOCAL_FREEP(&afmt);
++    MP_JNI_LOCAL_FREEP(&attr);
++    return supported;
++}
++
++// Incrementally unwraps an IEC 61937 stream (16-bit little-endian words as
++// produced by libavformat's spdif muxer) back into the raw codec byte
++// stream. Payload words are byte-swapped back to bitstream order; preambles
++// and zero padding are dropped. Burst boundaries may fall anywhere inside
++// [src, src+len), so parser state persists in priv across calls.
++static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
++                                     const uint8_t *src, int len)
++{
++    struct priv *p = ao->priv;
++    int out = 0;
++
++    for (int i = 0; i + 1 < len; i += 2) {
++        const uint8_t lo = src[i], hi = src[i + 1];
++
++        if (p->raw_state == RAW_PAYLOAD) {
++            // spdifenc byte-swaps the payload into LE words; a lone final
++            // byte rides the high half of its word. Swapping each pair and
++            // emitting only the bytes Pd promised undoes both.
++            dst[out++] = hi;
++            if (--p->raw_payload_left > 0) {
++                dst[out++] = lo;
++                p->raw_payload_left--;
++            }
++            if (p->raw_payload_left == 0)
++                p->raw_state = RAW_SYNC_PA;
++            continue;
++        }
++
++        const uint16_t word = lo | (hi << 8);
++        switch (p->raw_state) {
++        case RAW_SYNC_PA:
++            if (word == 0xf872)
++                p->raw_state = RAW_SYNC_PB;
++            break;
++        case RAW_SYNC_PB:
++            if (word == 0x4e1f)
++                p->raw_state = RAW_PC;
++            else
++                p->raw_state = word == 0xf872 ? RAW_SYNC_PB : RAW_SYNC_PA;
++            break;
++        case RAW_PC:
++            p->raw_data_type = word & 0x7f;
++            p->raw_state = RAW_PD;
++            break;
++        case RAW_PD:
++            switch (p->raw_data_type) {
++            case IEC61937_AC3:
++            case IEC61937_DTS1:
++            case IEC61937_DTS2:
++            case IEC61937_DTS3:
++                p->raw_payload_left = word >> 3; // Pd in bits
++                break;
++            case IEC61937_EAC3:
++                p->raw_payload_left = word; // Pd in bytes
++                break;
++            default:
++                MP_WARN(ao, "unexpected IEC 61937 data type 0x%x\n",
++                        p->raw_data_type);
++                p->raw_payload_left = 0;
++                break;
++            }
++            p->raw_state = p->raw_payload_left > 0 ? RAW_PAYLOAD : RAW_SYNC_PA;
++            break;
++        }
++    }
++
++    return out;
++}
++
+ static int AudioTrack_write(struct ao *ao, int len)
+ {
+     struct priv *p = ao->priv;
+@@ -495,7 +683,21 @@
+     void *buf = p->chunk;
+ 
+     jint ret;
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
++    if (p->raw_passthrough) {
++        int payload = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
++        if (payload == 0)
++            return len; // only preamble/padding: consumed, nothing to write
++        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        MP_JNI_LOCAL_FREEP(&bbuf);
++        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, payload, AudioTrack.WRITE_BLOCKING);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        if (ret < 0) return ret;
++        if (ret != payload)
++            MP_WARN(ao, "raw passthrough: short write (%d of %d bytes)\n", ret, payload);
++        // written_frames accounting stays in input (IEC frame) units.
++        return len;
++    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
+         (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+         ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
+@@ -657,11 +859,34 @@
+     if (init_jni(ao) < 0)
+         return -1;
+ 
++    p->raw_rate_mult = 1;
++
+     const bool spdif = af_fmt_is_spdif(ao->format);
+ 
+     if (spdif) {
+-        p->format = AudioFormat.ENCODING_IEC61937;
+-        if (!p->format || !AudioTrack.writeShortV23) {
++        int rate_mult = 1;
++        jint raw_format = p->cfg_raw_passthrough
++                        ? raw_encoding_for_format(ao->format, &rate_mult) : 0;
++        if (raw_format &&
++            !AudioTrack_rawRouteSupported(ao, raw_format,
++                                          ao->samplerate / rate_mult,
++                                          AudioFormat.CHANNEL_OUT_STEREO)) {
++            MP_VERBOSE(ao, "route rejects a raw %s track, using IEC 61937\n",
++                       af_fmt_to_str(ao->format));
++            raw_format = 0;
++        }
++        if (raw_format && AudioTrack.writeBufferV21) {
++            // Feed the codec bitstream itself and let the platform wrap or
++            // transcode it; see the priv comment.
++            p->format = raw_format;
++            p->raw_passthrough = true;
++            p->raw_rate_mult = rate_mult;
++            MP_VERBOSE(ao, "using raw passthrough for %s\n",
++                       af_fmt_to_str(ao->format));
++        } else {
++            p->format = AudioFormat.ENCODING_IEC61937;
++        }
++        if (!p->format || (!p->raw_passthrough && !AudioTrack.writeShortV23)) {
+             MP_ERR(ao, "spdif passthrough not supported by API\n");
+             return -1;
+         }
+@@ -690,6 +915,11 @@
+         }
+     }
+     p->samplerate = ao->samplerate;
++    if (p->raw_passthrough) {
++        // The IEC rate is the burst carrier rate; the raw track runs at the
++        // codec's frame rate (192 kHz E-AC3 bursts carry 48 kHz frames).
++        p->samplerate = ao->samplerate / p->raw_rate_mult;
++    }
+ 
+     /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
+     static const struct mp_chmap layouts[] = {
+@@ -748,20 +978,51 @@
+         p->channel_config,
+         p->format
+     );
++    if (p->raw_passthrough && (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0)) {
++        // The route rejected the raw encoding outright; fall back to the
++        // IEC 61937 carrier rather than failing passthrough entirely.
++        MP_WARN(ao, "raw passthrough rejected (buffer size %d), trying IEC 61937\n",
++                buffer_size);
++        p->raw_passthrough = false;
++        p->raw_rate_mult = 1;
++        p->format = AudioFormat.ENCODING_IEC61937;
++        p->samplerate = ao->samplerate;
++        if (!p->format || !AudioTrack.writeShortV23) {
++            MP_ERR(ao, "spdif passthrough not supported by API\n");
++            return -1;
++        }
++        buffer_size = MP_JNI_CALL_STATIC_INT(
++            AudioTrack.clazz,
++            AudioTrack.getMinBufferSize,
++            p->samplerate,
++            p->channel_config,
++            p->format
++        );
++    }
+     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0) {
+         MP_FATAL(ao, "AudioTrack.getMinBufferSize returned an invalid size: %d", buffer_size);
+         return -1;
+     }
+ 
+-    // Choose double of the minimum buffer size suggested by the driver, but not
+-    // less than 75ms or more than 150ms.
+     const int bps = af_fmt_to_bytes(ao->format);
+-    int min = 0.075 * p->samplerate * bps * ao->channels.num;
+-    int max = min * 2;
+-    min = MP_ALIGN_UP(min, bps);
+-    max = MP_ALIGN_UP(max, bps);
+-    p->size = MPCLAMP(buffer_size * 2, min, max);
+-    MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
++    if (p->raw_passthrough) {
++        // getMinBufferSize answers in bitstream bytes for raw encodings.
++        // Sizing by the IEC byte rate would buffer seconds of compressed
++        // audio; twice the HAL minimum keeps the write cadence smooth while
++        // the reported delay stays under mpv's 2 s sanity cap at real
++        // bitrates.
++        p->size = MP_ALIGN_UP(buffer_size * 2, bps);
++        MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d)\n", p->size, buffer_size);
++    } else {
++        // Choose double of the minimum buffer size suggested by the driver, but not
++        // less than 75ms or more than 150ms.
++        int min = 0.075 * p->samplerate * bps * ao->channels.num;
++        int max = min * 2;
++        min = MP_ALIGN_UP(min, bps);
++        max = MP_ALIGN_UP(max, bps);
++        p->size = MPCLAMP(buffer_size * 2, min, max);
++        MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
++    }
+     mp_assert(p->size % bps == 0);
+     ao->device_buffer = p->size / bps;
+ 
+@@ -777,7 +1038,13 @@
+     MP_JNI_LOCAL_FREEP(&timestamp);
+ 
+     // decide and create buffer of right type
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
++    if (p->raw_passthrough) {
++        MP_VERBOSE(ao, "Using NIO ByteBuffer for raw passthrough\n");
++        p->rawbuf = talloc_size(ao, p->chunksize);
++        jobject bbuf = (*env)->NewDirectByteBuffer(env, p->rawbuf, p->chunksize);
++        p->bbuf = (*env)->NewGlobalRef(env, bbuf);
++        MP_JNI_LOCAL_FREEP(&bbuf);
++    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
+         jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
+         p->shortarray = (*env)->NewGlobalRef(env, shortarray);
+         MP_JNI_LOCAL_FREEP(&shortarray);
+@@ -834,6 +1101,8 @@
+     p->written_frames = 0;
+     p->timestamp_fetched = 0;
+     p->timestamp_set = false;
++    p->raw_state = RAW_SYNC_PA;
++    p->raw_payload_left = 0;
+ }
+ 
+ static void start(struct ao *ao)
+@@ -863,9 +1132,11 @@
+     .priv_size = sizeof(struct priv),
+     .priv_defaults = &(const OPT_BASE_STRUCT) {
+         .cfg_pcm_float = 1,
++        .cfg_raw_passthrough = 1,
+     },
+     .options   = (const struct m_option[]) {
+         {"pcm-float", OPT_BOOL(cfg_pcm_float)},
++        {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
+         {"session-id", OPT_INT(cfg_session_id)},
+         {0}
+     },

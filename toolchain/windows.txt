@@ -1,0 +1,14 @@
+# Toolchain generation for content-addressed windows binaries.
+#
+# The windows toolchain (llvm/clang cross-compiler + rust, bootstrapped by
+# `ninja llvm && ninja rustup && ninja llvm-clang`) is defined by the
+# mpv-winbuild-cmake sources, and that repository is pinned as the versions.json
+# component `mpv-winbuild-cmake` -- its commit is already a key input for every
+# libmpv-windows artifact, so toolchain recipe changes invalidate keys through
+# the component pin, not through this file.
+#
+# What the pin does NOT capture: rustup resolving `stable` at bootstrap time,
+# and anything else the toolchain fetches live. Bump the generation below to
+# force a rebuild when the toolchain moved underneath the same winbuild commit
+# in a way that matters (rust stable codegen fix, a miscompile).
+generation=1

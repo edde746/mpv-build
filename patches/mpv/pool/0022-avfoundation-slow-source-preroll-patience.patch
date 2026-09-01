@@ -1,0 +1,48 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index c1a9469..e3fa4e9 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -112,6 +112,7 @@ - (void)invalidate;
+     bool avp_start_seeked;       // seek-to-start workaround already tried
+     bool avp_eof;
+     int64_t avp_start_deadline;  // mp_time_ns() deadline; -1 = healthy
++    int64_t avp_primed_pts;      // es_pts at the last observed priming progress
+     int avp_last_item_status;    // last logged AVPlayerItemStatus
+     int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
+     int avp_heartbeat;           // verbose position log divider
+@@ -505,6 +506,19 @@ static void avp_update_transport(struct ao *ao)
+         p->avp_start_deadline = -1; // playing; nothing left to supervise
+         return;
+     }
++    // A source that cannot outpace realtime (a realtime-pinned or
++    // CPU-bound server transcode) trickles preroll in slowly; a hard
++    // deadline would abandon it for PCM within seconds. Keep waiting while
++    // priming is still making progress, like a blocking loader would: the
++    // pipeline engages once preroll is satisfied, just late. The startup
++    // gate bounds this -- a parked player keeps pulling at full speed,
++    // tops the gate out quickly, progress stops, and the deadline below
++    // resumes its work.
++    if (p->es_pts > p->avp_primed_pts && p->es_pts < AVP_START_LEAD_NS(p)) {
++        p->avp_primed_pts = p->es_pts;
++        p->avp_start_deadline = now + AVP_START_GRACE_NS;
++        return;
++    }
+     if (now < p->avp_start_deadline)
+         return;
+     if (!p->avp_start_seeked) {
+@@ -611,6 +625,7 @@ static void avp_create_item(struct ao *ao)
+     p->avp_eof = false;
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;
++    p->avp_primed_pts = 0;
+     p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
+     p->au_len = 0;
+     p->avp_last_item_status = -1;
+@@ -646,6 +661,7 @@ static void avp_teardown_item(struct ao *ao)
+     p->avp_eof = false;
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;
++    p->avp_primed_pts = 0;
+     p->au_len = 0;
+ }
+ 

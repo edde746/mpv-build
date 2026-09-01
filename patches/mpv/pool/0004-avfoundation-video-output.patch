@@ -1,0 +1,2897 @@
+From 362b6eabb164c6fd9e2f9fb771754c615a39cbae Mon Sep 17 00:00:00 2001
+From: Alex Kim <alexkim@Alexs-MacBook-Pro.local>
+Date: Sat, 23 Aug 2025 20:11:28 +1000
+Subject: [PATCH] AVfoundation video output
+
+---
+ meson.build                 |   15 +
+ meson.options               |    1 +
+ video/out/vo.c              |    4 +
+ video/out/vo_avfoundation.m | 2818 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 2838 insertions(+)
+ create mode 100644 video/out/vo_avfoundation.m
+
+diff --git a/meson.build b/meson.build
+index f6f8e7f..55612b4 100644
+--- a/meson.build
++++ b/meson.build
+@@ -823,6 +823,21 @@ if features['avfoundation']
+     sources += files('audio/out/ao_avfoundation.m')
+ endif
+ 
++vo_avfoundation_frameworks = ['AVFoundation', 'CoreMedia', 'CoreVideo',
++                             'CoreImage', 'QuartzCore', 'Metal']
++if cc.has_header('UIKit/UIKit.h')
++    vo_avfoundation_frameworks += ['UIKit']
++elif cc.has_header('AppKit/AppKit.h')
++    vo_avfoundation_frameworks += ['AppKit']
++endif
++vo_avfoundation = dependency('appleframeworks', modules: vo_avfoundation_frameworks,
++                             required: get_option('vo-avfoundation'))
++features += {'vo-avfoundation': vo_avfoundation.found()}
++if features['vo-avfoundation']
++    dependencies += vo_avfoundation
++    sources += files('video/out/vo_avfoundation.m')
++endif
++
+ coreaudio = dependency('appleframeworks', modules: ['CoreFoundation', 'CoreAudio',
+                        'AudioUnit', 'AudioToolbox'], required: get_option('coreaudio'))
+ features += {'coreaudio': coreaudio.found()}
+diff --git a/meson.options b/meson.options
+index 81bc931..1ac622a 100644
+--- a/meson.options
++++ b/meson.options
+@@ -62,6 +62,7 @@ option('d3d11', type: 'feature', value: 'auto', description: 'Direct3D 11 video
+ option('direct3d', type: 'feature', value: 'auto', description: 'Direct3D support')
+ option('dmabuf-wayland', type: 'feature', value: 'auto', description: 'dmabuf-wayland video output')
+ option('drm', type: 'feature', value: 'auto', description: 'Direct Rendering Manager (DRM)')
++option('vo-avfoundation', type: 'feature', value: 'auto', description: 'AVFoundation video output')
+ option('egl', type: 'feature', value: 'auto', description: 'EGL 1.4')
+ option('egl-android', type: 'feature', value: 'auto', description: 'Android EGL support')
+ option('egl-angle', type: 'feature', value: 'auto', description: 'OpenGL ANGLE headers')
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..582acbe 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -46,6 +46,7 @@
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+ 
++extern const struct vo_driver video_out_avfoundation;
+ extern const struct vo_driver video_out_mediacodec_embed;
+ extern const struct vo_driver video_out_x11;
+ extern const struct vo_driver video_out_vdpau;
+@@ -69,6 +70,9 @@ extern const struct vo_driver video_out_kitty;
+ 
+ static const struct vo_driver *const video_out_drivers[] =
+ {
++#if HAVE_VO_AVFOUNDATION
++    &video_out_avfoundation,
++#endif
+     // high-quality and well-supported VOs first:
+     &video_out_gpu_next,
+     &video_out_gpu,
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+new file mode 100644
+index 0000000..9b7b4e1
+--- /dev/null
++++ b/video/out/vo_avfoundation.m
+@@ -0,0 +1,2818 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <math.h>
++#include <stdlib.h>
++#include <stdatomic.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_videotoolbox.h>
++#include "common/common.h"
++#include "options/m_config.h"
++#include "options/m_option.h"
++#include "osdep/timer.h"
++#include "vo.h"
++#include "video/mp_image.h"
++#include "video/hwdec.h"
++#include "sub/osd.h"
++
++#import <CoreMedia/CoreMedia.h>
++#import <AVFoundation/AVFoundation.h>
++#import <CoreGraphics/CoreGraphics.h>
++#import <CoreImage/CoreImage.h>
++#import <QuartzCore/QuartzCore.h>
++#import <Metal/Metal.h>
++#import <TargetConditionals.h>
++
++#if TARGET_OS_IPHONE
++#import <UIKit/UIKit.h>
++#else
++#import <AppKit/AppKit.h>
++#endif
++
++struct avf_render_geometry {
++    int w, h;
++    struct mp_rect src, dst;
++    struct mp_osd_res osd_res;
++};
++
++enum avf_osd_draw_path {
++    AVF_OSD_DRAW_NONE = 0,
++    AVF_OSD_DRAW_DIRECT_LIBASS,
++    AVF_OSD_DRAW_DIRECT_BGRA,
++    AVF_OSD_DRAW_COREGRAPHICS,
++};
++
++// How enqueued samples are timed against the display layer's timebase.
++//
++// Host mode reproduces the original single-clock design: samples carry
++// mpv's scheduled display time (frame->pts) and the timebase free-runs on
++// the host clock at rate 1.0. mpv's audio-slaved scheduler re-times every
++// frame, so audio/host clock skew is absorbed continuously in
++// microsecond-scale per-frame adjustments and no timing state accumulates
++// in the VO. The cost: the layer cannot pause autonomously, so up to
++// queue-lead-ms of already-queued frames still present after a pause.
++//
++// Media mode stamps container PTS against a media timebase that is
++// anchored and rate-servoed to follow mpv's schedule. PiP requires it (the
++// system PiP UI reads media time and playback rate off the layer's
++// timebase), but any error between the two clock domains can only be
++// retired by rate slewing or a visible re-anchor snap (plezy#1776).
++enum avf_presentation_mode {
++    AVF_PRESENTATION_MEDIA = 0,
++    AVF_PRESENTATION_HOST = 1,
++};
++
++struct avfoundation_opts {
++    bool composite_osd;
++    bool pip_composite_osd;
++    int queue_lead_ms;
++    int presentation;
++};
++
++struct priv {
++    struct mp_hwdec_ctx hwctx;
++    struct m_config_cache *opts_cache;
++    struct avfoundation_opts *opts;
++    // Presentation mode is latched at preinit; runtime option changes are
++    // deliberately ignored because switching would require re-seeding the
++    // layer timebase under queued samples.
++    bool presentation_host;
++
++    struct mp_image *next_image;
++    double next_pts;
++    CMTimebaseRef timebase;
++    int64_t next_present_host_ns;
++    int64_t next_media_pts_ns;
++    bool next_media_pts_valid;
++    __strong AVSampleBufferDisplayLayer *displayLayer;
++
++    // OSD/Subtitle support (timed AVSampleBufferDisplayLayer overlay mode)
++    __strong AVSampleBufferDisplayLayer *osdLayer;
++    int64_t osd_change_id;
++    int osd_w, osd_h;
++    struct mp_osd_res osd_res;
++    struct avf_render_geometry render_geometry;
++    bool render_geometry_valid;
++    CVPixelBufferPoolRef osdPool;
++    int osd_pool_w, osd_pool_h;
++    bool osd_needs_enqueue;
++
++    // Compositing mode support
++    __strong id<MTLDevice> mtlDevice;
++    __strong CIContext *ciContext;
++    CVPixelBufferPoolRef outputPool;
++    int output_pool_w, output_pool_h;
++    OSType output_pool_format;
++    CGImageRef cachedSubtitleImage;
++    CVPixelBufferRef cachedSubtitleBuffer;
++    int subtitle_x0, subtitle_y0, subtitle_x1, subtitle_y1;
++    bool has_subtitle;
++
++    // Software frame upload support
++    CVPixelBufferPoolRef swUploadPool;
++    int sw_pool_w, sw_pool_h;
++    OSType sw_pool_format;
++
++    // Frame counter for periodic maintenance
++    int frame_count;
++    int not_ready_drop_count;
++    int64_t last_not_ready_drop_ns;
++    int64_t last_display_recovery_ns;
++    int64_t last_video_enqueue_ns;
++    int64_t last_media_pts_ns;
++    int64_t last_present_host_ns;
++    bool last_media_pts_valid;
++    bool timebase_anchor_valid;
++    bool timebase_paused;
++    bool playback_paused;
++    double timebase_rate;
++
++    // Track if OSD callback was invoked this frame
++    bool osd_callback_invoked;
++
++    // Track whether the previous frame was rendered through Core Image for
++    // video geometry so the layer can recover cleanly when zoom is reset.
++    bool applied_geometry_last_frame;
++
++    // Avoid logging every frame if geometry rendering repeatedly fails.
++    bool geometry_render_failure_logged;
++
++    // App-active presentation resync (iOS/tvOS). The system suspends the
++    // autonomous AVSampleBufferDisplayLayer on resign-active without setting
++    // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
++    id app_active_observer;
++    id app_resign_observer;
++    bool presentation_suspended;
++    atomic_bool pending_presentation_resync;
++};
++
++static CGFloat get_screen_scale(void)
++{
++#if TARGET_OS_IPHONE
++    return [UIScreen mainScreen].scale;
++#else
++    NSScreen *screen = [NSScreen mainScreen];
++    return screen ? screen.backingScaleFactor : 1.0;
++#endif
++}
++
++static void dispatch_main_sync_safe(dispatch_block_t block);
++static void clear_subtitle_cache(struct priv *p);
++static void release_ci_compositor(struct priv *p);
++static const struct m_sub_options avfoundation_conf;
++
++static bool should_composite_into_video(struct priv *p)
++{
++    return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
++}
++
++static bool should_use_inline_osd_layer(struct priv *p)
++{
++    return !should_composite_into_video(p);
++}
++
++static bool should_apply_video_geometry(struct vo *vo)
++{
++    struct mp_vo_opts *opts = vo->opts;
++    // Only per-frame geometry options use Core Image; panscan and aspect
++    // override stay on the sample-buffer/videoGravity path.
++    return opts && (fabsf(opts->zoom) > 0.0001f ||
++                    fabsf(opts->pan_x) > 0.0001f ||
++                    fabsf(opts->pan_y) > 0.0001f ||
++                    fabsf(opts->scale_x - 1.0f) > 0.0001f ||
++                    fabsf(opts->scale_y - 1.0f) > 0.0001f);
++}
++
++static bool is_p010_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
++           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++}
++
++static bool is_nv12_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
++           format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
++}
++
++static bool is_biplanar_yuv_format(OSType format)
++{
++    return is_nv12_format(format) || is_p010_format(format);
++}
++
++static bool is_full_range_yuv_format(OSType format)
++{
++    return format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
++           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++}
++
++static id<AVQueuedSampleBufferRendering> active_sample_buffer_renderer(
++    AVSampleBufferDisplayLayer *displayLayer)
++{
++    if (!displayLayer)
++        return nil;
++
++    if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *))
++        return displayLayer.sampleBufferRenderer;
++
++    return displayLayer;
++}
++
++static AVQueuedSampleBufferRenderingStatus sample_buffer_renderer_status(
++    AVSampleBufferDisplayLayer *displayLayer)
++{
++    if (!displayLayer)
++        return AVQueuedSampleBufferRenderingStatusUnknown;
++
++    if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *))
++        return displayLayer.sampleBufferRenderer.status;
++
++    return displayLayer.status;
++}
++
++static bool sample_buffer_renderer_requires_flush(
++    AVSampleBufferDisplayLayer *displayLayer)
++{
++    if (!displayLayer)
++        return false;
++
++    if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *))
++        return displayLayer.sampleBufferRenderer.requiresFlushToResumeDecoding;
++
++    if (@available(iOS 14.0, tvOS 14.0, macOS 11.0, *))
++        return displayLayer.requiresFlushToResumeDecoding;
++
++    return false;
++}
++
++static bool sample_buffer_renderer_is_ready(AVSampleBufferDisplayLayer *displayLayer)
++{
++    id<AVQueuedSampleBufferRendering> renderer =
++        active_sample_buffer_renderer(displayLayer);
++    return renderer && renderer.isReadyForMoreMediaData;
++}
++
++static bool media_pts_is_valid(double pts)
++{
++    return pts != MP_NOPTS_VALUE && isfinite(pts);
++}
++
++static int64_t media_pts_to_ns(double pts)
++{
++    return (int64_t)(pts * (double)NSEC_PER_SEC + (pts >= 0 ? 0.5 : -0.5));
++}
++
++static CMTime cm_time_from_ns(int64_t ns)
++{
++    return CMTimeMake(ns, NSEC_PER_SEC);
++}
++
++static int64_t cm_time_to_ns(CMTime time)
++{
++    if (!CMTIME_IS_NUMERIC(time))
++        return 0;
++
++    CMTime converted = CMTimeConvertScale(time, NSEC_PER_SEC,
++                                          kCMTimeRoundingMethod_Default);
++    return converted.value;
++}
++
++static int64_t current_media_time_ns(struct priv *p)
++{
++    if (p->next_media_pts_valid)
++        return p->next_media_pts_ns;
++    if (p->last_media_pts_valid)
++        return p->last_media_pts_ns;
++    if (p->timebase)
++        return cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++    return 0;
++}
++
++// Presentation timestamp for enqueued video/OSD samples, in the unit the
++// active mode's timebase runs in: mpv's scheduled host display time in
++// host mode, container media PTS in media mode.
++static int64_t sample_presentation_pts_ns(struct priv *p)
++{
++    if (p->presentation_host)
++        return p->next_present_host_ns > 0 ? p->next_present_host_ns
++                                           : mp_time_ns();
++    return current_media_time_ns(p);
++}
++
++static void reset_media_timing(struct priv *p)
++{
++    p->next_media_pts_ns = 0;
++    p->next_media_pts_valid = false;
++    p->last_media_pts_ns = 0;
++    p->last_present_host_ns = 0;
++    p->last_media_pts_valid = false;
++    p->timebase_anchor_valid = false;
++    p->timebase_paused = false;
++    p->playback_paused = false;
++    p->timebase_rate = 1.0;
++}
++
++static double infer_timebase_rate(struct priv *p, int64_t media_pts_ns,
++                                  int64_t present_host_ns)
++{
++    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++
++    if (!p->last_media_pts_valid || !p->last_present_host_ns)
++        return rate;
++
++    int64_t media_delta = media_pts_ns - p->last_media_pts_ns;
++    int64_t host_delta = present_host_ns - p->last_present_host_ns;
++    if (media_delta <= 0 || host_delta <= MP_TIME_MS_TO_NS(5))
++        return rate;
++
++    double inferred = (double)media_delta / (double)host_delta;
++    return inferred >= 0.05 && inferred <= 8.0 ? inferred : rate;
++}
++
++static void update_media_timebase_for_frame(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->timebase || !p->next_media_pts_valid)
++        return;
++
++    int64_t now = mp_time_ns();
++    int64_t present_host_ns = p->next_present_host_ns > 0
++        ? p->next_present_host_ns
++        : now;
++    int64_t media_pts_ns = p->next_media_pts_ns;
++    double rate = p->playback_paused
++        ? 0.0
++        : infer_timebase_rate(p, media_pts_ns, present_host_ns);
++
++    bool should_anchor = !p->timebase_anchor_valid || p->timebase_paused ||
++        p->playback_paused || fabs(rate - p->timebase_rate) > 0.01;
++
++    if (!should_anchor) {
++        int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++        int64_t projected_ns = timebase_ns +
++            (int64_t)((double)(present_host_ns - now) * p->timebase_rate);
++        should_anchor = llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20);
++    }
++
++    if (should_anchor) {
++        OSStatus err = CMTimebaseSetRateAndAnchorTime(
++            p->timebase, rate, cm_time_from_ns(media_pts_ns),
++            cm_time_from_ns(present_host_ns));
++        if (err != noErr) {
++            MP_WARN(vo, "Failed to anchor AVFoundation media timebase: %d\n", (int)err);
++        }
++        p->timebase_rate = rate;
++        p->timebase_anchor_valid = true;
++        p->timebase_paused = p->playback_paused;
++    }
++
++    p->last_media_pts_ns = media_pts_ns;
++    p->last_present_host_ns = present_host_ns;
++    p->last_media_pts_valid = true;
++}
++
++static void set_media_timebase_paused(struct vo *vo, bool paused)
++{
++    struct priv *p = vo->priv;
++    if (!p->timebase)
++        return;
++    p->playback_paused = paused;
++
++    if (paused) {
++        CMTime media_time = CMTimebaseGetTime(p->timebase);
++        if (!CMTIME_IS_NUMERIC(media_time)) {
++            media_time = cm_time_from_ns(p->last_media_pts_valid
++                ? p->last_media_pts_ns
++                : 0);
++        }
++        OSStatus err = CMTimebaseSetRateAndAnchorTime(
++            p->timebase, 0.0, media_time, cm_time_from_ns(mp_time_ns()));
++        if (err != noErr)
++            MP_WARN(vo, "Failed to pause AVFoundation media timebase: %d\n", (int)err);
++        p->timebase_paused = true;
++        return;
++    }
++
++    p->timebase_paused = false;
++    p->timebase_anchor_valid = false;
++}
++
++static void sample_buffer_renderer_flush(AVSampleBufferDisplayLayer *displayLayer,
++                                         bool remove_image)
++{
++    if (!displayLayer)
++        return;
++
++    if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *)) {
++        AVSampleBufferVideoRenderer *renderer = displayLayer.sampleBufferRenderer;
++        if (remove_image) {
++            [renderer flushWithRemovalOfDisplayedImage:YES completionHandler:NULL];
++        } else {
++            [renderer flush];
++        }
++        return;
++    }
++
++    if (remove_image) {
++        [displayLayer flushAndRemoveImage];
++    } else {
++        [displayLayer flush];
++    }
++}
++
++static void sample_buffer_renderer_enqueue(AVSampleBufferDisplayLayer *displayLayer,
++                                           CMSampleBufferRef buf)
++{
++    id<AVQueuedSampleBufferRendering> renderer =
++        active_sample_buffer_renderer(displayLayer);
++    [renderer enqueueSampleBuffer:buf];
++}
++
++static bool display_layer_needs_recovery(AVSampleBufferDisplayLayer *displayLayer)
++{
++    if (!displayLayer)
++        return false;
++
++    return sample_buffer_renderer_status(displayLayer) ==
++               AVQueuedSampleBufferRenderingStatusFailed ||
++           sample_buffer_renderer_requires_flush(displayLayer);
++}
++
++static void recover_display_layer(struct vo *vo, const char *reason, bool force)
++{
++    struct priv *p = vo->priv;
++    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++
++    if (!displayLayer) {
++        [osdLayer release];
++        return;
++    }
++
++    int64_t now = mp_time_ns();
++    if (!force && p->last_display_recovery_ns &&
++        now - p->last_display_recovery_ns < MP_TIME_MS_TO_NS(500)) {
++        [displayLayer release];
++        [osdLayer release];
++        return;
++    }
++    p->last_display_recovery_ns = now;
++
++    __block AVQueuedSampleBufferRenderingStatus status =
++        AVQueuedSampleBufferRenderingStatusUnknown;
++    __block bool requires_flush = false;
++    __block bool ready = false;
++    __block int64_t timebase_ns = 0;
++    __block double timebase_rate = 0.0;
++
++    dispatch_main_sync_safe(^{
++        status = sample_buffer_renderer_status(displayLayer);
++        requires_flush = sample_buffer_renderer_requires_flush(displayLayer);
++        ready = sample_buffer_renderer_is_ready(displayLayer);
++        if (p->timebase) {
++            timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++            timebase_rate = CMTimebaseGetRate(p->timebase);
++        }
++
++        sample_buffer_renderer_flush(displayLayer, false);
++        sample_buffer_renderer_flush(osdLayer, false);
++    });
++
++    MP_WARN(vo, "Recovered AVFoundation display layer after %s "
++                "(status=%ld, requiresFlush=%s, ready=%s, "
++                "mediaPts=%.3f, timebase=%.3f, rate=%.3f)\n",
++            reason, (long)status, requires_flush ? "yes" : "no",
++            ready ? "yes" : "no",
++            current_media_time_ns(p) / 1000000000.0,
++            timebase_ns / 1000000000.0, timebase_rate);
++
++    p->not_ready_drop_count = 0;
++    p->last_not_ready_drop_ns = 0;
++    p->last_video_enqueue_ns = 0;
++    p->timebase_anchor_valid = false;
++    p->timebase_paused = p->playback_paused;
++    p->osd_change_id = 0;
++    p->osd_needs_enqueue = false;
++
++    [displayLayer release];
++    [osdLayer release];
++}
++
++static void record_not_ready_drop(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int64_t now = mp_time_ns();
++
++    if (p->last_not_ready_drop_ns == 0 ||
++        now - p->last_not_ready_drop_ns > MP_TIME_MS_TO_NS(500))
++        p->not_ready_drop_count = 0;
++
++    p->last_not_ready_drop_ns = now;
++    p->not_ready_drop_count++;
++
++    if (p->not_ready_drop_count >= 3 &&
++        (!p->last_video_enqueue_ns ||
++         now - p->last_video_enqueue_ns >= MP_TIME_MS_TO_NS(500)))
++        recover_display_layer(vo, "repeated not-ready drops", false);
++}
++
++static void update_avfoundation_geometry(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->displayLayer)
++        return;
++
++    __block int width = 0;
++    __block int height = 0;
++    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++    dispatch_main_sync_safe(^{
++        CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++        CGSize size = displayLayer.bounds.size;
++        if (size.width <= 0 || size.height <= 0)
++            size = displayLayer.frame.size;
++
++        width = MPMAX(1, (int)(size.width * scale + 0.5));
++        height = MPMAX(1, (int)(size.height * scale + 0.5));
++    });
++    [displayLayer release];
++
++    vo->dwidth = width;
++    vo->dheight = height;
++    vo->monitor_par = 1.0;
++}
++
++static struct avf_render_geometry compute_render_geometry(struct vo *vo,
++                                                          int frame_w,
++                                                          int frame_h)
++{
++    struct priv *p = vo->priv;
++    struct mp_rect src, dst;
++    struct mp_osd_res vo_osd;
++
++    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
++
++    if (frame_w <= 0)
++        frame_w = vo->params ? vo->params->w : 0;
++    if (frame_h <= 0)
++        frame_h = vo->params ? vo->params->h : 0;
++
++    if (should_use_inline_osd_layer(p)) {
++        return (struct avf_render_geometry){
++            .w = vo_osd.w,
++            .h = vo_osd.h,
++            .src = src,
++            .dst = dst,
++            .osd_res = vo_osd,
++        };
++    }
++
++    if (frame_w <= 0 || frame_h <= 0 || vo_osd.w <= 0 || vo_osd.h <= 0) {
++        return (struct avf_render_geometry){0};
++    }
++
++    int params_w = vo->params ? vo->params->w : frame_w;
++    int params_h = vo->params ? vo->params->h : frame_h;
++    if (src.x1 <= src.x0 || src.y1 <= src.y0) {
++        src = (struct mp_rect){0, 0, params_w, params_h};
++    }
++
++    return (struct avf_render_geometry){
++        .w = vo_osd.w,
++        .h = vo_osd.h,
++        .src = src,
++        .dst = dst,
++        .osd_res = vo_osd,
++    };
++}
++
++static void invalidate_render_geometry(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    p->render_geometry_valid = false;
++}
++
++static void update_render_geometry(struct vo *vo, int frame_w, int frame_h)
++{
++    struct priv *p = vo->priv;
++
++    if (frame_w <= 0)
++        frame_w = vo->params ? vo->params->w : 0;
++    if (frame_h <= 0)
++        frame_h = vo->params ? vo->params->h : 0;
++
++    update_avfoundation_geometry(vo);
++    p->render_geometry = compute_render_geometry(vo, frame_w, frame_h);
++    p->render_geometry_valid = true;
++}
++
++static struct avf_render_geometry get_render_geometry(struct vo *vo,
++                                                      int frame_w,
++                                                      int frame_h)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->render_geometry_valid || should_apply_video_geometry(vo))
++        update_render_geometry(vo, frame_w, frame_h);
++
++    return p->render_geometry;
++}
++
++// Helper to sync OSD layer frame with display layer frame.
++static void sync_osd_layer_frame(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    update_avfoundation_geometry(vo);
++    invalidate_render_geometry(vo);
++
++    if (!should_use_inline_osd_layer(p) || !p->osdLayer || !p->displayLayer)
++        return;
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++    if (!osdLayer || !displayLayer) {
++        [osdLayer release];
++        [displayLayer release];
++        return;
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        if (osdLayer.superlayer == displayLayer) {
++            osdLayer.frame = displayLayer.bounds;
++        } else {
++            osdLayer.frame = displayLayer.frame;
++            osdLayer.zPosition = displayLayer.zPosition + 1;
++        }
++        osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++        osdLayer.videoGravity = AVLayerVideoGravityResize;
++        [CATransaction commit];
++        [osdLayer release];
++        [displayLayer release];
++    });
++}
++
++static void avfoundation_opts_wakeup(void *ctx)
++{
++    vo_wakeup(ctx);
++}
++
++static void update_avfoundation_options(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->opts_cache || !p->opts)
++        return;
++
++    bool old_composite_osd = p->opts->composite_osd;
++    bool old_pip_composite_osd = p->opts->pip_composite_osd;
++    int old_queue_lead_ms = p->opts->queue_lead_ms;
++
++    if (!m_config_cache_update(p->opts_cache))
++        return;
++
++    if (old_queue_lead_ms != p->opts->queue_lead_ms)
++        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++
++    if (old_composite_osd == p->opts->composite_osd &&
++        old_pip_composite_osd == p->opts->pip_composite_osd)
++        return;
++
++    MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
++               "pip_composite_osd: %s\n",
++               p->opts->composite_osd ? "yes" : "no",
++               p->opts->pip_composite_osd ? "yes" : "no");
++
++    clear_subtitle_cache(p);
++    if (!should_composite_into_video(p))
++        release_ci_compositor(p);
++    if (p->osdLayer)
++        sample_buffer_renderer_flush(p->osdLayer, true);
++    sync_osd_layer_frame(vo);
++}
++
++static bool wait_until_ready_for_more_media_data(struct vo *vo, int64_t present_host_ns)
++{
++    struct priv *p = vo->priv;
++    if (display_layer_needs_recovery(p->displayLayer))
++        recover_display_layer(vo, "layer recovery request", false);
++
++    if (sample_buffer_renderer_is_ready(p->displayLayer)) {
++        p->not_ready_drop_count = 0;
++        p->last_not_ready_drop_ns = 0;
++        return true;
++    }
++
++    int64_t now = mp_time_ns();
++    int64_t latest = present_host_ns > 0
++        ? present_host_ns - MP_TIME_MS_TO_NS(4)
++        : now + MP_TIME_MS_TO_NS(1);
++    int64_t give_up = MPMIN(now + MP_TIME_MS_TO_NS(2), latest);
++
++    if (give_up <= now) {
++        MP_VERBOSE(vo, "Display layer not ready %.2f ms before PTS; dropping frame\n",
++                   (present_host_ns - now) / 1000000.0);
++        record_not_ready_drop(vo);
++        return false;
++    }
++
++    while (!sample_buffer_renderer_is_ready(p->displayLayer)) {
++        if (mp_time_ns() >= give_up) {
++            MP_VERBOSE(vo, "Display layer not ready after bounded wait; dropping frame\n");
++            record_not_ready_drop(vo);
++            return false;
++        }
++        mp_sleep_ns(MP_TIME_MS_TO_NS(1));
++    }
++
++    p->not_ready_drop_count = 0;
++    p->last_not_ready_drop_ns = 0;
++    return true;
++}
++
++static void dispatch_main_sync_safe(dispatch_block_t block)
++{
++    if ([NSThread isMainThread]) {
++        block();
++    } else {
++        dispatch_sync(dispatch_get_main_queue(), block);
++    }
++}
++
++static AVBufferRef *create_videotoolbox_device_ref(struct vo *vo)
++{
++    AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
++    if (!device_ref) {
++        MP_ERR(vo, "Failed to allocate VideoToolbox device\n");
++        return NULL;
++    }
++
++    if (av_hwdevice_ctx_init(device_ref) < 0) {
++        MP_ERR(vo, "Failed to init VideoToolbox device\n");
++        av_buffer_unref(&device_ref);
++        return NULL;
++    }
++
++    return device_ref;
++}
++
++// Generic pixel buffer pool creation helper
++static bool create_pixel_buffer_pool(struct vo *vo, CVPixelBufferPoolRef *poolRef,
++                                     int *cached_w, int *cached_h, OSType *cached_fmt,
++                                     int w, int h, OSType format, const char *name)
++{
++    // Don't recreate if dimensions and format match
++    if (*poolRef && *cached_w == w && *cached_h == h &&
++        (!cached_fmt || *cached_fmt == format))
++        return true;
++
++    // Release old pool
++    if (*poolRef) {
++        CVPixelBufferPoolFlush(*poolRef, kCVPixelBufferPoolFlushExcessBuffers);
++        CVPixelBufferPoolRelease(*poolRef);
++        *poolRef = NULL;
++    }
++
++    NSDictionary *poolAttrs = @{
++        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
++        (id)kCVPixelBufferPoolMaximumBufferAgeKey: @1.0
++    };
++
++    NSDictionary *bufferAttrs = @{
++        (id)kCVPixelBufferPixelFormatTypeKey: @(format),
++        (id)kCVPixelBufferWidthKey: @(w),
++        (id)kCVPixelBufferHeightKey: @(h),
++        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
++        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
++    };
++
++    CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault,
++        (__bridge CFDictionaryRef)poolAttrs,
++        (__bridge CFDictionaryRef)bufferAttrs, poolRef);
++
++    if (status != kCVReturnSuccess) {
++        MP_ERR(vo, "Failed to create %s pool: %d\n", name, status);
++        return false;
++    }
++
++    *cached_w = w;
++    *cached_h = h;
++    if (cached_fmt)
++        *cached_fmt = format;
++
++    MP_VERBOSE(vo, "Created %s pool: %dx%d format=%d\n", name, w, h, (int)format);
++    return true;
++}
++
++
++static OSType ci_output_format_for_source(OSType format)
++{
++    if (format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
++        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
++        return kCVPixelFormatType_64RGBAHalf;
++    return kCVPixelFormatType_32BGRA;
++}
++
++static bool create_output_pool(struct vo *vo, int w, int h, OSType outputFormat)
++{
++    struct priv *p = vo->priv;
++
++    return create_pixel_buffer_pool(vo, &p->outputPool, &p->output_pool_w,
++        &p->output_pool_h, &p->output_pool_format, w, h, outputFormat,
++        "composite output");
++}
++
++static CFStringRef get_cv_color_primaries(enum pl_color_primaries primaries)
++{
++    switch (primaries) {
++    case PL_COLOR_PRIM_BT_709:
++        return kCVImageBufferColorPrimaries_ITU_R_709_2;
++    case PL_COLOR_PRIM_BT_2020:
++        return kCVImageBufferColorPrimaries_ITU_R_2020;
++    default:
++        return NULL;
++    }
++}
++
++static CFStringRef get_cv_transfer_function(enum pl_color_transfer transfer)
++{
++    switch (transfer) {
++    case PL_COLOR_TRC_SRGB:
++        return kCVImageBufferTransferFunction_sRGB;
++    case PL_COLOR_TRC_BT_1886:
++        return kCVImageBufferTransferFunction_ITU_R_709_2;
++    case PL_COLOR_TRC_PQ:
++        return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ;
++    case PL_COLOR_TRC_HLG:
++        return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++    default:
++        return NULL;
++    }
++}
++
++static CFStringRef get_cv_ycbcr_matrix(enum pl_color_system sys)
++{
++    switch (sys) {
++    case PL_COLOR_SYSTEM_BT_601:
++        return kCVImageBufferYCbCrMatrix_ITU_R_601_4;
++    case PL_COLOR_SYSTEM_BT_709:
++        return kCVImageBufferYCbCrMatrix_ITU_R_709_2;
++    case PL_COLOR_SYSTEM_BT_2020_NC:
++    case PL_COLOR_SYSTEM_BT_2020_C:
++    case PL_COLOR_SYSTEM_BT_2100_PQ:
++    case PL_COLOR_SYSTEM_BT_2100_HLG:
++        return kCVImageBufferYCbCrMatrix_ITU_R_2020;
++    default:
++        return NULL;
++    }
++}
++
++static void set_colorspace_from_attachments(CVPixelBufferRef pixbuf)
++{
++    CFDictionaryRef attachments = CVBufferGetAttachments(
++        pixbuf, kCVAttachmentMode_ShouldPropagate);
++    if (!attachments)
++        return;
++
++    CGColorSpaceRef colorspace = CVImageBufferCreateColorSpaceFromAttachments(attachments);
++    if (!colorspace)
++        return;
++
++    CVBufferSetAttachment(pixbuf, kCVImageBufferCGColorSpaceKey, colorspace,
++                          kCVAttachmentMode_ShouldPropagate);
++    CGColorSpaceRelease(colorspace);
++}
++
++static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
++                                            const struct mp_image_params *params)
++{
++    CFStringRef primaries = get_cv_color_primaries(params->color.primaries);
++    CFStringRef transfer = get_cv_transfer_function(params->color.transfer);
++    CFStringRef matrix = get_cv_ycbcr_matrix(params->repr.sys);
++
++    if (primaries) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferColorPrimariesKey,
++                              primaries, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (transfer) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
++                              transfer, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (matrix) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey,
++                              matrix, kCVAttachmentMode_ShouldPropagate);
++    }
++    if (primaries || transfer || matrix)
++        set_colorspace_from_attachments(pixbuf);
++}
++
++static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf)
++{
++    if (!pixbuf || !vo->params)
++        return;
++
++    int p_w = vo->params->p_w;
++    int p_h = vo->params->p_h;
++    size_t bw = CVPixelBufferGetWidth(pixbuf);
++    size_t bh = CVPixelBufferGetHeight(pixbuf);
++
++    // Only coded-size passthrough/upload buffers need the source sample aspect
++    // ratio. Geometry- and composite-rendered buffers are already display-shaped
++    // (letterboxed via vo_get_src_dst_rects) and must stay square pixels to avoid
++    // double-correcting the aspect.
++    bool coded_size = bw == (size_t)vo->params->w && bh == (size_t)vo->params->h;
++
++    if (coded_size && p_w > 0 && p_h > 0 && p_w != p_h) {
++        NSDictionary *par = @{
++            (id)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(p_w),
++            (id)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(p_h)
++        };
++        CVBufferSetAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey,
++                              (__bridge CFDictionaryRef)par,
++                              kCVAttachmentMode_ShouldPropagate);
++    } else {
++        // Square pixels (or a reused pool buffer): strip any stale attachment.
++        CVBufferRemoveAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey);
++    }
++}
++
++static void copy_pixel_buffer_attachment(CVBufferRef src, CVBufferRef dst,
++                                         CFStringRef key)
++{
++    CVAttachmentMode mode = kCVAttachmentMode_ShouldPropagate;
++    CFTypeRef value = CVBufferGetAttachment(src, key, &mode);
++    if (value) {
++        CVBufferSetAttachment(dst, key, value, mode);
++    } else {
++        CVBufferRemoveAttachment(dst, key);
++    }
++}
++
++static void copy_pixel_buffer_metadata(CVPixelBufferRef src, CVPixelBufferRef dst,
++                                       OSType dst_format)
++{
++    CVBufferPropagateAttachments(src, dst);
++
++    const CFStringRef keys[] = {
++        kCVImageBufferCGColorSpaceKey,
++        kCVImageBufferICCProfileKey,
++        kCVImageBufferGammaLevelKey,
++        kCVImageBufferColorPrimariesKey,
++        kCVImageBufferTransferFunctionKey,
++        kCVImageBufferYCbCrMatrixKey,
++        kCVImageBufferMasteringDisplayColorVolumeKey,
++        kCVImageBufferContentLightLevelInfoKey,
++        kCVImageBufferChromaLocationTopFieldKey,
++        kCVImageBufferChromaLocationBottomFieldKey,
++        kCVImageBufferChromaSubsamplingKey,
++        kCVImageBufferCleanApertureKey,
++        kCVImageBufferPreferredCleanApertureKey,
++        kCVImageBufferPixelAspectRatioKey,
++    };
++
++    for (int i = 0; i < MP_ARRAY_SIZE(keys); i++)
++        copy_pixel_buffer_attachment(src, dst, keys[i]);
++
++    if (!is_biplanar_yuv_format(dst_format))
++        CVBufferRemoveAttachment(dst, kCVImageBufferYCbCrMatrixKey);
++
++    if (!CVBufferGetAttachment(dst, kCVImageBufferCGColorSpaceKey, NULL) &&
++        !is_biplanar_yuv_format(dst_format))
++        set_colorspace_from_attachments(dst);
++}
++
++static void get_yuv_coefficients(CVPixelBufferRef pixbuf, double *kr, double *kb)
++{
++    *kr = 0.2126;
++    *kb = 0.0722;
++
++    CFTypeRef matrix = CVBufferGetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey, NULL);
++    if (!matrix)
++        return;
++
++    if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020)) {
++        *kr = 0.2627;
++        *kb = 0.0593;
++    } else if (CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) {
++        *kr = 0.299;
++        *kb = 0.114;
++    }
++}
++
++static bool copy_pixel_buffer_planes(CVPixelBufferRef src, CVPixelBufferRef dst)
++{
++    CVReturn src_status = CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++    if (src_status != kCVReturnSuccess)
++        return false;
++
++    CVReturn dst_status = CVPixelBufferLockBaseAddress(dst, 0);
++    if (dst_status != kCVReturnSuccess) {
++        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++        return false;
++    }
++
++    size_t planes = CVPixelBufferGetPlaneCount(src);
++    bool ok = planes == CVPixelBufferGetPlaneCount(dst);
++    if (ok && planes > 0) {
++        for (size_t plane = 0; plane < planes; plane++) {
++            uint8_t *src_base = CVPixelBufferGetBaseAddressOfPlane(src, plane);
++            uint8_t *dst_base = CVPixelBufferGetBaseAddressOfPlane(dst, plane);
++            size_t src_stride = CVPixelBufferGetBytesPerRowOfPlane(src, plane);
++            size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane);
++            size_t height = MPMIN(CVPixelBufferGetHeightOfPlane(src, plane),
++                                  CVPixelBufferGetHeightOfPlane(dst, plane));
++            size_t bytes = MPMIN(src_stride, dst_stride);
++            if (!src_base || !dst_base) {
++                ok = false;
++                break;
++            }
++            for (size_t y = 0; y < height; y++)
++                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
++        }
++    } else if (ok) {
++        uint8_t *src_base = CVPixelBufferGetBaseAddress(src);
++        uint8_t *dst_base = CVPixelBufferGetBaseAddress(dst);
++        size_t src_stride = CVPixelBufferGetBytesPerRow(src);
++        size_t dst_stride = CVPixelBufferGetBytesPerRow(dst);
++        size_t height = MPMIN(CVPixelBufferGetHeight(src), CVPixelBufferGetHeight(dst));
++        size_t bytes = MPMIN(src_stride, dst_stride);
++        ok = src_base && dst_base;
++        if (ok) {
++            for (size_t y = 0; y < height; y++)
++                memcpy(dst_base + y * dst_stride, src_base + y * src_stride, bytes);
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(dst, 0);
++    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
++    return ok;
++}
++
++static int clip_u8(double value)
++{
++    return MPCLAMP((int)(value + 0.5), 0, 255);
++}
++
++static int clip_u10(double value)
++{
++    return MPCLAMP((int)(value + 0.5), 0, 1023);
++}
++
++static void update_subtitle_bounds(struct priv *p, CVPixelBufferRef subtitle)
++{
++    p->subtitle_x0 = p->osd_w;
++    p->subtitle_y0 = p->osd_h;
++    p->subtitle_x1 = 0;
++    p->subtitle_y1 = 0;
++
++    if (!subtitle || p->osd_w <= 0 || p->osd_h <= 0)
++        return;
++
++    if (CVPixelBufferLockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
++        return;
++
++    uint8_t *base = CVPixelBufferGetBaseAddress(subtitle);
++    size_t stride = CVPixelBufferGetBytesPerRow(subtitle);
++    if (base && stride) {
++        for (int y = 0; y < p->osd_h; y++) {
++            uint8_t *row = base + (size_t)y * stride;
++            for (int x = 0; x < p->osd_w; x++) {
++                if (row[(size_t)x * 4 + 3]) {
++                    p->subtitle_x0 = MPMIN(p->subtitle_x0, x);
++                    p->subtitle_y0 = MPMIN(p->subtitle_y0, y);
++                    p->subtitle_x1 = MPMAX(p->subtitle_x1, x + 1);
++                    p->subtitle_y1 = MPMAX(p->subtitle_y1, y + 1);
++                }
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly);
++}
++
++// Map mpv image format to CVPixelBuffer format
++static OSType get_cv_pixel_format(int imgfmt)
++{
++    switch (imgfmt) {
++        case IMGFMT_NV12:
++            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++        case IMGFMT_420P:
++            return kCVPixelFormatType_420YpCbCr8Planar;
++        case IMGFMT_P010:
++            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++        default:
++            return 0;
++    }
++}
++
++// Create software upload pool
++static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
++{
++    struct priv *p = vo->priv;
++    return create_pixel_buffer_pool(vo, &p->swUploadPool, &p->sw_pool_w,
++        &p->sw_pool_h, &p->sw_pool_format, w, h, format, "software upload");
++}
++
++static bool create_osd_pool(struct vo *vo, int w, int h)
++{
++    struct priv *p = vo->priv;
++    return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
++        &p->osd_pool_h, NULL, w, h, kCVPixelFormatType_32BGRA, "OSD overlay");
++}
++
++// Upload a software-decoded frame to CVPixelBuffer
++static CVPixelBufferRef upload_software_frame(struct vo *vo, struct mp_image *mpi)
++{
++    struct priv *p = vo->priv;
++
++    OSType cvFormat = get_cv_pixel_format(mpi->imgfmt);
++    if (!cvFormat) {
++        MP_ERR(vo, "Unsupported software format: %d\n", mpi->imgfmt);
++        return NULL;
++    }
++
++    int w = mpi->w;
++    int h = mpi->h;
++
++    if (!create_sw_upload_pool(vo, w, h, cvFormat))
++        return NULL;
++
++    CVPixelBufferRef pixbuf = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->swUploadPool, &pixbuf);
++
++    if (status != kCVReturnSuccess || !pixbuf) {
++        MP_ERR(vo, "Failed to get upload buffer: %d\n", status);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++
++    size_t planeCount = CVPixelBufferGetPlaneCount(pixbuf);
++
++    if (planeCount == 0) {
++        // Non-planar format
++        void *dst = CVPixelBufferGetBaseAddress(pixbuf);
++        size_t dstStride = CVPixelBufferGetBytesPerRow(pixbuf);
++        size_t srcStride = mpi->stride[0];
++
++        // Fast path: single memcpy if strides match
++        if (dstStride == srcStride) {
++            memcpy(dst, mpi->planes[0], dstStride * h);
++        } else {
++            size_t copyBytes = MPMIN(dstStride, srcStride);
++            for (int y = 0; y < h; y++) {
++                memcpy((uint8_t *)dst + y * dstStride,
++                       mpi->planes[0] + y * srcStride,
++                       copyBytes);
++            }
++        }
++    } else {
++        // Planar format (NV12, YUV420P, P010)
++        for (size_t plane = 0; plane < planeCount && plane < MP_MAX_PLANES; plane++) {
++            void *dst = CVPixelBufferGetBaseAddressOfPlane(pixbuf, plane);
++            size_t dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, plane);
++            size_t dstHeight = CVPixelBufferGetHeightOfPlane(pixbuf, plane);
++
++            uint8_t *src = mpi->planes[plane];
++            size_t srcStride = mpi->stride[plane];
++
++            if (!src)
++                continue;
++
++            // Fast path: single memcpy if strides match
++            if (dstStride == srcStride) {
++                memcpy(dst, src, dstStride * dstHeight);
++            } else {
++                size_t copyBytes = MPMIN(dstStride, srcStride);
++                for (size_t y = 0; y < dstHeight; y++) {
++                    memcpy((uint8_t *)dst + y * dstStride,
++                           src + y * srcStride,
++                           copyBytes);
++                }
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    tag_pixel_buffer_color_metadata(pixbuf, &mpi->params);
++
++    return pixbuf;
++}
++
++static void draw_subtitle_bitmaps(CGContextRef context, struct sub_bitmaps *imgs,
++                                  int h)
++{
++    CGColorSpaceRef partColorSpace = (imgs->format == SUBBITMAP_BGRA)
++        ? CGColorSpaceCreateDeviceRGB() : NULL;
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++
++        CGDataProviderRef provider = CGDataProviderCreateWithData(
++            NULL, sb->bitmap, sb->stride * sb->h, NULL);
++
++        if (!provider)
++            continue;
++
++        if (imgs->format == SUBBITMAP_BGRA) {
++            CGImageRef partImage = CGImageCreate(
++                sb->w, sb->h, 8, 32, sb->stride, partColorSpace,
++                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
++                provider, NULL, false, kCGRenderingIntentDefault);
++
++            if (partImage) {
++                CGRect destRect = CGRectMake(sb->x, h - sb->y - sb->dh, sb->dw, sb->dh);
++                CGContextDrawImage(context, destRect, partImage);
++                CGImageRelease(partImage);
++            }
++        } else if (imgs->format == SUBBITMAP_LIBASS) {
++            // Invert decode array: libass uses 255=opaque, but CGImageMask uses 0=paint
++            CGFloat decode[] = {1, 0};
++            CGImageRef mask = CGImageMaskCreate(
++                sb->w, sb->h, 8, 8, sb->stride, provider, decode, false);
++
++            if (mask) {
++                CGContextSaveGState(context);
++                CGRect destRect = CGRectMake(sb->x, h - sb->y - sb->dh, sb->dw, sb->dh);
++                CGContextClipToMask(context, destRect, mask);
++
++                uint32_t c = sb->libass.color;
++                float r = ((c >> 24) & 0xFF) / 255.0f;
++                float g = ((c >> 16) & 0xFF) / 255.0f;
++                float b = ((c >> 8) & 0xFF) / 255.0f;
++                float a = 1.0f - ((c >> 0) & 0xFF) / 255.0f;
++
++                CGContextSetRGBFillColor(context, r, g, b, a);
++                CGContextFillRect(context, destRect);
++                CGContextRestoreGState(context);
++                CGImageRelease(mask);
++            }
++        }
++
++        CGDataProviderRelease(provider);
++    }
++
++    if (partColorSpace)
++        CGColorSpaceRelease(partColorSpace);
++}
++
++static int get_direct_osd_draw_path(struct sub_bitmaps *imgs)
++{
++    if (!imgs || imgs->num_parts <= 0)
++        return AVF_OSD_DRAW_NONE;
++
++    int path = AVF_OSD_DRAW_NONE;
++    if (imgs->format == SUBBITMAP_LIBASS) {
++        path = AVF_OSD_DRAW_DIRECT_LIBASS;
++    } else if (imgs->format == SUBBITMAP_BGRA) {
++        path = AVF_OSD_DRAW_DIRECT_BGRA;
++    } else {
++        return AVF_OSD_DRAW_NONE;
++    }
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++
++        int dw = sb->dw > 0 ? sb->dw : sb->w;
++        int dh = sb->dh > 0 ? sb->dh : sb->h;
++        if (dw != sb->w || dh != sb->h)
++            return AVF_OSD_DRAW_COREGRAPHICS;
++    }
++
++    return path;
++}
++
++static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
++                              uint8_t *src, int src_stride,
++                              int w, int h, uint32_t color)
++{
++    const unsigned int r = (color >> 24) & 0xff;
++    const unsigned int g = (color >> 16) & 0xff;
++    const unsigned int b = (color >>  8) & 0xff;
++    const unsigned int a = 0xff - (color & 0xff);
++
++    if (!a)
++        return;
++
++    for (int y = 0; y < h; y++) {
++        uint32_t *dstrow = (uint32_t *)dst;
++        for (int x = 0; x < w; x++) {
++            const unsigned int v = src[x];
++            if (!v)
++                continue;
++
++            unsigned int aa = a * v;
++            unsigned int inv = 255 * 255 - aa;
++            uint32_t dstpix = dstrow[x];
++            unsigned int dstb =  dstpix        & 0xff;
++            unsigned int dstg = (dstpix >>  8) & 0xff;
++            unsigned int dstr = (dstpix >> 16) & 0xff;
++            unsigned int dsta = (dstpix >> 24) & 0xff;
++
++            dstb = (v * b * a + dstb * inv + 32512) / (255 * 255);
++            dstg = (v * g * a + dstg * inv + 32512) / (255 * 255);
++            dstr = (v * r * a + dstr * inv + 32512) / (255 * 255);
++            dsta = (aa * 255 + dsta * inv + 32512) / (255 * 255);
++            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
++                                 uint8_t *src, int src_stride,
++                                 int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        uint32_t *srcrow = (uint32_t *)src;
++        uint32_t *dstrow = (uint32_t *)dst;
++        for (int x = 0; x < w; x++) {
++            uint32_t srcpix = srcrow[x];
++            unsigned int srca = (srcpix >> 24) & 0xff;
++            if (!srca)
++                continue;
++            if (srca == 0xff || !dstrow[x]) {
++                dstrow[x] = srcpix;
++                continue;
++            }
++
++            uint32_t dstpix = dstrow[x];
++            unsigned int inv = 0xff - srca;
++            unsigned int srcb =  srcpix        & 0xff;
++            unsigned int srcg = (srcpix >>  8) & 0xff;
++            unsigned int srcr = (srcpix >> 16) & 0xff;
++            unsigned int dstb =  dstpix        & 0xff;
++            unsigned int dstg = (dstpix >>  8) & 0xff;
++            unsigned int dstr = (dstpix >> 16) & 0xff;
++            unsigned int dsta = (dstpix >> 24) & 0xff;
++
++            dstb = MPMIN(0xff, srcb + (dstb * inv + 127) / 255);
++            dstg = MPMIN(0xff, srcg + (dstg * inv + 127) / 255);
++            dstr = MPMIN(0xff, srcr + (dstr * inv + 127) / 255);
++            dsta = MPMIN(0xff, srca + (dsta * inv + 127) / 255);
++            dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++static void draw_direct_libass_bitmap(uint8_t *base, size_t stride,
++                                      int w, int h, struct sub_bitmap *sb)
++{
++    int x0 = MPCLAMP(sb->x, 0, w);
++    int y0 = MPCLAMP(sb->y, 0, h);
++    int x1 = MPCLAMP(sb->x + sb->w, 0, w);
++    int y1 = MPCLAMP(sb->y + sb->h, 0, h);
++    int draw_w = x1 - x0;
++    int draw_h = y1 - y0;
++    if (draw_w <= 0 || draw_h <= 0)
++        return;
++
++    uint8_t *dst = base + (size_t)y0 * stride + (size_t)x0 * 4;
++    uint8_t *src = (uint8_t *)sb->bitmap + (y0 - sb->y) * sb->stride + (x0 - sb->x);
++    blend_libass_bgra(dst, stride, src, sb->stride, draw_w, draw_h, sb->libass.color);
++}
++
++static void draw_direct_bgra_bitmap(uint8_t *base, size_t stride,
++                                    int w, int h, struct sub_bitmap *sb)
++{
++    int dw = sb->dw > 0 ? sb->dw : sb->w;
++    int dh = sb->dh > 0 ? sb->dh : sb->h;
++    int x0 = MPCLAMP(sb->x, 0, w);
++    int y0 = MPCLAMP(sb->y, 0, h);
++    int x1 = MPCLAMP(sb->x + dw, 0, w);
++    int y1 = MPCLAMP(sb->y + dh, 0, h);
++    int draw_w = x1 - x0;
++    int draw_h = y1 - y0;
++    if (draw_w <= 0 || draw_h <= 0)
++        return;
++
++    uint8_t *dst = base + (size_t)y0 * stride + (size_t)x0 * 4;
++    uint8_t *src = (uint8_t *)sb->bitmap + (y0 - sb->y) * sb->stride + (size_t)(x0 - sb->x) * 4;
++    blend_bgra_over_bgra(dst, stride, src, sb->stride, draw_w, draw_h);
++}
++
++static bool draw_subtitle_bitmaps_direct(struct priv *p, uint8_t *base,
++                                         size_t stride, int w, int h,
++                                         struct sub_bitmaps *imgs)
++{
++    int path = get_direct_osd_draw_path(imgs);
++    if (path != AVF_OSD_DRAW_DIRECT_LIBASS && path != AVF_OSD_DRAW_DIRECT_BGRA)
++        return false;
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++        if (path == AVF_OSD_DRAW_DIRECT_LIBASS)
++            draw_direct_libass_bitmap(base, stride, w, h, sb);
++        else
++            draw_direct_bgra_bitmap(base, stride, w, h, sb);
++    }
++
++    return true;
++}
++
++// Render subtitle bitmap to CGImage (used by compositing mode)
++static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
++{
++    struct priv *p = vo->priv;
++
++    if (!imgs || imgs->num_parts == 0)
++        return NULL;
++
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (w <= 0 || h <= 0)
++        return NULL;
++
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    if (!colorSpace)
++        return NULL;
++
++    CGContextRef context = CGBitmapContextCreate(
++        NULL, w, h, 8, w * 4, colorSpace,
++        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big
++    );
++    CGColorSpaceRelease(colorSpace);
++
++    if (!context)
++        return NULL;
++
++    CGContextClearRect(context, CGRectMake(0, 0, w, h));
++    draw_subtitle_bitmaps(context, imgs, h);
++
++    CGImageRef result = CGBitmapContextCreateImage(context);
++    CGContextRelease(context);
++
++    return result;
++}
++
++static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (w <= 0 || h <= 0)
++        return NULL;
++
++    if (!create_osd_pool(vo, w, h))
++        return NULL;
++
++    CVPixelBufferRef pixbuf = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->osdPool, &pixbuf);
++
++    if (status != kCVReturnSuccess || !pixbuf) {
++        MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++    memset(base, 0, stride * h);
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return pixbuf;
++}
++
++static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
++                                                     struct sub_bitmaps *imgs)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (!imgs || imgs->num_parts == 0)
++        return NULL;
++
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        return pixbuf;
++    }
++
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGContextRef context = colorSpace ? CGBitmapContextCreate(
++        base, w, h, 8, stride, colorSpace,
++        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
++    ) : NULL;
++
++    if (colorSpace)
++        CGColorSpaceRelease(colorSpace);
++
++    if (!context) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    draw_subtitle_bitmaps(context, imgs, h);
++    CGContextRelease(context);
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return pixbuf;
++}
++
++static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
++                                                  int64_t media_pts_ns,
++                                                  bool *needed)
++{
++    struct priv *p = vo->priv;
++
++    if (needed)
++        *needed = false;
++
++    if (!should_use_inline_osd_layer(p) || !p->osd_needs_enqueue)
++        return NULL;
++
++    if (needed)
++        *needed = true;
++
++    CVPixelBufferRef pixbuf = NULL;
++    if (p->has_subtitle && p->cachedSubtitleBuffer) {
++        pixbuf = CVPixelBufferRetain(p->cachedSubtitleBuffer);
++    } else {
++        pixbuf = create_empty_osd_pixel_buffer(vo);
++    }
++    if (!pixbuf)
++        return NULL;
++
++    CMSampleTimingInfo info = {
++        .presentationTimeStamp = cm_time_from_ns(media_pts_ns),
++        .duration = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid
++    };
++
++    CMFormatDescriptionRef format = NULL;
++    CMSampleBufferRef buf = NULL;
++    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
++    if (err == noErr && format)
++        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, pixbuf, format, &info, &buf);
++
++    if (format)
++        CFRelease(format);
++    CVPixelBufferRelease(pixbuf);
++
++    if (err != noErr || !buf) {
++        MP_ERR(vo, "Failed to create OSD sample buffer: %d\n", (int)err);
++        return NULL;
++    }
++
++    return buf;
++}
++
++static bool enqueue_osd_sample(struct vo *vo, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (!buf)
++        return true;
++
++    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++    if (!osdLayer)
++        return false;
++
++    if (!sample_buffer_renderer_is_ready(osdLayer)) {
++        MP_VERBOSE(vo, "OSD layer not ready; dropping subtitle sample for this frame\n");
++        [osdLayer release];
++        return false;
++    }
++
++    sample_buffer_renderer_enqueue(osdLayer, buf);
++    [osdLayer release];
++
++    return true;
++}
++
++// Callback for osd_draw - renders subtitle bitmaps
++static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
++{
++    struct vo *vo = ctx;
++    struct priv *p = vo->priv;
++
++    // Mark that callback was invoked this frame
++    p->osd_callback_invoked = true;
++
++    // Clear subtitles when there are none
++    if (!imgs || imgs->num_parts == 0) {
++        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
++            p->has_subtitle = false;
++            p->osd_change_id = 0;  // Reset change_id so next subtitle renders
++            if (p->cachedSubtitleImage) {
++                CGImageRelease(p->cachedSubtitleImage);
++                p->cachedSubtitleImage = NULL;
++            }
++            if (p->cachedSubtitleBuffer) {
++                CVPixelBufferRelease(p->cachedSubtitleBuffer);
++                p->cachedSubtitleBuffer = NULL;
++            }
++            if (should_use_inline_osd_layer(p))
++                p->osd_needs_enqueue = true;
++        }
++        return;
++    }
++
++    // Skip redraw if content hasn't changed AND we already have a subtitle cached
++    // This prevents unnecessary re-rendering but ensures we don't skip first render
++    bool need_image = should_composite_into_video(p);
++    bool need_buffer = should_use_inline_osd_layer(p) || should_composite_into_video(p);
++    bool has_cached_subtitle = (!need_image || p->cachedSubtitleImage) &&
++        (!need_buffer || p->cachedSubtitleBuffer);
++    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
++        p->has_subtitle && has_cached_subtitle) {
++        return;
++    }
++
++    bool rendered = false;
++    if (need_image) {
++        CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
++        if (subtitleImage) {
++            if (p->cachedSubtitleImage)
++                CGImageRelease(p->cachedSubtitleImage);
++            p->cachedSubtitleImage = subtitleImage;
++            rendered = true;
++        }
++    }
++
++    if (need_buffer) {
++        CVPixelBufferRef subtitleBuffer = render_subtitle_pixel_buffer(vo, imgs);
++        if (!subtitleBuffer && !rendered)
++            return;
++
++        if (subtitleBuffer) {
++            if (p->cachedSubtitleBuffer)
++                CVPixelBufferRelease(p->cachedSubtitleBuffer);
++            p->cachedSubtitleBuffer = subtitleBuffer;
++            update_subtitle_bounds(p, subtitleBuffer);
++            rendered = true;
++        }
++    }
++
++    if (!rendered)
++        return;
++
++    p->osd_change_id = imgs->change_id;
++    p->has_subtitle = true;
++    if (should_use_inline_osd_layer(p))
++        p->osd_needs_enqueue = true;
++}
++
++// Render OSD/subtitles for an already computed geometry.
++static bool render_osd_with_geometry(struct vo *vo, double pts,
++                                     struct avf_render_geometry geometry)
++{
++    struct priv *p = vo->priv;
++
++    if (!vo->osd)
++        return false;
++
++    // In compositing modes, we don't need the inline OSD layer.
++    if (!should_composite_into_video(p) && !p->osdLayer)
++        return false;
++
++    struct mp_osd_res osd_res = geometry.osd_res;
++
++    if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
++        return false;
++
++    if (!osd_res_equals(p->osd_res, osd_res)) {
++        p->osd_res = osd_res;
++        p->osd_change_id = 0;
++    }
++    p->osd_w = geometry.w;
++    p->osd_h = geometry.h;
++
++    static const bool formats[SUBBITMAP_COUNT] = {
++        [SUBBITMAP_BGRA] = true,
++        [SUBBITMAP_LIBASS] = true,
++    };
++
++    // Reset flag before calling osd_draw
++    p->osd_callback_invoked = false;
++
++    osd_draw(vo->osd, osd_res, pts, 0, formats, draw_osd_cb, vo);
++
++    // If callback wasn't invoked, there are no subtitles for this PTS
++    // Clear any cached subtitle state
++    if (!p->osd_callback_invoked && p->has_subtitle) {
++        p->has_subtitle = false;
++        p->osd_change_id = 0;
++        if (p->cachedSubtitleImage) {
++            CGImageRelease(p->cachedSubtitleImage);
++            p->cachedSubtitleImage = NULL;
++        }
++        if (p->cachedSubtitleBuffer) {
++            CVPixelBufferRelease(p->cachedSubtitleBuffer);
++            p->cachedSubtitleBuffer = NULL;
++        }
++        if (should_use_inline_osd_layer(p))
++            p->osd_needs_enqueue = true;
++    }
++
++    return true;
++}
++
++// Render OSD/subtitles synchronously so timed clear samples are never skipped.
++static void render_osd(struct vo *vo, double pts)
++{
++    struct priv *p = vo->priv;
++    int frame_w = p->next_image ? p->next_image->w : 0;
++    int frame_h = p->next_image ? p->next_image->h : 0;
++    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
++
++    render_osd_with_geometry(vo, pts, geometry);
++}
++
++static bool ensure_ci_compositor(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->ciContext)
++        return true;
++
++    p->mtlDevice = MTLCreateSystemDefaultDevice();
++    if (!p->mtlDevice) {
++        MP_ERR(vo, "Failed to create Metal device\n");
++        return false;
++    }
++
++    NSDictionary *ciOptions = @{
++        kCIContextHighQualityDownsample: @NO,
++        kCIContextUseSoftwareRenderer: @NO
++    };
++    p->ciContext = [[CIContext contextWithMTLDevice:p->mtlDevice options:ciOptions] retain];
++    if (!p->ciContext) {
++        MP_ERR(vo, "Failed to create CIContext\n");
++        [p->mtlDevice release];
++        p->mtlDevice = nil;
++        return false;
++    }
++
++    return true;
++}
++
++static void release_ci_compositor(struct priv *p)
++{
++    [p->ciContext release];
++    p->ciContext = nil;
++    [p->mtlDevice release];
++    p->mtlDevice = nil;
++}
++
++static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef videoBuffer,
++                                           OSType sourceFormat, bool in_place)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->cachedSubtitleBuffer || p->subtitle_x1 <= p->subtitle_x0 ||
++        p->subtitle_y1 <= p->subtitle_y0)
++        return NULL;
++
++    int videoW = (int)CVPixelBufferGetWidth(videoBuffer);
++    int videoH = (int)CVPixelBufferGetHeight(videoBuffer);
++    if (videoW <= 0 || videoH <= 0)
++        return NULL;
++
++    int subW = (int)CVPixelBufferGetWidth(p->cachedSubtitleBuffer);
++    int subH = (int)CVPixelBufferGetHeight(p->cachedSubtitleBuffer);
++    if (subW <= 0 || subH <= 0)
++        return NULL;
++
++    struct avf_render_geometry geometry = get_render_geometry(vo, videoW, videoH);
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    int srcW = src.x1 - src.x0;
++    int srcH = src.y1 - src.y0;
++    int dstW = dst.x1 - dst.x0;
++    int dstH = dst.y1 - dst.y0;
++    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
++        return NULL;
++
++    int video_x0 = MPCLAMP(src.x0, 0, videoW);
++    int video_y0 = MPCLAMP(src.y0, 0, videoH);
++    int video_x1 = MPCLAMP(src.x1, 0, videoW);
++    int video_y1 = MPCLAMP(src.y1, 0, videoH);
++    if (video_x1 <= video_x0 || video_y1 <= video_y0)
++        return NULL;
++
++    int osd_x0 = MPMAX(p->subtitle_x0, MPMAX(dst.x0, 0));
++    int osd_y0 = MPMAX(p->subtitle_y0, MPMAX(dst.y0, 0));
++    int osd_x1 = MPMIN(p->subtitle_x1, MPMIN(dst.x1, subW));
++    int osd_y1 = MPMIN(p->subtitle_y1, MPMIN(dst.y1, subH));
++    if (osd_x1 <= osd_x0 || osd_y1 <= osd_y0)
++        return NULL;
++
++    int vx0 = src.x0 + (int)(((int64_t)(osd_x0 - dst.x0) * srcW) / dstW) - 1;
++    int vy0 = src.y0 + (int)(((int64_t)(osd_y0 - dst.y0) * srcH) / dstH) - 1;
++    int vx1 = src.x0 + (int)((((int64_t)(osd_x1 - dst.x0) * srcW) + dstW - 1) / dstW) + 1;
++    int vy1 = src.y0 + (int)((((int64_t)(osd_y1 - dst.y0) * srcH) + dstH - 1) / dstH) + 1;
++    vx0 = MPCLAMP(vx0, video_x0, video_x1);
++    vy0 = MPCLAMP(vy0, video_y0, video_y1);
++    vx1 = MPCLAMP(vx1, video_x0, video_x1);
++    vy1 = MPCLAMP(vy1, video_y0, video_y1);
++    if (vx1 <= vx0 || vy1 <= vy0)
++        return NULL;
++
++    CVPixelBufferRef outputBuffer = NULL;
++    if (in_place) {
++        outputBuffer = CVPixelBufferRetain(videoBuffer);
++    } else {
++        if (!create_output_pool(vo, videoW, videoH, sourceFormat))
++            return NULL;
++
++        CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++            kCFAllocatorDefault, p->outputPool, &outputBuffer);
++        if (status != kCVReturnSuccess || !outputBuffer) {
++            MP_ERR(vo, "Failed to get YUV composite buffer: %d\n", status);
++            return NULL;
++        }
++
++        copy_pixel_buffer_metadata(videoBuffer, outputBuffer, sourceFormat);
++        if (!copy_pixel_buffer_planes(videoBuffer, outputBuffer)) {
++            CVPixelBufferRelease(outputBuffer);
++            return NULL;
++        }
++    }
++
++    if (CVPixelBufferLockBaseAddress(outputBuffer, 0) != kCVReturnSuccess) {
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++    if (CVPixelBufferLockBaseAddress(p->cachedSubtitleBuffer,
++                                     kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
++        CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++
++    uint8_t *subBase = CVPixelBufferGetBaseAddress(p->cachedSubtitleBuffer);
++    size_t subStride = CVPixelBufferGetBytesPerRow(p->cachedSubtitleBuffer);
++    uint8_t *yBase = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 0);
++    uint8_t *uvBase = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 1);
++    size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 0);
++    size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 1);
++
++    if (!subBase || !subStride || subW <= 0 || subH <= 0 || !yBase || !uvBase) {
++        CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
++        CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++        CVPixelBufferRelease(outputBuffer);
++        return NULL;
++    }
++
++    double kr, kb;
++    get_yuv_coefficients(videoBuffer, &kr, &kb);
++    double kg = 1.0 - kr - kb;
++    bool fullRange = is_full_range_yuv_format(sourceFormat);
++    bool p010 = is_p010_format(sourceFormat);
++
++    double yOffset = fullRange ? 0.0 : (p010 ? 64.0 : 16.0);
++    double yRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 876.0 : 219.0);
++    double cCenter = p010 ? 512.0 : 128.0;
++    double cRange = fullRange ? (p010 ? 1023.0 : 255.0) : (p010 ? 896.0 : 224.0);
++
++    for (int y = vy0; y < vy1; y++) {
++        int sy = MPCLAMP(dst.y0 + (int)(((int64_t)(y - src.y0) * dstH) / srcH), 0, subH - 1);
++        uint8_t *subRow = subBase + (size_t)sy * subStride;
++        if (p010) {
++            uint16_t *yRow = (uint16_t *)(yBase + (size_t)y * yStride);
++            uint16_t *uvRow = (uint16_t *)(uvBase + (size_t)(y / 2) * uvStride);
++            for (int x = vx0; x < vx1; x++) {
++                int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
++                uint8_t *sp = subRow + (size_t)sx * 4;
++                double alpha = sp[3] / 255.0;
++                if (alpha <= 0.0)
++                    continue;
++
++                double b = sp[0] / 255.0;
++                double g = sp[1] / 255.0;
++                double r = sp[2] / 255.0;
++                double py = kr * r + kg * g + kb * b;
++                double oldY = yRow[x] >> 6;
++                yRow[x] = (uint16_t)(clip_u10(oldY * (1.0 - alpha) + yOffset * alpha + yRange * py) << 6);
++
++                if ((x & 1) == 0 && (y & 1) == 0) {
++                    double pu = (b - py) / (2.0 * (1.0 - kb));
++                    double pv = (r - py) / (2.0 * (1.0 - kr));
++                    int uvx = (x / 2) * 2;
++                    double oldU = uvRow[uvx] >> 6;
++                    double oldV = uvRow[uvx + 1] >> 6;
++                    uvRow[uvx] = (uint16_t)(clip_u10(oldU * (1.0 - alpha) + cCenter * alpha + cRange * pu) << 6);
++                    uvRow[uvx + 1] = (uint16_t)(clip_u10(oldV * (1.0 - alpha) + cCenter * alpha + cRange * pv) << 6);
++                }
++            }
++        } else {
++            uint8_t *yRow = yBase + (size_t)y * yStride;
++            uint8_t *uvRow = uvBase + (size_t)(y / 2) * uvStride;
++            for (int x = vx0; x < vx1; x++) {
++                int sx = MPCLAMP(dst.x0 + (int)(((int64_t)(x - src.x0) * dstW) / srcW), 0, subW - 1);
++                uint8_t *sp = subRow + (size_t)sx * 4;
++                double alpha = sp[3] / 255.0;
++                if (alpha <= 0.0)
++                    continue;
++
++                double b = sp[0] / 255.0;
++                double g = sp[1] / 255.0;
++                double r = sp[2] / 255.0;
++                double py = kr * r + kg * g + kb * b;
++                yRow[x] = (uint8_t)clip_u8(yRow[x] * (1.0 - alpha) + yOffset * alpha + yRange * py);
++
++                if ((x & 1) == 0 && (y & 1) == 0) {
++                    double pu = (b - py) / (2.0 * (1.0 - kb));
++                    double pv = (r - py) / (2.0 * (1.0 - kr));
++                    int uvx = (x / 2) * 2;
++                    uvRow[uvx] = (uint8_t)clip_u8(uvRow[uvx] * (1.0 - alpha) + cCenter * alpha + cRange * pu);
++                    uvRow[uvx + 1] = (uint8_t)clip_u8(uvRow[uvx + 1] * (1.0 - alpha) + cCenter * alpha + cRange * pv);
++                }
++            }
++        }
++    }
++
++    CVPixelBufferUnlockBaseAddress(p->cachedSubtitleBuffer, kCVPixelBufferLock_ReadOnly);
++    CVPixelBufferUnlockBaseAddress(outputBuffer, 0);
++    return outputBuffer;
++}
++
++static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
++                                                    CVPixelBufferRef videoBuffer,
++                                                    bool include_subtitle)
++{
++    struct priv *p = vo->priv;
++
++    if (!ensure_ci_compositor(vo))
++        return NULL;
++
++    size_t videoW = CVPixelBufferGetWidth(videoBuffer);
++    size_t videoH = CVPixelBufferGetHeight(videoBuffer);
++
++    struct avf_render_geometry geometry = get_render_geometry(vo, (int)videoW, (int)videoH);
++    size_t outW = geometry.w > 0 ? (size_t)geometry.w : videoW;
++    size_t outH = geometry.h > 0 ? (size_t)geometry.h : videoH;
++    if (!outW || !outH)
++        return NULL;
++
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    if (src.x1 <= src.x0 || src.y1 <= src.y0 || dst.x1 <= dst.x0 || dst.y1 <= dst.y0)
++        return NULL;
++
++    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
++    OSType outputFormat = ci_output_format_for_source(sourceFormat);
++    if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
++        return NULL;
++
++    CVPixelBufferRef outputBuffer = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->outputPool, &outputBuffer);
++
++    if (status != kCVReturnSuccess || !outputBuffer) {
++        MP_ERR(vo, "Failed to get geometry output buffer: %d\n", status);
++        return NULL;
++    }
++
++    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, outputFormat);
++
++    @autoreleasepool {
++        CGColorSpaceRef srcColorSpace = CVImageBufferGetColorSpace(videoBuffer);
++        CGColorSpaceRef fallbackColorSpace = NULL;
++        if (!srcColorSpace) {
++            fallbackColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++            srcColorSpace = fallbackColorSpace;
++        }
++
++        CIImage *videoImage;
++        if (srcColorSpace) {
++            NSDictionary *videoOptions = @{
++                kCIImageColorSpace: (__bridge id)srcColorSpace
++            };
++            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer options:videoOptions];
++        } else {
++            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer];
++        }
++
++        if (fallbackColorSpace)
++            CGColorSpaceRelease(fallbackColorSpace);
++
++        if (!videoImage) {
++            CVPixelBufferRelease(outputBuffer);
++            return NULL;
++        }
++
++        CGRect srcRect = CGRectMake(src.x0, videoH - src.y1,
++                                   src.x1 - src.x0, src.y1 - src.y0);
++        CGFloat dstW = dst.x1 - dst.x0;
++        CGFloat dstH = dst.y1 - dst.y0;
++        CGFloat dstY = outH - dst.y1;
++
++        videoImage = [videoImage imageByCroppingToRect:srcRect];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(-srcRect.origin.x, -srcRect.origin.y)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeScale(dstW / srcRect.size.width, dstH / srcRect.size.height)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(dst.x0, dstY)];
++
++        CIImage *background = [[CIImage imageWithColor:
++            [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:CGRectMake(0, 0, outW, outH)];
++        CIImage *outputImage = [videoImage imageByCompositingOverImage:background];
++
++        if (include_subtitle && p->cachedSubtitleImage) {
++            CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
++            if (subtitleImage) {
++                CGSize subSize = subtitleImage.extent.size;
++                if (subSize.width != (CGFloat)outW || subSize.height != (CGFloat)outH) {
++                    CGFloat scaleX = (CGFloat)outW / subSize.width;
++                    CGFloat scaleY = (CGFloat)outH / subSize.height;
++                    subtitleImage = [subtitleImage imageByApplyingTransform:
++                        CGAffineTransformMakeScale(scaleX, scaleY)];
++                }
++                outputImage = [subtitleImage imageByCompositingOverImage:outputImage];
++            }
++        }
++
++        CGColorSpaceRef outputColorSpace = CVImageBufferGetColorSpace(videoBuffer);
++        if (outputColorSpace) {
++            [p->ciContext render:outputImage
++                 toCVPixelBuffer:outputBuffer
++                          bounds:CGRectMake(0, 0, outW, outH)
++                      colorSpace:outputColorSpace];
++        } else {
++            [p->ciContext render:outputImage
++                 toCVPixelBuffer:outputBuffer
++                          bounds:CGRectMake(0, 0, outW, outH)
++                      colorSpace:nil];
++        }
++    }
++
++    return outputBuffer;
++}
++
++// Composite subtitle onto video frame using Core Image (GPU) - HDR compatible
++static CVPixelBufferRef composite_frame(struct vo *vo, CVPixelBufferRef videoBuffer)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->has_subtitle)
++        return NULL;
++
++    OSType sourceFormat = CVPixelBufferGetPixelFormatType(videoBuffer);
++    if (is_biplanar_yuv_format(sourceFormat)) {
++        CVPixelBufferRef composited = composite_yuv_frame(vo, videoBuffer, sourceFormat, true);
++        if (composited)
++            return composited;
++
++        composited = composite_yuv_frame(vo, videoBuffer, sourceFormat, false);
++        if (composited)
++            return composited;
++    }
++
++    if (!p->cachedSubtitleImage || !ensure_ci_compositor(vo))
++        return NULL;
++
++    size_t videoW = CVPixelBufferGetWidth(videoBuffer);
++    size_t videoH = CVPixelBufferGetHeight(videoBuffer);
++
++    struct avf_render_geometry geometry = get_render_geometry(vo, (int)videoW, (int)videoH);
++    size_t outW = geometry.w > 0 ? (size_t)geometry.w : videoW;
++    size_t outH = geometry.h > 0 ? (size_t)geometry.h : videoH;
++    if (!outW || !outH)
++        return NULL;
++
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    if (src.x1 <= src.x0 || src.y1 <= src.y0 || dst.x1 <= dst.x0 || dst.y1 <= dst.y0)
++        return NULL;
++
++    CGRect outputRect = CGRectMake(0, 0, outW, outH);
++
++    OSType outputFormat = ci_output_format_for_source(sourceFormat);
++
++    // Ensure output pool matches dimensions and format
++    if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
++        return NULL;
++
++    // Get output buffer from pool
++    CVPixelBufferRef outputBuffer = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->outputPool, &outputBuffer);
++
++    if (status != kCVReturnSuccess || !outputBuffer) {
++        MP_ERR(vo, "Failed to get output buffer from pool: %d\n", status);
++        return NULL;
++    }
++
++    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, outputFormat);
++
++    // Use autoreleasepool to ensure CIImage objects are released promptly
++    @autoreleasepool {
++        // Create CIImages - preserve color space from source for HDR
++        CGColorSpaceRef srcColorSpace = CVImageBufferGetColorSpace(videoBuffer);
++        CGColorSpaceRef fallbackColorSpace = NULL;
++        if (!srcColorSpace) {
++            fallbackColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++            srcColorSpace = fallbackColorSpace;
++        }
++
++        CIImage *videoImage;
++        if (srcColorSpace) {
++            NSDictionary *videoOptions = @{
++                kCIImageColorSpace: (__bridge id)srcColorSpace
++            };
++            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer options:videoOptions];
++        } else {
++            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer];
++        }
++
++        if (fallbackColorSpace)
++            CGColorSpaceRelease(fallbackColorSpace);
++
++        if (!videoImage) {
++            CVPixelBufferRelease(outputBuffer);
++            return NULL;
++        }
++
++        CGRect srcRect = CGRectMake(src.x0, videoH - src.y1,
++                                   src.x1 - src.x0, src.y1 - src.y0);
++        CGFloat dstW = dst.x1 - dst.x0;
++        CGFloat dstH = dst.y1 - dst.y0;
++        CGFloat dstY = outH - dst.y1;
++
++        videoImage = [videoImage imageByCroppingToRect:srcRect];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(-srcRect.origin.x, -srcRect.origin.y)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeScale(dstW / srcRect.size.width, dstH / srcRect.size.height)];
++        videoImage = [videoImage imageByApplyingTransform:
++            CGAffineTransformMakeTranslation(dst.x0, dstY)];
++
++        CIImage *background = [[CIImage imageWithColor:
++            [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:outputRect];
++        videoImage = [videoImage imageByCompositingOverImage:background];
++
++        CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
++
++        if (!subtitleImage) {
++            CVPixelBufferRelease(outputBuffer);
++            return NULL;
++        }
++
++        // Scale subtitle to match output dimensions
++        CGSize subSize = subtitleImage.extent.size;
++
++        if (subSize.width != (CGFloat)outW || subSize.height != (CGFloat)outH) {
++            CGFloat scaleX = (CGFloat)outW / subSize.width;
++            CGFloat scaleY = (CGFloat)outH / subSize.height;
++            subtitleImage = [subtitleImage imageByApplyingTransform:
++                CGAffineTransformMakeScale(scaleX, scaleY)];
++        }
++
++        // Composite subtitle over video
++        CIImage *composited = [subtitleImage imageByCompositingOverImage:videoImage];
++
++        // Render to output buffer, preserving color space
++        CGColorSpaceRef outputColorSpace = CVImageBufferGetColorSpace(videoBuffer);
++        if (outputColorSpace) {
++            [p->ciContext render:composited
++                 toCVPixelBuffer:outputBuffer
++                          bounds:outputRect
++                      colorSpace:outputColorSpace];
++        } else {
++            [p->ciContext render:composited toCVPixelBuffer:outputBuffer bounds:outputRect colorSpace:nil];
++        }
++    }
++
++    return outputBuffer;
++}
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    p->opts_cache = m_config_cache_alloc(p, vo->global, &avfoundation_conf);
++    p->opts = p->opts_cache->opts;
++    m_config_cache_set_wakeup_cb(p->opts_cache, avfoundation_opts_wakeup, vo);
++
++    if (vo->opts->WinID == -1) {
++        MP_ERR(vo, "No AVSampleBufferDisplayLayer provided via --wid\n");
++        return -1;
++    }
++
++    p->displayLayer = [(__bridge AVSampleBufferDisplayLayer *)(intptr_t)(vo->opts->WinID) retain];
++
++    MP_VERBOSE(vo, "displayLayer: %p, composite_osd: %s, pip_composite_osd: %s\n",
++               p->displayLayer, p->opts->composite_osd ? "yes" : "no",
++               p->opts->pip_composite_osd ? "yes" : "no");
++
++    if (CMTimebaseCreateWithSourceClock(kCFAllocatorDefault,
++                                        CMClockGetHostTimeClock(),
++                                        &p->timebase) != noErr || !p->timebase) {
++        MP_ERR(vo, "Failed to create display layer timebase\n");
++        [p->displayLayer release];
++        p->displayLayer = nil;
++        return -1;
++    }
++
++    p->presentation_host = p->opts->presentation == AVF_PRESENTATION_HOST;
++    reset_media_timing(p);
++    if (p->presentation_host) {
++        // mp_time_ns() and the CoreMedia host clock advance together on
++        // Apple platforms, so a rate-1.0 timebase seeded with mp_time makes
++        // timebase time equal to mpv host time for the layer's lifetime.
++        CMTimebaseSetTime(p->timebase, cm_time_from_ns(mp_time_ns()));
++        CMTimebaseSetRate(p->timebase, 1.0);
++    } else {
++        CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
++        CMTimebaseSetRate(p->timebase, 0.0);
++    }
++    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++    CMTimebaseRef timebase = p->timebase;
++    dispatch_main_sync_safe(^{
++        displayLayer.controlTimebase = timebase;
++    });
++    [displayLayer release];
++    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    update_avfoundation_geometry(vo);
++
++    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
++        MP_WARN(vo, "Core Image fallback compositor unavailable\n");
++
++    // Create a timed OSD sample-buffer layer only if not in composite mode.
++    if (!p->opts->composite_osd) {
++        AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
++        CMTimebaseRef osdTimebase = p->timebase;
++        dispatch_main_sync_safe(^{
++            AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
++            osdLayer.frame = osdDisplayLayer.frame;
++            osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
++#if !TARGET_OS_IPHONE
++            osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++#endif
++            osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
++            osdLayer.backgroundColor = NULL;
++            osdLayer.opaque = NO;
++            osdLayer.videoGravity = AVLayerVideoGravityResize;
++            osdLayer.controlTimebase = osdTimebase;
++
++            CALayer *parent = osdDisplayLayer.superlayer;
++            if (parent) {
++                [parent addSublayer:osdLayer];
++                osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
++            } else {
++                [osdDisplayLayer addSublayer:osdLayer];
++                osdLayer.frame = osdDisplayLayer.bounds;
++                MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
++            }
++            p->osdLayer = osdLayer;
++        });
++        [osdDisplayLayer release];
++    }
++
++    vo->hwdec_devs = hwdec_devices_create();
++    p->hwctx = (struct mp_hwdec_ctx){
++        .driver_name = "avfoundation",
++        .av_device_ref = create_videotoolbox_device_ref(vo),
++        .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
++    };
++    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++
++    atomic_init(&p->pending_presentation_resync, false);
++#if TARGET_OS_IPHONE
++    dispatch_main_sync_safe(^{
++        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++        p->app_resign_observer = [[nc
++            addObserverForName:UIApplicationWillResignActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            p->presentation_suspended = true;
++        }] retain];
++        p->app_active_observer = [[nc
++            addObserverForName:UIApplicationDidBecomeActiveNotification
++                        object:nil
++                         queue:[NSOperationQueue mainQueue]
++                    usingBlock:^(NSNotification *note) {
++            if (p->presentation_suspended) {
++                p->presentation_suspended = false;
++                atomic_store(&p->pending_presentation_resync, true);
++                vo_wakeup(vo);
++            }
++        }] retain];
++    });
++#endif
++
++    return 0;
++}
++
++static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *mpi)
++{
++    @autoreleasepool {
++        struct priv *p = vo->priv;
++
++        CVPixelBufferRef pixbuf = NULL;
++        bool pixbufNeedsRelease = false;
++
++        // Handle different input formats
++        if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX) {
++            // Hardware decoded: zero-copy passthrough
++            pixbuf = (CVPixelBufferRef)mpi->planes[3];
++        } else {
++            // Software decoded: upload to CVPixelBuffer
++            pixbuf = upload_software_frame(vo, mpi);
++            if (!pixbuf) {
++                MP_ERR(vo, "Failed to upload software frame\n");
++                return NULL;
++            }
++            pixbufNeedsRelease = true;
++        }
++
++        CVPixelBufferRef finalBuffer = pixbuf;
++        bool needsRelease = false;
++
++        bool applyGeometry = should_apply_video_geometry(vo);
++        if (applyGeometry) {
++            CVPixelBufferRef rendered = render_video_geometry_frame(vo, pixbuf, p->has_subtitle);
++            if (rendered) {
++                if (!p->applied_geometry_last_frame) {
++                    struct mp_vo_opts *opts = vo->opts;
++                    MP_INFO(vo, "AVFoundation geometry rendering enabled "
++                                "(zoom=%.3f pan=%.3f,%.3f scale=%.3f,%.3f)\n",
++                            opts ? opts->zoom : 0.0f,
++                            opts ? opts->pan_x : 0.0f,
++                            opts ? opts->pan_y : 0.0f,
++                            opts ? opts->scale_x : 1.0f,
++                            opts ? opts->scale_y : 1.0f);
++                }
++                finalBuffer = rendered;
++                needsRelease = true;
++                p->applied_geometry_last_frame = true;
++                p->geometry_render_failure_logged = false;
++            } else if (!p->geometry_render_failure_logged) {
++                MP_WARN(vo, "AVFoundation geometry rendering failed; "
++                            "falling back to original sample-buffer frame\n");
++                p->geometry_render_failure_logged = true;
++            }
++        } else {
++            if (p->applied_geometry_last_frame || p->geometry_render_failure_logged) {
++                if (p->applied_geometry_last_frame)
++                    MP_INFO(vo, "AVFoundation geometry rendering disabled; "
++                                "returning to sample-buffer passthrough\n");
++                if (p->outputPool)
++                    CVPixelBufferPoolFlush(p->outputPool, kCVPixelBufferPoolFlushExcessBuffers);
++                p->applied_geometry_last_frame = false;
++                p->geometry_render_failure_logged = false;
++            }
++        }
++
++        if (!needsRelease && !applyGeometry && should_composite_into_video(p)) {
++            // In compositing modes, composite the subtitle rendered for this flip.
++            CVPixelBufferRef composited = composite_frame(vo, pixbuf);
++            if (composited) {
++                finalBuffer = composited;
++                needsRelease = true;
++            }
++        }
++
++        CMSampleTimingInfo info = {
++            .presentationTimeStamp = cm_time_from_ns(sample_presentation_pts_ns(p)),
++            .duration = kCMTimeInvalid,
++            .decodeTimeStamp = kCMTimeInvalid
++        };
++
++        // DVD/anamorphic sources carry their display aspect in the sample aspect
++        // ratio; AVSampleBufferDisplayLayer only honors it via a buffer attachment.
++        tag_pixel_buffer_pixel_aspect(vo, finalBuffer);
++
++        CMSampleBufferRef buf = NULL;
++        CMFormatDescriptionRef format = NULL;
++        OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, finalBuffer, &format);
++        if (err != noErr || !format) {
++            MP_ERR(vo, "Failed to create format description: %d\n", (int)err);
++            if (needsRelease)
++                CVPixelBufferRelease(finalBuffer);
++            if (pixbufNeedsRelease)
++                CVPixelBufferRelease(pixbuf);
++            return NULL;
++        }
++
++        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, finalBuffer, format, &info, &buf);
++        CFRelease(format);
++
++        if (err != noErr || !buf) {
++            MP_ERR(vo, "Failed to create sample buffer: %d\n", (int)err);
++            if (needsRelease)
++                CVPixelBufferRelease(finalBuffer);
++            if (pixbufNeedsRelease)
++                CVPixelBufferRelease(pixbuf);
++            return NULL;
++        }
++
++        // Release composited output buffer (always owned by us)
++        if (needsRelease)
++            CVPixelBufferRelease(finalBuffer);
++
++        // Release uploaded software frame buffer (owned by us, not by mpi)
++        if (pixbufNeedsRelease)
++            CVPixelBufferRelease(pixbuf);
++
++        return buf;
++    }
++}
++
++static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (!buf)
++        return false;
++
++    sample_buffer_renderer_enqueue(p->displayLayer, buf);
++    p->last_video_enqueue_ns = mp_time_ns();
++    return true;
++}
++
++static void flip_page(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (atomic_exchange(&p->pending_presentation_resync, false))
++        recover_display_layer(vo, "presentation resume", true);
++
++    if (p->next_image) {
++        CMSampleBufferRef osd_buf = NULL;
++        bool osd_needed = false;
++
++        render_osd(vo, p->next_pts);
++
++        osd_buf = create_osd_sample_buffer(vo,
++            sample_presentation_pts_ns(p), &osd_needed);
++
++        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
++
++        bool osd_enqueued = !osd_needed;
++
++        if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
++            if (!p->presentation_host)
++                update_media_timebase_for_frame(vo);
++
++            if (osd_buf) {
++                osd_enqueued = enqueue_osd_sample(vo, osd_buf);
++                if (osd_enqueued)
++                    p->osd_needs_enqueue = false;
++            }
++
++            enqueue_video_sample(vo, video_buf);
++        }
++
++        if (osd_needed && !osd_enqueued)
++            p->osd_change_id = 0;
++
++        if (osd_buf)
++            CFRelease(osd_buf);
++        if (video_buf)
++            CFRelease(video_buf);
++    }
++
++    // Flush excess buffers every ~60 frames to prevent memory growth
++    // without causing buffer churn on every frame
++    if (++p->frame_count >= 60) {
++        p->frame_count = 0;
++        if (p->outputPool)
++            CVPixelBufferPoolFlush(p->outputPool, kCVPixelBufferPoolFlushExcessBuffers);
++        if (p->osdPool)
++            CVPixelBufferPoolFlush(p->osdPool, kCVPixelBufferPoolFlushExcessBuffers);
++        if (p->swUploadPool)
++            CVPixelBufferPoolFlush(p->swUploadPool, kCVPixelBufferPoolFlushExcessBuffers);
++    }
++
++    mp_image_unrefp(&p->next_image);
++}
++
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++
++    mp_image_unrefp(&p->next_image);
++
++    if (!frame->current || (frame->repeat && !frame->redraw)) {
++        p->next_pts = MP_NOPTS_VALUE;
++        p->next_present_host_ns = mp_time_ns();
++        p->next_media_pts_valid = false;
++        return true;
++    }
++
++    p->next_image = mp_image_new_ref(frame->current);
++    if (!p->next_image)
++        return false;
++
++    double pts = p->next_image->pts;
++    if (pts == MP_NOPTS_VALUE)
++        pts = frame->current->pts;
++
++    p->next_pts = pts;
++    p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
++    p->next_media_pts_valid = media_pts_is_valid(pts);
++    p->next_media_pts_ns = p->next_media_pts_valid
++        ? media_pts_to_ns(pts)
++        : current_media_time_ns(p);
++    return true;
++}
++
++static int query_format(struct vo *vo, int format)
++{
++    switch (format) {
++        case IMGFMT_VIDEOTOOLBOX:  // Hardware decoded (zero-copy)
++        case IMGFMT_NV12:          // Software decoded (common)
++        case IMGFMT_420P:          // YUV420P (very common)
++        case IMGFMT_P010:          // 10-bit (HDR software decode)
++            return 1;
++        default:
++            return 0;
++    }
++}
++
++static void clear_subtitle_cache(struct priv *p)
++{
++    if (p->cachedSubtitleImage) {
++        CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = NULL;
++    }
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
++    }
++    p->has_subtitle = false;
++    p->osd_change_id = 0;
++    p->osd_needs_enqueue = false;
++    p->osd_callback_invoked = false;
++    p->subtitle_x0 = p->subtitle_y0 = p->subtitle_x1 = p->subtitle_y1 = 0;
++}
++
++// Helper to clear all subtitle state (called on video change/stop)
++static void clear_subtitle_state(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    clear_subtitle_cache(p);
++
++    if (p->osdLayer) {
++        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++        if (!osdLayer)
++            return;
++        dispatch_async(dispatch_get_main_queue(), ^{
++            sample_buffer_renderer_flush(osdLayer, true);
++            [osdLayer release];
++        });
++    }
++}
++
++static int reconfig(struct vo *vo, struct mp_image_params *params)
++{
++    MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
++
++    // Clear subtitles when video configuration changes
++    clear_subtitle_state(vo);
++    sync_osd_layer_frame(vo);
++
++    return 0;
++}
++
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++#if TARGET_OS_IPHONE
++    if (p->app_resign_observer || p->app_active_observer) {
++        dispatch_main_sync_safe(^{
++            NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++            if (p->app_resign_observer) {
++                [nc removeObserver:p->app_resign_observer];
++                [p->app_resign_observer release];
++                p->app_resign_observer = nil;
++            }
++            if (p->app_active_observer) {
++                [nc removeObserver:p->app_active_observer];
++                [p->app_active_observer release];
++                p->app_active_observer = nil;
++            }
++        });
++    }
++#endif
++
++    mp_image_unrefp(&p->next_image);
++    sample_buffer_renderer_flush(p->displayLayer, true);
++    sample_buffer_renderer_flush(p->osdLayer, true);
++
++    if (p->timebase) {
++        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
++        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
++        dispatch_main_sync_safe(^{
++            displayLayer.controlTimebase = NULL;
++            osdLayer.controlTimebase = NULL;
++        });
++        [displayLayer release];
++        [osdLayer release];
++        CFRelease(p->timebase);
++        p->timebase = NULL;
++    }
++
++    if (p->cachedSubtitleImage) {
++        CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = NULL;
++    }
++
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
++    }
++
++    if (p->outputPool) {
++        CVPixelBufferPoolRelease(p->outputPool);
++        p->outputPool = NULL;
++    }
++
++    if (p->osdPool) {
++        CVPixelBufferPoolRelease(p->osdPool);
++        p->osdPool = NULL;
++    }
++
++    if (p->swUploadPool) {
++        CVPixelBufferPoolRelease(p->swUploadPool);
++        p->swUploadPool = NULL;
++    }
++
++    AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
++    p->osdLayer = nil;
++    if (osdLayer) {
++        dispatch_main_sync_safe(^{
++            [osdLayer removeFromSuperlayer];
++        });
++        [osdLayer release];
++    }
++
++    [p->ciContext release];
++    p->ciContext = nil;
++    [p->mtlDevice release];
++    p->mtlDevice = nil;
++
++    [p->displayLayer release];
++    p->displayLayer = nil;
++
++    talloc_free(p->opts_cache);
++    p->opts_cache = NULL;
++    p->opts = NULL;
++
++    hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
++    av_buffer_unref(&p->hwctx.av_device_ref);
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
++    struct priv *p = vo->priv;
++
++    switch (request) {
++    case VOCTRL_CHECK_EVENTS:
++        if (atomic_exchange(&p->pending_presentation_resync, false))
++            recover_display_layer(vo, "presentation resume", true);
++        update_avfoundation_options(vo);
++        return VO_TRUE;
++    case VOCTRL_VO_OPTS_CHANGED:
++        update_avfoundation_options(vo);
++        clear_subtitle_cache(p);
++        sync_osd_layer_frame(vo);
++        return VO_TRUE;
++    case VOCTRL_SET_PANSCAN:
++        clear_subtitle_cache(p);
++        sync_osd_layer_frame(vo);
++        return VO_TRUE;
++    case VOCTRL_RESET:
++        // Called when playback stops or video changes
++        clear_subtitle_state(vo);
++        p->not_ready_drop_count = 0;
++        p->last_not_ready_drop_ns = 0;
++        p->last_display_recovery_ns = 0;
++        p->last_video_enqueue_ns = 0;
++        p->applied_geometry_last_frame = false;
++        p->geometry_render_failure_logged = false;
++        bool was_paused = p->playback_paused;
++        reset_media_timing(p);
++        p->playback_paused = was_paused;
++        p->timebase_paused = was_paused;
++        sample_buffer_renderer_flush(p->displayLayer, true);
++        sample_buffer_renderer_flush(p->osdLayer, true);
++        if (p->presentation_host && p->timebase) {
++            // Fresh host-time samples arrive with future timestamps; the
++            // free-running timebase needs no correction, only a re-seed in
++            // case CoreMedia clamped it while torn between videos.
++            CMTimebaseSetTime(p->timebase, cm_time_from_ns(mp_time_ns()));
++            CMTimebaseSetRate(p->timebase, 1.0);
++        } else if (p->timebase) {
++            CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
++            CMTimebaseSetRate(p->timebase, 0.0);
++        }
++        return VO_TRUE;
++    case VOCTRL_PAUSE:
++        if (!p->presentation_host)
++            set_media_timebase_paused(vo, true);
++        return VO_TRUE;
++    case VOCTRL_RESUME:
++        if (!p->presentation_host)
++            set_media_timebase_paused(vo, false);
++        return VO_TRUE;
++    case VOCTRL_REDRAW:
++        p->osd_change_id = 0;
++        return VO_TRUE;
++    case VOCTRL_UPDATE_WINDOW_TITLE:
++        return VO_TRUE;
++    }
++    return VO_NOTIMPL;
++}
++
++
++#define OPT_BASE_STRUCT struct priv
++static const struct m_option priv_options[] = {
++    {0},
++};
++
++#undef OPT_BASE_STRUCT
++#define OPT_BASE_STRUCT struct avfoundation_opts
++static const struct m_option avfoundation_options[] = {
++    {"composite-osd", OPT_BOOL(composite_osd)},
++    {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
++    {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},
++    {"presentation", OPT_CHOICE(presentation,
++        {"media", AVF_PRESENTATION_MEDIA},
++        {"host", AVF_PRESENTATION_HOST})},
++    {0},
++};
++
++static const struct m_sub_options avfoundation_conf = {
++    .prefix = "avfoundation",
++    .opts = avfoundation_options,
++    .size = sizeof(struct avfoundation_opts),
++    .defaults = &(const struct avfoundation_opts){
++        .queue_lead_ms = 128,
++        // tvOS has no PiP, so nothing needs the media timebase there; the
++        // host-time model is the one that never accumulates clock drift
++        // against mpv's audio-slaved schedule (plezy#1776).
++        .presentation = TARGET_OS_TV ? AVF_PRESENTATION_HOST
++                                     : AVF_PRESENTATION_MEDIA,
++    },
++};
++
++const struct vo_driver video_out_avfoundation = {
++    .description = "AVFoundation AVSampleBufferDisplayLayer (macOS/iOS)",
++    .name = "avfoundation",
++    .caps = 0,
++    .preinit = preinit,
++    .query_format = query_format,
++    .control = control,
++    .draw_frame = draw_frame,
++    .flip_page = flip_page,
++    .reconfig = reconfig,
++    .uninit = uninit,
++    .priv_size = sizeof(struct priv),
++    .options = priv_options,
++    .global_opts = &avfoundation_conf,
++};

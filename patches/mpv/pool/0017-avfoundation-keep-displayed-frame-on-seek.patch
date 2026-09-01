@@ -1,0 +1,54 @@
+From fe66f1f93623238f0bd7558f3aa0133c59eb78f5 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 15:49:37 +0200
+Subject: [PATCH] fix(avfoundation): keep the displayed frame across seek
+ resets
+
+Every seek fires VOCTRL_RESET (vo_seek_reset()), which the VO answered
+with flushAndRemoveImage on the display layer. Removing the displayed
+image blanks the AVSampleBufferDisplayLayer to black until the first
+post-seek frame makes it through demux and decode, so every skip
+flashed black for the seek latency -- glaring on tvOS where seeks ride
+the network (plezy#1803). Reference VOs (gpu/gpu-next) hold the last
+rendered frame through a seek.
+
+Flush without removal instead: queued-but-undisplayed samples are still
+discarded, but the on-screen frame holds until the first frame at the
+new position re-anchors the timebase and replaces it. The OSD layer
+keeps removing its image so a stale subtitle doesn't linger over the
+held frame, and uninit still removes the image on teardown.
+---
+ video/out/vo_avfoundation.m | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index d7f6f46..c253d27 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -3769,7 +3769,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         sync_osd_layer_frame(vo);
+         return VO_TRUE;
+     case VOCTRL_RESET:
+-        // Called when playback stops or video changes
++        // Fired by vo_seek_reset() on every seek (and on stop/track change).
++        // Flush queued-but-undisplayed samples without removing the on-screen
++        // frame: removing it blanks the layer to black until the first
++        // post-seek frame survives demux+decode, a visible flash on every
++        // skip. Reference VOs (gpu/gpu-next) hold the last frame through
++        // seeks; the OSD layer still drops so stale subtitles don't linger
++        // over the held frame.
+         clear_subtitle_state(vo);
+         p->not_ready_drop_count = 0;
+         p->last_not_ready_drop_ns = 0;
+@@ -3781,7 +3787,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         reset_media_timing(p);
+         p->playback_paused = was_paused;
+         p->timebase_paused = was_paused;
+-        sample_buffer_renderer_flush(p->displayLayer, true);
++        sample_buffer_renderer_flush(p->displayLayer, false);
+         sample_buffer_renderer_flush(p->osdLayer, true);
+         if (p->presentation_host && p->timebase) {
+             // Fresh host-time samples arrive with future timestamps; the
+-- 
+2.50.1 (Apple Git-155)
+

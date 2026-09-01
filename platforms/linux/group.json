@@ -1,0 +1,16 @@
+{
+  "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-linux",
+  "toolchain": "toolchain/linux.txt",
+  "driver": [
+    "platforms/linux/build.sh",
+    "platforms/linux/package.sh",
+    "platforms/linux/container-build.sh"
+  ],
+  "artifacts": {
+    "libmpv-linux": {
+      "components": ["mpv", "ffmpeg", "libass", "libplacebo", "dav1d", "shaderc"],
+      "variants": ["x86_64", "aarch64"],
+      "assetPattern": "libmpv-linux-{key}-{variant}.tar.zst"
+    }
+  }
+}

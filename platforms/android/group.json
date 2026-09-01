@@ -1,0 +1,46 @@
+{
+  "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
+  "toolchain": "toolchain/android.txt",
+  "driver": [
+    "platforms/android/build.sh",
+    "platforms/android/download.sh",
+    "platforms/android/package.sh",
+    "platforms/android/include/depinfo.sh",
+    "platforms/android/include/download-sdk.sh",
+    "platforms/android/include/libdovi/rpu_parser.h",
+    "platforms/android/include/loadarch.sh",
+    "platforms/android/include/path.sh",
+    "platforms/android/scripts/dav1d.sh",
+    "platforms/android/scripts/ffmpeg.sh",
+    "platforms/android/scripts/freetype.sh",
+    "platforms/android/scripts/fribidi.sh",
+    "platforms/android/scripts/harfbuzz.sh",
+    "platforms/android/scripts/libass.sh",
+    "platforms/android/scripts/libdovi.sh",
+    "platforms/android/scripts/libplacebo.sh",
+    "platforms/android/scripts/libunibreak.sh",
+    "platforms/android/scripts/lua.sh",
+    "platforms/android/scripts/mbedtls.sh",
+    "platforms/android/scripts/mpv.sh"
+  ],
+  "artifacts": {
+    "libmpv-android": {
+      "components": [
+        "mpv",
+        "ffmpeg",
+        "libass",
+        "libplacebo",
+        "dav1d",
+        "mbedtls",
+        "freetype",
+        "fribidi",
+        "harfbuzz",
+        "libunibreak",
+        "lua",
+        "libdovi"
+      ],
+      "variants": ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"],
+      "assetPattern": "libmpv-android-{key}-{variant}.tar.gz"
+    }
+  }
+}

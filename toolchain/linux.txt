@@ -1,0 +1,30 @@
+# Toolchain generation for content-addressed binaries (linux group).
+#
+# Content keys are derived from sources only, so they are reproducible on any
+# machine. The compiler is deliberately NOT sampled from the environment; what
+# pins the toolchain is the container image below, which every published build
+# runs inside (platforms/linux/container-build.sh). The glibc the build links
+# against is the floor every user of the artifact inherits, so it must never
+# be "whatever ubuntu-latest is this month".
+#
+# Image decision: ubuntu:24.04 (noble, glibc 2.39), pinned by multi-arch index
+# digest. ubuntu:22.04 (glibc 2.35) was evaluated first for the lower floor
+# and rejected on dependency constraints:
+#   - jammy has no libdisplay-info-dev at all, and mpv's `drm` feature -- which
+#     build.sh pins to -Ddrm=enabled precisely so it cannot silently vanish --
+#     hard-requires libdisplay-info on mpv 0.40.
+#   - jammy's meson is 0.61.2, below mpv 0.40's minimum, which would force an
+#     unpinned pip-installed meson on top of the "stable" image.
+# noble carries libdisplay-info-dev, meson 1.3.x, cmake 3.28, nasm 2.16 and
+# gcc 13 straight from the archive. The resulting glibc 2.39 floor is exactly
+# what today's artifacts already require (they were built on ubuntu-latest =
+# 24.04 runners), so no user regresses; the digest pin just stops the floor
+# from drifting when GitHub rotates runner images.
+#
+# The digest pins the base image; build dependencies are installed from the
+# noble archive at build time, which only takes stable-release updates, so the
+# glibc ABI floor stays 2.39 for the life of the pin. Bump the generation
+# below (or the digest, which is also hashed) to force a rebuild of every
+# self-built library when the toolchain changes in a way that matters.
+generation=1
+image=docker.io/library/ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517

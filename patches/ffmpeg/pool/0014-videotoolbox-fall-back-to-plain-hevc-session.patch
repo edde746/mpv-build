@@ -1,0 +1,113 @@
+From 4505c4956ad1ea208a5d888334ece27c3efd6cc1 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Wed, 10 Jun 2026 10:01:17 +0200
+Subject: [PATCH] videotoolbox: fall back to plain HEVC when Dolby Vision
+ session fails
+
+If VideoToolbox rejects a Dolby Vision HEVC session (unsupported dvvC
+combination, hardware limits, ...), retry once with a plain HEVC
+session so profile 8 streams degrade to hardware HDR10/HLG decode of
+the backward-compatible base layer instead of falling all the way back
+to software decode. Profile 5 is excluded: its IPT base layer would
+render with wrong colors, and the existing software fallback at least
+renders it correctly.
+
+Key the per-frame Dolby Vision handling (RPU forwarding, attachment
+preservation and tagging) off the live session codec type instead of
+the stream side data, so a downgraded session is treated exactly like
+a plain HEVC one.
+---
+ libavcodec/videotoolbox.c | 54 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index 5d23e4d..1f83eae 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -876,9 +876,22 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
+     }
+ }
+ 
++/* Whether the active VideoToolbox session decodes via the Apple Dolby Vision
++ * path. Distinct from videotoolbox_dovi_is_apple_hevc(): session creation may
++ * have fallen back to a plain HEVC session for a Dolby Vision stream, in which
++ * case per-frame DV handling (RPU forwarding, attachment preservation) must
++ * stay off. */
++static int videotoolbox_session_is_dovi(AVCodecContext *avctx)
++{
++    AVVideotoolboxContext *videotoolbox = videotoolbox_get_context(avctx);
++
++    return videotoolbox &&
++           videotoolbox->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF;
++}
++
+ static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx)
+ {
+-    return videotoolbox_dovi_is_apple_hevc(videotoolbox_dovi_get_conf(avctx));
++    return videotoolbox_session_is_dovi(avctx);
+ }
+ 
+ static int videotoolbox_dovi_is_hlg(const AVDOVIDecoderConfigurationRecord *dovi)
+@@ -922,6 +935,9 @@ static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
+     CGColorSpaceRef colorspace;
+     CFStringRef transfer_function;
+ 
++    if (!videotoolbox_session_is_dovi(avctx))
++        return;
++
+     if (!videotoolbox_dovi_is_apple_hevc(dovi) ||
+         !videotoolbox_dovi_has_hdr_compatible_base(dovi))
+         return;
+@@ -1260,6 +1276,39 @@ static int videotoolbox_start(AVCodecContext *avctx)
+                                           &decoder_cb,               // outputCallback
+                                           &videotoolbox->session);   // decompressionSessionOut
+ 
++    /* If VideoToolbox rejects the Dolby Vision session (unsupported dvvC
++     * combination, hardware limits, ...), retry as a plain HEVC session so
++     * profile 8 streams degrade to hardware HDR10/HLG decode of the
++     * backward-compatible base layer instead of software decoding. Profile 5
++     * is excluded: its IPT base layer would render with wrong colors. */
++    if (status && videotoolbox->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF &&
++        videotoolbox_dovi_has_hdr_compatible_base(videotoolbox_dovi_get_conf(avctx))) {
++        av_log(avctx, AV_LOG_WARNING,
++               "Dolby Vision VideoToolbox session creation failed (%d); "
++               "retrying as plain HEVC.\n", (int)status);
++        videotoolbox->session = NULL;
++        videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
++        if (videotoolbox->cm_fmt_desc) {
++            CFRelease(videotoolbox->cm_fmt_desc);
++            videotoolbox->cm_fmt_desc = NULL;
++        }
++        if (decoder_spec)
++            CFRelease(decoder_spec);
++        decoder_spec = videotoolbox_decoder_config_create(videotoolbox->cm_codec_type, avctx);
++        if (decoder_spec)
++            videotoolbox->cm_fmt_desc = videotoolbox_format_desc_create(videotoolbox->cm_codec_type,
++                                                                        decoder_spec,
++                                                                        avctx->width,
++                                                                        avctx->height);
++        if (videotoolbox->cm_fmt_desc)
++            status = VTDecompressionSessionCreate(NULL,                      // allocator
++                                                  videotoolbox->cm_fmt_desc, // videoFormatDescription
++                                                  decoder_spec,              // videoDecoderSpecification
++                                                  buf_attr,                  // destinationImageBufferAttributes
++                                                  &decoder_cb,               // outputCallback
++                                                  &videotoolbox->session);   // decompressionSessionOut
++    }
++
+     if (!status && videotoolbox->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF) {
+         OSStatus property_status;
+ 
+@@ -1474,6 +1523,9 @@ static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
+     const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+     int convert_p7 = videotoolbox_dovi_needs_p81_conversion(dovi);
+ 
++    if (!videotoolbox_session_is_dovi(avctx))
++        return 0;
++
+     if (!videotoolbox_dovi_is_apple_hevc(dovi))
+         return 0;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,123 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index c9365f7..c1a9469 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -115,10 +115,23 @@ - (void)invalidate;
+     int avp_last_item_status;    // last logged AVPlayerItemStatus
+     int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
+     int avp_heartbeat;           // verbose position log divider
++    int64_t avp_lead_ns;         // steady-state ES feed lead (from option)
+     // Whether this AO accepts compressed AC3/EAC3 and routes it through
+     // AVPlayer. Disable to let the next configured audio output handle the
+     // bitstream instead.
+     bool opt_accept_compressed;
++    // How far ahead of the observed playhead the elementary stream is fed,
++    // in seconds. The system's audio decode pipeline reads unboundedly far
++    // ahead of the playhead (the loader's read offset sits pinned at the
++    // write head at any lead), and it consumes its buffered stream in fixed
++    // ~1.8 s quanta. When only 2 s were fed the refill periodically overran
++    // the write head and the renderer skipped ~100-220 ms of audio to stay
++    // on clock -- an audible dropout every 1.79 s during (E-)AC-3
++    // passthrough on tvOS (plezy#1300, plezy#1776), independent of stream
++    // bitrate and route. 8 s gives the pipeline 4x its own quantum; measured
++    // dropouts over ~4 min fell from 21/min (Plezy 2.15) and 10.6/min
++    // (this AO at 2 s) to zero.
++    double opt_compressed_lead;
+ #if TARGET_OS_OSX
+     // The bounded PCM lookahead is macOS-only. That is where --volume is
+     // driven from a slider or the keyboard and the lag is felt; on tvOS and
+@@ -153,13 +166,10 @@ - (void)invalidate;
+ #define SPDIF_FRAMES_PER_BURST 1536
+ 
+ #define AVP_TICK_NS         MP_TIME_MS_TO_NS(50)
+-// How far ahead of the playhead the elementary stream is fed. Bounds both
+-// memory and how much stale audio a teardown throws away.
+-#define AVP_LEAD_NS         MP_TIME_S_TO_NS(2)
+ // Startup allowance while the playhead has not moved yet: preroll consumes
+ // several seconds before the transport engages, and capping it at the
+ // steady-state lead deadlocks the start against a frozen playhead.
+-#define AVP_START_LEAD_NS   MP_TIME_S_TO_NS(4)
++#define AVP_START_LEAD_NS(p) (2 * (p)->avp_lead_ns)
+ // Minimum priming before the transport is started.
+ #define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
+ // Deadline for the item to become ready once primed.
+@@ -168,9 +178,9 @@ - (void)invalidate;
+ #define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
+ // History kept behind the loader's read position for offset-0 restarts.
+ #define AVP_ES_HISTORY_BYTES (2 * 1024 * 1024)
+-// Total window: history + the time-bounded lead (~1.5 MB at the highest
+-// legal EAC3 rate) + slack.
+-#define AVP_ES_RING_BYTES    (6 * 1024 * 1024)
++// Byte budget per second of lead when sizing the ES window: the highest
++// legal E-AC-3 rate (6.144 Mb/s) is 768 KiB/s.
++#define AVP_ES_LEAD_BYTES_PER_S (768 * 1024)
+ 
+ // A failed compressed AO must reject its immediate reload so mpv can decode
+ // to PCM. A later successful PCM initialization clears this process-local
+@@ -532,11 +542,21 @@ static void feed_avp(struct ao *ao)
+     }
+     if (++p->avp_heartbeat % 100 == 0) {
+         CMTime t = [p->item currentTime];
++        int64_t write_head = p->es_head + p->es_len;
++        int64_t reader_gap = -1;
++        for (AVAssetResourceLoadingRequest *req in p->loader->requests) {
++            AVAssetResourceLoadingDataRequest *dr = req.dataRequest;
++            if (!dr || dr.currentOffset > write_head)
++                continue;
++            int64_t gap = write_head - dr.currentOffset;
++            if (reader_gap < 0 || gap < reader_gap)
++                reader_gap = gap;
++        }
+         MP_VERBOSE(ao, "heartbeat: raw pos %.3fs, clamped %.3fs, fed %.3fs, "
+-                   "status %d, tc %d\n",
++                   "status %d, tc %d, reader gap %lld B\n",
+                    CMTIME_IS_NUMERIC(t) ? CMTimeGetNanoseconds(t) / 1e9 : -1.0,
+                    avp_current_time_ns(ao) / 1e9, p->es_pts / 1e9,
+-                   item_status, tcs);
++                   item_status, tcs, (long long)reader_gap);
+     }
+     if ([p->item status] == AVPlayerItemStatusFailed || [p->player error]) {
+         NSError *error = [p->item error] ? [p->item error] : [p->player error];
+@@ -551,7 +571,7 @@ static void feed_avp(struct ao *ao)
+ 
+     for (int guard = 0; guard < 64 && !p->avp_eof; guard++) {
+         int64_t cur = avp_feed_position_ns(ao);
+-        if (p->es_pts - cur >= (cur > 0 ? AVP_LEAD_NS : AVP_START_LEAD_NS))
++        if (p->es_pts - cur >= (cur > 0 ? p->avp_lead_ns : AVP_START_LEAD_NS(p)))
+             break;
+         // One pull can extract every burst buffered in the stash, so demand
+         // room for a full stash's worth of payload before pulling.
+@@ -1131,11 +1151,16 @@ static int init(struct ao *ao)
+         // traps, and an idle timer costs nothing.
+         dispatch_resume(p->avp_timer);
+ 
++        p->avp_lead_ns = (int64_t)(p->opt_compressed_lead * 1e9);
++
+         // 100ms of IEC data per pull plus room for carried-over bursts
+         p->stash_size = (ao->samplerate / 10) * af_fmt_to_bytes(ao->format) *
+                         ao->channels.num + p->spdif_burst_size * 4;
+         p->stash = talloc_size(ao, p->stash_size);
+-        p->es_size = AVP_ES_RING_BYTES;
++        // history + the time-bounded startup lead at the highest legal
++        // EAC3 rate + slack
++        p->es_size = AVP_ES_HISTORY_BYTES + 1024 * 1024 +
++                     (int)(2 * p->opt_compressed_lead * AVP_ES_LEAD_BYTES_PER_S);
+         p->es_buf = talloc_size(ao, p->es_size);
+         p->au_buf = talloc_size(ao, p->spdif_burst_size);
+ 
+@@ -1340,6 +1365,7 @@ static void uninit(struct ao *ao)
+     .priv_size      = sizeof(struct priv),
+     .priv_defaults  = &(const struct priv){
+         .opt_accept_compressed = true,
++        .opt_compressed_lead = 8,
+         // Well inside the renderer's own depth, so the queue still absorbs
+         // scheduling jitter, while cutting the delay before a volume change
+         // is audible to a fraction of what it was.
+@@ -1352,6 +1378,7 @@ static void uninit(struct ao *ao)
+         {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
+ #endif
+         {"accept-compressed", OPT_BOOL(opt_accept_compressed)},
++        {"compressed-lead", OPT_DOUBLE(opt_compressed_lead), M_RANGE(1, 30)},
+         {0}
+     },
+     .options_prefix = "ao-avfoundation",

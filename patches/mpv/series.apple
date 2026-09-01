@@ -1,0 +1,26 @@
+# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for mpv.
+# One pool filename per line; order is authoritative and nothing is sorted.
+0001-player-add-moltenvk-context.patch
+0002-revert-build-static.patch
+0003-fix-coreaudio-hal-guards-for-non-macos.patch
+0004-avfoundation-video-output.patch
+0005-audiounit-reject-spdif.patch
+0006-avfoundation-avplayer-compressed-passthrough.patch
+0007-avfoundation-osd-performance.patch
+0008-avfoundation-coremedia-source-timebase.patch
+0009-avfoundation-sw-frame-upload-performance.patch
+0011-avfoundation-high-speed-playback.patch
+0012-avfoundation-layer-resize-tracking.patch
+0013-moltenvk-gate-presentation-on-hidden-layer.patch
+0014-avfoundation-preserve-dolby-vision-transfer.patch
+0015-avfoundation-bound-pcm-lookahead.patch
+0016-avfoundation-timebase-rate-servo.patch
+0017-avfoundation-keep-displayed-frame-on-seek.patch
+0018-avfoundation-refuse-geometry-render-for-dolby-vision.patch
+0019-avfoundation-configurable-compressed-audio.patch
+0020-avfoundation-compressed-clock-accounting.patch
+0021-avfoundation-configurable-compressed-lead.patch
+0022-avfoundation-slow-source-preroll-patience.patch
+0023-avfoundation-refuse-reads-past-the-write-head.patch
+0024-avfoundation-frame-space-osd-in-pip.patch
+0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch

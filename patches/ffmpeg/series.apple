@@ -1,0 +1,15 @@
+# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for ffmpeg.
+# One pool filename per line; order is authoritative and nothing is sorted.
+0001-fix-visionos-videotoolbox.patch
+0002-videotoolbox-add-dolby-vision-hevc-format.patch
+0003-videotoolbox-convert-dolby-vision-p7.patch
+0004-videotoolbox-preserve-dolby-vision-attachments.patch
+0005-videotoolbox-tag-dolby-vision-hdr.patch
+0008-videotoolbox-set-sample-size.patch
+0009-videotoolbox-forward-dolby-vision-rpus.patch
+0010-hevc-downlevel-duplicate-dovi-rpu-log.patch
+0011-securetransport-disable-pem-import-for-catalyst.patch
+0012-videotoolbox-disable-plezy-dv-diagnostics.patch
+0013-videotoolbox-never-signal-dolby-vision-metadata-compression.patch
+0014-videotoolbox-fall-back-to-plain-hevc-session.patch
+0015-hevc-downlevel-skipped-nal-log.patch

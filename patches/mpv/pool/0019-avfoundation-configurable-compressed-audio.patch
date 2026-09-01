@@ -1,0 +1,43 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 545cb1a..102c53d 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -109,6 +109,10 @@ - (void)invalidate;
+     int avp_last_item_status;    // last logged AVPlayerItemStatus
+     int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
+     int avp_heartbeat;           // verbose position log divider
++    // Whether this AO accepts compressed AC3/EAC3 and routes it through
++    // AVPlayer. Disable to let the next configured audio output handle the
++    // bitstream instead.
++    bool opt_accept_compressed;
+ #if TARGET_OS_OSX
+     // The bounded PCM lookahead is macOS-only. That is where --volume is
+     // driven from a slider or the keyboard and the lag is felt; on tvOS and
+@@ -1000,6 +1004,11 @@ static int init(struct ao *ao)
+     AudioChannelLayout *layout = NULL;
+     bool spdif = af_fmt_is_spdif(ao->format);
+ 
++    if (spdif && !p->opt_accept_compressed) {
++        MP_VERBOSE(ao, "compressed audio disabled; trying next audio output\n");
++        return CONTROL_ERROR;
++    }
++
+     if (!spdif) {
+         atomic_store(&spdif_format_latch[0], false);
+         atomic_store(&spdif_format_latch[1], false);
+@@ -1303,6 +1312,7 @@ static void uninit(struct ao *ao)
+     .list_devs      = ca_get_device_list,
+     .priv_size      = sizeof(struct priv),
+     .priv_defaults  = &(const struct priv){
++        .opt_accept_compressed = true,
+         // Well inside the renderer's own depth, so the queue still absorbs
+         // scheduling jitter, while cutting the delay before a volume change
+         // is audible to a fraction of what it was.
+@@ -1314,6 +1324,7 @@ static void uninit(struct ao *ao)
+ #if TARGET_OS_OSX
+         {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
+ #endif
++        {"accept-compressed", OPT_BOOL(opt_accept_compressed)},
+         {0}
+     },
+     .options_prefix = "ao-avfoundation",

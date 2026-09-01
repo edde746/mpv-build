@@ -1,0 +1,165 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -63,6 +63,20 @@
+     int raw_payload_left; // payload bytes still to emit for this burst
+     void *rawbuf;         // unwrapped payload, chunk-sized
+ 
++    // An HDMI display-mode switch renegotiates the link and can rebind the
++    // audio route after a passthrough track was created against the old
++    // one; the track keeps draining but the sink never locks onto the
++    // bitstream (edde746/plezy#2190). The AO thread polls the routed
++    // device and requests an AO reload when the route changes under a live
++    // passthrough track - the rebuild media3 performs from its
++    // AudioDeviceCallback. PCM tracks are exempt: the framework reroutes
++    // them transparently, and a reload would add a gap where none is
++    // needed.
++    jint routed_device;      // 0 = no routed device observed yet
++    bool routing_lost;       // the observed route went away; rebind decides
++    bool routing_reload_requested;
++    int64_t routing_checked; // last poll, mp_time_ns
++
+     void *chunk;
+     int chunksize;
+     jbyteArray bytearray;
+@@ -72,6 +86,7 @@
+ 
+     bool cfg_pcm_float;
+     bool cfg_raw_passthrough;
++    bool cfg_route_reload;
+     int cfg_session_id;
+ 
+     bool thread_terminate;
+@@ -114,6 +129,7 @@
+     jmethodID getLatency;
+     jmethodID getMinBufferSize;
+     jmethodID isDirectPlaybackSupported;
++    jmethodID getRoutedDevice;
+     jmethodID getNativeOutputSampleRate;
+     jint STATE_INITIALIZED;
+     jint PLAYSTATE_STOPPED;
+@@ -149,6 +165,7 @@
+     {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
+     {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
+     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
++    {"getRoutedDevice", "()Landroid/media/AudioDeviceInfo;", MP_JNI_METHOD, OFFSET(getRoutedDevice), 0},
+     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
+     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
+     {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
+@@ -285,6 +302,18 @@
+ };
+ #undef OFFSET
+ 
++static struct JNIAudioDeviceInfo {
++    jclass clazz;
++    jmethodID getId;
++} AudioDeviceInfo;
++#define OFFSET(member) offsetof(struct JNIAudioDeviceInfo, member)
++static const struct MPJniField AudioDeviceInfo_mapping[] = {
++    {"android/media/AudioDeviceInfo", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"getId", "()I", MP_JNI_METHOD, OFFSET(getId), 0},
++    {0}
++};
++#undef OFFSET
++
+ #define ENTRY(name) { &name, name ## _mapping }
+ static const struct {
+     void *fields;
+@@ -298,6 +327,7 @@
+     ENTRY(AudioFormatBuilder),
+     ENTRY(AudioManager),
+     ENTRY(AudioTimestamp),
++    ENTRY(AudioDeviceInfo),
+ };
+ #undef ENTRY
+ 
+@@ -400,6 +430,10 @@
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+     MP_JNI_EXCEPTION_LOG(ao);
+     MP_JNI_GLOBAL_FREEP(&p->audiotrack);
++    // The fresh track binds wherever the route points now; re-baseline so
++    // the rebind itself does not read as another route change.
++    p->routed_device = 0;
++    p->routing_lost = false;
+     return AudioTrack_New(ao);
+ }
+ 
+@@ -768,6 +802,57 @@
+     return -1;
+ }
+ 
++static jint AudioTrack_getRoutedDeviceId(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (!AudioTrack.getRoutedDevice || !AudioDeviceInfo.getId || !p->audiotrack)
++        return 0;
++    jobject device = MP_JNI_CALL_OBJECT(p->audiotrack, AudioTrack.getRoutedDevice);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !device)
++        return 0;
++    jint id = MP_JNI_CALL_INT(device, AudioDeviceInfo.getId);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        id = 0;
++    MP_JNI_LOCAL_FREEP(&device);
++    return id;
++}
++
++// See the routing comment in priv: reload the AO when the route changes
++// under a live passthrough track.
++static void AudioTrack_checkRouteChange(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->cfg_route_reload || p->routing_reload_requested)
++        return;
++    if (!p->raw_passthrough && p->format != AudioFormat.ENCODING_IEC61937)
++        return;
++    int64_t now = mp_time_ns();
++    if (p->routing_checked && now - p->routing_checked < MP_TIME_MS_TO_NS(250))
++        return;
++    p->routing_checked = now;
++    jint id = AudioTrack_getRoutedDeviceId(ao);
++    if (!id) {
++        // Unrouted is not a change by itself: a track that has not started
++        // has no route yet, and a device mid-renegotiation reports none.
++        // Remember the loss; the next rebind decides.
++        if (p->routed_device)
++            p->routing_lost = true;
++        return;
++    }
++    if (!p->routed_device) {
++        p->routed_device = id;
++        return;
++    }
++    if (id != p->routed_device || p->routing_lost) {
++        MP_WARN(ao, "audio route changed under a passthrough track "
++                "(device %d -> %d), reloading AO\n",
++                (int)p->routed_device, (int)id);
++        p->routing_reload_requested = true;
++        ao_request_reload(ao);
++    }
++}
++
+ static MP_THREAD_VOID ao_thread(void *arg)
+ {
+     struct ao *ao = arg;
+@@ -776,6 +861,7 @@
+     mp_thread_set_name("ao/audiotrack");
+     mp_mutex_lock(&p->lock);
+     while (!p->thread_terminate) {
++        AudioTrack_checkRouteChange(ao);
+         int state = AudioTrack.PLAYSTATE_PAUSED;
+         if (p->audiotrack) {
+             state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
+@@ -1133,10 +1219,12 @@
+     .priv_defaults = &(const OPT_BASE_STRUCT) {
+         .cfg_pcm_float = 1,
+         .cfg_raw_passthrough = 1,
++        .cfg_route_reload = 1,
+     },
+     .options   = (const struct m_option[]) {
+         {"pcm-float", OPT_BOOL(cfg_pcm_float)},
+         {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
++        {"route-reload", OPT_BOOL(cfg_route_reload)},
+         {"session-id", OPT_INT(cfg_session_id)},
+         {0}
+     },

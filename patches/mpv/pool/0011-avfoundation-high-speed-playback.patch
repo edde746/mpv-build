@@ -1,0 +1,238 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index fe16972..d4c5906 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -180,6 +180,15 @@
+     bool timebase_paused;
+     bool playback_paused;
+     double timebase_rate;
++    int64_t anchor_media_pts_ns;
++    int64_t anchor_present_host_ns;
++
++    // Periodic presentation-pacing diagnostics (logged every ~5s)
++    int64_t diag_window_start_ns;
++    int diag_wait_count;
++    int64_t diag_wait_total_ns;
++    int diag_drop_count;
++    int diag_anchor_count;
+ 
+     // Track if OSD callback was invoked this frame
+     bool osd_callback_invoked;
+@@ -390,24 +399,11 @@ static void reset_media_timing(struct priv *p)
+     p->timebase_anchor_valid = false;
+     p->timebase_paused = false;
+     p->playback_paused = false;
+-    p->timebase_rate = 1.0;
+-}
+-
+-static double infer_timebase_rate(struct priv *p, int64_t media_pts_ns,
+-                                  int64_t present_host_ns)
+-{
+-    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
+-
+-    if (!p->last_media_pts_valid || !p->last_present_host_ns)
+-        return rate;
+-
+-    int64_t media_delta = media_pts_ns - p->last_media_pts_ns;
+-    int64_t host_delta = present_host_ns - p->last_present_host_ns;
+-    if (media_delta <= 0 || host_delta <= MP_TIME_MS_TO_NS(5))
+-        return rate;
+-
+-    double inferred = (double)media_delta / (double)host_delta;
+-    return inferred >= 0.05 && inferred <= 8.0 ? inferred : rate;
++    // Keep a previously inferred rate across seeks/track switches; the
++    // player's speed persists, so the first post-seek anchor starts correct.
++    p->timebase_rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++    p->anchor_media_pts_ns = 0;
++    p->anchor_present_host_ns = 0;
+ }
+ 
+ static void update_media_timebase_for_frame(struct vo *vo)
+@@ -421,18 +417,58 @@ static void update_media_timebase_for_frame(struct vo *vo)
+         ? p->next_present_host_ns
+         : now;
+     int64_t media_pts_ns = p->next_media_pts_ns;
+-    double rate = p->playback_paused
+-        ? 0.0
+-        : infer_timebase_rate(p, media_pts_ns, present_host_ns);
++
++    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++
++    // Infer the playback rate over the span since the last anchor point.
++    // Present timestamps jitter by up to ~1ms frame to frame, so a
++    // frame-to-frame estimate is too noisy at high rates (error scales with
++    // rate / span) and would re-anchor the timebase on nearly every frame.
++    bool inferred_valid = false;
++    double inferred = rate;
++    int64_t span_host_ns = 0;
++    if (p->timebase_anchor_valid && p->anchor_present_host_ns) {
++        int64_t media_delta = media_pts_ns - p->anchor_media_pts_ns;
++        span_host_ns = present_host_ns - p->anchor_present_host_ns;
++        if (media_delta > 0 && span_host_ns >= MP_TIME_MS_TO_NS(5)) {
++            double candidate = (double)media_delta / (double)span_host_ns;
++            if (candidate >= 0.05 && candidate <= 8.0) {
++                inferred = candidate;
++                inferred_valid = true;
++            }
++        }
++    }
++
++    // Accept a rate change only if it exceeds what timing jitter could
++    // explain at the current span: one frame in only detects real speed
++    // changes, longer spans detect progressively finer drift (1% floor).
++    bool rate_changed = false;
++    if (inferred_valid && !p->playback_paused) {
++        double noise_gate = (double)MP_TIME_MS_TO_NS(3) / (double)span_host_ns;
++        double gate = MPMAX(0.01, noise_gate);
++        if (fabs(inferred - rate) > gate * rate) {
++            rate = inferred;
++            rate_changed = true;
++        }
++    }
++    if (p->playback_paused)
++        rate = 0.0;
+ 
+     bool should_anchor = !p->timebase_anchor_valid || p->timebase_paused ||
+-        p->playback_paused || fabs(rate - p->timebase_rate) > 0.01;
++        p->playback_paused || rate_changed;
+ 
+     if (!should_anchor) {
+         int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
+         int64_t projected_ns = timebase_ns +
+             (int64_t)((double)(present_host_ns - now) * p->timebase_rate);
+-        should_anchor = llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20);
++        if (llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20)) {
++            should_anchor = true;
++            // Accumulated drift means the anchored rate was off; adopt the
++            // span-inferred rate (accurate by now) so the same drift does
++            // not simply build up again.
++            if (inferred_valid && span_host_ns >= MP_TIME_MS_TO_NS(100))
++                rate = inferred;
++        }
+     }
+ 
+     if (should_anchor) {
+@@ -446,6 +482,9 @@ static void update_media_timebase_for_frame(struct vo *vo)
+         p->timebase_rate = rate;
+         p->timebase_anchor_valid = true;
+         p->timebase_paused = p->playback_paused;
++        p->anchor_media_pts_ns = media_pts_ns;
++        p->anchor_present_host_ns = present_host_ns;
++        p->diag_anchor_count++;
+     }
+ 
+     p->last_media_pts_ns = media_pts_ns;
+@@ -786,6 +825,14 @@ static void update_avfoundation_options(struct vo *vo)
+     sync_osd_layer_frame(vo);
+ }
+ 
++static void record_deadline_drop(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    record_not_ready_drop(vo);
++    vo_increment_drop_count(vo, 1);
++    p->diag_drop_count++;
++}
++
+ static bool wait_until_ready_for_more_media_data(struct vo *vo, int64_t present_host_ns)
+ {
+     struct priv *p = vo->priv;
+@@ -798,33 +845,80 @@ static bool wait_until_ready_for_more_media_data(struct vo *vo, int64_t present_
+         return true;
+     }
+ 
+-    int64_t now = mp_time_ns();
+-    int64_t latest = present_host_ns > 0
++    // A renderer that reports not-ready while the frame's deadline is still
++    // far away is back-pressure, not a failure: frames arrive up to
++    // queue-lead-ms ahead of their presentation time, and at high playback
++    // rates the renderer's queue fills long before frames are due. Pace to
++    // the drain rate by waiting until shortly before the deadline (#1484).
++    int64_t start = mp_time_ns();
++    int64_t give_up = present_host_ns > 0
+         ? present_host_ns - MP_TIME_MS_TO_NS(4)
+-        : now + MP_TIME_MS_TO_NS(1);
+-    int64_t give_up = MPMIN(now + MP_TIME_MS_TO_NS(2), latest);
++        : start + MP_TIME_MS_TO_NS(2);
+ 
+-    if (give_up <= now) {
++    if (give_up <= start) {
+         MP_VERBOSE(vo, "Display layer not ready %.2f ms before PTS; dropping frame\n",
+-                   (present_host_ns - now) / 1000000.0);
+-        record_not_ready_drop(vo);
++                   (present_host_ns - start) / 1000000.0);
++        record_deadline_drop(vo);
+         return false;
+     }
+ 
+     while (!sample_buffer_renderer_is_ready(p->displayLayer)) {
+         if (mp_time_ns() >= give_up) {
+-            MP_VERBOSE(vo, "Display layer not ready after bounded wait; dropping frame\n");
+-            record_not_ready_drop(vo);
++            MP_VERBOSE(vo, "Display layer not ready at PTS deadline; dropping frame\n");
++            record_deadline_drop(vo);
+             return false;
+         }
++        if (display_layer_needs_recovery(p->displayLayer)) {
++            recover_display_layer(vo, "not-ready wait", false);
++            if (display_layer_needs_recovery(p->displayLayer)) {
++                // Recovery was throttle-suppressed; don't poll a failed
++                // renderer all the way to the deadline.
++                MP_VERBOSE(vo, "Display layer unrecovered during wait; dropping frame\n");
++                record_deadline_drop(vo);
++                return false;
++            }
++            continue;
++        }
+         mp_sleep_ns(MP_TIME_MS_TO_NS(1));
+     }
+ 
+     p->not_ready_drop_count = 0;
+     p->last_not_ready_drop_ns = 0;
++    p->diag_wait_count++;
++    p->diag_wait_total_ns += mp_time_ns() - start;
+     return true;
+ }
+ 
++static void report_presentation_diagnostics(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int64_t now = mp_time_ns();
++
++    if (!p->diag_window_start_ns) {
++        p->diag_window_start_ns = now;
++        return;
++    }
++    if (now - p->diag_window_start_ns < MP_TIME_MS_TO_NS(5000))
++        return;
++
++    if (p->diag_wait_count || p->diag_drop_count || p->diag_anchor_count) {
++        MP_VERBOSE(vo, "Presentation pacing over %.1fs: %d ready-waits "
++                   "(avg %.2f ms), %d deadline drops, %d timebase anchors\n",
++                   (now - p->diag_window_start_ns) / 1e9,
++                   p->diag_wait_count,
++                   p->diag_wait_count
++                       ? p->diag_wait_total_ns / 1e6 / p->diag_wait_count
++                       : 0.0,
++                   p->diag_drop_count, p->diag_anchor_count);
++    }
++
++    p->diag_window_start_ns = now;
++    p->diag_wait_count = 0;
++    p->diag_wait_total_ns = 0;
++    p->diag_drop_count = 0;
++    p->diag_anchor_count = 0;
++}
++
+ static void dispatch_main_sync_safe(dispatch_block_t block)
+ {
+     if ([NSThread isMainThread]) {
+@@ -3023,6 +3117,8 @@ static void flip_page(struct vo *vo)
+     if (atomic_exchange(&p->pending_presentation_resync, false))
+         recover_display_layer(vo, "presentation resume", true);
+ 
++    report_presentation_diagnostics(vo);
++
+     if (p->next_image) {
+         CMSampleBufferRef osd_buf = NULL;
+         bool osd_needed = false;

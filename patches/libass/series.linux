@@ -1,0 +1,5 @@
+# Linux patch series for libass. Empty today: the linux build clones the
+# edde746/libass fork tag straight from versions.json, so every fork commit is
+# already in the tree. A patch lands here only when linux needs a change on
+# top of the fork that no other platform wants; promote it to series.common
+# the moment a second platform needs the same pool file.

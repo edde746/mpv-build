@@ -1,0 +1,142 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index d4c5906..ce6a430 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -207,6 +207,13 @@
+     id app_resign_observer;
+     bool presentation_suspended;
+     atomic_bool pending_presentation_resync;
++
++    // Host layer resize tracking (KVO). The embedding app owns the --wid
++    // layer and resizes it directly (device rotation, external-display
++    // moves); no VOCTRL fires for that, so a KVO observer flags it and
++    // VOCTRL_CHECK_EVENTS resyncs the cached OSD geometry.
++    id layer_geometry_observer;
++    atomic_bool pending_layer_geometry_sync;
+ };
+ 
+ static CGFloat get_screen_scale(void)
+@@ -224,6 +231,37 @@ static CGFloat get_screen_scale(void)
+ static void release_ci_compositor(struct priv *p);
+ static const struct m_sub_options avfoundation_conf;
+ 
++// KVO observer for host-driven resizes of the --wid display layer. The
++// callback runs on whatever thread mutates the layer (the app's main
++// thread); it must only flag the change and wake the VO thread.
++@interface MPVLayerGeometryObserver : NSObject {
++@public
++    struct vo *vo;
++}
++@end
++
++@implementation MPVLayerGeometryObserver
++- (void)observeValueForKeyPath:(NSString *)keyPath
++                      ofObject:(id)object
++                        change:(NSDictionary *)change
++                       context:(void *)context
++{
++    // KVO fires on every setter call; only real changes matter. A spurious
++    // resync flushes the OSD layer, blinking any displayed subtitle.
++    id oldValue = change[NSKeyValueChangeOldKey];
++    id newValue = change[NSKeyValueChangeNewKey];
++    if (oldValue && newValue && [oldValue isEqual:newValue])
++        return;
++
++    struct vo *target = self->vo;
++    if (!target)
++        return;
++    struct priv *p = target->priv;
++    atomic_store(&p->pending_layer_geometry_sync, true);
++    vo_wakeup(target);
++}
++@end
++
+ static bool should_composite_into_video(struct priv *p)
+ {
+     return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
+@@ -825,6 +863,29 @@ static void update_avfoundation_options(struct vo *vo)
+     sync_osd_layer_frame(vo);
+ }
+ 
++// Consume a pending host-layer resize flagged by MPVLayerGeometryObserver.
++static void handle_layer_geometry_change(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    // Composite mode draws the OSD into the video samples, which follow the
++    // layer via videoGravity; skipping here also keeps system-driven PiP
++    // window resizes from rescaling PiP subtitles. Inline geometry is
++    // re-read when composite-osd flips back anyway.
++    if (!should_use_inline_osd_layer(p))
++        return;
++
++    MP_VERBOSE(vo, "Host layer resized; resyncing OSD geometry\n");
++
++    clear_subtitle_cache(p);
++    if (p->osdLayer)
++        sample_buffer_renderer_flush(p->osdLayer, true);
++    sync_osd_layer_frame(vo);
++    // Repaint promptly even while paused so a rotation doesn't leave the
++    // old-geometry subtitle on screen until the next natural frame.
++    vo->want_redraw = true;
++}
++
+ static void record_deadline_drop(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -2932,6 +2993,27 @@ static int preinit(struct vo *vo)
+     });
+ #endif
+ 
++    atomic_init(&p->pending_layer_geometry_sync, false);
++    {
++        MPVLayerGeometryObserver *observer = [[MPVLayerGeometryObserver alloc] init];
++        observer->vo = vo;
++        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
++        dispatch_main_sync_safe(^{
++            [observedLayer addObserver:observer
++                            forKeyPath:@"bounds"
++                               options:NSKeyValueObservingOptionOld |
++                                       NSKeyValueObservingOptionNew
++                               context:NULL];
++            [observedLayer addObserver:observer
++                            forKeyPath:@"contentsScale"
++                               options:NSKeyValueObservingOptionOld |
++                                       NSKeyValueObservingOptionNew
++                               context:NULL];
++        });
++        [observedLayer release];
++        p->layer_geometry_observer = observer;
++    }
++
+     return 0;
+ }
+ 
+@@ -3317,6 +3399,18 @@ static void uninit(struct vo *vo)
+     }
+ #endif
+ 
++    if (p->layer_geometry_observer) {
++        MPVLayerGeometryObserver *observer = p->layer_geometry_observer;
++        p->layer_geometry_observer = nil;
++        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
++        dispatch_main_sync_safe(^{
++            [observedLayer removeObserver:observer forKeyPath:@"bounds"];
++            [observedLayer removeObserver:observer forKeyPath:@"contentsScale"];
++        });
++        [observedLayer release];
++        [observer release];
++    }
++
+     mp_image_unrefp(&p->next_image);
+     sample_buffer_renderer_flush(p->displayLayer, true);
+     sample_buffer_renderer_flush(p->osdLayer, true);
+@@ -3398,6 +3492,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_CHECK_EVENTS:
+         if (atomic_exchange(&p->pending_presentation_resync, false))
+             recover_display_layer(vo, "presentation resume", true);
++        if (atomic_exchange(&p->pending_layer_geometry_sync, false))
++            handle_layer_geometry_change(vo);
+         update_avfoundation_options(vo);
+         return VO_TRUE;
+     case VOCTRL_VO_OPTS_CHANGED:

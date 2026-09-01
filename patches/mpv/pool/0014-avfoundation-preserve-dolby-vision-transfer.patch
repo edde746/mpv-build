@@ -1,0 +1,51 @@
+From 3b6b24e30251158d0c7b250716440914ded142e4 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Mon, 13 Jul 2026 22:38:36 +0200
+Subject: [PATCH] fix(avfoundation): preserve Dolby Vision transfer metadata
+
+---
+ video/out/vo_avfoundation.m | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index ce6a430..e2291eb 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -1156,6 +1156,22 @@ static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
+         set_colorspace_from_attachments(pixbuf);
+ }
+ 
++static void restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
++                                          const struct mp_image_params *params)
++{
++    if (!pixbuf || params->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
++        return;
++    if (!CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL) ||
++        CVBufferGetAttachment(pixbuf, kCVImageBufferTransferFunctionKey, NULL))
++        return;
++
++    CFStringRef transfer = get_cv_transfer_function(params->color.transfer);
++    if (transfer) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
++                              transfer, kCVAttachmentMode_ShouldPropagate);
++    }
++}
++
+ static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf)
+ {
+     if (!pixbuf || !vo->params)
+@@ -3096,6 +3112,11 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+         // ratio; AVSampleBufferDisplayLayer only honors it via a buffer attachment.
+         tag_pixel_buffer_pixel_aspect(vo, finalBuffer);
+ 
++        // Profile 5 may retain its RPU while losing VideoToolbox's PQ tag.
++        // Its color primaries and matrix must remain unspecified.
++        if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX && finalBuffer == pixbuf)
++            restore_dolby_vision_transfer(finalBuffer, &mpi->params);
++
+         // The format description is stable across frames from the same pool;
+         // CMVideoFormatDescriptionMatchesImageBuffer compares dimensions,
+         // pixel format and the relevant attachments, so any real change
+-- 
+2.50.1 (Apple Git-155)
+

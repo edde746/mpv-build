@@ -1,0 +1,50 @@
+From 70eb3f1d6a7c7049235f7b91c04188edfd7f9f95 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 7 May 2026 16:30:00 +0200
+Subject: [PATCH] videotoolbox: preserve Dolby Vision output attachments
+
+VideoToolbox can attach platform-native Dolby Vision/HDR display metadata
+to decoded pixel buffers. Do not overwrite those attachments with FFmpeg's
+container-level color fields for frames decoded through the Apple Dolby
+Vision HEVC path.
+---
+ libavcodec/videotoolbox.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index df551d0..294fc4e 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -116,6 +116,8 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
+     return 0;
+ }
+ 
++static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx);
++
+ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+ {
+     int ret;
+@@ -132,7 +134,8 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+     frame->crop_top = 0;
+     frame->crop_bottom = 0;
+ 
+-    if ((ret = av_vt_pixbuf_set_attachments(avctx, ref->pixbuf, frame)) < 0)
++    if (!videotoolbox_dovi_should_preserve_attachments(avctx) &&
++        (ret = av_vt_pixbuf_set_attachments(avctx, ref->pixbuf, frame)) < 0)
+         return ret;
+ 
+     frame->data[3] = (uint8_t*)ref->pixbuf;
+@@ -865,6 +868,11 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
+     }
+ }
+ 
++static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx)
++{
++    return videotoolbox_dovi_is_apple_hevc(videotoolbox_dovi_get_conf(avctx));
++}
++
+ enum PlezyDoviConversionMode {
+     PLEZY_DOVI_AUTO,
+     PLEZY_DOVI_DISABLED,
+-- 
+2.50.1 (Apple Git-155)

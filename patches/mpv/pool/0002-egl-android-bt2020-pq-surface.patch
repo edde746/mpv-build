@@ -1,0 +1,76 @@
+diff --git a/options/options.c b/options/options.c
+index 716c3e6..46a97e1 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -244,6 +244,9 @@ static const m_option_t mp_vo_opt_list[] = {
+ #endif
+ #if HAVE_EGL_ANDROID
+     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
++    {"android-surface-colorspace", OPT_CHOICE(android_surface_colorspace,
++        {"auto", 0},
++        {"bt2020-pq", 1})},
+ #endif
+ #if HAVE_D3D11
+     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
+diff --git a/options/options.h b/options/options.h
+index 12dafea..433fe93 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -85,6 +85,7 @@ typedef struct mp_vo_opts {
+     int video_sync;
+ 
+     struct m_geometry android_surface_size;
++    int android_surface_colorspace;
+ 
+     struct m_geometry d3d11_composition_size;
+ 
+diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
+index 0a12cf8..85fb427 100644
+--- a/video/out/opengl/context_android.c
++++ b/video/out/opengl/context_android.c
+@@ -23,6 +23,13 @@
+ #include "common/common.h"
+ #include "context.h"
+ 
++#ifndef EGL_GL_COLORSPACE_KHR
++#define EGL_GL_COLORSPACE_KHR 0x309D
++#endif
++#ifndef EGL_GL_COLORSPACE_BT2020_PQ_EXT
++#define EGL_GL_COLORSPACE_BT2020_PQ_EXT 0x3340
++#endif
++
+ struct priv {
+     struct GL gl;
+     EGLDisplay egl_display;
+@@ -74,8 +81,30 @@ static bool android_init(struct ra_ctx *ctx)
+     eglGetConfigAttrib(p->egl_display, config, EGL_NATIVE_VISUAL_ID, &format);
+     ANativeWindow_setBuffersGeometry(native_window, 0, 0, format);
+ 
++    // An HDR session asks for a PQ-flagged window surface so the buffers
++    // reach SurfaceFlinger with a BT.2020/PQ dataspace instead of sRGB. The
++    // embedder owns the policy (content colorimetry, display capability, and
++    // whether a 10-bit config exists) and requests it together with
++    // egl-output-format=rgb10_a2 and a PQ render target; all this context
++    // owns is the surface attribute.
++    EGLint surface_attribs[3] = {EGL_NONE};
++    if (ctx->vo->opts->android_surface_colorspace == 1) {
++        const char *exts = eglQueryString(p->egl_display, EGL_EXTENSIONS);
++        if (exts && strstr(exts, "EGL_EXT_gl_colorspace_bt2020_pq")) {
++            surface_attribs[0] = EGL_GL_COLORSPACE_KHR;
++            surface_attribs[1] = EGL_GL_COLORSPACE_BT2020_PQ_EXT;
++            surface_attribs[2] = EGL_NONE;
++            MP_VERBOSE(ctx, "Creating BT.2020 PQ window surface.\n");
++        } else {
++            MP_WARN(ctx, "bt2020-pq surface requested but "
++                    "EGL_EXT_gl_colorspace_bt2020_pq is unavailable; "
++                    "using the default colorspace.\n");
++        }
++    }
++
+     p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
+-                                    (EGLNativeWindowType)native_window, NULL);
++                                    (EGLNativeWindowType)native_window,
++                                    surface_attribs[0] != EGL_NONE ? surface_attribs : NULL);
+ 
+     if (p->egl_surface == EGL_NO_SURFACE) {
+         MP_FATAL(ctx, "Could not create EGL surface!\n");

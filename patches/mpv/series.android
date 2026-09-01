@@ -1,0 +1,10 @@
+# Android patch series for mpv, migrated from edde746/libmpv-android
+# buildscripts/patches/mpv (its patch.sh applied the directory glob, so this
+# order is that fork's lexicographic apply order).
+# One pool filename per line; order is authoritative and nothing is sorted.
+0001-vo-mediacodec-timed-surface-with-osd-plane.patch
+0002-egl-android-bt2020-pq-surface.patch
+0003-opengl-treat-gles-direct-rendering-as-slow.patch
+0101-ao-audiotrack-multichannel-iec61937.patch
+0102-ao-audiotrack-raw-passthrough.patch
+0103-ao-audiotrack-route-change-reload.patch

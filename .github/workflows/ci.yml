@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - develop
+    tags:
+      - '*'
+  # Version-bump PRs (check_version.yml) change versions.json pins; the
+  # patches job proves the series still apply to the new sources before merge.
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  patches:
+    name: Patch series
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate patch series
+        run: python3 scripts/patches.py check
+
+      - name: Test patch framework
+        run: bash scripts/test_patches.sh
+
+      - name: Test content keys
+        run: bash scripts/test_keys.sh
+
+      # Every nonempty (component, group) series must still apply cleanly to
+      # the exact source tree versions.json pins for it, otherwise the next
+      # publish run breaks. `apply --check` lands the whole stack and unwinds
+      # it again, so the clone stays pristine.
+      - name: Apply every series against its pinned source
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          GROUPS = ['apple', 'android', 'linux', 'windows']
+
+          components = json.loads(Path('versions.json').read_text(encoding='utf-8'))['components']
+          work = Path('.ci-sources')
+          work.mkdir(exist_ok=True)
+
+          def resolve(component, group):
+            result = subprocess.run(
+              [sys.executable, 'scripts/patches.py', 'resolve', component, group],
+              capture_output=True, text=True, check=True)
+            return [line for line in result.stdout.splitlines() if line.strip()]
+
+          def fetch(component, group, dest):
+            entry = components[component]
+            override = (entry.get('overrides') or {}).get(group) or {}
+            kind = entry['kind']
+            url = override.get('url', entry.get('url'))
+            if kind == 'git':
+              ref = override.get('ref', entry.get('ref'))
+              subprocess.run(['git', 'clone', '--depth', '1', '--branch', ref, url, str(dest)], check=True)
+              commit = override.get('commit', entry.get('commit'))
+              if commit:
+                head = subprocess.run(['git', '-C', str(dest), 'rev-parse', 'HEAD'],
+                                      capture_output=True, text=True, check=True).stdout.strip()
+                if head != commit:
+                  raise SystemExit(f'{component}: {ref} is {head}, versions.json pins {commit}')
+            elif kind == 'archive':
+              archive = work / f'{component}-{group}.archive'
+              urllib.request.urlretrieve(url, archive)
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              expected = override.get('sha256', entry.get('sha256'))
+              if expected and digest != expected:
+                raise SystemExit(f'{component}: archive sha256 {digest}, versions.json pins {expected}')
+              dest.mkdir()
+              subprocess.run(['tar', '-xf', str(archive), '--strip-components=1', '-C', str(dest)], check=True)
+            else:
+              raise SystemExit(f'{component}: cannot fetch kind {kind!r} to check patches against')
+
+          checked = 0
+          for component_dir in sorted(Path('patches').iterdir()):
+            if not component_dir.is_dir():
+              continue
+            component = component_dir.name
+            for group in GROUPS:
+              series = resolve(component, group)
+              if not series:
+                continue
+              dest = work / f'{component}-{group}'
+              if not dest.exists():
+                fetch(component, group, dest)
+              print(f'{component}/{group}: checking {len(series)} patch(es)')
+              subprocess.run(
+                [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest), '--check'],
+                check=True)
+              checked += 1
+
+          if checked == 0:
+            raise SystemExit('no (component, group) series resolved; expected at least mpv/apple')
+          print(f'checked {checked} series')
+          PY
+
+  build:
+    name: Demo apps
+    # The demo builds are expensive; keep them on the pushes they always ran
+    # on, and off the version-bump PRs the patches job exists for.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Show available SDKs
+        run: xcodebuild -showsdks
+
+      - name: Build macOS
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Demo/Demo-macOS/Demo-macOS.xcodeproj \
+            -scheme Demo-macOS
+
+          xcodebuild -project Demo/Demo-macOS/Demo-macOS.xcodeproj \
+            -scheme Demo-macOS \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build iOS
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
+            -scheme Demo-iOS
+
+          xcodebuild -project Demo/Demo-iOS/Demo-iOS.xcodeproj \
+            -scheme Demo-iOS \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+
+      - name: Build Succeeded
+        run: |
+          echo "Build completed successfully."

@@ -1,0 +1,911 @@
+name: Publish binaries
+
+# Every push to main publishes the binaries that commit needs, so any commit on
+# main is pinnable. Asset names are content-addressed (they carry a key derived
+# from the sources that produced them), which makes them immutable: an asset
+# that already exists on a rolling prerelease is byte-identical to the one this
+# run would upload, so it is skipped instead of clobbered.
+#
+# Binaries are sharded per platform group. Each group builds independently,
+# uploads to its own `binaries-<group>` rolling prerelease and contributes only
+# its own `platforms.<group>` section of artifacts.json; one final job splices
+# the sections together and commits the manifest. Enabling a new group touches:
+#   1. env.PLATFORM_GROUPS (append the group name),
+#   2. the plan job's outputs block (stale_<group> / any_<group>),
+#   3. a build-<group> + publish-<group> job pair modeled on the apple ones,
+#   4. the manifest job's needs list and its all-or-nothing gate.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Two pushes must never interleave asset uploads or commits to main, and a
+# cancelled run could leave the manifest committed without its assets.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Active platform groups, space-separated. Every group here needs its
+  # plan outputs, a build-<group>/publish-<group> job pair and a manifest
+  # needs entry (see the header comment).
+  PLATFORM_GROUPS: apple android linux windows
+
+jobs:
+  tests:
+    name: Patch regression tests
+    # The marker sits on this workflow's own commit, so the run it triggers
+    # stops here instead of looping.
+    if: ${{ !contains(github.event.head_commit.message, '[skip binaries]') }}
+    permissions:
+      contents: read
+    # The harnesses need only bash, python3 and cc, but not a Linux cc:
+    # test_avf_timebase_servo.c uses M_PI under -std=c11, which glibc hides in
+    # strict ISO mode (gcc 13 on ubuntu-24.04: "'M_PI' undeclared"), while
+    # Apple libc exposes it. Keep them on the compiler they are written for.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test AO PCM lookahead
+        run: ./scripts/test_ao_pcm_lookahead.sh
+
+      - name: Test AO compressed-audio option
+        run: ./scripts/test_ao_compressed_audio_option.sh
+
+      - name: Test AO probe refusal
+        run: ./scripts/test_ao_probe_refusal.sh
+
+      - name: Test AVFoundation timebase servo
+        run: ./scripts/test_avf_timebase_servo.sh
+
+      - name: Test AVFoundation PiP frame-space OSD
+        run: ./scripts/test_avf_pip_frame_space_osd.sh
+
+      - name: Test patch framework
+        run: ./scripts/test_patches.sh
+
+      - name: Test content keys
+        run: ./scripts/test_keys.sh
+
+  plan:
+    name: Plan
+    needs: tests
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      # One stale_<group>/any_<group> pair per active platform group.
+      stale_apple: ${{ steps.stale.outputs.stale_apple }}
+      any_apple: ${{ steps.stale.outputs.any_apple }}
+      stale_android: ${{ steps.stale.outputs.stale_android }}
+      any_android: ${{ steps.stale.outputs.any_android }}
+      stale_linux: ${{ steps.stale.outputs.stale_linux }}
+      any_linux: ${{ steps.stale.outputs.any_linux }}
+      stale_windows: ${{ steps.stale.outputs.stale_windows }}
+      any_windows: ${{ steps.stale.outputs.any_windows }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate patch series
+        run: python3 scripts/patches.py check
+
+      - name: Compute stale libraries per group
+        id: stale
+        # shell: bash adds pipefail, which the default `bash -e` lacks, so a
+        # crash in keys.py is not swallowed by the pipe into paste.
+        shell: bash
+        run: |
+          for group in ${PLATFORM_GROUPS}; do
+            stale="$(python3 scripts/keys.py stale --platform-group "${group}" | paste -sd, -)"
+            echo "stale_${group}=${stale}" >> "$GITHUB_OUTPUT"
+            if [ -n "${stale}" ]; then
+              echo "any_${group}=true" >> "$GITHUB_OUTPUT"
+              echo "${group}: rebuilding ${stale}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "any_${group}=false" >> "$GITHUB_OUTPUT"
+              echo "${group}: binaries already published for this tree" >> "$GITHUB_STEP_SUMMARY"
+              # Nothing to build means the committed manifest must already
+              # describe this tree exactly, otherwise the commit is not
+              # pinnable and no later job would notice.
+              python3 scripts/keys.py verify --platform-group "${group}"
+            fi
+          done
+
+  build-apple:
+    name: Build apple ${{ matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.any_apple == 'true'
+    permissions:
+      contents: read
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            platforms: macos
+            platform_type: macos
+          - name: maccatalyst
+            platforms: maccatalyst
+            platform_type: maccatalyst
+          - name: iphoneos
+            platforms: ios-device
+            platform_type: ios
+          - name: iphonesimulator
+            platforms: ios-simulator
+            platform_type: isimulator
+          - name: tvos
+            platforms: tvos-device
+            platform_type: tvos
+          - name: tvsimulator
+            platforms: tvos-simulator
+            platform_type: tvsimulator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install autoconf automake libtool ninja
+          python -m pip install meson==1.4.2
+
+      # Only the stale libraries are compiled; the rest are restored from their
+      # published per-platform zips. No version= argument: the URLs the build
+      # script would spell from it are replaced by the manifest's
+      # content-addressed ones in the publish job.
+      - name: Build GPL version (${{ matrix.name }})
+        run: |
+          make build enable-gpl use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
+
+      - name: Name per-platform binaries by content (${{ matrix.platform_type }})
+        run: |
+          python3 scripts/keys.py record-platform \
+            --platform-group apple \
+            --platform ${{ matrix.platform_type }} \
+            --release-dir dist/release
+
+      - name: Upload platform build (${{ matrix.name }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-${{ matrix.name }}
+          path: |
+            ./dist/release/*.zip
+            ./dist/release/*.checksum.txt
+            ./dist/release/Package.swift
+          if-no-files-found: error
+
+  publish-apple:
+    name: Publish apple
+    needs: build-apple
+    permissions:
+      contents: write
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apple-*
+          path: ./dist/partials
+
+      - name: Merge platform XCFrameworks
+        run: |
+          python3 - <<'PY'
+          import shutil
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          partial_root = Path('dist/partials')
+          release_dir = Path('dist/release')
+          xcframework_dir = release_dir / 'xcframework'
+
+          if release_dir.exists():
+            shutil.rmtree(release_dir)
+          release_dir.mkdir(parents=True)
+          xcframework_dir.mkdir()
+
+          # The per-platform zips pass straight through: they are the artifacts a
+          # later run restores instead of recompiling, and they are already named
+          # by content.
+          prebuilt_zips = sorted(partial_root.glob('*/*-all-*.zip'))
+          for zip_path in prebuilt_zips:
+            shutil.copy2(zip_path, release_dir / zip_path.name)
+          print(f'Collected {len(prebuilt_zips)} per-platform prebuilt zips')
+
+          grouped_zips = {}
+          for zip_path in partial_root.glob('*/*.xcframework.zip'):
+            grouped_zips.setdefault(zip_path.name, []).append(zip_path)
+          if not grouped_zips:
+            raise SystemExit('No platform XCFramework artifacts found')
+
+          for zip_name, zip_parts in sorted(grouped_zips.items()):
+            framework_name = zip_name[:-len('.xcframework.zip')]
+            output_xcframework = xcframework_dir / f'{framework_name}.xcframework'
+            framework_paths = []
+
+            with tempfile.TemporaryDirectory() as tmp:
+              tmp_path = Path(tmp)
+              for index, zip_part in enumerate(sorted(zip_parts)):
+                extract_dir = tmp_path / f'part-{index}'
+                extract_dir.mkdir()
+                subprocess.run(['/usr/bin/unzip', '-q', str(zip_part.resolve()), '-d', str(extract_dir)], check=True)
+                framework_paths.extend(sorted(path for path in extract_dir.glob('*.xcframework/**/*.framework') if path.is_dir()))
+
+              if not framework_paths:
+                raise SystemExit(f'No frameworks found inside {zip_name}')
+
+              args = ['/usr/bin/xcodebuild', '-create-xcframework']
+              for framework_path in framework_paths:
+                args.extend(['-framework', str(framework_path)])
+              args.extend(['-output', str(output_xcframework)])
+              subprocess.run(args, check=True)
+
+            merged_zip = release_dir / zip_name
+            subprocess.run(['/usr/bin/zip', '-qry', str(merged_zip.resolve()), output_xcframework.name], cwd=xcframework_dir, check=True)
+            print(f'Merged {zip_name} from {len(zip_parts)} platform artifacts')
+          PY
+
+      - name: Name frameworks by content and record them
+        run: python3 scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
+
+      - name: Render Package.swift from the manifest
+        run: python3 scripts/keys.py render --platform-group apple
+
+      - name: Verify manifest matches this commit
+        run: python3 scripts/keys.py verify --platform-group apple
+
+      - name: Upload binaries that are not published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view binaries-apple >/dev/null 2>&1; then
+            gh release create binaries-apple \
+              --prerelease \
+              --title "Rolling binaries (apple)" \
+              --notes "Content-addressed apple build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. Package.swift pins these URLs; deleting an asset breaks every commit and tag that references it."
+          fi
+
+          gh release view binaries-apple --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
+          section = manifest['platforms']['apple']
+          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          release_dir = Path('dist/release')
+
+          wanted = []
+          for library, entry in sorted(section['libraries'].items()):
+            for asset in entry.get('prebuilt', {}).values():
+              wanted.append((library, asset))
+            for framework in entry.get('frameworks', {}).values():
+              wanted.append((library, framework['asset']))
+
+          uploads = []
+          seen = set()
+          missing = []
+          for library, asset in wanted:
+            if asset in seen:
+              continue
+            seen.add(asset)
+            if asset in published:
+              print(f'published {asset}')
+              continue
+            path = release_dir / asset
+            if path.is_file():
+              uploads.append(path)
+            else:
+              missing.append(f'{library}: {asset}')
+
+          # A manifest asset that is neither published nor built would leave a
+          # dead URL in Package.swift, so refuse to commit that manifest.
+          if missing:
+            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
+
+          if not uploads:
+            print('every manifest asset is already published')
+          else:
+            for path in uploads:
+              print(f'upload    {path.name}')
+            # No --clobber: an existing name is the same bytes by construction.
+            subprocess.run(['gh', 'release', 'upload', 'binaries-apple', *(str(path) for path in uploads)], check=True)
+          PY
+
+      - name: Upload manifest for the commit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-apple
+          path: |
+            ./artifacts.json
+            ./Package.swift
+          if-no-files-found: error
+
+  build-android:
+    name: Build android ${{ matrix.abi }}
+    needs: plan
+    if: needs.plan.outputs.any_android == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # One job per ABI: the driver builds one architecture per --arch invocation
+    # (platforms/android/build.sh), the ABIs share nothing but sources, and the
+    # dependency graph is expensive enough that four runners beat one.
+    strategy:
+      fail-fast: false
+      matrix:
+        # arch is the driver's spelling (loadarch.sh), abi the group.json
+        # variant the tarball and the manifest are named by.
+        include:
+          - arch: arm64
+            abi: arm64-v8a
+          - arch: armv7l
+            abi: armeabi-v7a
+          - arch: x86
+            abi: x86
+          - arch: x86_64
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Host build tools from apt plus the exact NDK pinned in
+      # toolchain/android.txt (part of every android content key).
+      - name: Install host toolchain and pinned NDK
+        run: bash platforms/android/include/download-sdk.sh
+
+      - name: Fetch and patch pinned sources
+        run: bash platforms/android/download.sh
+
+      - name: Build libmpv-android (${{ matrix.abi }})
+        run: bash platforms/android/build.sh --arch ${{ matrix.arch }}
+
+      # package.sh names the tarball by content key itself, so the build leg
+      # uploads it as-is; publish-android records every variant at once.
+      - name: Package per-ABI tarball (${{ matrix.abi }})
+        run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
+
+      - name: Upload platform build (${{ matrix.abi }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: ./dist/release/*.tar.gz
+          if-no-files-found: error
+
+  publish-android:
+    name: Publish android
+    needs: build-android
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: android-*
+          path: ./dist/partials
+
+      - name: Collect release assets
+        run: |
+          mkdir -p dist/release
+          find dist/partials -type f -exec cp -v {} dist/release/ \;
+
+      # For group.json groups record-platform is the verb that writes the
+      # manifest section, so it runs here -- once per variant against the
+      # merged release dir -- not in the build legs, whose partial manifests
+      # would each carry a single variant.
+      - name: Record variants in the manifest
+        run: |
+          for variant in arm64-v8a armeabi-v7a x86 x86_64; do
+            python3 scripts/keys.py record-platform \
+              --platform-group android \
+              --platform "${variant}" \
+              --release-dir dist/release
+          done
+
+      - name: Verify manifest matches this commit
+        run: python3 scripts/keys.py verify --platform-group android
+
+      - name: Upload binaries that are not published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view binaries-android >/dev/null 2>&1; then
+            gh release create binaries-android \
+              --prerelease \
+              --title "Rolling binaries (android)" \
+              --notes "Content-addressed android build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
+          fi
+
+          gh release view binaries-android --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          group = 'android'
+          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
+          section = manifest['platforms'][group]
+          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          release_dir = Path('dist/release')
+
+          wanted = []
+          for library, entry in sorted(section['libraries'].items()):
+            for variant in sorted(entry.get('prebuilt', {})):
+              wanted.append((library, entry['prebuilt'][variant]['asset']))
+
+          uploads = []
+          seen = set()
+          missing = []
+          for library, asset in wanted:
+            if asset in seen:
+              continue
+            seen.add(asset)
+            if asset in published:
+              print(f'published {asset}')
+              continue
+            path = release_dir / asset
+            if path.is_file():
+              uploads.append(path)
+            else:
+              missing.append(f'{library}: {asset}')
+
+          # A manifest asset that is neither published nor built would leave a
+          # dead URL in artifacts.json, so refuse to commit that manifest.
+          if missing:
+            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
+
+          if not uploads:
+            print('every manifest asset is already published')
+          else:
+            for path in uploads:
+              print(f'upload    {path.name}')
+            # No --clobber: an existing name is the same bytes by construction.
+            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
+          PY
+
+      - name: Upload manifest for the commit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-android
+          path: ./artifacts.json
+          if-no-files-found: error
+
+  build-linux:
+    name: Build linux ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.any_linux == 'true'
+    permissions:
+      contents: read
+    # The aarch64 leg runs on GitHub's native arm runner: toolchain/linux.txt
+    # pins the container image by multi-arch index digest, so the same
+    # container-build.sh invocation resolves the arm64 image natively -- no
+    # qemu, and the glibc floor is identical to the x86_64 leg's.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # KEY makes container-build.sh run package.sh inside the container, so
+      # the tarball comes out already named by content; ARCH pins the name's
+      # architecture tag to the runner this leg was scheduled on.
+      - name: Build and package in the pinned container (${{ matrix.arch }})
+        run: |
+          KEY="$(python3 scripts/keys.py keys --platform-group linux \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["libmpv-linux"])')"
+          KEY="${KEY}" ARCH=${{ matrix.arch }} bash platforms/linux/container-build.sh
+
+      - name: Upload platform build (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: ./dist/release/*.tar.zst
+          if-no-files-found: error
+
+  publish-linux:
+    name: Publish linux
+    needs: build-linux
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: ./dist/partials
+
+      - name: Collect release assets
+        run: |
+          mkdir -p dist/release
+          find dist/partials -type f -exec cp -v {} dist/release/ \;
+
+      - name: Record variants in the manifest
+        run: |
+          for variant in x86_64 aarch64; do
+            python3 scripts/keys.py record-platform \
+              --platform-group linux \
+              --platform "${variant}" \
+              --release-dir dist/release
+          done
+
+      - name: Verify manifest matches this commit
+        run: python3 scripts/keys.py verify --platform-group linux
+
+      - name: Upload binaries that are not published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view binaries-linux >/dev/null 2>&1; then
+            gh release create binaries-linux \
+              --prerelease \
+              --title "Rolling binaries (linux)" \
+              --notes "Content-addressed linux build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
+          fi
+
+          gh release view binaries-linux --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          group = 'linux'
+          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
+          section = manifest['platforms'][group]
+          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          release_dir = Path('dist/release')
+
+          wanted = []
+          for library, entry in sorted(section['libraries'].items()):
+            for variant in sorted(entry.get('prebuilt', {})):
+              wanted.append((library, entry['prebuilt'][variant]['asset']))
+
+          uploads = []
+          seen = set()
+          missing = []
+          for library, asset in wanted:
+            if asset in seen:
+              continue
+            seen.add(asset)
+            if asset in published:
+              print(f'published {asset}')
+              continue
+            path = release_dir / asset
+            if path.is_file():
+              uploads.append(path)
+            else:
+              missing.append(f'{library}: {asset}')
+
+          # A manifest asset that is neither published nor built would leave a
+          # dead URL in artifacts.json, so refuse to commit that manifest.
+          if missing:
+            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
+
+          if not uploads:
+            print('every manifest asset is already published')
+          else:
+            for path in uploads:
+              print(f'upload    {path.name}')
+            # No --clobber: an existing name is the same bytes by construction.
+            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
+          PY
+
+      - name: Upload manifest for the commit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-linux
+          path: ./artifacts.json
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.any_windows == 'true'
+    permissions:
+      contents: read
+    # Both target arches cross-compile from an x86_64 host: winbuild's
+    # GCC_ARCH probe runs the HOST compiler with -march=x86-64 and fails on
+    # arm64 hosts, and aarch64-w64-mingw32 only needs the clang toolchain,
+    # which build.sh hardcodes.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Core set validated through the pinned configure (git..libtool, with
+      # apt meson 1.3.2 passing winbuild's >=1.3.0 gate; unzip+patch are hard
+      # configure requirements, zip is for package.sh), plus the winbuild
+      # README ubuntu set the full ~60-package graph needs. libc++-dev and
+      # lld: the llvm bootstrap compiles with the host clang against libc++.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git cmake ninja-build build-essential meson pkg-config curl unzip \
+            zip patch ca-certificates python3 autoconf automake libtool \
+            libtool-bin bison flex gettext mercurial subversion gyp yasm nasm \
+            gcc-multilib g++-multilib clang lld libc++-dev libc++abi-dev \
+            libgmp-dev libmpfr-dev libmpc-dev libgcrypt-dev gperf ragel \
+            texinfo autopoint re2c asciidoc rst2pdf python3-docutils \
+            python3-mako python3-jsonschema p7zip-full
+
+      - name: Resolve the winbuild pin
+        id: winbuild
+        run: |
+          commit="$(python3 - <<'PY'
+          import json
+          entry = json.load(open('versions.json'))['components']['mpv-winbuild-cmake']
+          override = (entry.get('overrides') or {}).get('windows') or {}
+          print(override.get('commit', entry['commit']))
+          PY
+          )"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+      # The llvm/rust bootstrap takes hours, so its trees are cached: the
+      # installed sysroot, the toolchain ExternalProject stamps (what makes
+      # `ninja llvm` a no-op on a warm run), the rustup tree and the toolchain
+      # package sources. Package sources and stamps are deliberately NOT
+      # cached: their pins move with versions.json, which this key cannot see,
+      # and a stale stamp would silently ship a wrong-source binary under a
+      # fresh key. The key pins toolchain/windows.txt (generation) and the
+      # winbuild commit (the toolchain recipe); the run_id suffix plus prefix
+      # restore let every run save its progress, failed bootstraps included.
+      - name: Restore toolchain cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/windows/rustup
+            build/windows/${{ matrix.arch }}/install
+            build/windows/${{ matrix.arch }}/toolchain
+            build/windows/src/llvm*
+            build/windows/src/mingw-w64*
+            build/windows/src/winpthreads
+            build/windows/src/gcc-binutils
+            build/windows/src/cppwinrt
+            build/windows/src/gendef
+            build/windows/src/widl
+            build/windows/src/rustup
+          key: windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ github.run_id }}
+          restore-keys: |
+            windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-
+
+      - name: Build libmpv-windows (${{ matrix.arch }})
+        run: bash platforms/windows/build.sh ${{ matrix.arch }}
+
+      # package.sh names the zip by content key itself, so the build leg
+      # uploads it as-is; publish-windows records every variant at once.
+      - name: Package dev zip (${{ matrix.arch }})
+        run: bash platforms/windows/package.sh ${{ matrix.arch }}
+
+      - name: Save toolchain cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/windows/rustup
+            build/windows/${{ matrix.arch }}/install
+            build/windows/${{ matrix.arch }}/toolchain
+            build/windows/src/llvm*
+            build/windows/src/mingw-w64*
+            build/windows/src/winpthreads
+            build/windows/src/gcc-binutils
+            build/windows/src/cppwinrt
+            build/windows/src/gendef
+            build/windows/src/widl
+            build/windows/src/rustup
+          key: windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ github.run_id }}
+
+      - name: Upload platform build (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: ./dist/release/*.zip
+          if-no-files-found: error
+
+  publish-windows:
+    name: Publish windows
+    needs: build-windows
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: ./dist/partials
+
+      - name: Collect release assets
+        run: |
+          mkdir -p dist/release
+          find dist/partials -type f -exec cp -v {} dist/release/ \;
+
+      - name: Record variants in the manifest
+        run: |
+          for variant in x86_64 aarch64; do
+            python3 scripts/keys.py record-platform \
+              --platform-group windows \
+              --platform "${variant}" \
+              --release-dir dist/release
+          done
+
+      - name: Verify manifest matches this commit
+        run: python3 scripts/keys.py verify --platform-group windows
+
+      - name: Upload binaries that are not published yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view binaries-windows >/dev/null 2>&1; then
+            gh release create binaries-windows \
+              --prerelease \
+              --title "Rolling binaries (windows)" \
+              --notes "Content-addressed windows build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
+          fi
+
+          gh release view binaries-windows --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          group = 'windows'
+          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
+          section = manifest['platforms'][group]
+          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          release_dir = Path('dist/release')
+
+          wanted = []
+          for library, entry in sorted(section['libraries'].items()):
+            for variant in sorted(entry.get('prebuilt', {})):
+              wanted.append((library, entry['prebuilt'][variant]['asset']))
+
+          uploads = []
+          seen = set()
+          missing = []
+          for library, asset in wanted:
+            if asset in seen:
+              continue
+            seen.add(asset)
+            if asset in published:
+              print(f'published {asset}')
+              continue
+            path = release_dir / asset
+            if path.is_file():
+              uploads.append(path)
+            else:
+              missing.append(f'{library}: {asset}')
+
+          # A manifest asset that is neither published nor built would leave a
+          # dead URL in artifacts.json, so refuse to commit that manifest.
+          if missing:
+            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
+
+          if not uploads:
+            print('every manifest asset is already published')
+          else:
+            for path in uploads:
+              print(f'upload    {path.name}')
+            # No --clobber: an existing name is the same bytes by construction.
+            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
+          PY
+
+      - name: Upload manifest for the commit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-windows
+          path: ./artifacts.json
+          if-no-files-found: error
+
+  manifest:
+    name: Commit manifest
+    # All-or-nothing composition: every group the plan job marked stale must
+    # have published successfully, and at least one group must have published
+    # (all-clean runs have nothing to splice and are fully verified by the
+    # plan job). A group with nothing stale keeps its committed section; the
+    # splice below composes however many manifest-* artifacts arrive.
+    needs: [plan, publish-apple, publish-android, publish-linux, publish-windows]
+    if: >-
+      !cancelled() &&
+      (needs.publish-apple.result == 'success' ||
+       needs.publish-android.result == 'success' ||
+       needs.publish-linux.result == 'success' ||
+       needs.publish-windows.result == 'success') &&
+      (needs.plan.outputs.any_apple == 'false' || needs.publish-apple.result == 'success') &&
+      (needs.plan.outputs.any_android == 'false' || needs.publish-android.result == 'success') &&
+      (needs.plan.outputs.any_linux == 'false' || needs.publish-linux.result == 'success') &&
+      (needs.plan.outputs.any_windows == 'false' || needs.publish-windows.result == 'success')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download group manifests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: ./dist/manifests
+
+      # Each group's publish job rewrote only its own platforms.<group> section
+      # of artifacts.json (keys.py re-serializes the rest untouched), so
+      # splicing every downloaded section into the checked-out manifest
+      # composes the groups. The serialization below matches keys.py
+      # save_manifest byte for byte.
+      - name: Splice group sections into artifacts.json
+        run: |
+          python3 - <<'PY'
+          import json
+          import shutil
+          from pathlib import Path
+
+          manifest_path = Path('artifacts.json')
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          partials = sorted(Path('dist/manifests').glob('manifest-*'))
+          if not partials:
+            raise SystemExit('no group manifests were downloaded')
+
+          for partial in partials:
+            group = partial.name[len('manifest-'):]
+            data = json.loads((partial / 'artifacts.json').read_text(encoding='utf-8'))
+            manifest['platforms'][group] = data['platforms'][group]
+            print(f'spliced platforms.{group}')
+            if group == 'apple':
+              # Package.swift is rendered from the apple section alone.
+              shutil.copy2(partial / 'Package.swift', 'Package.swift')
+
+          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+
+      - name: Check for manifest changes
+        id: changes
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git status --porcelain -- Package.swift artifacts.json)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # No pull/rebase before this: if main moved while the binaries were
+      # building, this run is superseded and its push is meant to be rejected.
+      # Rebasing would land a manifest computed from an older tree on top of the
+      # newer one, which is exactly the skew `verify` exists to prevent; the
+      # queued run for the newer commit publishes the right manifest instead.
+      # The assets uploaded above are content-addressed, so that run reuses them.
+      - name: Push binary manifest
+        if: steps.changes.outputs.changed == 'true'
+        uses: EndBug/add-and-commit@v9
+        with:
+          default_author: github_actions
+          add: |
+            - Package.swift
+            - artifacts.json
+          message: "chore: binaries for ${{ steps.changes.outputs.short_sha }} [skip binaries]"
+          push: "origin HEAD:${{ github.ref_name }}"

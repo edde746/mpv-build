@@ -1,0 +1,77 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 102c53d..9ef38cc 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -94,6 +94,8 @@ - (void)invalidate;
+     int es_len;
+     int64_t es_head;             // stream offset of es_buf[0]
+     int64_t es_pts;              // ns of audio appended since the item epoch
++    int64_t pulled_samples;      // IEC samples handed over by ao_read_data
++    int64_t es_dropped_ns;       // AU periods pulled but never appended
+     // Last complete access unit, kept to satisfy far-offset probes: the
+     // system estimates duration/bitrate by reading near the end of the fake
+     // endless resource, and refusing those reads parks preroll forever.
+@@ -271,6 +273,8 @@ static void avp_append_es(struct ao *ao, const uint8_t *payload, int payload_len
+     if (payload_len & 1) {
+         // (E-)AC-3 frame sizes are counted in 16-bit words
+         MP_WARN(ao, "discarding burst with odd payload length\n");
++        p->es_dropped_ns += CMTimeGetNanoseconds(
++            CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
+         return;
+     }
+     if (p->es_len + payload_len > p->es_size) {
+@@ -287,6 +291,8 @@ static void avp_append_es(struct ao *ao, const uint8_t *payload, int payload_len
+     }
+     if (dst[0] != 0x0b || dst[1] != 0x77) {
+         MP_WARN(ao, "discarding burst without syncframe\n");
++        p->es_dropped_ns += CMTimeGetNanoseconds(
++            CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
+         return;
+     }
+     memcpy(p->au_buf, dst, payload_len);
+@@ -315,9 +321,18 @@ static bool avp_pull(struct ao *ao)
+     int64_t cur_time_av = avp_current_time_ns(ao);
+     int64_t cur_time_mp = mp_time_ns();
+     int64_t time_delta = CMTimeGetNanoseconds(CMTimeMake(request_sample_count, samplerate));
++    // The end time handed to ao_read_data becomes mpv's audio clock verbatim
++    // (buffer_state.end_time_ns), and audio-slaved video follows it frame by
++    // frame. The IEC 61937 stream is isochronous, so samples pulled measure
++    // written stream time exactly (minus AU periods that never reached the
++    // ES). es_pts is unusable here: it is credited a whole burst period the
++    // moment a payload lands, which sawtooths the clock by up to 32 ms, and
++    // video retires every wrap as a visible skip/hold pair (plezy#1776).
++    int64_t written_ns = CMTimeGetNanoseconds(
++        CMTimeMake(p->pulled_samples, samplerate)) - p->es_dropped_ns;
+     void *data[] = {p->stash + p->stash_len};
+     int real_sample_count = ao_read_data(ao, data, request_sample_count,
+-        p->es_pts - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
++        written_ns - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
+     if (eof) {
+         p->avp_eof = true;
+         ao_stop_streaming(ao);
+@@ -325,6 +340,7 @@ static bool avp_pull(struct ao *ao)
+     if (real_sample_count == 0)
+         return false;
+     p->stash_len += real_sample_count * sstride;
++    p->pulled_samples += real_sample_count;
+ 
+     // extract every complete IEC 61937 burst
+     int pos = 0;
+@@ -563,6 +579,8 @@ static void avp_create_item(struct ao *ao)
+     p->es_len = 0;
+     p->es_head = 0;
+     p->es_pts = 0;
++    p->pulled_samples = 0;
++    p->es_dropped_ns = 0;
+     p->avp_eof = false;
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;
+@@ -596,6 +614,8 @@ static void avp_teardown_item(struct ao *ao)
+     p->es_len = 0;
+     p->es_head = 0;
+     p->es_pts = 0;
++    p->pulled_samples = 0;
++    p->es_dropped_ns = 0;
+     p->avp_eof = false;
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;

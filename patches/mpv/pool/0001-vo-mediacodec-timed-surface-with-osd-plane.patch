@@ -1,0 +1,541 @@
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 814e1e4..b7d0cfb 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -723,6 +723,28 @@ Available video output drivers are:
+         :yes:   Attempt to enable VRR, whether the capability is reported or not.
+         :auto:  Attempt to enable VRR if support is reported.
+ 
++``mediacodec`` (Android)
++    Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``
++    with per-frame presentation timestamps, and renders subtitles/OSD into a
++    second, transparent ``android.view.Surface``. Requires
++    ``--wid=(intptr_t)(*android.view.Surface)`` and, for OSD/subtitles,
++    ``--vo-mediacodec-osd-surface=(intptr_t)(*android.view.Surface)``.
++    Hardware sessions require ``--hwdec=mediacodec`` (not ``-copy``); software
++    frames are rejected, since copying them in would connect the Surface as a
++    CPU producer and prevent a GL VO from binding it later.
++
++    The embedder owns geometry: the video Surface must be sized to the
++    aspect-corrected video rectangle (decoded buffers are scaled to the whole
++    Surface), and the OSD Surface must be placed directly above it with the
++    same bounds. Since decoded buffers go straight to the system compositor,
++    the decoder's dataspace (HDR) is preserved and no GPU pass runs, but
++    video filters and screenshots are unavailable.
++
++    On Android 11+ the driver also votes the presentation frame rate on the
++    video Surface (``ANativeWindow_setFrameRate``, seamless-only), so the
++    compositor can match the display refresh; deliberate display-mode
++    switches remain the embedder's job.
++
+ ``mediacodec_embed`` (Android)
+     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
+     Requires ``--hwdec=mediacodec`` for hardware decoding, along with
+diff --git a/meson.build b/meson.build
+index fb10be5..a77c20d 100644
+--- a/meson.build
++++ b/meson.build
+@@ -474,6 +474,7 @@ if features['android']
+     sources += files('misc/jni.c',
+                      'osdep/android/strnlen.c',
+                      'video/out/android_common.c',
++                     'video/out/vo_mediacodec.c',
+                      'video/out/vo_mediacodec_embed.c')
+ endif
+ 
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..c8cb30e 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -46,6 +46,7 @@
+ #include "osdep/io.h"
+ #include "osdep/threads.h"
+ 
++extern const struct vo_driver video_out_mediacodec;
+ extern const struct vo_driver video_out_mediacodec_embed;
+ extern const struct vo_driver video_out_x11;
+ extern const struct vo_driver video_out_vdpau;
+@@ -86,6 +87,7 @@ static const struct vo_driver *const video_out_drivers[] =
+     &video_out_xv,
+ #endif
+ #if HAVE_ANDROID
++    &video_out_mediacodec,
+     &video_out_mediacodec_embed,
+ #endif
+ #if HAVE_SDL2_VIDEO
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+new file mode 100644
+index 0000000..d92f185
+--- /dev/null
++++ b/video/out/vo_mediacodec.c
+@@ -0,0 +1,470 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Timed MediaCodec Surface video output with a sibling OSD plane.
++ *
++ * Like vo_mediacodec_embed, decoded buffers are handed straight to the
++ * android.view.Surface passed via --wid: the display path is decoder ->
++ * BufferQueue -> system compositor, with no GPU pass and with the decoder's
++ * dataspace (HDR10/HLG) intact. Unlike the embed VO:
++ *
++ *  - Frames are presented with MediaCodec.releaseOutputBuffer(index, ns)
++ *    (av_mediacodec_render_buffer_at_time), scheduled at the frame's target
++ *    display time in the CLOCK_MONOTONIC domain, so the compositor latches
++ *    each frame on the intended vsync instead of "as soon as possible".
++ *  - OSD and subtitles are rendered. A second, transparent Surface is passed
++ *    via --vo-mediacodec-osd-surface; mpv rasterizes the OSD with
++ *    mp_draw_sub_overlay (libass runs on the CPU as usual) and blits only the
++ *    modified region into that surface. The OSD plane must be positioned by
++ *    the embedder directly on top of the video Surface and sized to the same
++ *    rectangle: OSD coordinate space == OSD surface == video rectangle.
++ *    The OSD buffer for a frame is posted immediately before the video
++ *    buffer's timed release, so both latch on the same vsync in the common
++ *    case. (A guaranteed pairing via ASurfaceControl transactions with
++ *    setDesiredPresentTime is a possible future upgrade; it needs API 29.)
++ *
++ * The embedder owns all geometry: the video Surface must be sized to the
++ * aspect-corrected video rectangle (MediaCodec scales the decoded buffer to
++ * whatever the Surface is), and the OSD Surface must track it. Consequently
++ * VOCTRL_SET_PANSCAN and friends are not implemented, mirroring how the
++ * avfoundation VO leaves zoom to the embedding layer.
++ *
++ * Hardware sessions require --hwdec=mediacodec (not -copy), whose frames go
++ * through the timed release path above. Software frames are refused
++ * (query_format): copying them in would connect the Surface as a CPU
++ * producer, which permanently prevents EGL from binding it, so the embedder
++ * must route a software-decoding session to a GL VO instead.
++ */
++
++#include <dlfcn.h>
++#include <math.h>
++#include <time.h>
++
++#include <android/native_window.h>
++#include <android/native_window_jni.h>
++
++#include <libavcodec/mediacodec.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_mediacodec.h>
++
++#include "common/common.h"
++#include "misc/jni.h"
++#include "options/m_option.h"
++#include "osdep/timer.h"
++#include "sub/draw_bmp.h"
++#include "sub/osd.h"
++#include "video/hwdec.h"
++#include "video/mp_image.h"
++#include "vo.h"
++
++struct priv {
++    // Most recent frame. Kept after presentation so OSD redraws (e.g. while
++    // paused) still know the video pts; its MediaCodec buffer must only be
++    // released once.
++    struct mp_image *cur_image;
++    int64_t cur_pts; // mp_time_ns() target display time, 0 = immediately
++    bool cur_presented;
++
++    struct mp_hwdec_ctx hwctx;
++
++    ANativeWindow *osd_window;
++    struct mp_draw_sub_cache *osd_cache;
++    int osd_w, osd_h;
++    bool osd_force_full;
++    bool osd_missing_logged;
++
++    // The wid Surface, for the frame-rate vote only. Never locked: a CPU
++    // producer connection would leave it unusable for EGL.
++    ANativeWindow *video_window;
++
++    // Seamless frame-rate vote (ANativeWindow_setFrameRate, API 30+).
++    float voted_fps;
++    int64_t last_vote_ns;
++    bool hint_failed;
++
++    // options
++    int64_t osd_surface;
++};
++
++// ANativeWindow_setFrameRate is API 30+; resolved at runtime so the minSdk 25
++// (Fire OS 6) build keeps loading. Value from android/native_window.h.
++#define ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE 1
++
++typedef int32_t (*mp_set_frame_rate_fn)(ANativeWindow *, float, int8_t);
++
++static mp_set_frame_rate_fn get_set_frame_rate(void)
++{
++    static mp_set_frame_rate_fn set_frame_rate;
++    static bool resolved;
++    if (!resolved) {
++        void *lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_GLOBAL);
++        if (lib)
++            set_frame_rate = dlsym(lib, "ANativeWindow_setFrameRate");
++        resolved = true;
++    }
++    return set_frame_rate;
++}
++
++// Vote the presentation cadence on the video Surface so SurfaceFlinger can
++// pick a matching refresh rate and pace latching. Seamless-only by design
++// (the API 30 entry point never switches modes non-seamlessly); the embedder
++// owns deliberate display-mode changes. Mirrors MediaCodecVideoRenderer's
++// FIXED_SOURCE vote, but derives the rate from mpv's speed-adjusted frame
++// duration, so speeded playback votes what is actually presented.
++static void update_frame_rate_hint(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!p->video_window || p->hint_failed || frame->duration <= 0)
++        return;
++    mp_set_frame_rate_fn set_frame_rate = get_set_frame_rate();
++    if (!set_frame_rate)
++        return;
++
++    float fps = (float)(1e9 / frame->duration);
++    if (fps < 1.0f || fps > 1000.0f)
++        return;
++    // Estimated durations jitter; re-vote only on a real change, and at most
++    // twice a second so VFR content does not spam SurfaceFlinger.
++    int64_t now = mp_time_ns();
++    if (p->voted_fps > 0 && (fabsf(fps - p->voted_fps) < 0.01f ||
++                             now - p->last_vote_ns < MP_TIME_MS_TO_NS(500)))
++        return;
++
++    if (set_frame_rate(p->video_window, fps,
++                       ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) != 0) {
++        MP_VERBOSE(vo, "Frame rate hint rejected; disabling.\n");
++        p->hint_failed = true;
++        return;
++    }
++    p->voted_fps = fps;
++    p->last_vote_ns = now;
++    MP_VERBOSE(vo, "Frame rate hint: %.3f fps\n", fps);
++}
++
++static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
++{
++    if (vo->opts->WinID == 0 || vo->opts->WinID == -1)
++        return NULL;
++
++    AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
++    if (!device_ref)
++        return NULL;
++
++    AVHWDeviceContext *ctx = (void *)device_ref->data;
++    AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
++    hwctx->surface = (void *)(intptr_t)(vo->opts->WinID);
++
++    if (av_hwdevice_ctx_init(device_ref) < 0)
++        av_buffer_unref(&device_ref);
++
++    return device_ref;
++}
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    vo->hwdec_devs = hwdec_devices_create();
++    p->hwctx = (struct mp_hwdec_ctx){
++        .driver_name = "mediacodec",
++        .av_device_ref = create_mediacodec_device_ref(vo),
++        .hw_imgfmt = IMGFMT_MEDIACODEC,
++    };
++
++    if (!p->hwctx.av_device_ref) {
++        MP_ERR(vo, "Failed to create hwdevice_ctx; --wid must be a Surface.\n");
++        return -1;
++    }
++
++    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++
++    if (p->osd_surface && p->osd_surface != -1) {
++        JNIEnv *env = mp_jni_get_env(vo->log);
++        if (env) {
++            p->osd_window = ANativeWindow_fromSurface(env,
++                    (jobject)(intptr_t)p->osd_surface);
++        }
++        if (p->osd_window) {
++            ANativeWindow_setBuffersGeometry(p->osd_window, 0, 0,
++                                             WINDOW_FORMAT_RGBA_8888);
++            p->osd_force_full = true;
++        } else {
++            MP_ERR(vo, "Failed to wrap the OSD surface; "
++                       "subtitles/OSD will not render.\n");
++        }
++    }
++
++    return 0;
++}
++
++// Convert a time in mp_time_ns() units to CLOCK_MONOTONIC (the domain of
++// System.nanoTime(), which MediaCodec release timestamps use). mpv's raw
++// timer may run on CLOCK_MONOTONIC_RAW, so sample the offset here instead of
++// reusing mp_raw_time_ns().
++static int64_t mp_time_to_monotonic_ns(int64_t mp_time)
++{
++    struct timespec ts;
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
++        return 0;
++    int64_t mono_now = ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++    return mp_time - mp_time_ns() + mono_now;
++}
++
++// BGRA (mpv IMGFMT_BGRA byte order B,G,R,A) -> RGBA_8888 (R,G,B,A), both
++// premultiplied alpha. Word-wise R/B swap.
++static void copy_bgra_to_rgba(uint8_t *dst, ptrdiff_t dst_stride,
++                              const uint8_t *src, ptrdiff_t src_stride,
++                              int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        uint32_t *d = (uint32_t *)(dst + y * dst_stride);
++        const uint32_t *s = (const uint32_t *)(src + y * src_stride);
++        for (int x = 0; x < w; x++) {
++            uint32_t c = s[x];
++            d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
++        }
++    }
++}
++
++static void draw_osd(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_window) {
++        if (!p->osd_missing_logged) {
++            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
++                        "subtitles/OSD are not rendered.\n");
++            p->osd_missing_logged = true;
++        }
++        return;
++    }
++
++    int w = ANativeWindow_getWidth(p->osd_window);
++    int h = ANativeWindow_getHeight(p->osd_window);
++    if (w <= 0 || h <= 0)
++        return;
++
++    if (w != p->osd_w || h != p->osd_h) {
++        p->osd_w = w;
++        p->osd_h = h;
++        p->osd_force_full = true;
++    }
++
++    struct mp_osd_res res = {
++        .w = w,
++        .h = h,
++        .display_par = 1,
++    };
++
++    double pts = p->cur_image ? p->cur_image->pts : 0;
++    struct sub_bitmap_list *sbs =
++        osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
++    if (!sbs)
++        return;
++
++    if (!p->osd_cache)
++        p->osd_cache = mp_draw_sub_alloc(p, vo->global);
++
++    struct mp_rect act_rc[1], mod_rc[64];
++    int num_act_rc = 0, num_mod_rc = 0;
++    struct mp_image *osd = mp_draw_sub_overlay(p->osd_cache, sbs,
++            act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
++            mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc);
++    if (!osd)
++        goto done;
++    if (!num_mod_rc && !p->osd_force_full)
++        goto done; // OSD unchanged; keep the currently posted buffer
++
++    struct mp_rect dirty = {0, 0, w, h};
++    if (!p->osd_force_full) {
++        dirty = mod_rc[0];
++        for (int n = 1; n < num_mod_rc; n++)
++            mp_rect_union(&dirty, &mod_rc[n]);
++    }
++
++    // In/out: the system grows this to every region we must repaint (the
++    // dequeued buffer usually lags the last posted one).
++    ARect bounds = {dirty.x0, dirty.y0, dirty.x1, dirty.y1};
++    ANativeWindow_Buffer buffer;
++    if (ANativeWindow_lock(p->osd_window, &buffer, &bounds) != 0) {
++        MP_WARN(vo, "Failed to lock the OSD surface.\n");
++        p->osd_force_full = true;
++        goto done;
++    }
++
++    if (buffer.format != WINDOW_FORMAT_RGBA_8888 &&
++        buffer.format != WINDOW_FORMAT_RGBX_8888)
++    {
++        MP_ERR(vo, "Unexpected OSD buffer format %d.\n", buffer.format);
++        ANativeWindow_unlockAndPost(p->osd_window);
++        goto done;
++    }
++
++    // Mid-resize race: the buffer no longer matches the rendered overlay.
++    // Paint what we can and repaint fully on the next pass.
++    if (buffer.width != w || buffer.height != h)
++        p->osd_force_full = true;
++    else
++        p->osd_force_full = false;
++
++    int x0 = MPCLAMP(bounds.left, 0, buffer.width);
++    int y0 = MPCLAMP(bounds.top, 0, buffer.height);
++    int x1 = MPCLAMP(bounds.right, x0, buffer.width);
++    int y1 = MPCLAMP(bounds.bottom, y0, buffer.height);
++
++    ptrdiff_t dst_stride = (ptrdiff_t)buffer.stride * 4;
++    uint8_t *dst = (uint8_t *)buffer.bits + y0 * dst_stride + x0 * 4;
++
++    // Region covered by the overlay: swizzled copy. Region outside (only
++    // reachable in the resize race): transparent black.
++    int ow = MPCLAMP(osd->w - x0, 0, x1 - x0);
++    int oh = MPCLAMP(osd->h - y0, 0, y1 - y0);
++    if (ow > 0 && oh > 0) {
++        copy_bgra_to_rgba(dst, dst_stride,
++                          (uint8_t *)osd->planes[0] +
++                              (ptrdiff_t)y0 * osd->stride[0] + (ptrdiff_t)x0 * 4,
++                          osd->stride[0], ow, oh);
++    }
++    for (int y = 0; y < y1 - y0; y++) {
++        uint8_t *row = dst + y * dst_stride;
++        int filled = y < oh ? ow : 0;
++        if (filled < x1 - x0)
++            memset(row + (ptrdiff_t)filled * 4, 0, ((ptrdiff_t)(x1 - x0) - filled) * 4);
++    }
++
++    ANativeWindow_unlockAndPost(p->osd_window);
++
++done:
++    talloc_free(sbs);
++}
++
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++
++    if (!frame->redraw && !frame->repeat) {
++        update_frame_rate_hint(vo, frame);
++        talloc_free(p->cur_image);
++        p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
++        p->cur_pts = frame->pts;
++        p->cur_presented = false;
++    }
++
++    return VO_TRUE;
++}
++
++static void flip_page(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    // Post the OSD first: an immediate post latches on the next vsync, which
++    // is the vsync the video buffer's (near-future) timestamp targets.
++    draw_osd(vo);
++
++    if (!p->cur_image || p->cur_presented)
++        return;
++
++    AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
++
++    // releaseOutputBuffer(index, ns) drops buffers whose timestamp is not
++    // "reasonably close" to System.nanoTime(); Android documents roughly one
++    // second. Late or unset targets present immediately.
++    int64_t target = p->cur_pts > 0 ? mp_time_to_monotonic_ns(p->cur_pts) : 0;
++    if (target > 0) {
++        struct timespec ts;
++        int64_t mono_now = clock_gettime(CLOCK_MONOTONIC, &ts) == 0
++            ? ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec : 0;
++        if (mono_now <= 0 || target <= mono_now ||
++            target > mono_now + MP_TIME_MS_TO_NS(500))
++            target = 0;
++    }
++
++    if (target > 0) {
++        av_mediacodec_render_buffer_at_time(buffer, target);
++    } else {
++        av_mediacodec_release_buffer(buffer, 1);
++    }
++    p->cur_presented = true;
++}
++
++static int query_format(struct vo *vo, int format)
++{
++    return format == IMGFMT_MEDIACODEC;
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
++    return VO_NOTIMPL;
++}
++
++static int reconfig(struct vo *vo, struct mp_image_params *params)
++{
++    struct priv *p = vo->priv;
++    p->osd_force_full = true;
++
++    // Wrapped for the frame-rate vote only; MediaCodec stays the sole producer.
++    if (!p->video_window) {
++        JNIEnv *env = mp_jni_get_env(vo->log);
++        if (env) {
++            p->video_window = ANativeWindow_fromSurface(env,
++                    (jobject)(intptr_t)vo->opts->WinID);
++        }
++    }
++    p->voted_fps = 0; // re-vote per format; cadence may change
++
++    mp_image_unrefp(&p->cur_image);
++    return 0;
++}
++
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    mp_image_unrefp(&p->cur_image);
++
++    hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
++    av_buffer_unref(&p->hwctx.av_device_ref);
++
++    if (p->osd_window)
++        ANativeWindow_release(p->osd_window);
++    if (p->video_window) {
++        // Clear our frame-rate vote; the Surface layer outlives this vo.
++        mp_set_frame_rate_fn set_frame_rate = get_set_frame_rate();
++        if (set_frame_rate && p->voted_fps > 0)
++            set_frame_rate(p->video_window, 0.0f,
++                           ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
++        ANativeWindow_release(p->video_window);
++    }
++}
++
++#define OPT_BASE_STRUCT struct priv
++
++const struct vo_driver video_out_mediacodec = {
++    .description = "Android (Timed MediaCodec Surface with OSD plane)",
++    .name = "mediacodec",
++    .preinit = preinit,
++    .query_format = query_format,
++    .control = control,
++    .draw_frame = draw_frame,
++    .flip_page = flip_page,
++    .reconfig = reconfig,
++    .uninit = uninit,
++    .priv_size = sizeof(struct priv),
++    .options = (const struct m_option[]){
++        {"osd-surface", OPT_INT64(osd_surface)},
++        {0}
++    },
++    .options_prefix = "vo-mediacodec",
++};

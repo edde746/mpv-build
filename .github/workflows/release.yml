@@ -1,0 +1,88 @@
+name: Release
+
+# A release is a label on a commit, nothing more. The binaries a tag ships were
+# already published by "Publish binaries" and are pinned by content-addressed
+# URL in Package.swift, so this workflow builds nothing and uploads nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag name (default mpv version)"
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Tag and release
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Refuse to tag a commit whose Package.swift does not match the binaries
+      # published for it: the tag would ship URLs nobody can resolve.
+      - name: Verify binaries match this commit
+        run: python3 scripts/keys.py verify --platform-group apple
+
+      - name: Collect release metadata
+        id: version
+        env:
+          REQUESTED_RELEASE_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import textwrap
+          from pathlib import Path
+
+          def normalize_version(version_string):
+            version_string = re.sub(r'[^.0-9]+|-.+', '', version_string)
+            parts = re.split(r'\.', version_string)
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            patch = int(parts[2]) if len(parts) > 2 else 0
+            return f"{major}.{minor}.{patch}"
+
+          file_path = Path('./Sources/BuildScripts/XCFrameworkBuild/main.swift')
+          content = file_path.read_text(encoding='utf-8')
+
+          mpv_version = re.search(r'(case .libmpv[^"]+?)"(.+?)"', content).group(2)
+          ffmpeg_version = re.search(r'(case .FFmpeg[^"]+?)"(.+?)"', content).group(2)
+          libplacebo_version = re.search(r'(case .libplacebo[^"]+?)"(.+?)"', content).group(2)
+          vulkan_version = re.search(r'(case .vulkan[^"]+?)"(.+?)"', content).group(2)
+
+          release_version = os.environ.get('REQUESTED_RELEASE_VERSION') or normalize_version(mpv_version)
+          print(f'mpv version: {mpv_version}')
+          print(f'ffmpeg version: {ffmpeg_version}')
+          print(f'release version: {release_version}')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+            output.write(f'build_version={mpv_version}\n')
+            output.write(f'release_version={release_version}\n')
+
+          Path('/tmp/RELEASE_NOTE.txt').write_text(textwrap.dedent(f'''
+          * mpv version: {mpv_version} ([changelog](https://github.com/mpv-player/mpv/releases/tag/{mpv_version}))
+          * ffmpeg version: {ffmpeg_version} ([changelog](https://github.com/FFmpeg/FFmpeg/blob/{ffmpeg_version}/Changelog))
+          * placebo version: v{libplacebo_version}
+          * MoltenVK version: v{vulkan_version}
+
+          Binaries are pinned by content hash from the [rolling apple binaries](https://github.com/edde746/mpv-build/releases/tag/binaries-apple) prerelease; this tag carries no assets of its own.
+          ''').strip() + '\n', encoding='utf-8')
+          PY
+
+      - name: Create tag and release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.release_version }}
+          tag_name: ${{ steps.version.outputs.release_version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ contains(steps.version.outputs.release_version, '-') }}
+          body_path: /tmp/RELEASE_NOTE.txt
+          generate_release_notes: true

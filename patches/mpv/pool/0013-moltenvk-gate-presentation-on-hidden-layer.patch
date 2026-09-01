@@ -1,0 +1,68 @@
+diff --git a/video/out/vulkan/context_moltenvk.m b/video/out/vulkan/context_moltenvk.m
+index 8c8354d..70c7cdc 100644
+--- a/video/out/vulkan/context_moltenvk.m
++++ b/video/out/vulkan/context_moltenvk.m
+@@ -28,6 +28,7 @@
+     CAMetalLayer *layer;
+     int last_width;
+     int last_height;
++    bool was_hidden;
+ };
+ 
+ // Use CAMetalLayer.drawableSize as source of truth (not vo->dwidth/dheight)
+@@ -63,6 +64,18 @@ static void moltenvk_uninit(struct ra_ctx *ctx)
+     mpvk_uninit(&p->vk);
+ }
+ 
++// Presentation gate: the embedding app hides the CAMetalLayer while the
++// window is occluded, the app is hidden, or the displays are asleep.
++// Skipping start_frame while hidden prevents present-completion spins in
++// the swapchain (one core pinned at 100% after long display sleep).
++// CALayer reads are safe off the main thread; upstream context_mac.m
++// reads NSWindow.occlusionState from this same hook.
++static bool moltenvk_check_visible(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    return !p->layer.hidden;
++}
++
+ static bool moltenvk_init(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+@@ -78,6 +91,7 @@ static bool moltenvk_init(struct ra_ctx *ctx)
+         goto fail;
+ 
+     p->layer = (__bridge CAMetalLayer *)(intptr_t)ctx->vo->opts->WinID;
++    p->was_hidden = p->layer.hidden;
+ 
+     VkMetalSurfaceCreateInfoEXT info = {
+         .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
+@@ -91,7 +105,11 @@ static bool moltenvk_init(struct ra_ctx *ctx)
+         goto fail;
+     }
+ 
+-    if (!ra_vk_ctx_init(ctx, vk, (struct ra_ctx_params){0}, VK_PRESENT_MODE_FIFO_KHR))
++    struct ra_ctx_params params = {
++        .check_visible = moltenvk_check_visible,
++    };
++
++    if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
+         goto fail;
+ 
+     // Force one initial resize from the layer size, if available.
+@@ -116,6 +134,15 @@ static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *
+         return VO_NOTIMPL;
+ 
+     struct priv *p = ctx->priv;
++
++    // Regression lesson from upstream (mpv#16693 / 9f153e2a): on becoming
++    // visible again a redraw must be forced, or a paused video shows a
++    // stale frame (redraws attempted while hidden were skipped).
++    bool hidden = p->layer.hidden;
++    if (p->was_hidden && !hidden)
++        *events |= VO_EVENT_EXPOSE;
++    p->was_hidden = hidden;
++
+     CGSize s = p->layer.drawableSize;
+     int w = (int)s.width;
+     int h = (int)s.height;

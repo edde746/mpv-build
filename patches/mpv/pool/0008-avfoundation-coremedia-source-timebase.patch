@@ -1,0 +1,53 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index e585f7d..a5056ca 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -325,6 +325,20 @@ static int64_t cm_time_to_ns(CMTime time)
+     return converted.value;
+ }
+ 
++// CMTimebase anchors must use the immediate CoreMedia source clock. mpv's
++// scheduled presentation timestamps share mp_time_ns()'s epoch, not CM host time.
++static CMTime source_time_for_mp_time(struct priv *p, int64_t target_mp_ns)
++{
++    CMClockOrTimebaseRef source = CMTimebaseCopySource(p->timebase);
++    CMTime source_now = source ? CMSyncGetTime(source) : kCMTimeInvalid;
++    if (source)
++        CFRelease(source);
++    if (!CMTIME_IS_NUMERIC(source_now))
++        source_now = CMClockGetTime(CMClockGetHostTimeClock());
++
++    return CMTimeAdd(source_now, cm_time_from_ns(target_mp_ns - mp_time_ns()));
++}
++
+ static int64_t current_media_time_ns(struct priv *p)
+ {
+     if (p->next_media_pts_valid)
+@@ -403,9 +417,10 @@ static void update_media_timebase_for_frame(struct vo *vo)
+     }
+ 
+     if (should_anchor) {
++        CMTime source_time = source_time_for_mp_time(p, present_host_ns);
+         OSStatus err = CMTimebaseSetRateAndAnchorTime(
+             p->timebase, rate, cm_time_from_ns(media_pts_ns),
+-            cm_time_from_ns(present_host_ns));
++            source_time);
+         if (err != noErr) {
+             MP_WARN(vo, "Failed to anchor AVFoundation media timebase: %d\n", (int)err);
+         }
+@@ -429,12 +444,11 @@ static void set_media_timebase_paused(struct vo *vo, bool paused)
+     if (paused) {
+         CMTime media_time = CMTimebaseGetTime(p->timebase);
+         if (!CMTIME_IS_NUMERIC(media_time)) {
+-            media_time = cm_time_from_ns(p->last_media_pts_valid
+-                ? p->last_media_pts_ns
+-                : 0);
++            media_time = cm_time_from_ns(current_media_time_ns(p));
+         }
++        CMTime source_time = source_time_for_mp_time(p, mp_time_ns());
+         OSStatus err = CMTimebaseSetRateAndAnchorTime(
+-            p->timebase, 0.0, media_time, cm_time_from_ns(mp_time_ns()));
++            p->timebase, 0.0, media_time, source_time);
+         if (err != noErr)
+             MP_WARN(vo, "Failed to pause AVFoundation media timebase: %d\n", (int)err);
+         p->timebase_paused = true;

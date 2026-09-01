@@ -1,0 +1,6 @@
+# Windows patch series for ffmpeg (applied after series.common, which is
+# empty today -- the videotoolbox/dolby-vision stack lives in series.apple).
+# Empty for wave 2: the pinning change is isolated first; parity promotion of
+# portable patches comes later. Entries are staged into the mpv-winbuild-cmake
+# checkout and applied with `git apply` by the injected PATCH_COMMAND (see
+# platforms/windows/pin_packages.py).

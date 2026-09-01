@@ -1,0 +1,290 @@
+{
+  "formatVersion": 1,
+  "refreshContract": {
+    "rules": [
+      "Audit each new upstream release before changing its version, URL, ref, commit, or SHA-256.",
+      "For an archive or prebuilt, verify upstream release evidence first, hash the complete reviewed file, and update URL and SHA-256 together.",
+      "For Git, verify the upstream release-producing tag record, record the full dereferenced root commit, and review its dependency lock or gitlinks before updating.",
+      "Run python3 scripts/patches.py check after changing any patch pool or series file, and bash scripts/test_patches.sh after changing scripts/patches.py.",
+      "Never derive an expected checksum from bytes inside the production build or verification command."
+    ]
+  },
+  "components": {
+    "mpv": {
+      "kind": "git",
+      "version": "v0.41.0",
+      "url": "https://github.com/mpv-player/mpv",
+      "ref": "v0.41.0",
+      "commit": "41f6a645068483470267271e1d09966ca3b9f413",
+      "provenance": "Tag carried over from main.swift; commit is the annotated tag's dereferenced target, resolved 2026-09-01 with `git ls-remote https://github.com/mpv-player/mpv 'refs/tags/v0.41.0*'` (peeled ^{} line).",
+      "platforms": ["apple", "android", "linux", "windows"],
+      "overrides": {
+        "linux": {
+          "kind": "archive",
+          "version": "0.40.0",
+          "url": "https://github.com/mpv-player/mpv/archive/refs/tags/v0.40.0.tar.gz",
+          "sha256": "10a0f4654f62140a6dd4d380dcf0bbdbdcf6e697556863dc499c296182f081a3",
+          "commit": "e48ac7ce08462f5e33af6ef9deeac6fa87eef01e",
+          "provenance": "GitHub reports annotated tag object 287d7cdb78975ae350d7c2a287eae3c2072c93f7 as a valid PGP signature over release commit e48ac7ce08462f5e33af6ef9deeac6fa87eef01e; the complete tag archive was then hashed. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared v0.41.0 git pin is a later deliberate step."
+        }
+      }
+    },
+    "ffmpeg": {
+      "kind": "git",
+      "version": "n8.0.1",
+      "url": "https://github.com/FFmpeg/FFmpeg",
+      "ref": "n8.0.1",
+      "commit": "894da5ca7d742e4429ffb2af534fcda0103ef593",
+      "provenance": "Tag carried over from main.swift; commit is the annotated tag's dereferenced target, resolved 2026-09-01 with `git ls-remote https://github.com/FFmpeg/FFmpeg 'refs/tags/n8.0.1*'` (peeled ^{} line).",
+      "platforms": ["apple", "android", "linux", "windows"],
+      "overrides": {
+        "linux": {
+          "kind": "archive",
+          "version": "7.1",
+          "url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz",
+          "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6",
+          "provenance": "FFmpeg release archive verified against ffmpeg-7.1.tar.xz.asc with the official ffmpeg-devel.asc full fingerprint FCF986EA15E6E293A5644F10B4322F04D67658D8 before recording this digest. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared n8.0.1 git pin is a later deliberate step."
+        }
+      }
+    },
+    "libass": {
+      "kind": "git",
+      "version": "0.18.3",
+      "url": "https://github.com/edde746/libass",
+      "ref": "0.18.3",
+      "commit": "76cdb2bc174828aac74a458d38a0786cb7af922d",
+      "provenance": "Tag carried over from main.swift; 0.18.3 on the edde746 fork is a lightweight tag, so the ls-remote sha IS the commit (resolved 2026-09-01 with `git ls-remote https://github.com/edde746/libass 'refs/tags/0.18.3*'`; no peeled ^{} line exists).",
+      "platforms": ["apple", "android", "linux", "windows"],
+      "overrides": {}
+    },
+    "mpv-winbuild-cmake": {
+      "kind": "git",
+      "version": "master-2026-09-01",
+      "url": "https://github.com/shinchiro/mpv-winbuild-cmake",
+      "ref": "master",
+      "commit": "cd1edc11dc6887a50f705717619d879f5a93a488",
+      "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the master tip was resolved 2026-09-01 with `git ls-remote https://github.com/shinchiro/mpv-winbuild-cmake refs/heads/master` and frozen by commit; its internal dependency pins are keyed through this commit (see platforms/windows/README.md).",
+      "platforms": ["windows"],
+      "overrides": {}
+    },
+    "dav1d": {
+      "kind": "git",
+      "version": "1.5.3",
+      "url": "https://code.videolan.org/videolan/dav1d",
+      "ref": "1.5.3",
+      "commit": "b546257f770768b2c88258c533da38b91a06f737",
+      "provenance": "Official VideoLAN GitLab annotated tag object 0664c109d1b85503bc32bf89920f951cacf5702e (1.5.3) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "platforms": ["android", "linux"],
+      "overrides": {
+        "linux": {
+          "version": "1.5.4",
+          "url": "https://code.videolan.org/videolan/dav1d.git",
+          "mirror": "https://github.com/videolan/dav1d.git",
+          "ref": "1.5.4",
+          "commit": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
+          "provenance": "Official VideoLAN GitLab tag record 1.5.4 dereferences to this root commit; upstream's own GitHub mirror (videolan/dav1d, not a fork) reports the same annotated tag object 191bdda98ec3c68137754dc97da1db34043d7cd4 dereferencing to that same commit. The tag is annotated by the dav1d maintainers but not GPG-verified by GitHub; the two independent remotes agreeing on the tag object and root commit is the pinning evidence. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way."
+        }
+      }
+    },
+    "shaderc": {
+      "kind": "git",
+      "version": "2024.4",
+      "url": "https://github.com/google/shaderc.git",
+      "ref": "v2024.4",
+      "commit": "caa54d9779d5605aca4e1a0c0c962a3d8f4aeb31",
+      "provenance": "Official GitHub annotated tag object 3cd72062f297df05e6a042f2616c42bc8956c326 dereferences to this root commit; its DEPS file pins synchronized dependencies by full commit.",
+      "platforms": ["linux"],
+      "overrides": {}
+    },
+    "mbedtls": {
+      "kind": "git",
+      "version": "3.6.5",
+      "url": "https://github.com/Mbed-TLS/mbedtls",
+      "ref": "v3.6.5",
+      "commit": "e185d7fd85499c8ce5ca2a54f5cf8fe7dbe3f8df",
+      "provenance": "Official Mbed-TLS GitHub annotated tag object d934b47669d1cc60c72caecae2ae2a45aea70c79 (v3.6.5) dereferences to this root commit; its gitlinks pin the mbedtls-framework submodule the android driver clones recursively. TODO(provenance): review the framework gitlink target before the next bump.",
+      "platforms": ["android"],
+      "overrides": {}
+    },
+    "freetype": {
+      "kind": "git",
+      "version": "2.14.1",
+      "url": "https://gitlab.freedesktop.org/freetype/freetype",
+      "ref": "VER-2-14-1",
+      "commit": "526ec5c47b9ebccc4754c85ac0c0cdf7c85a5e9b",
+      "provenance": "Official freedesktop GitLab annotated tag object 3bd82b5f543bc84ccf2b1d0cdb63b95218099ee6 (VER-2-14-1) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "platforms": ["android"],
+      "overrides": {}
+    },
+    "fribidi": {
+      "kind": "git",
+      "version": "1.0.16",
+      "url": "https://github.com/fribidi/fribidi",
+      "ref": "v1.0.16",
+      "commit": "68162babff4f39c4e2dc164a5e825af93bda9983",
+      "provenance": "Official fribidi GitHub annotated tag object 9123b467f080c7ea15509bd7cbd457817544a7e1 (v1.0.16) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "platforms": ["android"],
+      "overrides": {}
+    },
+    "harfbuzz": {
+      "kind": "git",
+      "version": "12.3.2",
+      "url": "https://github.com/harfbuzz/harfbuzz",
+      "ref": "12.3.2",
+      "commit": "b42511e071162fe76102f613a6ccc009726c99af",
+      "provenance": "Official harfbuzz GitHub annotated tag object bf8ab7cd50cbcbcb2fd9021a3269d788991185f6 (12.3.2) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "platforms": ["android"],
+      "overrides": {}
+    },
+    "lua": {
+      "kind": "archive",
+      "version": "5.2.4",
+      "url": "https://www.lua.org/ftp/lua-5.2.4.tar.gz",
+      "sha256": "b9e2e4aad6789b3b63a056d442f7b39f0ecfca3ae0f1fc0ae4e9614401b69f4b",
+      "provenance": "Hashed the complete archive fetched from upstream lua.org over https on 2026-09-01; the digest equals lua.org's long-published 5.2.4 checksum. libmpv-android pinned the same version over plain http without a hash.",
+      "platforms": ["android"],
+      "overrides": {}
+    },
+    "libunibreak": {
+      "kind": "prebuilt",
+      "version": "0.17.4",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libunibreak-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple", "android"],
+      "overrides": {
+        "android": {
+          "kind": "archive",
+          "version": "6.1",
+          "url": "https://github.com/adah1972/libunibreak/releases/download/libunibreak_6_1/libunibreak-6.1.tar.gz",
+          "sha256": "cc4de0099cf7ff05005ceabff4afed4c582a736abc38033e70fdac86335ce93f",
+          "provenance": "Hashed the complete 6.1 release tarball fetched from the upstream adah1972/libunibreak GitHub release on 2026-09-01; the pinned version is carried over from libmpv-android's depinfo. TODO(provenance): cross-check the upstream release record's own published checksum before the next bump."
+        }
+      }
+    },
+    "libfreetype": {
+      "kind": "prebuilt",
+      "version": "0.17.4",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfreetype-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libfribidi": {
+      "kind": "prebuilt",
+      "version": "0.17.4",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfribidi-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libharfbuzz": {
+      "kind": "prebuilt",
+      "version": "0.17.4",
+      "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libharfbuzz-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libbluray": {
+      "kind": "prebuilt",
+      "version": "1.4.0",
+      "url": "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/libbluray-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "openssl": {
+      "kind": "prebuilt",
+      "version": "3.3.5",
+      "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libuavs3d": {
+      "kind": "prebuilt",
+      "version": "1.2.1-xcode",
+      "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-xcode/libuavs3d-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libdovi": {
+      "kind": "prebuilt",
+      "version": "3.3.2",
+      "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/libdovi-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple", "android"],
+      "overrides": {
+        "android": {
+          "kind": "prebuilt",
+          "version": "2.3.1",
+          "url": "https://github.com/edde746/libdovi-builds/releases/download/v2.3.1/libdovi-{triple}.tar.gz",
+          "provenance": "TODO(provenance): per-Rust-triple static-library tarballs ({triple} is substituted per ABI: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android), the same edde746/libdovi-builds artifacts the Plezy Android ExoPlayer DV module consumes; the release publishes no checksums -- hash each audited tarball and pin per-triple sha256s before the next bump."
+        }
+      }
+    },
+    "vulkan": {
+      "kind": "prebuilt",
+      "version": "1.4.1",
+      "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.1/MoltenVK-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libshaderc": {
+      "kind": "prebuilt",
+      "version": "2025.5.0",
+      "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "lcms2": {
+      "kind": "prebuilt",
+      "version": "2.17.0",
+      "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libplacebo": {
+      "kind": "prebuilt",
+      "version": "7.351.0-2512",
+      "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/libplacebo-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple", "linux", "android"],
+      "overrides": {
+        "android": {
+          "kind": "git",
+          "version": "7.360.0",
+          "url": "https://code.videolan.org/videolan/libplacebo",
+          "ref": "v7.360.0",
+          "commit": "b2ea27dceb6418aabfe9121174c6dbb232942998",
+          "provenance": "Official VideoLAN GitLab annotated tag object 2948be2e7bdb8797a3026677fd84e8c106107ff8 (v7.360.0) dereferences to this root commit; its gitlinks pin the recursive submodules the android driver clones."
+        },
+        "linux": {
+          "kind": "git",
+          "version": "7.351.0",
+          "url": "https://code.videolan.org/videolan/libplacebo.git",
+          "mirror": "https://github.com/haasn/libplacebo.git",
+          "ref": "v7.351.0",
+          "commit": "3188549fba13bbdf3a5a98de2a38c2e71f04e21e",
+          "provenance": "Official VideoLAN GitLab tag record v7.351.0 contains a PGP-signed release message and dereferences to this root commit; its gitlinks pin recursive submodules. The mirror is upstream's own author repository (haasn/libplacebo, not a fork), whose annotated v7.351.0 tag object 98c1416e95b21cd767b84ac9ee430ccadf263ff6 dereferences to that same commit. It is consulted only after the primary fails, and the commit pin is verified identically either way, so it cannot introduce a different tree."
+        }
+      }
+    },
+    "libdav1d": {
+      "kind": "prebuilt",
+      "version": "1.5.3-neon",
+      "url": "https://github.com/edde746/libdav1d-build/releases/download/1.5.3-neon/libdav1d-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libuchardet": {
+      "kind": "prebuilt",
+      "version": "0.0.8-xcode",
+      "url": "https://github.com/mpvkit/libuchardet-build/releases/download/0.0.8-xcode/libuchardet-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    },
+    "libluajit": {
+      "kind": "prebuilt",
+      "version": "2.1.0-xcode",
+      "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-xcode/libluajit-all.zip",
+      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": ["apple"]
+    }
+  }
+}

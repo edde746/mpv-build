@@ -1,0 +1,16 @@
+{
+  "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-windows",
+  "toolchain": "toolchain/windows.txt",
+  "driver": [
+    "platforms/windows/build.sh",
+    "platforms/windows/package.sh",
+    "platforms/windows/pin_packages.py"
+  ],
+  "artifacts": {
+    "libmpv-windows": {
+      "components": ["mpv", "ffmpeg", "libass", "mpv-winbuild-cmake"],
+      "variants": ["x86_64", "aarch64"],
+      "assetPattern": "libmpv-windows-{key}-{variant}.zip"
+    }
+  }
+}

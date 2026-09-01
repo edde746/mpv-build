@@ -1,0 +1,43 @@
+From 778af98642d2d8b60f9f0eb0ef693a471a1b9a53 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 7 May 2026 20:20:00 +0200
+Subject: [PATCH] videotoolbox: set compressed sample size explicitly
+
+VideoToolbox's Dolby Vision HEVC decoder can reject compressed samples
+with kCMBlockBufferBadLengthParameterErr when the CMSampleBuffer omits an
+explicit sample-size array. Provide the single sample size alongside the
+CMBlockBuffer instead of relying on CoreMedia to infer it from the block.
+---
+ libavcodec/videotoolbox.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index 5bf6bd0..9c1d0aa 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -690,9 +690,11 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
+     OSStatus status;
+     CMBlockBufferRef  block_buf;
+     CMSampleBufferRef sample_buf;
++    size_t sample_size;
+ 
+     block_buf  = NULL;
+     sample_buf = NULL;
++    sample_size = size;
+ 
+     status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,// structureAllocator
+                                                 buffer,             // memoryBlock
+@@ -715,9 +717,9 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
+                                       fmt_desc,             // formatDescription
+                                       1,                    // numSamples
+                                       0,                    // numSampleTimingEntries
+                                       NULL,                 // sampleTimingArray
+-                                      0,                    // numSampleSizeEntries
+-                                      NULL,                 // sampleSizeArray
++                                      1,                    // numSampleSizeEntries
++                                      &sample_size,         // sampleSizeArray
+                                       &sample_buf);
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)

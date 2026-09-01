@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sat, 09 May 2026 00:00:00 +0000
+Subject: [PATCH] securetransport: disable PEM import for Catalyst
+
+Mac Catalyst exposes Secure Transport but not the SecItemImport PEM import
+types used for custom CA and client certificate files. Disable this optional
+path on Catalyst so the Secure Transport backend still builds and uses system
+trust for normal HTTPS connections.
+---
+ libavformat/tls_securetransport.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/tls_securetransport.c b/libavformat/tls_securetransport.c
+index 0000000000..0000000000 100644
+--- a/libavformat/tls_securetransport.c
++++ b/libavformat/tls_securetransport.c
+@@ -37,6 +37,11 @@
+ #include <Security/Security.h>
+ #include <Security/SecureTransport.h>
+ #include <CoreFoundation/CoreFoundation.h>
++#include <TargetConditionals.h>
++
++#ifndef TARGET_OS_MACCATALYST
++#define TARGET_OS_MACCATALYST 0
++#endif
+ 
+ // We use a private API call here; it's good enough for WebKit.
+ SecIdentityRef SecIdentityCreate(CFAllocatorRef allocator, SecCertificateRef certificate, SecKeyRef privateKey);
+@@ -70,7 +74,7 @@ static int print_tls_error(URLContext *h, int ret)
+ 
+ static int import_pem(URLContext *h, char *path, CFArrayRef *array)
+ {
+-#if !HAVE_SECITEMIMPORT
++#if !HAVE_SECITEMIMPORT || TARGET_OS_MACCATALYST
+     return AVERROR_PATCHWELCOME;
+ #else
+     AVIOContext *s = NULL;
+-- 
+2.50.1 (Apple Git-155)

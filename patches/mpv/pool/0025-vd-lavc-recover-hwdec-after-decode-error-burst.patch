@@ -1,0 +1,89 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 399e1d5..9d02753 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -237,6 +237,9 @@ typedef struct lavc_ctx {
+ 
+     bool hwdec_request_reinit;
+     int hwdec_fail_count;
++    // Keyframes sent while a mid-stream hwdec decode-error burst is active
++    // (hwdec_fail_count > 0 after the hwdec already delivered frames).
++    int hwdec_err_keyframes;
+ 
+     struct mp_image_pool *hwdec_swpool;
+ 
+@@ -918,6 +921,7 @@ static void uninit_avctx(struct mp_filter *vd)
+ 
+     ctx->hwdec_failed = false;
+     ctx->hwdec_fail_count = 0;
++    ctx->hwdec_err_keyframes = 0;
+     ctx->max_delay_queue = 0;
+     ctx->hw_probing = false;
+     ctx->hwdec = (struct hwdec_info){0};
+@@ -1149,6 +1153,16 @@ static void prepare_decoding(struct mp_filter *vd)
+         reset_avctx(vd);
+ }
+ 
++// Give a previously working hwdec this many keyframes to shake off a
++// decode-error burst before falling back to software. One frame the hardware
++// refuses to decode poisons every frame that references it, so the burst
++// normally runs exactly until the next keyframe and then heals (observed with
++// VideoToolbox rejecting a single conformant HEVC frame, plezy issue #2167).
++#define HWDEC_ERR_RECOVER_KEYFRAMES 2
++// Absolute burst ceiling so a stream without regular keyframes (e.g. intra
++// refresh) still reaches the software fallback instead of freezing forever.
++#define HWDEC_ERR_MAX_RUN 240
++
+ static void handle_err(struct mp_filter *vd)
+ {
+     vd_ffmpeg_ctx *ctx = vd->priv;
+@@ -1157,11 +1171,21 @@ static void handle_err(struct mp_filter *vd)
+     MP_WARN(vd, "Error while decoding frame%s!\n",
+             ctx->use_hwdec ? " (hardware decoding)" : "");
+ 
+-    if (ctx->use_hwdec) {
+-        ctx->hwdec_fail_count += 1;
+-        if (ctx->hwdec_fail_count >= hwdec_opts->software_fallback)
+-            ctx->hwdec_failed = true;
+-    }
++    if (!ctx->use_hwdec)
++        return;
++
++    ctx->hwdec_fail_count += 1;
++    if (ctx->hwdec_fail_count < hwdec_opts->software_fallback)
++        return;
++
++    // While probing, fail over to the next method as quickly as configured.
++    // Past that point the hwdec has already delivered frames, so the errors
++    // are content-triggered rather than a broken decoder: hold the fallback
++    // until the burst survives whole keyframe intervals.
++    if (!ctx->hwdec_notified ||
++        ctx->hwdec_err_keyframes >= HWDEC_ERR_RECOVER_KEYFRAMES ||
++        ctx->hwdec_fail_count >= HWDEC_ERR_MAX_RUN)
++        ctx->hwdec_failed = true;
+ }
+ 
+ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
+@@ -1189,6 +1213,9 @@ static int send_packet(struct mp_filter *vd, struct demux_packet *pkt)
+     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+         return ret;
+ 
++    if (ctx->use_hwdec && ctx->hwdec_fail_count > 0 && pkt && pkt->keyframe)
++        ctx->hwdec_err_keyframes += 1;
++
+     if (ctx->hw_probing && ctx->num_sent_packets < 32 &&
+         ctx->hwdec_opts->software_fallback <= 32)
+     {
+@@ -1264,7 +1291,12 @@ static int decode_frame(struct mp_filter *vd)
+         return AVERROR_BUG;
+     }
+ 
++    if (ctx->use_hwdec && ctx->hwdec_fail_count > 0) {
++        MP_WARN(vd, "Hardware decoding recovered after %d errored frames.\n",
++                ctx->hwdec_fail_count);
++    }
+     ctx->hwdec_fail_count = 0;
++    ctx->hwdec_err_keyframes = 0;
+ 
+     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
+     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);

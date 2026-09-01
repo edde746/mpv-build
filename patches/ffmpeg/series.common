@@ -1,0 +1,5 @@
+# Patches applied on every platform, before series.<platform>.
+# Empty today: every patch below started life on apple. Promote a patch here
+# once a second platform needs the same pool file, instead of copying it into
+# another per-platform series -- the pool entry stays the single source of
+# truth and the resolved order stays series.common first.

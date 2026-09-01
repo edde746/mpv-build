@@ -1,0 +1,32 @@
+diff --git a/video/out/opengl/common.c b/video/out/opengl/common.c
+index a5de79c..5770ff2 100644
+--- a/video/out/opengl/common.c
++++ b/video/out/opengl/common.c
+@@ -54,6 +54,15 @@ static bool is_fast_dr(GL *gl)
+     if (!vendor)
+         return false;
+ 
++    // The vendor whitelist below is about desktop GPUs with CPU-cached
++    // pinned memory. GLES devices map write-combined memory: decoders
++    // that read back from their output frames (e.g. H.264 motion
++    // compensation on reference frames) hit uncached reads and collapse
++    // to a fraction of realtime. Tegra reports "NVIDIA Corporation" and
++    // would wrongly pass the desktop whitelist.
++    if (gl->es)
++        return false;
++
+     return strcasecmp(vendor, "AMD") == 0 ||
+            strcasecmp(vendor, "NVIDIA Corporation") == 0 ||
+            strcasecmp(vendor, "ATI Technologies Inc.") == 0;    // AMD on Windows
+@@ -662,8 +671,10 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
+         mp_verbose(log, "Detected suspected software renderer.\n");
+     }
+ 
+-    if (!is_fast_dr(gl))
++    if (!is_fast_dr(gl)) {
+         gl->mpgl_caps |= MPGL_CAP_SLOW_DR;
++        mp_verbose(log, "Direct rendering assumed slow (es=%d).\n", gl->es);
++    }
+ 
+     // GL_ARB_compute_shader & GL_ARB_shader_image_load_store
+     if (gl->DispatchCompute && gl->BindImageTexture)

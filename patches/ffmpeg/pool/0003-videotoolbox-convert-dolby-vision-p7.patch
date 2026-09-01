@@ -1,0 +1,304 @@
+From 1f7356fb2ed2d989266974dfaa220657005fef72 Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 7 May 2026 14:15:00 +0200
+Subject: [PATCH] videotoolbox: convert Dolby Vision profile 7 to profile 8.1
+
+Use the bundled libdovi C API to rewrite profile 7 RPU NALs through its
+profile 8.1 compatibility mode before VideoToolbox decode. Enhancement-layer
+NALs are dropped and the format description advertises a synthetic P8.1 dvvC
+atom so Apple can decode the compatible base layer through its native Dolby
+Vision path.
+
+The conversion mode is selected by PLEZY_DV_CONVERSION_MODE:
+auto/dv81 convert profile 7 to profile 8.1, hevc_strip drops only
+profile 7 RPU/EL NALs on the plain HEVC path, and disabled keeps profile 7
+unchanged.
+---
+ libavcodec/videotoolbox.c | 175 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 171 insertions(+), 4 deletions(-)
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index d2d3b7c..df551d0 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -23,6 +23,9 @@
+ #include "config.h"
+ #include "config_components.h"
+ #include "videotoolbox.h"
++#include <libdovi/rpu_parser.h>
++#include <stdlib.h>
++#include <string.h>
+ #include "libavutil/hwcontext_videotoolbox.h"
+ #include "libavutil/dovi_meta.h"
+ #include "libavutil/mem.h"
+@@ -844,12 +847,16 @@ static const AVDOVIDecoderConfigurationRecord *videotoolbox_dovi_get_conf(AVCode
+     return (const AVDOVIDecoderConfigurationRecord *)sd->data;
+ }
+ 
++static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi);
++
+ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+     if (!dovi || !dovi->rpu_present_flag || !dovi->bl_present_flag)
+         return 0;
+ 
+-    /* Profile 7 needs P8.1 conversion before Apple-native DV decode. */
++    if (videotoolbox_dovi_needs_p81_conversion(dovi))
++        return 1;
++
+     switch (dovi->dv_profile) {
+     case 5:
+         return 1;
+@@ -861,24 +864,108 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
+     }
+ }
+ 
++enum PlezyDoviConversionMode {
++    PLEZY_DOVI_AUTO,
++    PLEZY_DOVI_DISABLED,
++    PLEZY_DOVI_DV81,
++    PLEZY_DOVI_HEVC_STRIP,
++};
++
++static int videotoolbox_dovi_log_enabled(void)
++{
++    const char *value = getenv("PLEZY_DV_CONVERSION_LOG");
++
++    return value && (!strcmp(value, "1") || !strcmp(value, "yes") ||
++                     !strcmp(value, "true") || !strcmp(value, "on"));
++}
++
++static enum PlezyDoviConversionMode videotoolbox_dovi_conversion_mode(void)
++{
++    const char *mode = getenv("PLEZY_DV_CONVERSION_MODE");
++
++    if (!mode || !mode[0] || !strcmp(mode, "auto"))
++        return PLEZY_DOVI_AUTO;
++    if (!strcmp(mode, "dv81") || !strcmp(mode, "p8") ||
++        !strcmp(mode, "p7_to_p8") || !strcmp(mode, "p7-to-p8"))
++        return PLEZY_DOVI_DV81;
++    if (!strcmp(mode, "hevc_strip") || !strcmp(mode, "hevc") ||
++        !strcmp(mode, "p7_to_hevc") || !strcmp(mode, "p7-to-hevc"))
++        return PLEZY_DOVI_HEVC_STRIP;
++    if (!strcmp(mode, "disabled") || !strcmp(mode, "native"))
++        return PLEZY_DOVI_DISABLED;
++
++    return PLEZY_DOVI_AUTO;
++}
++
++static const char *videotoolbox_dovi_conversion_mode_name(enum PlezyDoviConversionMode mode)
++{
++    switch (mode) {
++    case PLEZY_DOVI_DISABLED:
++        return "disabled";
++    case PLEZY_DOVI_DV81:
++        return "dv81";
++    case PLEZY_DOVI_HEVC_STRIP:
++        return "hevc_strip";
++    default:
++        return "auto";
++    }
++}
++
++static int videotoolbox_dovi_needs_p81_conversion(const AVDOVIDecoderConfigurationRecord *dovi)
++{
++    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++
++    return dovi && dovi->dv_profile == 7 &&
++           dovi->rpu_present_flag && dovi->bl_present_flag &&
++           (mode == PLEZY_DOVI_AUTO || mode == PLEZY_DOVI_DV81);
++}
++
++static int videotoolbox_dovi_needs_hevc_strip(const AVDOVIDecoderConfigurationRecord *dovi)
++{
++    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++
++    return dovi && dovi->dv_profile == 7 &&
++           dovi->rpu_present_flag && dovi->bl_present_flag &&
++           mode == PLEZY_DOVI_HEVC_STRIP;
++}
++
++static int videotoolbox_dovi_effective_profile(const AVDOVIDecoderConfigurationRecord *dovi)
++{
++    if (!dovi)
++        return 0;
++
++    return videotoolbox_dovi_needs_p81_conversion(dovi) ? 8 : dovi->dv_profile;
++}
++
+ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigurationRecord *dovi)
+ {
+     uint8_t buf[24] = { 0 };
+     uint16_t flags;
++    int profile, el_present, bl_compatibility_id, compression;
+ 
+     if (!videotoolbox_dovi_is_apple_hevc(dovi))
+         return NULL;
+ 
++    profile = videotoolbox_dovi_effective_profile(dovi);
++    el_present = dovi->el_present_flag;
++    bl_compatibility_id = dovi->dv_bl_signal_compatibility_id;
++    compression = dovi->dv_md_compression;
++    if (videotoolbox_dovi_needs_p81_conversion(dovi)) {
++        el_present = 0;
++        bl_compatibility_id = 1;
++        compression = AV_DOVI_COMPRESSION_NONE;
++    }
++
+     buf[0] = dovi->dv_version_major;
+     buf[1] = dovi->dv_version_minor;
+-    flags = (dovi->dv_profile & 0x7f) << 9 |
++    flags = (profile & 0x7f) << 9 |
+             (dovi->dv_level & 0x3f) << 3 |
+             (!!dovi->rpu_present_flag) << 2 |
+-            (!!dovi->el_present_flag) << 1 |
++            (!!el_present) << 1 |
+             !!dovi->bl_present_flag;
+     AV_WB16(buf + 2, flags);
+-    buf[4] = (dovi->dv_bl_signal_compatibility_id & 0x0f) << 4 |
+-             (dovi->dv_md_compression & 0x03) << 2;
++    buf[4] = (bl_compatibility_id & 0x0f) << 4 |
++             (compression & 0x03) << 2;
+ 
+     return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
+ }
+@@ -930,7 +989,9 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
+             dovi = videotoolbox_dovi_get_conf(avctx);
+             dovi_data = videotoolbox_dovi_extradata_create(dovi);
+             if (dovi_data)
+-                CFDictionarySetValue(avc_info, dovi->dv_profile > 7 ? CFSTR("dvvC") : CFSTR("dvcC"), dovi_data);
++                CFDictionarySetValue(avc_info,
++                                     videotoolbox_dovi_effective_profile(dovi) > 7 ? CFSTR("dvvC") : CFSTR("dvcC"),
++                                     dovi_data);
+         }
+         break;
+ #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
+@@ -987,14 +1080,40 @@ static int videotoolbox_start(AVCodecContext *avctx)
+     case AV_CODEC_ID_HEVC :
+         {
+             const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
+ 
+             if (videotoolbox_dovi_is_apple_hevc(dovi)) {
+                 videotoolbox->cm_codec_type = kCMVideoCodecType_DolbyVisionHEVC_FF;
+-                av_log(avctx, AV_LOG_VERBOSE,
+-                       "Using Dolby Vision HEVC VideoToolbox format "
+-                       "(profile %u, compatibility %u).\n",
+-                       dovi->dv_profile, dovi->dv_bl_signal_compatibility_id);
++                if (videotoolbox_dovi_needs_p81_conversion(dovi)) {
++                    av_log(avctx, AV_LOG_VERBOSE,
++                           "Converting Dolby Vision profile 7 to profile 8.1 "
++                           "for VideoToolbox.\n");
++                } else {
++                    av_log(avctx, AV_LOG_VERBOSE,
++                           "Using Dolby Vision HEVC VideoToolbox format "
++                           "(profile %u, compatibility %u).\n",
++                           dovi->dv_profile, dovi->dv_bl_signal_compatibility_id);
++                }
++                if (videotoolbox_dovi_log_enabled()) {
++                    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++                    av_log(avctx, AV_LOG_INFO,
++                           "[Plezy DV] config profile=%u level=%u compat=%u "
++                           "rpu=%u el=%u bl=%u mode=%s effective_profile=%d vt_codec=dolbyvision-hevc.\n",
++                           dovi->dv_profile, dovi->dv_level, dovi->dv_bl_signal_compatibility_id,
++                           dovi->rpu_present_flag, dovi->el_present_flag, dovi->bl_present_flag,
++                           videotoolbox_dovi_conversion_mode_name(mode),
++                           videotoolbox_dovi_effective_profile(dovi));
++                }
+             } else {
+                 videotoolbox->cm_codec_type = kCMVideoCodecType_HEVC;
++                if (dovi && videotoolbox_dovi_log_enabled()) {
++                    enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++                    av_log(avctx, AV_LOG_INFO,
++                           "[Plezy DV] config profile=%u level=%u compat=%u "
++                           "rpu=%u el=%u bl=%u mode=%s effective_profile=%d vt_codec=hevc.\n",
++                           dovi->dv_profile, dovi->dv_level, dovi->dv_bl_signal_compatibility_id,
++                           dovi->rpu_present_flag, dovi->el_present_flag, dovi->bl_present_flag,
++                           videotoolbox_dovi_conversion_mode_name(mode),
++                           videotoolbox_dovi_effective_profile(dovi));
++                }
+             }
+         }
+@@ -1180,10 +1267,81 @@ static int videotoolbox_hevc_start_frame(AVCodecContext *avctx,
+     return 0;
+ }
+ 
++static int videotoolbox_hevc_decode_dovi_p81_rpu(AVCodecContext *avctx,
++                                                 const uint8_t *buffer,
++                                                 uint32_t size)
++{
++    DoviRpuOpaque *rpu;
++    const DoviData *data;
++    const char *error;
++    int ret;
++
++    rpu = dovi_parse_unspec62_nalu(buffer, size);
++    if (!rpu)
++        return AVERROR_EXTERNAL;
++
++    error = dovi_rpu_get_error(rpu);
++    if (error) {
++        av_log(avctx, AV_LOG_WARNING, "Failed to parse Dolby Vision RPU: %s\n", error);
++        dovi_rpu_free(rpu);
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (dovi_convert_rpu_with_mode(rpu, 2) < 0) {
++        error = dovi_rpu_get_error(rpu);
++        av_log(avctx, AV_LOG_WARNING, "Failed to convert Dolby Vision RPU to P8.1: %s\n",
++               error ? error : "unknown error");
++        dovi_rpu_free(rpu);
++        return AVERROR_INVALIDDATA;
++    }
++
++    data = dovi_write_unspec62_nalu(rpu);
++    if (!data) {
++        error = dovi_rpu_get_error(rpu);
++        av_log(avctx, AV_LOG_WARNING, "Failed to write Dolby Vision RPU: %s\n",
++               error ? error : "unknown error");
++        dovi_rpu_free(rpu);
++        return AVERROR_EXTERNAL;
++    }
++
++    if (data->len > UINT32_MAX) {
++        dovi_data_free(data);
++        dovi_rpu_free(rpu);
++        return AVERROR_INVALIDDATA;
++    }
++
++    ret = videotoolbox_common_decode_slice(avctx, data->data, data->len);
++    dovi_data_free(data);
++    dovi_rpu_free(rpu);
++    return ret;
++}
++
++static int videotoolbox_hevc_decode_dovi_slice(AVCodecContext *avctx,
++                                              const uint8_t *buffer,
++                                              uint32_t size)
++{
++    int nal_type;
++
++    if (size < 2)
++        return videotoolbox_common_decode_slice(avctx, buffer, size);
++
++    nal_type = (buffer[0] >> 1) & 0x3f;
++    if (nal_type == HEVC_NAL_UNSPEC62 || nal_type == HEVC_NAL_UNSPEC63)
++        return 0;
++
++    return videotoolbox_common_decode_slice(avctx, buffer, size);
++}
++
+ static int videotoolbox_hevc_decode_slice(AVCodecContext *avctx,
+                                           const uint8_t *buffer,
+                                           uint32_t size)
+ {
++    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
++
++    if (videotoolbox_dovi_needs_p81_conversion(dovi) ||
++        videotoolbox_dovi_needs_hevc_strip(dovi))
++        return videotoolbox_hevc_decode_dovi_slice(avctx, buffer, size);
++
+     return videotoolbox_common_decode_slice(avctx, buffer, size);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)

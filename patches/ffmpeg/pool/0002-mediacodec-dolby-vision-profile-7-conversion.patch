@@ -1,0 +1,338 @@
+diff --git a/configure b/configure
+index a0eed36..539747c 100755
+--- a/configure
++++ b/configure
+@@ -1934,6 +1934,7 @@ EXTERNAL_LIBRARY_LIST="
+     libcelt
+     libcodec2
+     libdav1d
++    libdovi
+     libdc1394
+     libflite
+     libfontconfig
+@@ -7034,6 +7035,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
+ enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
+ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+ enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
++enabled libdovi           && require libdovi libdovi/rpu_parser.h dovi_parse_unspec62_nalu -ldovi
+ enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+ enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
+ enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 4febddd..0e444c9 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -37,6 +37,9 @@
+ #include "codec_internal.h"
+ #include "decode.h"
+ #include "libavutil/dovi_meta.h"
++#if CONFIG_LIBDOVI
++#include <libdovi/rpu_parser.h>
++#endif
+ #include "h264_parse.h"
+ #include "h264_ps.h"
+ #include "hevc/parse.h"
+@@ -61,8 +64,24 @@ typedef struct MediaCodecH264DecContext {
+     // Ref. MediaFormat KEY_OPERATING_RATE
+     int operating_rate;
+     int dolby_vision;
++    int dv_p7_mode;
++    // Per-packet Dolby Vision NAL filter selected at init (DV_FILTER_*).
++    int dv_filter;
++    int dv_filter_warned;
+ } MediaCodecH264DecContext;
+ 
++// Dolby Vision profile 7 packet filters: convert rewrites the RPU (UNSPEC62)
++// to profile 8.1 and drops the enhancement layer (UNSPEC63); strip drops both.
++#define DV_FILTER_NONE    0
++#define DV_FILTER_CONVERT 1
++#define DV_FILTER_STRIP   2
++
++// dv_p7_mode option values.
++#define DV_P7_AUTO    0
++#define DV_P7_NATIVE  1
++#define DV_P7_CONVERT 2
++#define DV_P7_STRIP   3
++
+ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+ {
+     MediaCodecH264DecContext *s = avctx->priv_data;
+@@ -313,54 +332,215 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+  * only when a "video/dolby-vision" MediaCodec decodes the stream. For the
+  * single-layer profiles (dvhe.05, dvhe.08) the HEVC bitstream - with its
+  * in-band RPU NALs - is fed to the DV decoder unchanged; only the MIME and
+- * the profile/level format keys differ. The dual-layer profile 7 would need
+- * enhancement-layer handling and stays on the plain HEVC decoder (base
+- * layer only).
++ * the profile/level format keys differ.
++ *
++ * The dual-layer profile 7 has three outcomes, mirroring the decision tree
++ * of Plezy's ExoPlayer DoviBridge:
++ *   - a decoder advertising exact profile 7 gets the muxed BL+EL+RPU
++ *     stream unchanged (native);
++ *   - otherwise, with libdovi available and a profile 8 decoder present,
++ *     the RPU is converted to profile 8.1 per packet and the enhancement
++ *     layer dropped (convert);
++ *   - otherwise the plain HEVC decoder renders the base layer, optionally
++ *     with the DV NALs stripped (strip / fallback).
+  */
++static int dv_probe_profile(AVCodecContext *avctx, const char *mime, int profile)
++{
++    /* Requires a JVM (JNI MediaCodecList); returns NULL otherwise, which
++     * keeps the plain HEVC decoder - as does the absence of a hardware DV
++     * decoder advertising this profile. */
++    char *codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
++    if (!codec_name)
++        return 0;
++    av_freep(&codec_name);
++    return 1;
++}
++
+ static void dolby_vision_override(AVCodecContext *avctx, FFAMediaFormat *format,
+                                   const char **mime, int *profile_override)
+ {
+     static const char dv_mime[] = "video/dolby-vision";
++    MediaCodecH264DecContext *s = avctx->priv_data;
+     const AVPacketSideData *sd =
+         av_packet_side_data_get(avctx->coded_side_data, avctx->nb_coded_side_data,
+                                 AV_PKT_DATA_DOVI_CONF);
+     const AVDOVIDecoderConfigurationRecord *cfg;
+-    char *codec_name;
+-    int profile, level;
++    int profile = 0, level, convert = 0;
+ 
+     if (!sd || sd->size < sizeof(*cfg))
+         return;
+     cfg = (const AVDOVIDecoderConfigurationRecord *)sd->data;
+-    if (!cfg->rpu_present_flag || cfg->el_present_flag)
+-        return;
+-    if (cfg->dv_profile != 5 && cfg->dv_profile != 8)
++    if (!cfg->rpu_present_flag)
+         return;
++    level = cfg->dv_level > 0 ? 1 << (cfg->dv_level - 1) : 0;
+ 
+     /* MediaCodecInfo.CodecProfileLevel: DolbyVisionProfile* == 1 << dv_profile,
+      * DolbyVisionLevel* == 1 << (dv_level - 1). */
+-    profile = 1 << cfg->dv_profile;
+-    level = cfg->dv_level > 0 ? 1 << (cfg->dv_level - 1) : 0;
+-
+-    /* Requires a JVM (JNI MediaCodecList); returns NULL otherwise, which
+-     * keeps the plain HEVC decoder - as does the absence of a hardware DV
+-     * decoder advertising this profile. */
+-    codec_name = ff_AMediaCodecList_getCodecNameByType(dv_mime, profile, 0, avctx);
+-    if (!codec_name) {
+-        av_log(avctx, AV_LOG_VERBOSE,
+-               "No hardware decoder for %s profile 0x%x, using the base layer\n",
+-               dv_mime, profile);
++    if (!cfg->el_present_flag) {
++        if (!s->dolby_vision)
++            return;
++        if (cfg->dv_profile != 5 && cfg->dv_profile != 8)
++            return;
++        if (!dv_probe_profile(avctx, dv_mime, 1 << cfg->dv_profile)) {
++            av_log(avctx, AV_LOG_VERBOSE,
++                   "No hardware decoder for %s profile 0x%x, using the base layer\n",
++                   dv_mime, 1 << cfg->dv_profile);
++            return;
++        }
++        profile = 1 << cfg->dv_profile;
++    } else if (cfg->dv_profile == 7) {
++        int mode = s->dv_p7_mode;
++
++        /* With the DV decoder path disabled entirely, the only useful action
++         * for profile 7 is sparing the plain HEVC decoder the DV NALs. */
++        if (!s->dolby_vision)
++            mode = DV_P7_STRIP;
++        if (mode == DV_P7_STRIP) {
++            av_log(avctx, AV_LOG_INFO,
++                   "Dolby Vision profile 7: stripping DV metadata for the HEVC base layer\n");
++            s->dv_filter = DV_FILTER_STRIP;
++            return;
++        }
++        if ((mode == DV_P7_AUTO || mode == DV_P7_NATIVE) &&
++            dv_probe_profile(avctx, dv_mime, 1 << 7)) {
++            profile = 1 << 7;
++        }
++#if CONFIG_LIBDOVI
++        if (!profile && mode != DV_P7_NATIVE &&
++            dv_probe_profile(avctx, dv_mime, 1 << 8)) {
++            profile = 1 << 8;
++            convert = 1;
++        }
++#endif
++        if (!profile) {
++            av_log(avctx, AV_LOG_VERBOSE,
++                   "No usable Dolby Vision profile 7 path, using the base layer\n");
++            return;
++        }
++    } else {
+         return;
+     }
+-    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (%s)\n",
+-           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, codec_name);
+-    av_freep(&codec_name);
+ 
++    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (0x%x%s)\n",
++           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, profile,
++           convert ? ", converting RPU to profile 8.1" : "");
++
++    if (convert)
++        s->dv_filter = DV_FILTER_CONVERT;
+     *mime = dv_mime;
+     *profile_override = profile;
+     ff_AMediaFormat_setInt32(format, "profile", profile);
+     if (level)
+         ff_AMediaFormat_setInt32(format, "level", level);
+ }
++
++static const uint8_t *dv_next_startcode(const uint8_t *p, const uint8_t *end)
++{
++    for (; p + 3 <= end; p++) {
++        if (p[0] == 0 && p[1] == 0 && p[2] == 1)
++            return p;
++    }
++    return end;
++}
++
++/*
++ * Rewrite one annex-B access unit according to s->dv_filter: drop UNSPEC63
++ * (enhancement layer) NALs and either drop or convert-to-8.1 the UNSPEC62
++ * (RPU) NALs. Runs on every packet of a profile 7 stream; the packet buffer
++ * is only replaced when something actually changed.
++ */
++static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
++{
++    MediaCodecH264DecContext *s = avctx->priv_data;
++    const uint8_t *data = pkt->data, *end = pkt->data + pkt->size;
++    const uint8_t *sc;
++    AVBufferRef *buf;
++    uint8_t *out;
++    size_t out_size = 0, out_cap;
++    int changed = 0;
++
++    if (!pkt->size)
++        return 0;
++
++    /* Converted RPUs are ~2 KiB; generous headroom avoids a sizing pass. */
++    out_cap = (size_t)pkt->size + 8192 + AV_INPUT_BUFFER_PADDING_SIZE;
++    buf = av_buffer_alloc(out_cap);
++    if (!buf)
++        return AVERROR(ENOMEM);
++    out = buf->data;
++
++    sc = dv_next_startcode(data, end);
++    memcpy(out, data, sc - data);
++    out_size += sc - data;
++
++    while (sc < end) {
++        const uint8_t *nal = sc + 3;
++        const uint8_t *region = sc, *next_sc, *next_region;
++        int type;
++
++        if (region > data && region[-1] == 0)
++            region--;
++        next_sc = dv_next_startcode(nal, end);
++        next_region = next_sc;
++        if (next_region > nal && next_region < end && next_region[-1] == 0)
++            next_region--;
++
++        type = nal < end ? (nal[0] >> 1) & 0x3f : -1;
++
++        if (type == 63) {
++            changed = 1;
++        } else if (type == 62 && s->dv_filter == DV_FILTER_STRIP) {
++            changed = 1;
++        } else if (type == 62 && s->dv_filter == DV_FILTER_CONVERT) {
++#if CONFIG_LIBDOVI
++            static const uint8_t sc4[4] = { 0, 0, 0, 1 };
++            DoviRpuOpaque *rpu = dovi_parse_unspec62_nalu(nal, next_region - nal);
++            const DoviData *rpu_out = NULL;
++
++            /* Mode 2: profile 8.1 compatible, mapping curves set to no-op -
++             * the same conversion Plezy's ExoPlayer DoviBridge applies. */
++            if (rpu && !dovi_rpu_get_error(rpu) && !dovi_convert_rpu_with_mode(rpu, 2))
++                rpu_out = dovi_write_unspec62_nalu(rpu);
++
++            if (rpu_out && rpu_out->data && rpu_out->len &&
++                out_size + 4 + rpu_out->len + AV_INPUT_BUFFER_PADDING_SIZE <= out_cap) {
++                memcpy(out + out_size, sc4, 4);
++                out_size += 4;
++                memcpy(out + out_size, rpu_out->data, rpu_out->len);
++                out_size += rpu_out->len;
++            } else if (!s->dv_filter_warned) {
++                av_log(avctx, AV_LOG_WARNING,
++                       "Dolby Vision RPU conversion failed, dropping RPU NAL\n");
++                s->dv_filter_warned = 1;
++            }
++            if (rpu_out)
++                dovi_data_free(rpu_out);
++            if (rpu)
++                dovi_rpu_free(rpu);
++            changed = 1;
++#else
++            memcpy(out + out_size, region, next_region - region);
++            out_size += next_region - region;
++#endif
++        } else {
++            memcpy(out + out_size, region, next_region - region);
++            out_size += next_region - region;
++        }
++        sc = next_sc;
++    }
++
++    if (!changed) {
++        av_buffer_unref(&buf);
++        return 0;
++    }
++
++    memset(out + out_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    av_buffer_unref(&pkt->buf);
++    pkt->buf = buf;
++    pkt->data = out;
++    pkt->size = out_size;
++    return 0;
++}
+ #endif
+ 
+ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -410,7 +590,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+         ret = hevc_set_extradata(avctx, format);
+         if (ret < 0)
+             goto done;
+-        if (s->dolby_vision)
++        if (s->dolby_vision || s->dv_p7_mode == DV_P7_STRIP)
+             dolby_vision_override(avctx, format, &codec_mime, &profile_override);
+         break;
+ #endif
+@@ -615,6 +795,14 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ 
+         /* fetch new packet or eof */
+         ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
++#if CONFIG_HEVC_MEDIACODEC_DECODER
++        if (ret >= 0 && s->dv_filter != DV_FILTER_NONE) {
++            ret = dv_filter_packet(avctx, &s->buffered_pkt);
++            if (ret < 0)
++                return ret;
++            ret = 0;
++        }
++#endif
+         if (ret == AVERROR_EOF) {
+             AVPacket null_pkt = { 0 };
+             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
+@@ -664,6 +852,16 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+     { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
+                       OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
++    { "dv_p7_mode", "Dolby Vision profile 7 handling",
++                      OFFSET(dv_p7_mode), AV_OPT_TYPE_INT, {.i64 = DV_P7_AUTO}, 0, 3, VD, .unit = "dv_p7_mode" },
++        { "auto",    "native when advertised, else convert to 8.1, else base layer",
++                      0, AV_OPT_TYPE_CONST, {.i64 = DV_P7_AUTO}, 0, 0, VD, .unit = "dv_p7_mode" },
++        { "native",  "only feed profile 7 to an exact profile 7 decoder",
++                      0, AV_OPT_TYPE_CONST, {.i64 = DV_P7_NATIVE}, 0, 0, VD, .unit = "dv_p7_mode" },
++        { "convert", "convert the RPU to profile 8.1 and drop the enhancement layer",
++                      0, AV_OPT_TYPE_CONST, {.i64 = DV_P7_CONVERT}, 0, 0, VD, .unit = "dv_p7_mode" },
++        { "strip",   "strip DV NALs and decode the plain HEVC base layer",
++                      0, AV_OPT_TYPE_CONST, {.i64 = DV_P7_STRIP}, 0, 0, VD, .unit = "dv_p7_mode" },
+     { NULL }
+ };
+ 

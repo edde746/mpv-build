@@ -1,0 +1,99 @@
+From 9d8bb2f07d111cc51f7e950c5a1f4c2748a8d51c Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 7 May 2026 21:05:00 +0200
+Subject: [PATCH] videotoolbox: forward Dolby Vision RPU NALs
+
+HEVC hwaccel only forwards parameter NALs and VCL slices to VideoToolbox.
+Dolby Vision Profile 5/8 streams carry the RPU in UNSPEC62 NALs at the end
+of the access unit, so native dvh1 sessions were decoding samples with the
+Dolby Vision configuration record but without the per-frame RPU data.
+
+Append the RPU NALs into the length-prefixed compressed sample before the
+frame is submitted to VideoToolbox. Profile 7 uses the same libdovi P8.1
+conversion path as the slice callback so raw P7 RPUs are never mixed into
+the synthetic P8.1 VideoToolbox session.
+---
+ libavcodec/videotoolbox.c | 47 ++++++++++++++++++++++++++++++++++++++++++++-
+ libavcodec/vt_internal.h  |  3 +++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
+--- a/libavcodec/vt_internal.h
++++ b/libavcodec/vt_internal.h
+@@ -46,6 +46,9 @@ typedef struct VTContext {
+     uint8_t                     sps[3];
+     bool                        reconfig_needed;
+ 
++    // Whether Dolby Vision RPU append diagnostics have been logged.
++    int                         dovi_rpu_log_done;
++
+     void *logctx;
+ } VTContext;
+ 
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -1483,6 +1483,49 @@ static int videotoolbox_hevc_decode_slice(AVCodecContext *avctx,
+     return videotoolbox_common_decode_slice(avctx, buffer, size);
+ }
+ 
++static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
++{
++    HEVCContext *h = avctx->priv_data;
++    VTContext *vtctx = avctx->internal->hwaccel_priv_data;
++    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
++    int convert_p7 = videotoolbox_dovi_needs_p81_conversion(dovi);
++    int appended = 0;
++
++    if (!videotoolbox_dovi_is_apple_hevc(dovi))
++        return 0;
++
++    for (int i = 0; i < h->pkt.nb_nals; i++) {
++        H2645NAL *nal = &h->pkt.nals[i];
++        int ret;
++
++        if (nal->type != HEVC_NAL_UNSPEC62 || nal->raw_size <= 2)
++            continue;
++
++        ret = convert_p7 ?
++              videotoolbox_hevc_decode_dovi_p81_rpu(avctx, nal->raw_data, nal->raw_size) :
++              videotoolbox_common_decode_slice(avctx, nal->raw_data, nal->raw_size);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Failed to %s Dolby Vision RPU; stripping this RPU.\n",
++                   convert_p7 ? "convert" : "append");
++            continue;
++        }
++        appended++;
++    }
++
++    if (appended > 0 && videotoolbox_dovi_log_enabled() && !vtctx->dovi_rpu_log_done) {
++        enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
++        vtctx->dovi_rpu_log_done = 1;
++        av_log(avctx, AV_LOG_INFO,
++               "[Plezy DV] appended %d %s RPU NAL(s) to VideoToolbox sample "
++               "(mode=%s).\n",
++               appended, convert_p7 ? "converted P8.1" : "native",
++               videotoolbox_dovi_conversion_mode_name(mode));
++    }
++
++    return 0;
++}
++
+ 
+ static int videotoolbox_hevc_decode_params(AVCodecContext *avctx,
+                                            int type,
+@@ -1498,7 +1534,9 @@ static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
+     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
+     int ret;
+ 
+-    ret = ff_videotoolbox_common_end_frame(avctx, frame);
++    ret = videotoolbox_hevc_append_dovi_rpus(avctx);
++    if (ret >= 0)
++        ret = ff_videotoolbox_common_end_frame(avctx, frame);
+     vtctx->bitstream_size = 0;
+     return ret;
+ }
+-- 
+2.50.1 (Apple Git-155)

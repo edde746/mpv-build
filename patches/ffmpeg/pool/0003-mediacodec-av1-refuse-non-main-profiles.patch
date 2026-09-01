@@ -1,0 +1,89 @@
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -40,6 +40,7 @@
+ #if CONFIG_LIBDOVI
+ #include <libdovi/rpu_parser.h>
+ #endif
++#include "av1_parse.h"
+ #include "h264_parse.h"
+ #include "h264_ps.h"
+ #include "hevc/parse.h"
+@@ -326,6 +327,66 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+ }
+ #endif
+ 
++#if CONFIG_AV1_MEDIACODEC_DECODER
++/*
++ * Android defines MediaCodec profile constants only for AV1 Main
++ * (AV1ProfileMain8/Main10 and the HDR variants): no decoder can advertise
++ * High (4:4:4) or Professional (4:2:2 / 12-bit) support. Several TV
++ * decoders (Amazon/MTK, Amlogic C2) still accept such streams at configure
++ * time and then emit garbage frames or nothing at all, so a mismatch has to
++ * be refused here, before MediaCodec is started, for the caller to fall
++ * back to software decoding. The profile comes from the bitstream: the
++ * sequence header OBU when the extradata carries one, otherwise the av1C
++ * configuration record header. Without usable extradata nothing is
++ * narrowed and init proceeds as before.
++ */
++static int av1_check_profile(AVCodecContext *avctx)
++{
++    const uint8_t *data = avctx->extradata;
++    int size = avctx->extradata_size;
++    int profile = -1;
++
++    if (!data || size < 4)
++        return 0;
++
++    if (data[0] & 0x80) {
++        /* ISOBMFF/Matroska av1C configuration record */
++        if ((data[0] & 0x7f) != 1)
++            return 0; /* unknown version, do not narrow */
++        profile = data[1] >> 5;
++        data += 4;
++        size -= 4;
++    }
++
++    while (size > 0) {
++        int64_t obu_size;
++        int start_pos, type, temporal_id, spatial_id;
++        int len = parse_obu_header(data, size, &obu_size, &start_pos,
++                                   &type, &temporal_id, &spatial_id);
++        if (len < 0)
++            break;
++        if (type == AV1_OBU_SEQUENCE_HEADER && obu_size > 0 && start_pos < len) {
++            /* seq_profile: first 3 bits of the sequence header payload */
++            profile = data[start_pos] >> 5;
++            break;
++        }
++        data += len;
++        size -= len;
++    }
++
++    if (profile > AV_PROFILE_AV1_MAIN) {
++        av_log(avctx, AV_LOG_WARNING,
++               "AV1 %s profile (seq_profile %d) has no MediaCodec support, "
++               "refusing hardware decoding\n",
++               profile == AV_PROFILE_AV1_HIGH ? "High" : "Professional",
++               profile);
++        return AVERROR(ENOSYS);
++    }
++
++    return 0;
++}
++#endif
++
+ #if CONFIG_HEVC_MEDIACODEC_DECODER
+ /*
+  * Dolby Vision is decoder-led on Android: the display pipeline engages DV
+@@ -569,6 +630,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     case AV_CODEC_ID_AV1:
+         codec_mime = "video/av01";
+ 
++        ret = av1_check_profile(avctx);
++        if (ret < 0)
++            goto done;
++
+         ret = common_set_extradata(avctx, format);
+         if (ret < 0)
+             goto done;

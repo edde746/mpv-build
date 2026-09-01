@@ -1,0 +1,34 @@
+From 57bb873922a8df97dec1d34fa2652cd965c52f4a Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Fri, 28 Nov 2025 09:43:31 +0100
+Subject: [PATCH] videotoolbox: fix visionOS and macCatalyst builds by
+ excluding OpenGL keys
+
+visionOS and macCatalyst do not support OpenGL ES or OpenGL, so both
+kCVPixelBufferOpenGLESCompatibilityKey and
+kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey are unavailable.
+Guard both OpenGL code paths with !TARGET_OS_VISION and !TARGET_OS_MACCATALYST
+to allow builds on these platforms while maintaining iOS and macOS compatibility.
+---
+ libavcodec/videotoolbox.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index ccba249..79fb501 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -817,9 +817,9 @@ static CFDictionaryRef videotoolbox_buffer_attributes_create(int width,
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferIOSurfacePropertiesKey, io_surface_properties);
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferWidthKey, w);
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferHeightKey, h);
+-#if TARGET_OS_IPHONE
++#if TARGET_OS_IPHONE && !TARGET_OS_VISION && !TARGET_OS_MACCATALYST
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);
+-#else
++#elif !TARGET_OS_VISION && !TARGET_OS_MACCATALYST
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey, kCFBooleanTrue);
+ #endif
+ 
+-- 
+2.50.1 (Apple Git-155)
+

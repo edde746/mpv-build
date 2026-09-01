@@ -1,0 +1,30 @@
+From 1b95bd7e78bd4da0f4b0989e1e9e0eb8d715f6de Mon Sep 17 00:00:00 2001
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sat, 13 Jun 2026 19:10:00 +0200
+Subject: [PATCH] hevc: downlevel skipped NAL unit log
+
+Dolby Vision profile 7 enhancement-layer NALs are intentionally skipped by
+FFmpeg's HEVC parser when they are not handled by the active decode path. These
+can appear once per frame in remuxes, so logging each skipped NAL at info level
+floods libmpv clients during verbose playback diagnostics.
+
+Keep decode behavior unchanged, but emit the benign skipped-NAL message only at
+verbose level.
+---
+ libavcodec/hevc/hevcdec.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3666,7 +3666,7 @@ static int decode_nal_unit(HEVCContext *s, int nal_idx)
+     case HEVC_NAL_UNSPEC62:
+         break;
+     default:
+-        av_log(s->avctx, AV_LOG_INFO,
++        av_log(s->avctx, AV_LOG_VERBOSE,
+                "Skipping NAL unit %d\n", s->nal_unit_type);
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)

@@ -1,0 +1,235 @@
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 475201d..c377841 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -418,6 +418,9 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+     // One-shot log for refusing geometry rendering on Dolby Vision frames.
+     bool dovi_geometry_skip_logged;
+ 
++    // One-shot log for dropping a composite that changed the sample size.
++    bool composite_size_mismatch_logged;
++
+     // App-active presentation resync (iOS/tvOS). The system suspends the
+     // autonomous AVSampleBufferDisplayLayer on resign-active without setting
+     // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
+@@ -490,9 +493,23 @@ static bool should_use_inline_osd_layer(struct priv *p)
+     return !should_composite_into_video(p);
+ }
+ 
++// Whether the OSD is laid out on the video frame instead of the display layer.
++// PiP presents the enqueued samples directly, so the frame is the whole visible
++// surface: there is no window around it to place a subtitle in, and its
++// dimensions are what the system sizes the PiP window from.
++static bool should_use_frame_space_osd(struct priv *p)
++{
++    return p->opts && p->opts->pip_composite_osd;
++}
++
+ static bool should_apply_video_geometry(struct vo *vo)
+ {
++    struct priv *p = vo->priv;
+     struct mp_vo_opts *opts = vo->opts;
++    // Frame-space presentation has no window to zoom or pan against, and a
++    // geometry render would resize the samples the PiP window follows.
++    if (should_use_frame_space_osd(p))
++        return false;
+     // Only per-frame geometry options use Core Image; panscan and aspect
+     // override stay on the sample-buffer/videoGravity path.
+     return opts && (fabsf(opts->zoom) > 0.0001f ||
+@@ -924,6 +941,90 @@ static void update_avfoundation_geometry(struct vo *vo)
+     vo->monitor_par = 1.0;
+ }
+ 
++// --- avf frame-space osd core ---
++// PiP hands the enqueued samples themselves to the system, which sizes its
++// window from their dimensions. The OSD therefore cannot be laid out in
++// display-layer space: a plaintext subtitle sits in the letterbox margin around
++// the video by default (--sub-use-margins), which is not part of the frame, so
++// compositing it grew the sample to the layer's size and the PiP window resized
++// with every cue (plezy#2078).
++//
++// Frame-space geometry lays the OSD out on the frame's own coded grid instead:
++// margins collapse, so --sub-pos is a percentage of the presented frame, the
++// dimension-preserving composite always applies, and the Core Image fallback
++// still produces a frame-sized buffer. Non-square source pixels squeeze the
++// text exactly as the display layer stretches the frame back out, which is the
++// convention osd_res_from_image_params() uses for the same job.
++static struct avf_render_geometry avf_frame_space_geometry(int frame_w, int frame_h,
++                                                          int p_w, int p_h)
++{
++    if (frame_w <= 0 || frame_h <= 0)
++        return (struct avf_render_geometry){0};
++
++    struct mp_rect frame = {0, 0, frame_w, frame_h};
++
++    return (struct avf_render_geometry){
++        .w = frame_w,
++        .h = frame_h,
++        .src = frame,
++        .dst = frame,
++        .osd_res = {
++            .w = frame_w,
++            .h = frame_h,
++            .display_par = p_w > 0 && p_h > 0 ? p_h / (double)p_w : 1.0,
++        },
++    };
++}
++
++// Clip the cached subtitle's OSD-space bounding box against the video rect the
++// frame actually contains, then map it onto the frame's pixel grid, with a
++// pixel of slack per side for the inverse mapping the composite loop does.
++// Returns false when the box misses that rect entirely: in display-layer space
++// that means the subtitle was laid out in a letterbox margin.
++static bool avf_map_subtitle_rect(struct avf_render_geometry geometry,
++                                  struct mp_rect sub, int sub_w, int sub_h,
++                                  int frame_w, int frame_h,
++                                  struct mp_rect *out)
++{
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    int srcW = src.x1 - src.x0;
++    int srcH = src.y1 - src.y0;
++    int dstW = dst.x1 - dst.x0;
++    int dstH = dst.y1 - dst.y0;
++    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
++        return false;
++
++    int frame_x0 = MPCLAMP(src.x0, 0, frame_w);
++    int frame_y0 = MPCLAMP(src.y0, 0, frame_h);
++    int frame_x1 = MPCLAMP(src.x1, 0, frame_w);
++    int frame_y1 = MPCLAMP(src.y1, 0, frame_h);
++    if (frame_x1 <= frame_x0 || frame_y1 <= frame_y0)
++        return false;
++
++    int osd_x0 = MPMAX(sub.x0, MPMAX(dst.x0, 0));
++    int osd_y0 = MPMAX(sub.y0, MPMAX(dst.y0, 0));
++    int osd_x1 = MPMIN(sub.x1, MPMIN(dst.x1, sub_w));
++    int osd_y1 = MPMIN(sub.y1, MPMIN(dst.y1, sub_h));
++    if (osd_x1 <= osd_x0 || osd_y1 <= osd_y0)
++        return false;
++
++    int x0 = src.x0 + (int)(((int64_t)(osd_x0 - dst.x0) * srcW) / dstW) - 1;
++    int y0 = src.y0 + (int)(((int64_t)(osd_y0 - dst.y0) * srcH) / dstH) - 1;
++    int x1 = src.x0 + (int)((((int64_t)(osd_x1 - dst.x0) * srcW) + dstW - 1) / dstW) + 1;
++    int y1 = src.y0 + (int)((((int64_t)(osd_y1 - dst.y0) * srcH) + dstH - 1) / dstH) + 1;
++    x0 = MPCLAMP(x0, frame_x0, frame_x1);
++    y0 = MPCLAMP(y0, frame_y0, frame_y1);
++    x1 = MPCLAMP(x1, frame_x0, frame_x1);
++    y1 = MPCLAMP(y1, frame_y0, frame_y1);
++    if (x1 <= x0 || y1 <= y0)
++        return false;
++
++    *out = (struct mp_rect){x0, y0, x1, y1};
++    return true;
++}
++// --- end avf frame-space osd core ---
++
+ static struct avf_render_geometry compute_render_geometry(struct vo *vo,
+                                                           int frame_w,
+                                                           int frame_h)
+@@ -932,13 +1033,19 @@ static struct avf_render_geometry compute_render_geometry(struct vo *vo,
+     struct mp_rect src, dst;
+     struct mp_osd_res vo_osd;
+ 
+-    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
+-
+     if (frame_w <= 0)
+         frame_w = vo->params ? vo->params->w : 0;
+     if (frame_h <= 0)
+         frame_h = vo->params ? vo->params->h : 0;
+ 
++    if (should_use_frame_space_osd(p)) {
++        return avf_frame_space_geometry(frame_w, frame_h,
++                                        vo->params ? vo->params->p_w : 1,
++                                        vo->params ? vo->params->p_h : 1);
++    }
++
++    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
++
+     if (should_use_inline_osd_layer(p)) {
+         return (struct avf_render_geometry){
+             .w = vo_osd.w,
+@@ -1415,10 +1522,11 @@ static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf
+     size_t bw = CVPixelBufferGetWidth(pixbuf);
+     size_t bh = CVPixelBufferGetHeight(pixbuf);
+ 
+-    // Only coded-size passthrough/upload buffers need the source sample aspect
+-    // ratio. Geometry- and composite-rendered buffers are already display-shaped
+-    // (letterboxed via vo_get_src_dst_rects) and must stay square pixels to avoid
+-    // double-correcting the aspect.
++    // Only coded-size buffers carry the source sample aspect ratio: passthrough
++    // and upload buffers, plus the frame-space composites that keep the coded
++    // grid. A display-shaped buffer (window-space geometry or composite, both
++    // letterboxed via vo_get_src_dst_rects) is already square-pixel and must
++    // stay that way to avoid double-correcting the aspect.
+     bool coded_size = bw == (size_t)vo->params->w && bh == (size_t)vo->params->h;
+ 
+     if (coded_size && p_w > 0 && p_h > 0 && p_w != p_h) {
+@@ -2728,33 +2836,17 @@ static CVPixelBufferRef composite_yuv_frame(struct vo *vo, CVPixelBufferRef vide
+     int srcH = src.y1 - src.y0;
+     int dstW = dst.x1 - dst.x0;
+     int dstH = dst.y1 - dst.y0;
+-    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
+-        return NULL;
+ 
+-    int video_x0 = MPCLAMP(src.x0, 0, videoW);
+-    int video_y0 = MPCLAMP(src.y0, 0, videoH);
+-    int video_x1 = MPCLAMP(src.x1, 0, videoW);
+-    int video_y1 = MPCLAMP(src.y1, 0, videoH);
+-    if (video_x1 <= video_x0 || video_y1 <= video_y0)
++    struct mp_rect sub = {p->subtitle_x0, p->subtitle_y0,
++                          p->subtitle_x1, p->subtitle_y1};
++    struct mp_rect target;
++    if (!avf_map_subtitle_rect(geometry, sub, subW, subH, videoW, videoH, &target))
+         return NULL;
+ 
+-    int osd_x0 = MPMAX(p->subtitle_x0, MPMAX(dst.x0, 0));
+-    int osd_y0 = MPMAX(p->subtitle_y0, MPMAX(dst.y0, 0));
+-    int osd_x1 = MPMIN(p->subtitle_x1, MPMIN(dst.x1, subW));
+-    int osd_y1 = MPMIN(p->subtitle_y1, MPMIN(dst.y1, subH));
+-    if (osd_x1 <= osd_x0 || osd_y1 <= osd_y0)
+-        return NULL;
+-
+-    int vx0 = src.x0 + (int)(((int64_t)(osd_x0 - dst.x0) * srcW) / dstW) - 1;
+-    int vy0 = src.y0 + (int)(((int64_t)(osd_y0 - dst.y0) * srcH) / dstH) - 1;
+-    int vx1 = src.x0 + (int)((((int64_t)(osd_x1 - dst.x0) * srcW) + dstW - 1) / dstW) + 1;
+-    int vy1 = src.y0 + (int)((((int64_t)(osd_y1 - dst.y0) * srcH) + dstH - 1) / dstH) + 1;
+-    vx0 = MPCLAMP(vx0, video_x0, video_x1);
+-    vy0 = MPCLAMP(vy0, video_y0, video_y1);
+-    vx1 = MPCLAMP(vx1, video_x0, video_x1);
+-    vy1 = MPCLAMP(vy1, video_y0, video_y1);
+-    if (vx1 <= vx0 || vy1 <= vy0)
+-        return NULL;
++    int vx0 = target.x0;
++    int vy0 = target.y0;
++    int vx1 = target.x1;
++    int vy1 = target.y1;
+ 
+     CVPixelBufferRef outputBuffer = NULL;
+     if (in_place) {
+@@ -3343,6 +3435,25 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+         if (!needsRelease && !applyGeometry && should_composite_into_video(p)) {
+             // In compositing modes, composite the subtitle rendered for this flip.
+             CVPixelBufferRef composited = composite_frame(vo, pixbuf);
++            if (composited && should_use_frame_space_osd(p) &&
++                (CVPixelBufferGetWidth(composited) != CVPixelBufferGetWidth(pixbuf) ||
++                 CVPixelBufferGetHeight(composited) != CVPixelBufferGetHeight(pixbuf))) {
++                // The system sizes the PiP window from the enqueued samples, so a
++                // composite that changed them would resize the window on every
++                // cue. Present the frame without the overlay instead.
++                if (!p->composite_size_mismatch_logged) {
++                    MP_WARN(vo, "Composited frame is %zux%zu instead of the frame's "
++                                "%zux%zu; dropping the overlay to keep the sample "
++                                "size steady\n",
++                            CVPixelBufferGetWidth(composited),
++                            CVPixelBufferGetHeight(composited),
++                            CVPixelBufferGetWidth(pixbuf),
++                            CVPixelBufferGetHeight(pixbuf));
++                    p->composite_size_mismatch_logged = true;
++                }
++                CVPixelBufferRelease(composited);
++                composited = NULL;
++            }
+             if (composited) {
+                 finalBuffer = composited;
+                 needsRelease = true;

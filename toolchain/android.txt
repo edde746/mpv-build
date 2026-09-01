@@ -1,0 +1,15 @@
+# Toolchain generation for content-addressed android binaries.
+#
+# Content keys are derived from sources only, so they are reproducible on any
+# machine. Unlike apple (where Xcode is deliberately not sampled), the android
+# compiler IS pinned here: the NDK release below is installed by
+# include/download-sdk.sh and put on PATH by include/path.sh, so every build
+# uses exactly this toolchain. This whole file's bytes are hashed into every
+# libmpv-android key, therefore bumping the NDK invalidates every published
+# android asset -- deliberate, because a new NDK means new codegen.
+#
+# Bump the generation below to force a rebuild when something that matters
+# changes without changing any hashed source (runner image, a miscompile, a
+# sysroot fix).
+ndk=29.0.14206865
+generation=1

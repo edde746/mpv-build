@@ -1,0 +1,273 @@
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 78da5e1..545cb1a 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -22,6 +22,7 @@
+ #include "common/common.h"
+ #include "common/msg.h"
+ #include "internal.h"
++#include "options/m_option.h"
+ #include "osdep/timer.h"
+ #include "ta/ta_talloc.h"
+ 
+@@ -108,6 +109,30 @@ - (void)invalidate;
+     int avp_last_item_status;    // last logged AVPlayerItemStatus
+     int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
+     int avp_heartbeat;           // verbose position log divider
++#if TARGET_OS_OSX
++    // The bounded PCM lookahead is macOS-only. That is where --volume is
++    // driven from a slider or the keyboard and the lag is felt; on tvOS and
++    // iOS the hardware volume never reaches mpv's software gain, and the
++    // renderer's deep queue is what carries AirPlay. Everything below
++    // compiles out entirely there.
++    //
++    // How far ahead of the playhead the PCM path is allowed to enqueue.
++    // AVSampleBufferAudioRenderer's own backpressure sits far out -- around
++    // 1.7s when measured against a local route -- and mpv multiplies the
++    // software volume into the samples as it hands them over, so a volume
++    // change stays inaudible until that backlog has drained. Bounding the
++    // lookahead bounds that delay. 0 leaves the renderer's own depth alone.
++    int64_t pcm_lookahead_ns;
++    // One-shot, idle at DISPATCH_TIME_FOREVER. Owned here rather than being a
++    // dispatch_after so teardown can cancel it: the handler dereferences the
++    // AO, which ao_uninit() frees the moment uninit() returns.
++    dispatch_source_t feed_timer;
++    // Whether the PCM path should be feeding at all. A frozen clock does not
++    // drain the queue, so without this the bound stays exceeded and the timer
++    // wakes forever re-deciding not to feed. Only mutated on p->queue.
++    bool feed_enabled;
++    double opt_max_lookahead;
++#endif
+ };
+ 
+ #define IEC61937_HEADER_SIZE 8
+@@ -573,12 +598,92 @@ static void avp_teardown_item(struct ao *ao)
+     p->au_len = 0;
+ }
+ 
++#if TARGET_OS_OSX
++static void feed(struct ao *ao);
++
++static void pcm_request_media_data(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
++        feed(ao);
++    }];
++}
++
++// Idle the one-shot timer. Runs on p->queue, or on the player thread while
++// the queue is blocked in stop()/uninit(), so it never races the handler.
++static void pcm_cancel_pending_feed(struct priv *p)
++{
++    if (p->feed_timer) {
++        dispatch_source_set_timer(p->feed_timer, DISPATCH_TIME_FOREVER,
++                                  DISPATCH_TIME_FOREVER, 0);
++    }
++}
++
++// Stop feeding until the queue has drained back under the bound.
++//
++// Returning from the request block without enqueueing would spin instead of
++// waiting: the header has the block run "until the receiver's
++// readyForMoreMediaData property becomes NO or until there is no more data to
++// supply", and the renderer re-invokes it once it "becomes ready for more
++// media data again" -- an edge that never comes while it is already ready and
++// we are simply refusing to feed. So disarm and come back on a timer.
++static void pcm_pause_feeding(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    [p->renderer stopRequestingMediaData];
++    if (!p->feed_enabled)
++        return;
++    if (!p->feed_timer) {
++        // No timer to wake us: keep the renderer fed rather than stall.
++        pcm_request_media_data(ao);
++        return;
++    }
++    dispatch_source_set_timer(
++        p->feed_timer,
++        dispatch_time(DISPATCH_TIME_NOW, p->pcm_lookahead_ns / 2),
++        DISPATCH_TIME_FOREVER, p->pcm_lookahead_ns / 10);
++}
++
++// Turn the bounded PCM feed on or off. Serialized on p->queue so it cannot
++// race the timer handler; start()/stop() already hold the queue when they
++// call it, hence the reentrancy check.
++static void pcm_set_feeding(struct ao *ao, bool enabled)
++{
++    struct priv *p = ao->priv;
++
++    void (^block)(void) = ^{
++        p->feed_enabled = enabled;
++        pcm_cancel_pending_feed(p);
++        if (enabled) {
++            pcm_request_media_data(ao);
++        } else {
++            [p->renderer stopRequestingMediaData];
++        }
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        block();
++    else
++        dispatch_sync(p->queue, block);
++}
++#endif  // TARGET_OS_OSX
++
+ static void feed(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+     int samplerate = ao->samplerate;
+     int sstride = ao->sstride;
+ 
++#if TARGET_OS_OSX
++    if (p->pcm_lookahead_ns) {
++        int64_t now = CMTimeGetNanoseconds([p->synchronizer currentTime]);
++        if (p->end_time_av - now >= p->pcm_lookahead_ns) {
++            pcm_pause_feeding(ao);
++            return;
++        }
++    }
++#endif
++
+     CMBlockBufferRef block_buffer = NULL;
+     CMSampleBufferRef sample_buffer = NULL;
+     OSStatus err;
+@@ -678,6 +783,14 @@ static void start(struct ao *ao)
+ 
+     p->end_time_av = -1;
+     [p->synchronizer setRate:1];
++#if TARGET_OS_OSX
++    // With no bound there is nothing to gate, so arm exactly as before rather
++    // than routing the first arm through the queue.
++    if (p->pcm_lookahead_ns) {
++        pcm_set_feeding(ao, true);
++        return;
++    }
++#endif
+     [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+         feed(ao);
+     }];
+@@ -697,6 +810,12 @@ static void stop(struct ao *ao)
+         [p->renderer stopRequestingMediaData];
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
++#if TARGET_OS_OSX
++        // A frozen clock never drains the queue, so leave nothing scheduled;
++        // start() turns feeding back on.
++        p->feed_enabled = false;
++        pcm_cancel_pending_feed(p);
++#endif
+     };
+     if (dispatch_get_specific(&avfoundation_queue_key) == p)
+         stop_block();
+@@ -736,7 +855,18 @@ static bool set_pause(struct ao *ao, bool paused)
+ 
+     if (paused) {
+         [p->synchronizer setRate:0];
++#if TARGET_OS_OSX
++        // The clock is stopped, so the bound can never be undercut again on
++        // its own. Stop asking rather than waking every half-bound to
++        // rediscover that.
++        if (p->pcm_lookahead_ns)
++            pcm_set_feeding(ao, false);
++#endif
+     } else {
++#if TARGET_OS_OSX
++        if (p->pcm_lookahead_ns)
++            pcm_set_feeding(ao, true);
++#endif
+         [p->synchronizer setRate:1];
+     }
+ 
+@@ -990,6 +1120,35 @@ static int init(struct ao *ao)
+         goto error;
+     }
+ 
++#if TARGET_OS_OSX
++    // --audio-buffer is documented as a minimum the device may exceed, so it
++    // cannot double as this maximum; it only keeps the bound from dropping
++    // under what the core was told to expect.
++    if (p->opt_max_lookahead > 0) {
++        p->pcm_lookahead_ns =
++            (int64_t)(MPMAX(p->opt_max_lookahead, ao->def_buffer) * 1e9);
++        p->feed_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
++                                               p->queue);
++        if (p->feed_timer) {
++            dispatch_source_set_event_handler(p->feed_timer, ^{
++                pcm_cancel_pending_feed(p);  // one-shot: idle before refeeding
++                // A stop or pause may have landed between the fire and here.
++                if (p->feed_enabled)
++                    pcm_request_media_data(ao);
++            });
++            dispatch_source_set_timer(p->feed_timer, DISPATCH_TIME_FOREVER,
++                                      DISPATCH_TIME_FOREVER, 0);
++            // Left resumed for its whole life: releasing a suspended source
++            // traps, and an idle timer costs nothing.
++            dispatch_resume(p->feed_timer);
++        } else {
++            MP_WARN(ao, "no timer available; leaving the renderer's own "
++                        "buffer depth alone\n");
++            p->pcm_lookahead_ns = 0;
++        }
++    }
++#endif
++
+     if (ao->device && ao->device[0]) {
+ #if TARGET_OS_OSX
+         [p->renderer setAudioOutputDeviceUniqueID:(NSString*)cfstr_from_cstr(ao->device)];
+@@ -1054,6 +1213,13 @@ static int init(struct ao *ao)
+         dispatch_release(p->avp_timer);
+         p->avp_timer = NULL;
+     }
++#if TARGET_OS_OSX
++    if (p->feed_timer) {
++        dispatch_source_cancel(p->feed_timer);
++        dispatch_release(p->feed_timer);
++        p->feed_timer = NULL;
++    }
++#endif
+     if (p->loader) {
+         [p->loader invalidate];
+         [p->loader release];
+@@ -1093,6 +1259,19 @@ static void uninit(struct ao *ao)
+         [p->player release];
+         dispatch_release(p->queue);
+     } else {
++        // The handler dereferences the AO, and ao_uninit() frees it as soon
++        // as this returns. Cancelling on p->queue means no handler is
++        // mid-flight and none can start afterwards. stop() above already
++        // left the timer idle.
++#if TARGET_OS_OSX
++        if (p->feed_timer) {
++            dispatch_sync(p->queue, ^{
++                dispatch_source_cancel(p->feed_timer);
++            });
++            dispatch_release(p->feed_timer);
++            p->feed_timer = NULL;
++        }
++#endif
+         [p->renderer release];
+         [p->synchronizer release];
+         dispatch_release(p->queue);
+@@ -1123,4 +1302,19 @@ static void uninit(struct ao *ao)
+     .set_pause      = set_pause,
+     .list_devs      = ca_get_device_list,
+     .priv_size      = sizeof(struct priv),
++    .priv_defaults  = &(const struct priv){
++        // Well inside the renderer's own depth, so the queue still absorbs
++        // scheduling jitter, while cutting the delay before a volume change
++        // is audible to a fraction of what it was.
++#if TARGET_OS_OSX
++        .opt_max_lookahead = 0.5,
++#endif
++    },
++    .options = (const struct m_option[]) {
++#if TARGET_OS_OSX
++        {"max-lookahead", OPT_DOUBLE(opt_max_lookahead), M_RANGE(0, 10)},
++#endif
++        {0}
++    },
++    .options_prefix = "ao-avfoundation",
+ };
