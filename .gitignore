@@ -121,4 +121,5 @@ libmpv-prefix*/
 *.xcframework
 Package.resolved
 buildServer.json
-.vscode__pycache__/
+.vscode/
+__pycache__/
