@@ -115,7 +115,9 @@ class PinPackagesTest(unittest.TestCase):
         )
         # And the exact injected lines, contiguous, mbedtls-style 4-space indent.
         expected = (
-            "    PATCH_COMMAND ${EXEC} git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch\n"
+            "    PATCH_COMMAND ${EXEC} "
+            '"git reset --hard 41f6a645068483470267271e1d09966ca3b9f413 -q '
+            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch"\n'
             '    UPDATE_COMMAND ""\n'
             "    GIT_REMOTE_NAME origin\n"
             "    GIT_TAG v0.41.0\n"
@@ -158,6 +160,38 @@ class PinPackagesTest(unittest.TestCase):
         # Staged patch set converges too (stale files removed, same names).
         staged = sorted(p.name for p in self.packages.glob("*-*.patch"))
         self.assertEqual(staged, ["mpv-0001-0001-first.patch", "mpv-0002-0002-second.patch"])
+
+    def test_patch_command_resets_to_the_pinned_commit(self):
+        # A patch step re-run alone (series-only change, or a warm-cache step
+        # cascade) must converge instead of double-applying onto a patched
+        # tree, so the injected command resets to the pin before applying.
+        pinned, _ = self.run_pin("mpv")
+        self.assertIn(f'"git reset --hard {PINS["mpv"]["commit"]} -q && git apply ', pinned)
+
+    def test_check_git_fixture_matches_audited_idiom(self):
+        # neutralize_check_git string-matches the exact upstream injection
+        # guard; a winbuild bump that reshapes it must fail loud, not
+        # silently skip.
+        text = (TESTDATA / "custom_steps.cmake").read_text()
+        self.assertEqual(text.count(pin_packages.CHECK_GIT_ORIGINAL), 1)
+        self.assertNotIn(pin_packages.CHECK_GIT_NEUTRALIZED, text)
+
+    def test_neutralize_check_git_suppresses_and_converges(self):
+        text = (TESTDATA / "custom_steps.cmake").read_text()
+        fixed = pin_packages.neutralize_check_git(text)
+        self.assertNotIn(pin_packages.CHECK_GIT_ORIGINAL, fixed)
+        self.assertIn(pin_packages.CHECK_GIT_NEUTRALIZED, fixed)
+        # The step must be unreachable: its commands touch the download stamp
+        # and fake gitclone-lastrun.txt, which cascades warm rebuilds and can
+        # adopt a wrong-pin source. The guard flip must leave the else-branch
+        # (and everything else) intact.
+        self.assertIn("check-git", fixed)  # step text remains, dead
+        self.assertEqual(len(text.splitlines()), len(fixed.splitlines()))
+        self.assertEqual(pin_packages.neutralize_check_git(fixed), fixed)
+
+    def test_neutralize_check_git_fails_on_unknown_shape(self):
+        with self.assertRaises(SystemExit):
+            pin_packages.neutralize_check_git("function(force_rebuild_git _name)\n")
 
     def test_overrides_windows_folds_into_pins(self):
         versions = {

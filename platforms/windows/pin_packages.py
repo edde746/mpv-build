@@ -24,11 +24,15 @@ idiom, driven by versions.json resolved pins (overrides.windows folded in):
   * the resolved windows patch series (patches/<c>/series.common followed by
     patches/<c>/series.windows) is staged into packages/ as
     <c>-NNNN-<pool name>.patch and a PATCH_COMMAND is injected directly
-    before UPDATE_COMMAND "". It uses `git apply`, not `git am`: our pool
-    patches are plain `git diff` output without mail headers, which git am
-    rejects. ${EXEC} is winbuild's bash wrapper ending in `eval $*`, so the
-    glob expands lexically and the NNNN prefix preserves series order. An
-    empty series stages nothing and injects no PATCH_COMMAND.
+    before UPDATE_COMMAND "". It resets the source to the pinned commit and
+    then uses `git apply`, not `git am`: our pool patches are plain
+    `git diff` output without mail headers, which git am rejects, and the
+    reset makes the step idempotent -- ninja re-runs a patch step alone
+    whenever only the series changed, and it must not double-apply onto an
+    already-patched tree. ${EXEC} is winbuild's bash wrapper ending in
+    `eval $*`, so the quoted compound runs in a shell, the glob expands
+    lexically and the NNNN prefix preserves series order. An empty series
+    stages nothing and injects no PATCH_COMMAND.
 
 The rewrite is idempotent: previously injected keyword lines and previously
 staged <c>-*.patch files are dropped before injecting fresh ones. That is
@@ -36,6 +40,17 @@ safe because the pristine package files carry none of the injected keywords
 and the pinned winbuild commit ships no packages/<c>-*.patch for these
 components (both facts are asserted by test_pin_packages.py against fixture
 copies in testdata/).
+
+The script also suppresses the check-git step in cmake/custom_steps.cmake.
+Upstream injects it at configure time whenever a package's source dir already
+exists, to mark an adopted source's download step as done -- but the step is
+absent from a cold build's graph, so its first warm appearance cascades a
+full rebuild through the stamp chain, and its lastrun overwrite would let a
+source restored from a different pin state build as if it were the current
+pin. With the injection suppressed the graph is identical between cold and
+warm runs (what makes a warm run a true no-op) and the vanilla clone-script
+staleness compare handles adoption and pin bumps honestly (see the comment
+at CHECK_GIT_ORIGINAL).
 """
 
 import argparse
@@ -145,12 +160,56 @@ def rewrite(text, component, pins, have_patches):
     ]
     before = []
     if have_patches:
+        # One quoted argument: ${EXEC} is `eval $*`, so the compound runs in a
+        # shell. The reset makes a re-run of the patch step alone (series-only
+        # change, or a step cascade) converge instead of double-applying.
         before = [
-            f"{pad}PATCH_COMMAND ${{EXEC}} git apply "
-            f"${{CMAKE_CURRENT_SOURCE_DIR}}/{component}-*.patch"
+            f'{pad}PATCH_COMMAND ${{EXEC}} "git reset --hard {pins["commit"]} -q '
+            f'&& git apply ${{CMAKE_CURRENT_SOURCE_DIR}}/{component}-*.patch"'
         ]
     lines[at:at + 1] = before + [lines[at]] + after
     return "\n".join(lines) + "\n"
+
+
+# The check-git step upstream injects at configure time when a package source
+# dir already exists (cmake/custom_steps.cmake force_rebuild_git). It exists
+# to mark an adopted source's download step as done: it touches the download
+# stamp and overwrites gitclone-lastrun.txt with the current gitinfo.txt.
+# Both halves are wrong for this pipeline:
+#
+#   * the step is absent from the cold build's graph (no source dir at
+#     configure time), so its first warm appearance has no .ninja_log entry;
+#     every step that runs touches its stamp, so the whole package chain
+#     cascades through configure/build/install once per adoption -- and its
+#     touch of the download stamp re-triggers that cascade on every run;
+#   * the lastrun overwrite claims whatever state the adopted source is in
+#     IS the current pin; a source tree restored from a different pin state
+#     would silently build the wrong source under a fresh content key.
+#
+# Suppressing the injection keeps the ExternalProject graph identical between
+# cold and warm runs, which is what makes a warm run a true no-op. The
+# vanilla staleness machinery stays honest on its own: a pin bump rewrites
+# gitinfo.txt, dirtying the download step, and a missing/stale
+# gitclone-lastrun.txt makes the clone script re-clone for real.
+CHECK_GIT_ORIGINAL = "    if(EXISTS ${source_dir}/.git)\n"
+CHECK_GIT_NEUTRALIZED = (
+    "    if(FALSE) # check-git suppressed for warm-cache correctness "
+    "(pin_packages.py)\n"
+)
+
+
+def neutralize_check_git(text):
+    """custom_steps.cmake text with the cache-hostile check-git commands
+    replaced; pure so the tests can hammer it."""
+    if CHECK_GIT_NEUTRALIZED in text:
+        return text
+    if CHECK_GIT_ORIGINAL not in text:
+        fail(
+            "cmake/custom_steps.cmake: the check-git step no longer matches the "
+            "audited idiom; re-audit the cache-cascade rewrite against the new "
+            "winbuild commit before pinning to it"
+        )
+    return text.replace(CHECK_GIT_ORIGINAL, CHECK_GIT_NEUTRALIZED, 1)
 
 
 def main(argv):
@@ -186,6 +245,15 @@ def main(argv):
             package_file.write_text(pinned, encoding="utf-8")
         patched = f", {len(staged)} patch(es) staged" if staged else ""
         print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{patched}")
+
+    custom_steps = winbuild / "cmake" / "custom_steps.cmake"
+    if not custom_steps.is_file():
+        fail(f"{custom_steps}: missing")
+    steps_text = custom_steps.read_text(encoding="utf-8")
+    neutralized = neutralize_check_git(steps_text)
+    if neutralized != steps_text:
+        custom_steps.write_text(neutralized, encoding="utf-8")
+    print("neutralized the check-git cache cascade in cmake/custom_steps.cmake")
     return 0
 
 

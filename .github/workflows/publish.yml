@@ -650,7 +650,7 @@ jobs:
             gcc-multilib g++-multilib clang lld libc++-dev libc++abi-dev \
             libgmp-dev libmpfr-dev libmpc-dev libgcrypt-dev gperf ragel \
             texinfo autopoint re2c asciidoc rst2pdf python3-docutils \
-            python3-mako python3-jsonschema p7zip-full
+            python3-mako python3-jsonschema p7zip-full ccache
 
       - name: Resolve the winbuild pin
         id: winbuild
@@ -664,33 +664,41 @@ jobs:
           )"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
-      # The llvm/rust bootstrap takes hours, so its trees are cached: the
-      # installed sysroot, the toolchain ExternalProject stamps (what makes
-      # `ninja llvm` a no-op on a warm run), the rustup tree and the toolchain
-      # package sources. Package sources and stamps are deliberately NOT
-      # cached: their pins move with versions.json, which this key cannot see,
-      # and a stale stamp would silently ship a wrong-source binary under a
-      # fresh key. The key pins toolchain/windows.txt (generation) and the
-      # winbuild commit (the toolchain recipe); the run_id suffix plus prefix
-      # restore let every run save its progress, failed bootstraps included.
-      - name: Restore toolchain cache
+      # The llvm/rust bootstrap takes hours and the dependency graph builds
+      # ~60 packages, so the whole build state is cached, mirroring upstream
+      # winbuild's own CI (mpv_clang.yml caches src_packages, clang_root and
+      # the entire per-arch build tree). Skipping is stamp-driven ninja:
+      # an ExternalProject step re-runs only when its stamp is missing/older
+      # or its command line changed, and ninja treats an edge absent from
+      # .ninja_log as changed -- so the per-arch tree (stamps + .ninja_log +
+      # installed prefix + ccache) is the unit of caching, not a hand-picked
+      # subset. pin_packages.py suppresses upstream's check-git step, which
+      # is otherwise absent from cold graphs and cascades a full rebuild on
+      # its first warm appearance.
+      # Correctness of reuse: dep sources can only move through the winbuild
+      # commit, and the three packages pin_packages.py rewrites get new step
+      # command lines whenever versions.json pins or the patch series change,
+      # which dirties exactly those packages; build.sh fullcleans mpv every
+      # run (upstream's BUILDDATE naming dirties its packaging steps daily,
+      # and libmpv must relink against whatever changed underneath it anyway)
+      # and re-drives the toolchain targets when its bootstrap marker
+      # disagrees with the generation + winbuild pin, which makes the
+      # last, pin-free restore tier safe across winbuild bumps. The pins
+      # tier prefers a completed state over an older one; the run_id suffix
+      # keeps every run's save unique so failed bootstraps still checkpoint
+      # their progress.
+      - name: Restore build state cache
         uses: actions/cache/restore@v4
         with:
           path: |
+            build/windows/${{ matrix.arch }}
+            build/windows/src
             build/windows/rustup
-            build/windows/${{ matrix.arch }}/install
-            build/windows/${{ matrix.arch }}/toolchain
-            build/windows/src/llvm*
-            build/windows/src/mingw-w64*
-            build/windows/src/winpthreads
-            build/windows/src/gcc-binutils
-            build/windows/src/cppwinrt
-            build/windows/src/gendef
-            build/windows/src/widl
-            build/windows/src/rustup
-          key: windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ github.run_id }}
+          key: windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ hashFiles('versions.json', 'patches/**') }}-${{ github.run_id }}
           restore-keys: |
-            windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-
+            windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ hashFiles('versions.json', 'patches/**') }}-
+            windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-
+            windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-
 
       - name: Build libmpv-windows (${{ matrix.arch }})
         run: bash platforms/windows/build.sh ${{ matrix.arch }}
@@ -700,23 +708,15 @@ jobs:
       - name: Package dev zip (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
 
-      - name: Save toolchain cache
+      - name: Save build state cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
+            build/windows/${{ matrix.arch }}
+            build/windows/src
             build/windows/rustup
-            build/windows/${{ matrix.arch }}/install
-            build/windows/${{ matrix.arch }}/toolchain
-            build/windows/src/llvm*
-            build/windows/src/mingw-w64*
-            build/windows/src/winpthreads
-            build/windows/src/gcc-binutils
-            build/windows/src/cppwinrt
-            build/windows/src/gendef
-            build/windows/src/widl
-            build/windows/src/rustup
-          key: windows-toolchain-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ github.run_id }}
+          key: windows-ep2-${{ matrix.arch }}-${{ hashFiles('toolchain/windows.txt') }}-${{ steps.winbuild.outputs.commit }}-${{ hashFiles('versions.json', 'patches/**') }}-${{ github.run_id }}
 
       - name: Upload platform build (${{ matrix.arch }})
         uses: actions/upload-artifact@v4

@@ -36,6 +36,63 @@ libmpv-windows key. What the key does not see is network drift for the few
 winbuild packages that themselves track a branch tip; treat a winbuild pin
 bump as the refresh point for those.
 
+## CI build-state caching
+
+A cold build bootstraps the llvm/rust cross-toolchain (hours) and ~60
+dependencies, so `publish.yml` caches the whole build state between runs,
+mirroring upstream winbuild's own CI: the per-arch tree
+(`build/windows/<arch>`: installed prefix, ExternalProject stamps and
+`.ninja_log`), the shared sources (`build/windows/src`) and the shared rust
+toolchain (`build/windows/rustup`). The per-arch tree is the unit that makes
+a warm run skip: ninja re-runs a step only when its stamp is stale, its
+command line changed, or the edge is missing from `.ninja_log` -- caching
+stamps without the log (or vice versa) rebuilds everything.
+
+Why reusing a restored tree is sound:
+
+- dependency sources can only move through the `mpv-winbuild-cmake` commit;
+  the pin-free last restore tier reuses a tree across winbuild bumps, and
+  recipe changes still land because changed step command lines dirty their
+  packages;
+- the packages `pin_packages.py` rewrites (mpv, ffmpeg, libass) get new step
+  command lines whenever their pins or patch series change, which dirties
+  exactly those packages and their dependents, and the injected
+  PATCH_COMMAND resets to the pin before applying so a re-run converges
+  instead of double-applying;
+- `pin_packages.py` suppresses upstream's check-git step. Upstream injects
+  it at configure time whenever a source dir already exists, so the step is
+  absent from a cold build's graph; its first warm appearance has no
+  `.ninja_log` entry and cascades a full rebuild through the stamp chain,
+  and its gitclone-lastrun.txt overwrite would let a source restored from a
+  different pin state build as if it were the current pin. Suppression
+  keeps the graph identical between cold and warm runs -- which is what
+  makes a warm run a true no-op -- while a pin bump still invalidates
+  through the gitinfo.txt content change and the vanilla clone-script
+  staleness compare;
+- packages that track a branch tip upstream are frozen by their stamps on a
+  warm tree -- tighter, not looser, than a cold rebuild that would fetch the
+  tip of the day;
+- the toolchain is never re-driven on a warm tree: `build.sh` skips
+  `ninja llvm/rustup/llvm-clang` while its bootstrap marker matches the
+  toolchain generation + winbuild pin, and re-drives them (incrementally)
+  when it does not;
+- `build.sh` fullcleans and rebuilds mpv on every run: upstream's packaging
+  steps embed `BUILDDATE` in their command lines and `postremovebuild`
+  deletes build trees after install, so a date rollover would otherwise
+  re-run copy steps against a deleted tree -- and any stale windows key
+  requires relinking libmpv regardless.
+
+ccache (`-DENABLE_CCACHE=ON`, cache inside the cached install prefix) backs
+all of this up: it absorbs the compile cost of whatever a pin bump or a
+bootstrap retry does re-run.
+
+Residual: the installed prefix accumulates; a pin bump that *removes* a
+library leaves its old artifacts in `install/<target>` until the cache is
+cold again. Linking is name-driven via pkgconf, so a lingering library is
+only reachable if something still asks for it; bump
+`toolchain/windows.txt`'s generation to force a clean state when that
+matters.
+
 ## Slimming candidates (later pass, deliberately not wave 2)
 
 The dependency set is full-fat to keep the pinning change isolated. Candidates

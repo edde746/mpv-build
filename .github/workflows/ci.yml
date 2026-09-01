@@ -29,6 +29,9 @@ jobs:
       - name: Test content keys
         run: bash scripts/test_keys.sh
 
+      - name: Test windows package pinning
+        run: python3 platforms/windows/test_pin_packages.py
+
       # Every nonempty (component, group) series must still apply cleanly to
       # the exact source tree versions.json pins for it, otherwise the next
       # publish run breaks. `apply --check` lands the whole stack and unwinds
