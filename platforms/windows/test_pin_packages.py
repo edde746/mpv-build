@@ -294,6 +294,20 @@ class PinPackagesTest(unittest.TestCase):
             self.assertEqual(gated.count(flag), 1)
         self.assertEqual(pin_packages.gate_ffmpeg_cuda(gated), gated)
 
+    def test_mpv_master_only_options_are_stripped(self):
+        # meson hard-errors on unknown options; subrandr and libcurl landed
+        # after v0.41.0.
+        text = (TESTDATA / "mpv.cmake").read_text()
+        self.assertIn("-Dsubrandr=enabled", text)
+        self.assertIn("-Dlibcurl=enabled", text)
+        gated = pin_packages.gate_mpv_options(text)
+        self.assertNotIn("-Dsubrandr", gated)
+        self.assertNotIn("-Dlibcurl", gated)
+        # Only the two option lines vanish; the DEPENDS entry stays.
+        self.assertIn("subrandr\n", gated)
+        self.assertEqual(len(text.splitlines()) - 2, len(gated.splitlines()))
+        self.assertEqual(pin_packages.gate_mpv_options(gated), gated)
+
     def test_ffmpeg_cuda_gate_survives_full_rewrite_cycle(self):
         # main() applies rewrite() then gate_ffmpeg_cuda() on every run; a
         # second full cycle must converge byte-identically.

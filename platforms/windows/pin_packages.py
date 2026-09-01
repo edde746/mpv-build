@@ -269,6 +269,31 @@ FFMPEG_CUDA_GUARD = (
 )
 
 
+# winbuild's mpv recipe targets mpv master; the pinned release lacks two of
+# its meson options (subrandr and libcurl landed after v0.41.0), and meson
+# hard-errors on unknown options. The subrandr DEPENDS entry stays: the
+# library just goes unused. Re-audit when the mpv pin moves past them.
+MPV_MASTER_ONLY_OPTIONS = (
+    "        -Dsubrandr=enabled\n",
+    "        -Dlibcurl=enabled\n",
+)
+
+
+def gate_mpv_options(text):
+    """mpv.cmake text without the master-only meson options; pure for tests."""
+    if not any(option in text for option in MPV_MASTER_ONLY_OPTIONS):
+        if "-Dsubrandr" in text or "-Dlibcurl" in text:
+            fail(
+                "packages/mpv.cmake: master-only meson options no longer match "
+                "the audited shape; re-audit the option gate against the new "
+                "winbuild commit before pinning to it"
+            )
+        return text
+    for option in MPV_MASTER_ONLY_OPTIONS:
+        text = text.replace(option, "")
+    return text
+
+
 def gate_ffmpeg_cuda(text):
     """ffmpeg.cmake text with the cuda enables arch-gated; pure for tests."""
     if FFMPEG_CUDA_GATED in text and text.startswith(FFMPEG_CUDA_GUARD):
@@ -313,6 +338,8 @@ def main(argv):
         pinned = rewrite(text, component, pins, bool(staged))
         if component == "ffmpeg":
             pinned = gate_ffmpeg_cuda(pinned)
+        if component == "mpv":
+            pinned = gate_mpv_options(pinned)
         if pinned != text:
             package_file.write_text(pinned, encoding="utf-8")
         patched = f", {len(staged)} patch(es) staged" if staged else ""
