@@ -125,6 +125,20 @@ if [[ "$(uname -s)" != Linux ]]; then
   exit 1
 fi
 
+# winbuild runs ExternalProject steps with LOG 1, so a failing step's real
+# error goes to <pkg>-stamp/<pkg>-<step>-*.log and ninja only prints the
+# stamp path. Surface the actual errors on any failure past this point.
+dump_step_logs() {
+  echo "==> build failed; dumping step logs written during this run" >&2
+  find "$BUILD" -name '*.log' -path '*-stamp/*' -newer "$BUILD/.run-started" 2> /dev/null \
+    | while read -r log; do
+        printf '\n===== %s =====\n' "$log" >&2
+        tail -80 "$log" >&2
+      done
+}
+touch "$BUILD/.run-started"
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then dump_step_logs; fi; exit $rc' EXIT
+
 # CI restores the whole build state (per-arch tree + shared src + rustup) as
 # cache entries. The toolchain is fully described by the generation in
 # toolchain/windows.txt plus the winbuild commit, so when the marker written

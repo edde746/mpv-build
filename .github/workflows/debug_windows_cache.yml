@@ -1,0 +1,50 @@
+# Manual debugging for the windows build-state cache.
+#
+# winbuild runs its ExternalProject steps with LOG 1, so a failing step's
+# real error lands in <pkg>-prefix/src/<pkg>-stamp/<pkg>-<step>-*.log inside
+# the per-arch tree -- which the build job saves to the cache even on
+# failure. This workflow restores the newest cache entry for an arch and
+# prints the logs matching a pattern, so a CI-only failure can be read
+# without burning a build cycle.
+name: Debug windows cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: target arch
+        type: choice
+        options: [x86_64, aarch64]
+        default: x86_64
+      pattern:
+        description: find -path pattern for logs under build/windows
+        default: "*libvpl*"
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    name: Dump ${{ inputs.arch }} logs (${{ inputs.pattern }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore newest build state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/windows/${{ inputs.arch }}
+            build/windows/src
+            build/windows/rustup
+          key: windows-ep2-${{ inputs.arch }}-never-matches-exactly
+          restore-keys: |
+            windows-ep2-${{ inputs.arch }}-
+
+      - name: Dump matching logs
+        run: |
+          find build/windows -path "*${{ inputs.pattern }}*" -name '*.log' | while read -r f; do
+            echo "===== $f ====="
+            tail -120 "$f"
+            echo
+          done
+          echo "===== matching non-log files ====="
+          find build/windows -path "*${{ inputs.pattern }}*" ! -name '*.log' -maxdepth 6 | head -40
