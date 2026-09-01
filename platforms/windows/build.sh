@@ -146,9 +146,17 @@ trap 'rc=$?; if [[ $rc -ne 0 ]]; then dump_step_logs; fi; exit $rc' EXIT
 # stale mingw-w64 headers through three different invalidation attempts). So
 # ask git itself: our patch steps use `git apply` (worktree-only), so a
 # correctly fetched source has HEAD == pinned commit; anything else --
-# wrong pin after a bump, or stamps restored without their source -- gets a
-# fullclean, which deletes the package's stamps and re-drives its whole
-# chain, cascading into its dependents by stamp mtime.
+# wrong pin after a bump, or stamps restored without their source -- has its
+# source reset to the pin and its 0-byte stamp files dropped by hand (the
+# toolchain packages have no cleanup() step targets, so ninja fullclean is
+# not universally available). Deleted stamps re-drive the package's chain
+# and cascade into its dependents by stamp mtime; the re-run download step
+# early-exits because the source already sits at the pin.
+drop_stamps() {
+  # Keep the *.cmake step scripts cmake wrote beside the stamps, and the
+  # step logs (nonzero size); stamps are the 0-byte files.
+  find "$1" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
+}
 invalidate_stale_pins() {
   python3 - "$ROOT/versions.json" <<'PY' | while read -r component source_name pinned; do
 import json, sys
@@ -170,14 +178,19 @@ PY
       local head
       head="$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)"
       if [[ "$head" != "$pinned" ]]; then
-        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; fullcleaning"
-        ninja -C "$BUILD" "$component-fullclean"
+        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; resetting and dropping stamps"
+        git -C "$src" am --abort 2> /dev/null || true
+        # The filtered clone fetches missing objects lazily; fetch the pin
+        # explicitly in case the cached clone predates it.
+        git -C "$src" cat-file -e "$pinned^{commit}" 2> /dev/null \
+          || git -C "$src" fetch -q origin "$pinned"
+        git -C "$src" reset --hard -q "$pinned"
+        git -C "$src" clean -qdf
+        drop_stamps "$prefix/src/$component-stamp"
       fi
     elif [[ -d "$prefix/src/$component-stamp" ]]; then
-      # Stamps without a source: drop the 0-byte stamp files (keeping the
-      # step scripts cmake wrote beside them) so the chain re-clones.
       echo "==> $component stamps present without a source; dropping stamps"
-      find "$prefix/src/$component-stamp" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
+      drop_stamps "$prefix/src/$component-stamp"
     fi
   done
 }
