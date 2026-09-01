@@ -13,14 +13,19 @@ testdata/mbedtls.cmake -- uses its patched ExternalProject keywords:
     GIT_TAG <branch-or-tag>
     GIT_RESET <commit> # <human-readable version>
 
-This helper rewrites the three package files in a winbuild checkout to that
-idiom, driven by versions.json resolved pins (overrides.windows folded in):
+This helper rewrites the payload package files (and toolchain/mingw-w64.cmake,
+see TOOLCHAIN_COMPONENTS) in a winbuild checkout to that idiom, driven by
+versions.json resolved pins (overrides.windows folded in):
 
   * GIT_REPOSITORY is rewritten to the pinned url -- libass builds from our
     edde746/libass fork, not upstream libass/libass, which is the windows
     parity win of this pinning pass;
-  * GIT_REMOTE_NAME origin / GIT_TAG <ref> / GIT_RESET <commit> # <version>
-    are injected directly after UPDATE_COMMAND "", exactly like mbedtls;
+  * GIT_REMOTE_NAME origin / GIT_TAG <commit> / GIT_RESET <commit> # <human>
+    are injected directly after UPDATE_COMMAND "", like mbedtls -- except the
+    GIT_TAG carries the resolved commit, because the tag value is what lands
+    in <pkg>-gitinfo.txt, the only graph input that invalidates the download
+    step on a warm cached tree (a textually stable branch or re-pointed tag
+    must not silently keep the old source);
   * the resolved windows patch series (patches/<c>/series.common followed by
     patches/<c>/series.windows) is staged into packages/ as
     <c>-NNNN-<pool name>.patch and a PATCH_COMMAND is injected directly
@@ -160,10 +165,19 @@ def rewrite(text, component, pins, have_patches):
     at = update_lines[0]
     pad = indent_of(lines[at])
 
+    # GIT_TAG carries the resolved commit, not the human ref. The tag value
+    # is what ExternalProject records in <pkg>-gitinfo.txt, and that file's
+    # content is the ONLY graph input that invalidates the download step on
+    # a warm cached tree: a ref that stays textually identical while its
+    # target moves (a branch like mingw-w64's master, or a re-pointed tag)
+    # would otherwise leave the old source in place silently. GIT_RESET
+    # names the same commit for winbuild's reset/force-update machinery and
+    # keeps the human-readable ref and version in its comment.
+    comment = pins["version"] if pins["ref"] in pins["version"] else f"{pins['ref']} {pins['version']}"
     after = [
         f"{pad}GIT_REMOTE_NAME origin",
-        f"{pad}GIT_TAG {pins['ref']}",
-        f"{pad}GIT_RESET {pins['commit']} # {pins['version']}",
+        f"{pad}GIT_TAG {pins['commit']}",
+        f"{pad}GIT_RESET {pins['commit']} # {comment}",
     ]
     before = []
     if have_patches:

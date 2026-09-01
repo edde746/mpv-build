@@ -120,13 +120,17 @@ class PinPackagesTest(unittest.TestCase):
             "injected block does not follow the mbedtls.cmake keyword order",
         )
         # And the exact injected lines, contiguous, mbedtls-style 4-space indent.
+        # GIT_TAG is the resolved commit, not the tag name: the tag value is
+        # what lands in <pkg>-gitinfo.txt, the only graph input that dirties
+        # the download step on a warm tree. A textually stable ref whose
+        # target moved must invalidate.
         expected = (
             "    PATCH_COMMAND ${EXEC} "
             '"git reset --hard 41f6a645068483470267271e1d09966ca3b9f413 -q '
             '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch"\n'
             '    UPDATE_COMMAND ""\n'
             "    GIT_REMOTE_NAME origin\n"
-            "    GIT_TAG v0.41.0\n"
+            "    GIT_TAG 41f6a645068483470267271e1d09966ca3b9f413\n"
             "    GIT_RESET 41f6a645068483470267271e1d09966ca3b9f413 # v0.41.0\n"
         )
         self.assertIn(expected, pinned)
@@ -187,7 +191,7 @@ class PinPackagesTest(unittest.TestCase):
         self.assertIn(
             '    UPDATE_COMMAND ""\n'
             "    GIT_REMOTE_NAME origin\n"
-            "    GIT_TAG master\n"
+            f"    GIT_TAG {pins['commit']}\n"
             f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
             pinned,
         )
