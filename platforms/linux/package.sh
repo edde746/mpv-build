@@ -116,5 +116,10 @@ fi
 
 mkdir -p "$OUT_DIR"
 artifact="$OUT_DIR/libmpv-linux-${KEY}-${ARCH}.tar.zst"
-tar --zstd -C "$stage" -cf "$artifact" .
+# Reproducible bytes: the release skips re-uploading an existing
+# content-addressed name, so a rebuild of the same key MUST produce the
+# identical archive or the recorded checksum drifts from the published bytes.
+tar --sort=name --owner=0 --group=0 --numeric-owner \
+  --mtime='2020-01-01 00:00:00 UTC' \
+  --zstd -C "$stage" -cf "$artifact" .
 echo "==> Packaged $artifact"

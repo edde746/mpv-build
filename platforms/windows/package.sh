@@ -62,8 +62,11 @@ fi
 mkdir -p "$OUT"
 ASSET="$OUT/libmpv-windows-$KEY-$ARCH.zip"
 rm -f "$ASSET"
-# Sorted input and -X (no extra fs attributes) keep the archive as stable as
-# zip can make it; immutability is guaranteed by the key in the name, not by
-# byte-reproducibility.
-(cd "$DEV_DIR" && find . -type f | LC_ALL=C sort | zip -q -X -9 "$ASSET" -@)
+# Reproducible bytes: the release skips re-uploading an existing
+# content-addressed name, so a rebuild of the same key MUST produce the
+# identical archive or the recorded checksum drifts from the published bytes.
+# zip stores each file's DOS mtime, so normalize them; sorted input and -X
+# (no extra fs attributes) cover the rest.
+(cd "$DEV_DIR" && find . -type f -exec touch -t 202001010000 {} + \
+  && find . -type f | LC_ALL=C sort | zip -q -X -9 "$ASSET" -@)
 echo "$ASSET"

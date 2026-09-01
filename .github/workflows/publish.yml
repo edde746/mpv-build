@@ -271,7 +271,7 @@ jobs:
               --notes "Content-addressed apple build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. Package.swift pins these URLs; deleting an asset breaks every commit and tag that references it."
           fi
 
-          gh release view binaries-apple --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+          gh release view binaries-apple --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
 
           python3 - <<'PY'
           import json
@@ -280,7 +280,15 @@ jobs:
 
           manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
           section = manifest['platforms']['apple']
-          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          import hashlib
+          digests = {}
+          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+              continue
+            name, _, digest = line.partition(' ')
+            digests[name] = digest.removeprefix('sha256:')
+          published = set(digests)
           release_dir = Path('dist/release')
 
           wanted = []
@@ -298,7 +306,22 @@ jobs:
               continue
             seen.add(asset)
             if asset in published:
-              print(f'published {asset}')
+              # Verify-on-skip: an existing content-addressed name must hold
+              # exactly the bytes this run rebuilt, or the checksum recorded
+              # in artifacts.json drifts from what consumers download (this
+              # happened when the archives were not byte-reproducible).
+              local_path = release_dir / asset
+              remote = digests.get(asset, '')
+              if local_path.is_file() and remote:
+                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                if local != remote:
+                  raise SystemExit(
+                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
+                    'a content-addressed asset must never change bytes -- the '
+                    'archive packaging has lost reproducibility')
+                print(f'published {asset} (bytes verified)')
+              else:
+                print(f'published {asset}')
               continue
             path = release_dir / asset
             if path.is_file():
@@ -426,7 +449,7 @@ jobs:
               --notes "Content-addressed android build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
           fi
 
-          gh release view binaries-android --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+          gh release view binaries-android --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
 
           python3 - <<'PY'
           import json
@@ -436,7 +459,15 @@ jobs:
           group = 'android'
           manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
           section = manifest['platforms'][group]
-          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          import hashlib
+          digests = {}
+          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+              continue
+            name, _, digest = line.partition(' ')
+            digests[name] = digest.removeprefix('sha256:')
+          published = set(digests)
           release_dir = Path('dist/release')
 
           wanted = []
@@ -452,7 +483,22 @@ jobs:
               continue
             seen.add(asset)
             if asset in published:
-              print(f'published {asset}')
+              # Verify-on-skip: an existing content-addressed name must hold
+              # exactly the bytes this run rebuilt, or the checksum recorded
+              # in artifacts.json drifts from what consumers download (this
+              # happened when the archives were not byte-reproducible).
+              local_path = release_dir / asset
+              remote = digests.get(asset, '')
+              if local_path.is_file() and remote:
+                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                if local != remote:
+                  raise SystemExit(
+                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
+                    'a content-addressed asset must never change bytes -- the '
+                    'archive packaging has lost reproducibility')
+                print(f'published {asset} (bytes verified)')
+              else:
+                print(f'published {asset}')
               continue
             path = release_dir / asset
             if path.is_file():
@@ -562,7 +608,7 @@ jobs:
               --notes "Content-addressed linux build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
           fi
 
-          gh release view binaries-linux --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+          gh release view binaries-linux --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
 
           python3 - <<'PY'
           import json
@@ -572,7 +618,15 @@ jobs:
           group = 'linux'
           manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
           section = manifest['platforms'][group]
-          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          import hashlib
+          digests = {}
+          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+              continue
+            name, _, digest = line.partition(' ')
+            digests[name] = digest.removeprefix('sha256:')
+          published = set(digests)
           release_dir = Path('dist/release')
 
           wanted = []
@@ -588,7 +642,22 @@ jobs:
               continue
             seen.add(asset)
             if asset in published:
-              print(f'published {asset}')
+              # Verify-on-skip: an existing content-addressed name must hold
+              # exactly the bytes this run rebuilt, or the checksum recorded
+              # in artifacts.json drifts from what consumers download (this
+              # happened when the archives were not byte-reproducible).
+              local_path = release_dir / asset
+              remote = digests.get(asset, '')
+              if local_path.is_file() and remote:
+                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                if local != remote:
+                  raise SystemExit(
+                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
+                    'a content-addressed asset must never change bytes -- the '
+                    'archive packaging has lost reproducibility')
+                print(f'published {asset} (bytes verified)')
+              else:
+                print(f'published {asset}')
               continue
             path = release_dir / asset
             if path.is_file():
@@ -772,7 +841,7 @@ jobs:
               --notes "Content-addressed windows build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
           fi
 
-          gh release view binaries-windows --json assets --jq '.assets[].name' > ./dist/published-assets.txt
+          gh release view binaries-windows --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
 
           python3 - <<'PY'
           import json
@@ -782,7 +851,15 @@ jobs:
           group = 'windows'
           manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
           section = manifest['platforms'][group]
-          published = {line.strip() for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines() if line.strip()}
+          import hashlib
+          digests = {}
+          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+              continue
+            name, _, digest = line.partition(' ')
+            digests[name] = digest.removeprefix('sha256:')
+          published = set(digests)
           release_dir = Path('dist/release')
 
           wanted = []
@@ -798,7 +875,22 @@ jobs:
               continue
             seen.add(asset)
             if asset in published:
-              print(f'published {asset}')
+              # Verify-on-skip: an existing content-addressed name must hold
+              # exactly the bytes this run rebuilt, or the checksum recorded
+              # in artifacts.json drifts from what consumers download (this
+              # happened when the archives were not byte-reproducible).
+              local_path = release_dir / asset
+              remote = digests.get(asset, '')
+              if local_path.is_file() and remote:
+                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
+                if local != remote:
+                  raise SystemExit(
+                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
+                    'a content-addressed asset must never change bytes -- the '
+                    'archive packaging has lost reproducibility')
+                print(f'published {asset} (bytes verified)')
+              else:
+                print(f'published {asset}')
               continue
             path = release_dir / asset
             if path.is_file():

@@ -68,7 +68,13 @@ for arch in "${archs[@]}"; do
 		cp "prefix/$prefix_name/include/mpv/$header" "$staging/include/mpv/"
 	done
 	asset="libmpv-android-$key-$prefix_name.tar.gz"
-	tar -czf "$release_dir/$asset" -C "$staging" lib include
+	# Reproducible bytes: the release skips re-uploading an existing
+	# content-addressed name, so a rebuild of the same key MUST produce the
+	# identical archive or the recorded checksum drifts from the published
+	# bytes. Fixed order, owners and mtimes; gzip -n drops its own timestamp.
+	tar --sort=name --owner=0 --group=0 --numeric-owner \
+		--mtime='2020-01-01 00:00:00 UTC' \
+		-C "$staging" -cf - lib include | gzip -n -9 > "$release_dir/$asset"
 	rm -rf "$staging"
 	echo "packaged $asset"
 done

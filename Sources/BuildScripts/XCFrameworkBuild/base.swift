@@ -921,7 +921,7 @@ class BaseBuild {
             let sourceLib = releaseDirPath + [library.rawValue]
             let destZipLibPath = releaseDirPath + [library.rawValue + "-all.zip"]
             try? FileManager.default.removeItem(at: destZipLibPath)
-            try Utility.launch(path: "/usr/bin/zip", arguments: ["-qr", destZipLibPath.path, "./"], currentDirectoryURL: sourceLib)
+            try Self.deterministicZip(entry: "./", zipFile: destZipLibPath, currentDirectoryURL: sourceLib)
         }
 
         // zip xcframeworks
@@ -942,7 +942,7 @@ class BaseBuild {
             let XCFrameworkFile =  framework + ".xcframework"
             let zipFile = releaseDirPath + [framework + ".xcframework.zip"]
             let checksumFile = releaseDirPath + [framework + ".xcframework.checksum.txt"]
-            try Utility.launch(path: "/usr/bin/zip", arguments: ["-qry", zipFile.path, XCFrameworkFile], currentDirectoryURL: self.xcframeworkDirectoryURL)
+            try Self.deterministicZip(entry: XCFrameworkFile, zipFile: zipFile, currentDirectoryURL: self.xcframeworkDirectoryURL)
             Utility.shell("swift package compute-checksum \(zipFile.path) > \(checksumFile.path)")
 
             if BaseBuild.options.enableSplitPlatform {
@@ -958,12 +958,28 @@ class BaseBuild {
                     if FileManager.default.fileExists(atPath: XCFrameworkPath.path) {
                         let zipFile = releaseDirPath + [XCFrameworkName + ".xcframework.zip"]
                         let checksumFile = releaseDirPath + [XCFrameworkName + ".xcframework.checksum.txt"]
-                        try Utility.launch(path: "/usr/bin/zip", arguments: ["-qry", zipFile.path, XCFrameworkFile], currentDirectoryURL: self.xcframeworkDirectoryURL)
+                        try Self.deterministicZip(entry: XCFrameworkFile, zipFile: zipFile, currentDirectoryURL: self.xcframeworkDirectoryURL)
                         Utility.shell("swift package compute-checksum \(zipFile.path) > \(checksumFile.path)")
                     }
                 }
             }
         }
+    }
+
+    /// Zip with reproducible bytes. The release publishes content-addressed,
+    /// immutable assets and skips re-uploading an existing name, so a rebuild
+    /// of the same key MUST produce the identical archive or the recorded
+    /// checksum drifts from the published bytes (this happened: zip stores
+    /// each file's DOS mtime, so every rebuild differed). Normalize mtimes,
+    /// strip extended attributes (-X), keep symlinks (-y) and feed entries in
+    /// sorted order.
+    static func deterministicZip(entry: String, zipFile: URL, currentDirectoryURL: URL) throws {
+        _ = Utility.shell("find \(entry) -exec touch -h -t 202001010000 {} +", currentDirectoryURL: currentDirectoryURL)
+        _ = try Utility.launch(
+            path: "/bin/bash",
+            arguments: ["-c", "find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C sort | zip -q -X -y '\(zipFile.path)' -@"],
+            currentDirectoryURL: currentDirectoryURL
+        )
     }
 
     func packagePkgConfigRelease() throws {
