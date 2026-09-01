@@ -199,8 +199,8 @@ invalidate_stale_pins() {
 import json, sys
 components = json.load(open(sys.argv[1]))["components"]
 for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
-                               ("libass", "libass"), ("llvm", "llvm"),
-                               ("mingw-w64", "mingw-w64")):
+                               ("libass", "libass"), ("svt-av1", "svtav1"),
+                               ("llvm", "llvm"), ("mingw-w64", "mingw-w64")):
     entry = components[component]
     pins = {"commit": entry["commit"]}
     pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
@@ -212,7 +212,7 @@ PY
       mingw-w64) family="__sysroot_world__" ;;
       # Everything that builds out of the shared llvm-project source.
       llvm) family="llvm llvm-wrapper llvm-clang llvm-compiler-rt-builtin llvm-compiler-rt llvm-libcxx llvm-openmp" ;;
-      *) family="$component" ;;
+      *) family="$source_name" ;;
     esac
     if [[ -d "$src/.git" ]]; then
       local head
@@ -233,7 +233,7 @@ PY
           purge_component "$family"
         fi
       fi
-    elif find "$BUILD" -type d -name "$component-stamp" 2> /dev/null | grep -q .; then
+    elif find "$BUILD" -type d -name "$source_name-stamp" 2> /dev/null | grep -q .; then
       if [[ "$family" == "__sysroot_world__" ]]; then
         echo "==> $component stamps present without a source"
         purge_sysroot_world

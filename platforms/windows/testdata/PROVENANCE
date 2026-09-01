@@ -20,13 +20,15 @@
 #   b5dc88003f81d95e9a86c4befe1bac1472a4ec15c6d9a56a8bfd9c5fabf698a2  custom_steps.cmake
 #   55f2a2bb49ef17de05985beb0395c7a1acb44d613c50e048fce1e5a2c2fab8a3  mingw-w64.cmake
 #   a1168b87c9ef663c40ce08f666219e3f668efb328429e4cea8704741b8cb31db  llvm.cmake
+#   4649b91fa340471263d52ef23fcd5dd0ff520dc60e91df564ce1059c4be27c9e  svtav1.cmake
 #
 # mpv/ffmpeg/libass are the files pin_packages.py rewrites (pristine upstream:
 # no GIT_TAG, no GIT_RESET, no PATCH_COMMAND -- they track master).
-# mingw-w64.cmake and llvm.cmake are the toolchain source packages
-# pin_packages.py pins the same way (mingw-w64 pristine has no GIT_TAG at
-# all; llvm pristine carries upstream's own moving-branch GIT_TAG, which the
-# rewrite replaces).
+# mingw-w64.cmake, llvm.cmake and svtav1.cmake are the extra pinned packages
+# (see pin_packages.EXTRA_COMPONENTS; mingw-w64 pristine has no GIT_TAG at
+# all, llvm pristine carries upstream's own moving-branch GIT_TAG, which the
+# rewrite replaces, and svtav1 tracks the default branch). ffmpeg.cmake is
+# also the fixture for the aarch64 cuda gate rewrite.
 # mbedtls.cmake is upstream's own pinning idiom and is the reference the tests
 # compare the injected block's shape against; it is never rewritten.
 # custom_steps.cmake carries the check-git step whose injection
@@ -34,4 +36,4 @@
 # tests assert the audited idiom still matches and that the rewrite converges.
 #
 # When bumping the mpv-winbuild-cmake pin in versions.json, refresh these
-# seven fixtures from the new commit and update the hashes above.
+# eight fixtures from the new commit and update the hashes above.

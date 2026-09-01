@@ -48,6 +48,12 @@ PINS = {
         "ref": "release/22.x",
         "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
     },
+    "svt-av1": {
+        "version": "v3.1.2",
+        "url": "https://gitlab.com/AOMediaCodec/SVT-AV1",
+        "ref": "v3.1.2",
+        "commit": "b33dcc56cc64fcb3b3569094af8ab1d0d81ab4c1",
+    },
 }
 
 PATCH = """diff --git a/a.c b/a.c
@@ -235,6 +241,45 @@ class PinPackagesTest(unittest.TestCase):
         text = (TESTDATA / "custom_steps.cmake").read_text()
         self.assertEqual(text.count(pin_packages.CHECK_GIT_ORIGINAL), 1)
         self.assertNotIn(pin_packages.CHECK_GIT_NEUTRALIZED, text)
+
+    def test_svtav1_pin_matches_idiom(self):
+        # svt-av1 pins to a 3.x release: SVT-AV1 4.0 removed a field the
+        # pinned release ffmpeg still sets unguarded.
+        text = (TESTDATA / "svtav1.cmake").read_text()
+        pins = PINS["svt-av1"]
+        pinned = pin_packages.rewrite(text, "svt-av1", pins, False)
+        self.assertIn(
+            '    UPDATE_COMMAND ""\n'
+            "    GIT_REMOTE_NAME origin\n"
+            f"    GIT_TAG {pins['commit']}\n"
+            f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
+            pinned,
+        )
+        self.assertEqual(pin_packages.rewrite(pinned, "svt-av1", pins, False), pinned)
+
+    def test_ffmpeg_cuda_is_arch_gated(self):
+        # The pinned release ffmpeg's ffnvcodec probe fails on
+        # aarch64-w64-mingw32; the unconditional cuda enables become a
+        # variable that is only set off-aarch64.
+        text = (TESTDATA / "ffmpeg.cmake").read_text()
+        self.assertIn(pin_packages.FFMPEG_CUDA_ORIGINAL, text)
+        gated = pin_packages.gate_ffmpeg_cuda(text)
+        self.assertNotIn(pin_packages.FFMPEG_CUDA_ORIGINAL, gated)
+        self.assertIn("${ffmpeg_cuda}", gated)
+        self.assertTrue(gated.startswith(pin_packages.FFMPEG_CUDA_GUARD))
+        # The four flags survive, exactly once, inside the guard.
+        for flag in ("--enable-cuda-llvm", "--enable-cuvid", "--enable-nvdec", "--enable-nvenc"):
+            self.assertEqual(gated.count(flag), 1)
+        self.assertEqual(pin_packages.gate_ffmpeg_cuda(gated), gated)
+
+    def test_ffmpeg_cuda_gate_survives_full_rewrite_cycle(self):
+        # main() applies rewrite() then gate_ffmpeg_cuda() on every run; a
+        # second full cycle must converge byte-identically.
+        text = (TESTDATA / "ffmpeg.cmake").read_text()
+        pins = PINS["ffmpeg"]
+        once = pin_packages.gate_ffmpeg_cuda(pin_packages.rewrite(text, "ffmpeg", pins, False))
+        twice = pin_packages.gate_ffmpeg_cuda(pin_packages.rewrite(once, "ffmpeg", pins, False))
+        self.assertEqual(once, twice)
 
     def test_neutralize_check_git_suppresses_and_converges(self):
         text = (TESTDATA / "custom_steps.cmake").read_text()

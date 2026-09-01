@@ -14,7 +14,8 @@
         "libass",
         "mpv-winbuild-cmake",
         "mingw-w64",
-        "llvm"
+        "llvm",
+        "svt-av1"
       ],
       "variants": [
         "x86_64",

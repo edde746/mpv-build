@@ -14,7 +14,7 @@ testdata/mbedtls.cmake -- uses its patched ExternalProject keywords:
     GIT_RESET <commit> # <human-readable version>
 
 This helper rewrites the payload package files (and toolchain/mingw-w64.cmake,
-see TOOLCHAIN_COMPONENTS) in a winbuild checkout to that idiom, driven by
+see EXTRA_COMPONENTS) in a winbuild checkout to that idiom, driven by
 versions.json resolved pins (overrides.windows folded in):
 
   * GIT_REPOSITORY is rewritten to the pinned url -- libass builds from our
@@ -65,19 +65,22 @@ import sys
 from pathlib import Path
 
 COMPONENTS = ("mpv", "ffmpeg", "libass")
-# Toolchain source packages pinned the same way. mingw-w64 is cloned at
-# toolchain-bootstrap time and defines the target ABI (headers + CRT); its
-# tip is the one input the winbuild commit pin cannot see, and a tip
-# restructure (2026-08-29 secure-API header merge) has already broken the
-# dependency graph once. No patch-series support here: the staged-patch glob
-# is anchored to packages/, and toolchain sources have no pool.
-# Toolchain component -> cmake file inside the winbuild checkout. llvm's
-# pristine file carries upstream's own GIT_REMOTE_NAME/GIT_TAG (a moving
-# release branch); the strip-before-inject rewrite replaces them with the
-# resolved commit.
-TOOLCHAIN_COMPONENTS = {
+# Additional pinned packages, component -> cmake file inside the winbuild
+# checkout. These pin through the same strip-before-inject rewrite but carry
+# no patch series (the staged-patch glob is anchored to packages/ payload
+# names). Why each is pinned:
+#   mingw-w64: cloned at toolchain-bootstrap time, defines the target ABI;
+#     the 2026-08-29 secure-API restructure broke libvpl mid-day.
+#   llvm: the toolchain's other live-fetch (a moving release branch; its
+#     pristine file carries upstream's own GIT_REMOTE_NAME/GIT_TAG, which
+#     the rewrite replaces).
+#   svt-av1: follows ffmpeg master; SVT-AV1 4.0 removed a field the pinned
+#     release ffmpeg still sets unguarded, so the master tip cannot build
+#     with a release ffmpeg.
+EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
+    "svt-av1": "packages/svtav1.cmake",
 }
 GROUP = "windows"
 
@@ -240,6 +243,42 @@ def neutralize_check_git(text):
     return text.replace(CHECK_GIT_ORIGINAL, CHECK_GIT_NEUTRALIZED, 1)
 
 
+# winbuild enables cuda for every arch (2026-08-04, "ffmpeg: enable cuda for
+# aarch64") against ffmpeg master. Under the pinned release ffmpeg the
+# aarch64-w64-mingw32 ffnvcodec probe fails and configure aborts, so the
+# flags are rewritten behind an arch guard: x86_64 keeps cuda, aarch64 drops
+# it. Upstream builds this combination against master only; nobody tests
+# release-ffmpeg aarch64 cuda.
+FFMPEG_CUDA_ORIGINAL = (
+    "        --enable-cuda-llvm\n"
+    "        --enable-cuvid\n"
+    "        --enable-nvdec\n"
+    "        --enable-nvenc\n"
+)
+FFMPEG_CUDA_GATED = "        ${ffmpeg_cuda}\n"
+FFMPEG_CUDA_GUARD = (
+    "# cuda gated by pin_packages.py: the pinned release ffmpeg's ffnvcodec\n"
+    "# probe fails for aarch64-w64-mingw32 (upstream enables cuda for aarch64\n"
+    "# against ffmpeg master only).\n"
+    'if(NOT TARGET_CPU STREQUAL "aarch64")\n'
+    "    set(ffmpeg_cuda --enable-cuda-llvm --enable-cuvid --enable-nvdec --enable-nvenc)\n"
+    "endif()\n"
+)
+
+
+def gate_ffmpeg_cuda(text):
+    """ffmpeg.cmake text with the cuda enables arch-gated; pure for tests."""
+    if FFMPEG_CUDA_GATED in text and text.startswith(FFMPEG_CUDA_GUARD):
+        return text
+    if FFMPEG_CUDA_ORIGINAL not in text:
+        fail(
+            "packages/ffmpeg.cmake: the cuda enable flags no longer match the "
+            "audited shape; re-audit the aarch64 cuda gate against the new "
+            "winbuild commit before pinning to it"
+        )
+    return FFMPEG_CUDA_GUARD + text.replace(FFMPEG_CUDA_ORIGINAL, FFMPEG_CUDA_GATED, 1)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", required=True, help="mpv-winbuild-cmake checkout to rewrite")
@@ -269,12 +308,14 @@ def main(argv):
             fail(f"{package_file}: missing")
         text = package_file.read_text(encoding="utf-8")
         pinned = rewrite(text, component, pins, bool(staged))
+        if component == "ffmpeg":
+            pinned = gate_ffmpeg_cuda(pinned)
         if pinned != text:
             package_file.write_text(pinned, encoding="utf-8")
         patched = f", {len(staged)} patch(es) staged" if staged else ""
         print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{patched}")
 
-    for component, relpath in TOOLCHAIN_COMPONENTS.items():
+    for component, relpath in EXTRA_COMPONENTS.items():
         pins = resolved_pins(versions, component)
         toolchain_file = winbuild / relpath
         if not toolchain_file.is_file():
