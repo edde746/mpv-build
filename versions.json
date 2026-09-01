@@ -86,11 +86,11 @@
     },
     "mingw-w64": {
       "kind": "git",
-      "version": "master-2026-08-29",
+      "version": "master-2026-08-05",
       "url": "https://github.com/mingw-w64/mingw-w64",
       "ref": "master",
-      "commit": "ca4cc40bdcda1aa3e9df68d5443c7ceaf1f212f9",
-      "provenance": "Headers and CRT for the windows cross-toolchain. winbuild clones the master tip at bootstrap time, which is the one ABI-defining input the winbuild commit pin cannot see; pinned to the parent of d3930179 (the 2026-08-29 secure-API header restructure whose unconditional wcscpy_s breaks libvpl's MinGW compat macros), resolved 2026-09-01 from the GitHub commits API parent field of d3930179 and frozen by commit.",
+      "commit": "5ea8e9facd013b815f5f29f20ef26a566319a3de",
+      "provenance": "Headers and CRT for the windows cross-toolchain. winbuild clones the master tip at toolchain-bootstrap time, which is the one ABI-defining input the winbuild commit pin cannot see. Pinned to the master tip as of 2026-08-05T15:47Z, the moment upstream winbuild last built its own toolchain cache (llvm_clang.yml run 31022056534): every green daily mpv_clang build since compiles the full dependency graph, libvpl included, against exactly these headers. Later mingw-w64 master (the late-August secure-API restructure and its preparatory series) breaks libvpl's MinGW compat macros, and one intermediate commit (ca4cc40b) additionally ships a Makefile.in out of sync with its own tree. Resolved 2026-09-01 from the GitHub commits API (master, until=2026-08-05T15:47:20Z) and frozen by commit.",
       "platforms": [
         "windows"
       ],
