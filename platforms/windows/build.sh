@@ -157,6 +157,21 @@ drop_stamps() {
   # step logs (nonzero size); stamps are the 0-byte files.
   find "$1" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
 }
+# Invalidate every package that builds out of the component's source tree:
+# drop their stamps AND delete their build directories. A build dir restored
+# from the cache was configured against the previous source state; re-running
+# steps inside it against a reset source fails or, worse, silently builds a
+# mix (observed: mingw-w64-headers' autotools build dir kept Makefile rules
+# for header files that only exist in the newer source).
+purge_component() {
+  local member
+  for member in $1; do
+    find "$BUILD" -type d -name "$member-stamp" 2> /dev/null | while read -r d; do
+      drop_stamps "$d"
+    done
+    find "$BUILD" -type d -name "$member-build" -prune -exec rm -rf {} + 2> /dev/null || true
+  done
+}
 invalidate_stale_pins() {
   python3 - "$ROOT/versions.json" <<'PY' | while read -r component source_name pinned; do
 import json, sys
@@ -169,16 +184,17 @@ for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
                  if f == "commit"})
     print(component, source_name, pins["commit"])
 PY
-    local src="$WORK/src/$source_name" prefix
+    local src="$WORK/src/$source_name" family
     case "$component" in
-      mingw-w64) prefix="$BUILD/toolchain/$component-prefix" ;;
-      *) prefix="$BUILD/packages/$component-prefix" ;;
+      # Everything that configures/builds out of the shared mingw-w64 source.
+      mingw-w64) family="mingw-w64 mingw-w64-headers mingw-w64-crt winpthreads gendef widl" ;;
+      *) family="$component" ;;
     esac
     if [[ -d "$src/.git" ]]; then
       local head
       head="$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)"
       if [[ "$head" != "$pinned" ]]; then
-        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; resetting and dropping stamps"
+        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; resetting source, purging: $family"
         git -C "$src" am --abort 2> /dev/null || true
         # The filtered clone fetches missing objects lazily; fetch the pin
         # explicitly in case the cached clone predates it.
@@ -186,11 +202,11 @@ PY
           || git -C "$src" fetch -q origin "$pinned"
         git -C "$src" reset --hard -q "$pinned"
         git -C "$src" clean -qdf
-        drop_stamps "$prefix/src/$component-stamp"
+        purge_component "$family"
       fi
-    elif [[ -d "$prefix/src/$component-stamp" ]]; then
-      echo "==> $component stamps present without a source; dropping stamps"
-      drop_stamps "$prefix/src/$component-stamp"
+    elif find "$BUILD" -type d -name "$component-stamp" 2> /dev/null | grep -q .; then
+      echo "==> $component stamps present without a source; purging: $family"
+      purge_component "$family"
     fi
   done
 }
