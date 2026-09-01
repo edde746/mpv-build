@@ -300,11 +300,17 @@ class PinPackagesTest(unittest.TestCase):
         text = (TESTDATA / "mpv.cmake").read_text()
         self.assertIn("-Dsubrandr=enabled", text)
         self.assertIn("-Dlibcurl=enabled", text)
+        self.assertIn("-Dvapoursynth=enabled", text)
         gated = pin_packages.gate_mpv_options(text)
         self.assertNotIn("-Dsubrandr", gated)
         self.assertNotIn("-Dlibcurl", gated)
-        # Only the two option lines vanish; the DEPENDS entry stays.
+        # vapoursynth flips to disabled: its import library does not satisfy
+        # the pinned mpv's dllimport getVSScriptAPI reference.
+        self.assertIn("-Dvapoursynth=disabled", gated)
+        self.assertNotIn("-Dvapoursynth=enabled", gated)
+        # Only the two master-only option lines vanish; DEPENDS entries stay.
         self.assertIn("subrandr\n", gated)
+        self.assertIn("vapoursynth\n", gated)
         self.assertEqual(len(text.splitlines()) - 2, len(gated.splitlines()))
         self.assertEqual(pin_packages.gate_mpv_options(gated), gated)
 

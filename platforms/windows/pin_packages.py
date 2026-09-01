@@ -269,29 +269,40 @@ FFMPEG_CUDA_GUARD = (
 )
 
 
-# winbuild's mpv recipe targets mpv master; the pinned release lacks two of
+# winbuild's mpv recipe targets mpv master. The pinned release lacks two of
 # its meson options (subrandr and libcurl landed after v0.41.0), and meson
-# hard-errors on unknown options. The subrandr DEPENDS entry stays: the
-# library just goes unused. Re-audit when the mpv pin moves past them.
+# hard-errors on unknown options; vapoursynth links against a script API the
+# pinned mpv resolves as dllimport getVSScriptAPI, which the winbuild
+# vapoursynth import library does not provide for the release, so it is
+# disabled -- it is also the first entry in the README's slimming table and
+# unusable through libmpv in Plezy anyway. The subrandr/vapoursynth DEPENDS
+# entries stay: the libraries just go unused. Re-audit when the mpv pin
+# moves.
 MPV_MASTER_ONLY_OPTIONS = (
     "        -Dsubrandr=enabled\n",
     "        -Dlibcurl=enabled\n",
 )
+MPV_VAPOURSYNTH_ENABLED = "        -Dvapoursynth=enabled\n"
+MPV_VAPOURSYNTH_DISABLED = "        -Dvapoursynth=disabled\n"
 
 
 def gate_mpv_options(text):
-    """mpv.cmake text without the master-only meson options; pure for tests."""
-    if not any(option in text for option in MPV_MASTER_ONLY_OPTIONS):
-        if "-Dsubrandr" in text or "-Dlibcurl" in text:
-            fail(
-                "packages/mpv.cmake: master-only meson options no longer match "
-                "the audited shape; re-audit the option gate against the new "
-                "winbuild commit before pinning to it"
-            )
+    """mpv.cmake text with release-incompatible options gated; pure for
+    tests."""
+    already = (MPV_VAPOURSYNTH_DISABLED in text
+               and not any(option in text for option in MPV_MASTER_ONLY_OPTIONS))
+    if already:
         return text
+    if (not any(option in text for option in MPV_MASTER_ONLY_OPTIONS)
+            or MPV_VAPOURSYNTH_ENABLED not in text):
+        fail(
+            "packages/mpv.cmake: the release-incompatible meson options no "
+            "longer match the audited shape; re-audit the option gate against "
+            "the new winbuild commit before pinning to it"
+        )
     for option in MPV_MASTER_ONLY_OPTIONS:
         text = text.replace(option, "")
-    return text
+    return text.replace(MPV_VAPOURSYNTH_ENABLED, MPV_VAPOURSYNTH_DISABLED, 1)
 
 
 def gate_ffmpeg_cuda(text):
