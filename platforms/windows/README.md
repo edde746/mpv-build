@@ -26,15 +26,26 @@ sets `-Dgl=disabled -Degl-angle=disabled` for that target.
 
 ## Key coarseness
 
-`group.json` lists components `mpv`, `ffmpeg`, `libass`, `mpv-winbuild-cmake`.
-The winbuild graph builds ~60 more dependencies (freetype, harfbuzz, x264,
-dav1d, ...). Those are deliberately NOT individual versions.json components:
-they track whatever `GIT_RESET`/URL pins the winbuild commit carries, so they
-are keyed -- coarsely but honestly -- through the `mpv-winbuild-cmake` commit
-pin. Bumping that pin is the only way their sources move, and it moves the
-libmpv-windows key. What the key does not see is network drift for the few
-winbuild packages that themselves track a branch tip; treat a winbuild pin
-bump as the refresh point for those.
+`group.json` lists components `mpv`, `ffmpeg`, `libass`, `mpv-winbuild-cmake`
+and `mingw-w64`. The winbuild graph builds ~60 more dependencies (freetype,
+harfbuzz, x264, dav1d, ...). Those are deliberately NOT individual
+versions.json components: they track whatever `GIT_RESET`/URL pins the
+winbuild commit carries, so they are keyed -- coarsely but honestly --
+through the `mpv-winbuild-cmake` commit pin. Bumping that pin is the only
+way their sources move, and it moves the libmpv-windows key. What the key
+does not see is network drift for the few winbuild packages that themselves
+track a branch tip; treat a winbuild pin bump as the refresh point for
+those.
+
+`mingw-w64` is the exception: winbuild clones its master tip at
+toolchain-bootstrap time, and it defines the target ABI (headers + CRT), so
+`pin_packages.py` pins it like the payload packages and `build.sh` folds its
+commit into the toolchain bootstrap marker (a bump re-drives the toolchain
+targets). The pin exists because the 2026-08-29 secure-API header
+restructure on mingw-w64 master broke libvpl's MinGW compat macros mid-day;
+llvm's `release/22.x` branch is the remaining live-fetch in the toolchain
+and freezes only inside a warm cache -- pin it the same way if it ever
+bites.
 
 ## CI build-state caching
 

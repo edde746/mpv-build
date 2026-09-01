@@ -6,10 +6,10 @@
 # Stages:
 #   1. shallow-fetch shinchiro/mpv-winbuild-cmake at the commit pinned by the
 #      versions.json component `mpv-winbuild-cmake`
-#   2. pin packages/{mpv,ffmpeg,libass}.cmake to versions.json, stage the
-#      resolved windows patch series and neutralize the check-git cache
-#      cascade (pin_packages.py; libass then builds from our edde746/libass
-#      fork)
+#   2. pin packages/{mpv,ffmpeg,libass}.cmake and toolchain/mingw-w64.cmake
+#      to versions.json, stage the resolved windows patch series and
+#      neutralize the check-git cache cascade (pin_packages.py; libass then
+#      builds from our edde746/libass fork)
 #   3. cmake configure with the clang toolchain (aarch64 REQUIRES clang:
 #      gcc + aarch64 is a configure-time FATAL_ERROR upstream) and ccache
 #      baked into the cross-compiler wrappers. winbuild's
@@ -61,14 +61,21 @@ export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-# The winbuild pin, override-aware for the windows group.
-read -r WINBUILD_URL WINBUILD_COMMIT < <(python3 - "$ROOT/versions.json" <<'PY'
+# The winbuild and mingw-w64 pins, override-aware for the windows group.
+# mingw-w64 is part of the toolchain state: its pin moving must re-drive the
+# toolchain targets (headers/CRT rebuild), which the marker below gates.
+read -r WINBUILD_URL WINBUILD_COMMIT MINGW_COMMIT < <(python3 - "$ROOT/versions.json" <<'PY'
 import json, sys
-entry = json.load(open(sys.argv[1]))["components"]["mpv-winbuild-cmake"]
-pins = {f: entry[f] for f in ("url", "commit") if f in entry}
-pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
-             if f in ("url", "commit")})
-print(pins["url"], pins["commit"])
+components = json.load(open(sys.argv[1]))["components"]
+def resolved(name, *fields):
+    entry = components[name]
+    pins = {f: entry[f] for f in fields if f in entry}
+    pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
+                 if f in fields})
+    return pins
+winbuild = resolved("mpv-winbuild-cmake", "url", "commit")
+mingw = resolved("mingw-w64", "commit")
+print(winbuild["url"], winbuild["commit"], mingw["commit"])
 PY
 )
 
@@ -149,9 +156,9 @@ trap 'rc=$?; if [[ $rc -ne 0 ]]; then dump_step_logs; fi; exit $rc' EXIT
 # incrementally: unchanged steps are stamp-clean, changed recipes are dirtied
 # by their new command lines.
 TOOLCHAIN_MARKER="$BUILD/.toolchain-bootstrapped"
-TOOLCHAIN_STATE="$(grep -E '^generation=' "$ROOT/toolchain/windows.txt") winbuild=$WINBUILD_COMMIT"
+TOOLCHAIN_STATE="$(grep -E '^generation=' "$ROOT/toolchain/windows.txt") winbuild=$WINBUILD_COMMIT mingw=$MINGW_COMMIT"
 if [[ "$(cat "$TOOLCHAIN_MARKER" 2> /dev/null)" == "$TOOLCHAIN_STATE" ]]; then
-  echo "==> toolchain already bootstrapped for this generation+winbuild pin; skipping"
+  echo "==> toolchain already bootstrapped for this generation+winbuild+mingw pins; skipping"
   # rustup travels in its own cache path and can be evicted independently of
   # the per-arch stamps that claim it was installed; when the binary is gone,
   # fullclean the package so it reinstalls instead of every rust-built

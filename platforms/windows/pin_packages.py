@@ -60,6 +60,13 @@ import sys
 from pathlib import Path
 
 COMPONENTS = ("mpv", "ffmpeg", "libass")
+# Toolchain source packages pinned the same way. mingw-w64 is cloned at
+# toolchain-bootstrap time and defines the target ABI (headers + CRT); its
+# tip is the one input the winbuild commit pin cannot see, and a tip
+# restructure (2026-08-29 secure-API header merge) has already broken the
+# dependency graph once. No patch-series support here: the staged-patch glob
+# is anchored to packages/, and toolchain sources have no pool.
+TOOLCHAIN_COMPONENTS = ("mingw-w64",)
 GROUP = "windows"
 
 # Keywords this script owns inside the three package files. Stripped before
@@ -245,6 +252,17 @@ def main(argv):
             package_file.write_text(pinned, encoding="utf-8")
         patched = f", {len(staged)} patch(es) staged" if staged else ""
         print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{patched}")
+
+    for component in TOOLCHAIN_COMPONENTS:
+        pins = resolved_pins(versions, component)
+        toolchain_file = winbuild / "toolchain" / f"{component}.cmake"
+        if not toolchain_file.is_file():
+            fail(f"{toolchain_file}: missing")
+        text = toolchain_file.read_text(encoding="utf-8")
+        pinned = rewrite(text, component, pins, have_patches=False)
+        if pinned != text:
+            toolchain_file.write_text(pinned, encoding="utf-8")
+        print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}")
 
     custom_steps = winbuild / "cmake" / "custom_steps.cmake"
     if not custom_steps.is_file():

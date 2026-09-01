@@ -8,8 +8,8 @@
 #         2026-09-01 via `git ls-remote ... refs/heads/master`; the same
 #         commit versions.json pins as component mpv-winbuild-cmake)
 # Fetched: 2026-09-01, raw.githubusercontent.com/<repo>/<commit>/packages/<f>
-# (custom_steps.cmake: same commit, cmake/custom_steps.cmake, copied from a
-# verified local checkout at the pin on 2026-09-01)
+# (custom_steps.cmake and mingw-w64.cmake: same commit, cmake/ and toolchain/
+# respectively, copied from a verified local checkout at the pin 2026-09-01)
 #
 # sha256 of each fixture as fetched:
 #   359c9c7da360f57d3a438e6fe117af6169cbd9aa3672751fd2bfc31e02be8fff  ffmpeg.cmake
@@ -17,14 +17,17 @@
 #   c43469d77f50652718044e792b10f7db4ee378cb81949cdd3020e78b414083d6  mbedtls.cmake
 #   cfb9b0fbaaf6013069fe3eeda7e9e9644546f09cd772dbd549f8eb7fa21c7122  mpv.cmake
 #   b5dc88003f81d95e9a86c4befe1bac1472a4ec15c6d9a56a8bfd9c5fabf698a2  custom_steps.cmake
+#   55f2a2bb49ef17de05985beb0395c7a1acb44d613c50e048fce1e5a2c2fab8a3  mingw-w64.cmake
 #
 # mpv/ffmpeg/libass are the files pin_packages.py rewrites (pristine upstream:
 # no GIT_TAG, no GIT_RESET, no PATCH_COMMAND -- they track master).
+# mingw-w64.cmake is the toolchain source package pin_packages.py pins the
+# same way (pristine upstream: no GIT_TAG at all -- an implicit master tip).
 # mbedtls.cmake is upstream's own pinning idiom and is the reference the tests
 # compare the injected block's shape against; it is never rewritten.
-# custom_steps.cmake carries the check-git step whose commands
-# pin_packages.neutralize_check_git rewrites for warm-cache correctness; the
+# custom_steps.cmake carries the check-git step whose injection
+# pin_packages.neutralize_check_git suppresses for warm-cache correctness; the
 # tests assert the audited idiom still matches and that the rewrite converges.
 #
-# When bumping the mpv-winbuild-cmake pin in versions.json, refresh these five
+# When bumping the mpv-winbuild-cmake pin in versions.json, refresh these six
 # fixtures from the new commit and update the hashes above.

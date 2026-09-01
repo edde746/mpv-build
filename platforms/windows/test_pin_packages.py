@@ -36,6 +36,12 @@ PINS = {
         "ref": "0.18.3",
         "commit": "76cdb2bc174828aac74a458d38a0786cb7af922d",
     },
+    "mingw-w64": {
+        "version": "master-2026-08-29",
+        "url": "https://github.com/mingw-w64/mingw-w64",
+        "ref": "master",
+        "commit": "ca4cc40bdcda1aa3e9df68d5443c7ceaf1f212f9",
+    },
 }
 
 PATCH = """diff --git a/a.c b/a.c
@@ -167,6 +173,27 @@ class PinPackagesTest(unittest.TestCase):
         # tree, so the injected command resets to the pin before applying.
         pinned, _ = self.run_pin("mpv")
         self.assertIn(f'"git reset --hard {PINS["mpv"]["commit"]} -q && git apply ', pinned)
+
+    def test_mingw_fixture_is_pristine_and_pin_matches_idiom(self):
+        # The toolchain source package pins through the same machinery; its
+        # pristine upstream file has no GIT_TAG at all (implicit master tip).
+        text = (TESTDATA / "mingw-w64.cmake").read_text()
+        self.assertEqual(
+            keyword_sequence(text, set(pin_packages.INJECTED_KEYWORDS)), [],
+            "mingw-w64.cmake fixture unexpectedly carries injected keywords",
+        )
+        pins = PINS["mingw-w64"]
+        pinned = pin_packages.rewrite(text, "mingw-w64", pins, False)
+        self.assertIn(
+            '    UPDATE_COMMAND ""\n'
+            "    GIT_REMOTE_NAME origin\n"
+            "    GIT_TAG master\n"
+            f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
+            pinned,
+        )
+        self.assertNotIn("PATCH_COMMAND", pinned)
+        # Idempotent like the payload rewrites.
+        self.assertEqual(pin_packages.rewrite(pinned, "mingw-w64", pins, False), pinned)
 
     def test_check_git_fixture_matches_audited_idiom(self):
         # neutralize_check_git string-matches the exact upstream injection

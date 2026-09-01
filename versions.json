@@ -17,7 +17,12 @@
       "ref": "v0.41.0",
       "commit": "41f6a645068483470267271e1d09966ca3b9f413",
       "provenance": "Tag carried over from main.swift; commit is the annotated tag's dereferenced target, resolved 2026-09-01 with `git ls-remote https://github.com/mpv-player/mpv 'refs/tags/v0.41.0*'` (peeled ^{} line).",
-      "platforms": ["apple", "android", "linux", "windows"],
+      "platforms": [
+        "apple",
+        "android",
+        "linux",
+        "windows"
+      ],
       "overrides": {
         "linux": {
           "kind": "archive",
@@ -36,7 +41,12 @@
       "ref": "n8.0.1",
       "commit": "894da5ca7d742e4429ffb2af534fcda0103ef593",
       "provenance": "Tag carried over from main.swift; commit is the annotated tag's dereferenced target, resolved 2026-09-01 with `git ls-remote https://github.com/FFmpeg/FFmpeg 'refs/tags/n8.0.1*'` (peeled ^{} line).",
-      "platforms": ["apple", "android", "linux", "windows"],
+      "platforms": [
+        "apple",
+        "android",
+        "linux",
+        "windows"
+      ],
       "overrides": {
         "linux": {
           "kind": "archive",
@@ -54,7 +64,12 @@
       "ref": "0.18.3",
       "commit": "76cdb2bc174828aac74a458d38a0786cb7af922d",
       "provenance": "Tag carried over from main.swift; 0.18.3 on the edde746 fork is a lightweight tag, so the ls-remote sha IS the commit (resolved 2026-09-01 with `git ls-remote https://github.com/edde746/libass 'refs/tags/0.18.3*'`; no peeled ^{} line exists).",
-      "platforms": ["apple", "android", "linux", "windows"],
+      "platforms": [
+        "apple",
+        "android",
+        "linux",
+        "windows"
+      ],
       "overrides": {}
     },
     "mpv-winbuild-cmake": {
@@ -64,7 +79,21 @@
       "ref": "master",
       "commit": "cd1edc11dc6887a50f705717619d879f5a93a488",
       "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the master tip was resolved 2026-09-01 with `git ls-remote https://github.com/shinchiro/mpv-winbuild-cmake refs/heads/master` and frozen by commit; its internal dependency pins are keyed through this commit (see platforms/windows/README.md).",
-      "platforms": ["windows"],
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
+    "mingw-w64": {
+      "kind": "git",
+      "version": "master-2026-08-29",
+      "url": "https://github.com/mingw-w64/mingw-w64",
+      "ref": "master",
+      "commit": "ca4cc40bdcda1aa3e9df68d5443c7ceaf1f212f9",
+      "provenance": "Headers and CRT for the windows cross-toolchain. winbuild clones the master tip at bootstrap time, which is the one ABI-defining input the winbuild commit pin cannot see; pinned to the parent of d3930179 (the 2026-08-29 secure-API header restructure whose unconditional wcscpy_s breaks libvpl's MinGW compat macros), resolved 2026-09-01 from the GitHub commits API parent field of d3930179 and frozen by commit.",
+      "platforms": [
+        "windows"
+      ],
       "overrides": {}
     },
     "dav1d": {
@@ -74,7 +103,10 @@
       "ref": "1.5.3",
       "commit": "b546257f770768b2c88258c533da38b91a06f737",
       "provenance": "Official VideoLAN GitLab annotated tag object 0664c109d1b85503bc32bf89920f951cacf5702e (1.5.3) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
-      "platforms": ["android", "linux"],
+      "platforms": [
+        "android",
+        "linux"
+      ],
       "overrides": {
         "linux": {
           "version": "1.5.4",
@@ -93,7 +125,9 @@
       "ref": "v2024.4",
       "commit": "caa54d9779d5605aca4e1a0c0c962a3d8f4aeb31",
       "provenance": "Official GitHub annotated tag object 3cd72062f297df05e6a042f2616c42bc8956c326 dereferences to this root commit; its DEPS file pins synchronized dependencies by full commit.",
-      "platforms": ["linux"],
+      "platforms": [
+        "linux"
+      ],
       "overrides": {}
     },
     "mbedtls": {
@@ -103,7 +137,9 @@
       "ref": "v3.6.5",
       "commit": "e185d7fd85499c8ce5ca2a54f5cf8fe7dbe3f8df",
       "provenance": "Official Mbed-TLS GitHub annotated tag object d934b47669d1cc60c72caecae2ae2a45aea70c79 (v3.6.5) dereferences to this root commit; its gitlinks pin the mbedtls-framework submodule the android driver clones recursively. TODO(provenance): review the framework gitlink target before the next bump.",
-      "platforms": ["android"],
+      "platforms": [
+        "android"
+      ],
       "overrides": {}
     },
     "freetype": {
@@ -113,7 +149,9 @@
       "ref": "VER-2-14-1",
       "commit": "526ec5c47b9ebccc4754c85ac0c0cdf7c85a5e9b",
       "provenance": "Official freedesktop GitLab annotated tag object 3bd82b5f543bc84ccf2b1d0cdb63b95218099ee6 (VER-2-14-1) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
-      "platforms": ["android"],
+      "platforms": [
+        "android"
+      ],
       "overrides": {}
     },
     "fribidi": {
@@ -123,7 +161,9 @@
       "ref": "v1.0.16",
       "commit": "68162babff4f39c4e2dc164a5e825af93bda9983",
       "provenance": "Official fribidi GitHub annotated tag object 9123b467f080c7ea15509bd7cbd457817544a7e1 (v1.0.16) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
-      "platforms": ["android"],
+      "platforms": [
+        "android"
+      ],
       "overrides": {}
     },
     "harfbuzz": {
@@ -133,7 +173,9 @@
       "ref": "12.3.2",
       "commit": "b42511e071162fe76102f613a6ccc009726c99af",
       "provenance": "Official harfbuzz GitHub annotated tag object bf8ab7cd50cbcbcb2fd9021a3269d788991185f6 (12.3.2) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
-      "platforms": ["android"],
+      "platforms": [
+        "android"
+      ],
       "overrides": {}
     },
     "lua": {
@@ -142,7 +184,9 @@
       "url": "https://www.lua.org/ftp/lua-5.2.4.tar.gz",
       "sha256": "b9e2e4aad6789b3b63a056d442f7b39f0ecfca3ae0f1fc0ae4e9614401b69f4b",
       "provenance": "Hashed the complete archive fetched from upstream lua.org over https on 2026-09-01; the digest equals lua.org's long-published 5.2.4 checksum. libmpv-android pinned the same version over plain http without a hash.",
-      "platforms": ["android"],
+      "platforms": [
+        "android"
+      ],
       "overrides": {}
     },
     "libunibreak": {
@@ -150,7 +194,10 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libunibreak-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple", "android"],
+      "platforms": [
+        "apple",
+        "android"
+      ],
       "overrides": {
         "android": {
           "kind": "archive",
@@ -166,49 +213,64 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfreetype-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libfribidi": {
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfribidi-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libharfbuzz": {
       "kind": "prebuilt",
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libharfbuzz-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libbluray": {
       "kind": "prebuilt",
       "version": "1.4.0",
       "url": "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/libbluray-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "openssl": {
       "kind": "prebuilt",
       "version": "3.3.5",
       "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libuavs3d": {
       "kind": "prebuilt",
       "version": "1.2.1-xcode",
       "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-xcode/libuavs3d-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libdovi": {
       "kind": "prebuilt",
       "version": "3.3.2",
       "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/libdovi-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple", "android"],
+      "platforms": [
+        "apple",
+        "android"
+      ],
       "overrides": {
         "android": {
           "kind": "prebuilt",
@@ -223,28 +285,38 @@
       "version": "1.4.1",
       "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.1/MoltenVK-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libshaderc": {
       "kind": "prebuilt",
       "version": "2025.5.0",
       "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "lcms2": {
       "kind": "prebuilt",
       "version": "2.17.0",
       "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libplacebo": {
       "kind": "prebuilt",
       "version": "7.351.0-2512",
       "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/libplacebo-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple", "linux", "android"],
+      "platforms": [
+        "apple",
+        "linux",
+        "android"
+      ],
       "overrides": {
         "android": {
           "kind": "git",
@@ -270,21 +342,27 @@
       "version": "1.5.3-neon",
       "url": "https://github.com/edde746/libdav1d-build/releases/download/1.5.3-neon/libdav1d-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libuchardet": {
       "kind": "prebuilt",
       "version": "0.0.8-xcode",
       "url": "https://github.com/mpvkit/libuchardet-build/releases/download/0.0.8-xcode/libuchardet-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     },
     "libluajit": {
       "kind": "prebuilt",
       "version": "2.1.0-xcode",
       "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-xcode/libluajit-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
-      "platforms": ["apple"]
+      "platforms": [
+        "apple"
+      ]
     }
   }
 }

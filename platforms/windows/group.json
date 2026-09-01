@@ -8,8 +8,17 @@
   ],
   "artifacts": {
     "libmpv-windows": {
-      "components": ["mpv", "ffmpeg", "libass", "mpv-winbuild-cmake"],
-      "variants": ["x86_64", "aarch64"],
+      "components": [
+        "mpv",
+        "ffmpeg",
+        "libass",
+        "mpv-winbuild-cmake",
+        "mingw-w64"
+      ],
+      "variants": [
+        "x86_64",
+        "aarch64"
+      ],
       "assetPattern": "libmpv-windows-{key}-{variant}.zip"
     }
   }
