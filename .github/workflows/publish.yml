@@ -159,7 +159,7 @@ jobs:
       # content-addressed ones in the publish job.
       - name: Build GPL version (${{ matrix.name }})
         run: |
-          make build enable-gpl use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
+          make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
 
       - name: Name per-platform binaries by content (${{ matrix.platform_type }})
         run: |

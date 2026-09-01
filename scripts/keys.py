@@ -88,9 +88,9 @@ artifact (schema 2), one line per field, `\n`-terminated, in this order:
                                       #   sorted order, series order within a
                                       #   component, pool-file sha256
 
-There are no gpl=/debug= lines: group.json builds have no flag matrix (the
-android build is unconditionally GPL), so --no-gpl and --debug do not move
-these keys. The asset one artifact publishes per variant is assetPattern with
+There are no gpl=/debug= lines: every build is GPL (there is no LGPL variant to
+key) and group.json builds have no flag matrix, so --debug does not move these
+keys. The asset one artifact publishes per variant is assetPattern with
 {key} and {variant} substituted; the pattern, including its extension, is
 authoritative. record-platform renames the unkeyed `<artifact>-<variant><ext>`
 (or accepts the already-keyed name), then records
@@ -874,13 +874,9 @@ def main(argv: list[str]) -> int:
         default=argparse.SUPPRESS,
         help="platform group to operate on (default: apple)",
     )
-    common.add_argument(
-        "--no-gpl",
-        dest="gpl",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help="key the non-GPL build (CI builds GPL)",
-    )
+    # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true and
+    # the group.json builds have no flag matrix. The key text keeps its gpl=1
+    # line for apple so published keys stay stable; there is no LGPL build to key.
     common.add_argument(
         "--debug",
         action="store_true",

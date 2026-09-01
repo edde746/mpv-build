@@ -608,8 +608,8 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     check(android_key(repo) == key, "android keys must be reproducible for the same tree")
     check(
-        keys(repo, "--platform-group", "android", "--no-gpl") == android,
-        "gpl/debug flags must not move a group.json key",
+        keys(repo, "--platform-group", "android", "--debug") == android,
+        "the debug flag must not move a group.json key",
     )
 
     inputs = run(repo, "keys", "--platform-group", "android", "--show-inputs").stdout
