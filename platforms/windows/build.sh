@@ -139,15 +139,50 @@ dump_step_logs() {
 touch "$BUILD/.run-started"
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then dump_step_logs; fi; exit $rc' EXIT
 
-# The three toolchain targets run unconditionally. On a clean warm tree they
-# are stamp-driven no-ops (observed: ~50ms total, once pin_packages.py has
-# suppressed the check-git cascade); a moved pin re-drives exactly the dirty
-# subgraph, because pin moves reach the graph through GIT_TAG in
-# <pkg>-gitinfo.txt and through changed step command lines. Do NOT add a
-# skip-if-bootstrapped marker here: an earlier one recorded intent instead
-# of reality and kept serving stale mingw-w64 headers from the cache after
-# the pin moved.
-#
+# Enforce the pins against reality before building anything. ExternalProject
+# never re-examines a completed download: with UPDATE_COMMAND "" disabled,
+# neither a changed GIT_TAG/GIT_RESET nor the regenerated gitinfo file makes
+# a warm tree re-fetch a pinned source (empirically: three CI runs served
+# stale mingw-w64 headers through three different invalidation attempts). So
+# ask git itself: our patch steps use `git apply` (worktree-only), so a
+# correctly fetched source has HEAD == pinned commit; anything else --
+# wrong pin after a bump, or stamps restored without their source -- gets a
+# fullclean, which deletes the package's stamps and re-drives its whole
+# chain, cascading into its dependents by stamp mtime.
+invalidate_stale_pins() {
+  python3 - "$ROOT/versions.json" <<'PY' | while read -r component source_name pinned; do
+import json, sys
+components = json.load(open(sys.argv[1]))["components"]
+for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
+                               ("libass", "libass"), ("mingw-w64", "mingw-w64")):
+    entry = components[component]
+    pins = {"commit": entry["commit"]}
+    pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
+                 if f == "commit"})
+    print(component, source_name, pins["commit"])
+PY
+    local src="$WORK/src/$source_name" prefix
+    case "$component" in
+      mingw-w64) prefix="$BUILD/toolchain/$component-prefix" ;;
+      *) prefix="$BUILD/packages/$component-prefix" ;;
+    esac
+    if [[ -d "$src/.git" ]]; then
+      local head
+      head="$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)"
+      if [[ "$head" != "$pinned" ]]; then
+        echo "==> $component source at ${head:0:10}, pin is ${pinned:0:10}; fullcleaning"
+        ninja -C "$BUILD" "$component-fullclean"
+      fi
+    elif [[ -d "$prefix/src/$component-stamp" ]]; then
+      # Stamps without a source: drop the 0-byte stamp files (keeping the
+      # step scripts cmake wrote beside them) so the chain re-clones.
+      echo "==> $component stamps present without a source; dropping stamps"
+      find "$prefix/src/$component-stamp" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
+    fi
+  done
+}
+invalidate_stale_pins
+
 # rustup travels in its own cache path and can be evicted independently of
 # the per-arch stamps that claim it was installed; when the binary is gone,
 # fullclean the package so it reinstalls instead of every rust-built
