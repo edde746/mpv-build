@@ -162,16 +162,19 @@ fi
 # lines, so a partially-dirty mpv would try to re-run copy steps against a
 # build tree that no longer exists. Any run that reaches this point has a
 # stale windows key, which always requires relinking libmpv anyway.
-# fullclean's git commands need the mpv source; when the shared source cache
-# was evicted independently of the per-arch stamps, drop mpv's prefix
-# (stamps and logs only -- the source lives under src/) so the whole chain
-# re-clones and rebuilds instead of trusting stamps for a source that is
-# gone.
+#
+# Gate on .git, not the directory: ExternalProject pre-creates every empty
+# SOURCE_DIR at configure time, and fullclean's git commands die in a
+# non-repo. Without a clone (cold run, or the shared source cache evicted
+# independently of the per-arch stamps) drop only mpv's 0-byte stamp files
+# -- upstream's own fullclean idiom -- so the whole chain re-clones and
+# rebuilds; the stamp dir also holds the step scripts cmake wrote at
+# configure time, so it must not be deleted wholesale.
 echo "==> building mpv (produces the libmpv dev package)"
-if [[ -d "$WORK/src/mpv" ]]; then
+if [[ -d "$WORK/src/mpv/.git" ]]; then
   ninja -C "$BUILD" mpv-fullclean
 else
-  rm -rf "$BUILD/packages/mpv-prefix"
+  find "$BUILD/packages/mpv-prefix/src/mpv-stamp" -type f ! -iname '*.cmake' -size 0c -delete 2> /dev/null || true
 fi
 rm -rf "$BUILD"/mpv-*
 ninja -C "$BUILD" mpv
