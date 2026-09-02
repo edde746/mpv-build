@@ -291,9 +291,10 @@
     },
     "libuavs3d": {
       "kind": "prebuilt",
-      "version": "1.2.1-xcode",
-      "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-xcode/libuavs3d-all.zip",
-      "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "version": "1.2.1-fix",
+      "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-fix/libuavs3d-all.zip",
+      "sha256": "8644c7a8182679dbe762b522356606220bb6d2196a5ec65511eda42ef48b3e7a",
+      "provenance": "Upstream mpvkit/libuavs3d-build 1.2.1-fix release; the complete archive checksum was independently verified.",
       "platforms": [
         "apple"
       ]
