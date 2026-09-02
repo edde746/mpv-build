@@ -19,7 +19,7 @@ index a0eed36..539747c 100755
  enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
  enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 4febddd..0e444c9 100644
+index 4febddd..459ddb0 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
 @@ -37,6 +37,9 @@
@@ -32,7 +32,7 @@ index 4febddd..0e444c9 100644
  #include "h264_parse.h"
  #include "h264_ps.h"
  #include "hevc/parse.h"
-@@ -61,8 +64,24 @@ typedef struct MediaCodecH264DecContext {
+@@ -61,8 +64,29 @@ typedef struct MediaCodecH264DecContext {
      // Ref. MediaFormat KEY_OPERATING_RATE
      int operating_rate;
      int dolby_vision;
@@ -40,6 +40,11 @@ index 4febddd..0e444c9 100644
 +    // Per-packet Dolby Vision NAL filter selected at init (DV_FILTER_*).
 +    int dv_filter;
 +    int dv_filter_warned;
++    // Drop in-band HDR10+ SEI whenever a "video/dolby-vision" decoder is
++    // selected: MediaTek-class chipsets (Fire TV 4K Max, Google TV Streamer)
++    // wedge or black-screen when a native DV codec also receives ST 2094-40
++    // dynamic metadata (Kodi xbmc#24584, androidx/media#3085).
++    int dv_strip_hdr10plus;
  } MediaCodecH264DecContext;
  
 +// Dolby Vision profile 7 packet filters: convert rewrites the RPU (UNSPEC62)
@@ -57,7 +62,7 @@ index 4febddd..0e444c9 100644
  static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
  {
      MediaCodecH264DecContext *s = avctx->priv_data;
-@@ -313,54 +332,215 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -313,54 +337,264 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
   * only when a "video/dolby-vision" MediaCodec decodes the stream. For the
   * single-layer profiles (dvhe.05, dvhe.08) the HEVC bitstream - with its
   * in-band RPU NALs - is fed to the DV decoder unchanged; only the MIME and
@@ -172,12 +177,13 @@ index 4febddd..0e444c9 100644
 -           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, codec_name);
 -    av_freep(&codec_name);
  
-+    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (0x%x%s)\n",
++    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (0x%x%s), filtering HDR10+ SEI\n",
 +           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, profile,
 +           convert ? ", converting RPU to profile 8.1" : "");
 +
 +    if (convert)
 +        s->dv_filter = DV_FILTER_CONVERT;
++    s->dv_strip_hdr10plus = 1;
      *mime = dv_mime;
      *profile_override = profile;
      ff_AMediaFormat_setInt32(format, "profile", profile);
@@ -195,10 +201,49 @@ index 4febddd..0e444c9 100644
 +}
 +
 +/*
-+ * Rewrite one annex-B access unit according to s->dv_filter: drop UNSPEC63
-+ * (enhancement layer) NALs and either drop or convert-to-8.1 the UNSPEC62
-+ * (RPU) NALs. Runs on every packet of a profile 7 stream; the packet buffer
-+ * is only replaced when something actually changed.
++ * Returns whether an SEI NAL's RBSP (starting after the 2-byte HEVC NAL
++ * header) begins with an HDR10+ message: user_data_registered_itu_t_t35 with
++ * country code 0xB5 (United States), provider code 0x003C (Samsung), provider
++ * oriented code 0x0001, application identifier 4 (ST 2094-40), application
++ * version 0 or 1. Malformed or truncated data answers no so the NAL is kept.
++ * The identifier bytes cannot contain the 0x000003 emulation prevention
++ * pattern, so no RBSP unescaping is needed to read them.
++ */
++static int dv_is_hdr10plus_sei(const uint8_t *nal, const uint8_t *nal_end)
++{
++    const uint8_t *p = nal + 2;
++    int payload_type = 0, payload_size = 0;
++
++    while (p < nal_end) {
++        int b = *p++;
++        payload_type += b;
++        if (b != 0xFF)
++            break;
++    }
++    while (p < nal_end) {
++        int b = *p++;
++        payload_size += b;
++        if (b != 0xFF)
++            break;
++    }
++
++    if (payload_type != 4 /* user_data_registered_itu_t_t35 */ ||
++        payload_size < 7 || p + 7 > nal_end)
++        return 0;
++
++    return p[0] == 0xB5 &&                    /* country code */
++           p[1] == 0x00 && p[2] == 0x3C &&    /* provider code */
++           p[3] == 0x00 && p[4] == 0x01 &&    /* provider oriented code */
++           p[5] == 4 &&                       /* ST 2094-40 */
++           (p[6] == 0 || p[6] == 1);          /* application version */
++}
++
++/*
++ * Rewrite one annex-B access unit: drop UNSPEC63 (enhancement layer) NALs and
++ * either drop or convert-to-8.1 the UNSPEC62 (RPU) NALs per s->dv_filter, and
++ * drop HDR10+ SEI NALs when s->dv_strip_hdr10plus is set. Runs on every
++ * packet of a stream whose init armed either action; the packet buffer is
++ * only replaced when something actually changed.
 + */
 +static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
 +{
@@ -221,8 +266,13 @@ index 4febddd..0e444c9 100644
 +    out = buf->data;
 +
 +    sc = dv_next_startcode(data, end);
-+    memcpy(out, data, sc - data);
-+    out_size += sc - data;
++    /* Bytes before the first NAL's region. A 4-byte start code's leading
++     * zero belongs to that region (the loop's region--), not to the head,
++     * or it would be emitted twice. */
++    out_size = sc - data;
++    if (sc > data && sc < end && sc[-1] == 0)
++        out_size--;
++    memcpy(out, data, out_size);
 +
 +    while (sc < end) {
 +        const uint8_t *nal = sc + 3;
@@ -241,6 +291,10 @@ index 4febddd..0e444c9 100644
 +        if (type == 63) {
 +            changed = 1;
 +        } else if (type == 62 && s->dv_filter == DV_FILTER_STRIP) {
++            changed = 1;
++        } else if ((type == 39 || type == 40) && s->dv_strip_hdr10plus &&
++                   nal + 2 <= next_region && dv_is_hdr10plus_sei(nal, next_region)) {
++            /* Prefix/suffix SEI carrying ST 2094-40 dynamic metadata. */
 +            changed = 1;
 +        } else if (type == 62 && s->dv_filter == DV_FILTER_CONVERT) {
 +#if CONFIG_LIBDOVI
@@ -295,7 +349,7 @@ index 4febddd..0e444c9 100644
  #endif
  
  static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
-@@ -410,7 +590,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -410,7 +644,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
          ret = hevc_set_extradata(avctx, format);
          if (ret < 0)
              goto done;
@@ -304,12 +358,12 @@ index 4febddd..0e444c9 100644
              dolby_vision_override(avctx, format, &codec_mime, &profile_override);
          break;
  #endif
-@@ -615,6 +795,14 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -615,6 +849,14 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
  
          /* fetch new packet or eof */
          ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
 +#if CONFIG_HEVC_MEDIACODEC_DECODER
-+        if (ret >= 0 && s->dv_filter != DV_FILTER_NONE) {
++        if (ret >= 0 && (s->dv_filter != DV_FILTER_NONE || s->dv_strip_hdr10plus)) {
 +            ret = dv_filter_packet(avctx, &s->buffered_pkt);
 +            if (ret < 0)
 +                return ret;
@@ -319,7 +373,7 @@ index 4febddd..0e444c9 100644
          if (ret == AVERROR_EOF) {
              AVPacket null_pkt = { 0 };
              ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
-@@ -664,6 +852,16 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -664,6 +906,16 @@ static const AVOption ff_mediacodec_vdec_options[] = {
              OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
      { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
