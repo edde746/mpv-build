@@ -8,3 +8,4 @@
 0101-ao-audiotrack-multichannel-iec61937.patch
 0102-ao-audiotrack-raw-passthrough.patch
 0103-ao-audiotrack-route-change-reload.patch
+0104-ao-audiotrack-frame-aligned-pcm-buffer.patch

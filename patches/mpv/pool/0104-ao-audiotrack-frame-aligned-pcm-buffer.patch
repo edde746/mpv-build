@@ -1,0 +1,25 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -1101,12 +1101,16 @@
+         MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d)\n", p->size, buffer_size);
+     } else {
+         // Choose double of the minimum buffer size suggested by the driver, but not
+-        // less than 75ms or more than 150ms.
+-        int min = 0.075 * p->samplerate * bps * ao->channels.num;
++        // less than 75ms or more than 150ms. AudioTrack rejects a PCM buffer
++        // that is not a whole number of frames, and 75 ms is only a whole
++        // frame count at some rates (3307.5 frames at 44.1 kHz), so align to
++        // the frame, not the sample.
++        const int frame = bps * ao->channels.num;
++        int min = 0.075 * p->samplerate * frame;
+         int max = min * 2;
+-        min = MP_ALIGN_UP(min, bps);
+-        max = MP_ALIGN_UP(max, bps);
+-        p->size = MPCLAMP(buffer_size * 2, min, max);
++        min = MP_ALIGN_UP(min, frame);
++        max = MP_ALIGN_UP(max, frame);
++        p->size = MP_ALIGN_UP(MPCLAMP(buffer_size * 2, min, max), frame);
+         MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
+     }
+     mp_assert(p->size % bps == 0);
