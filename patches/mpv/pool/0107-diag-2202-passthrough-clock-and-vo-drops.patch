@@ -1,0 +1,159 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index 30ae7a7..e5ebbff 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ 
+ #include "ao.h"
+@@ -91,6 +92,18 @@ struct priv {
+     int64_t smooth_reported;  // last returned estimate, unwrapped
+     int64_t smooth_reported_ns;
+ 
++    // Passthrough clock diagnostics (edde746/plezy#2202): per-sample raw
++    // head steps and the discontinuity of the delay the core sees.
++    int64_t diag_last_ns;
++    uint32_t diag_last_raw;
++    uint32_t diag_last_written;
++    double diag_last_end_ns;   // last (now + delay), in ns
++    int64_t diag_window_ns;
++    int diag_n;
++    int32_t diag_step_min, diag_step_max;
++    double diag_dev_min, diag_dev_max;   // raw step vs wall clock, ms
++    double diag_jump_min, diag_jump_max; // delay discontinuity, ms
++
+     void *chunk;
+     int chunksize;
+     jbyteArray bytearray;
+@@ -460,6 +473,9 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+     p->smooth_head = 0;
+     p->smooth_reported = 0;
+     p->smooth_reported_ns = 0;
++    p->diag_last_ns = 0;
++    p->diag_window_ns = 0;
++    p->diag_n = 0;
+ }
+ 
+ // Passthrough tracks have no AudioTimestamp here, so their only clock is
+@@ -633,6 +649,57 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+     return (p->playhead_pos - p->playhead_offset) * (uint32_t)p->raw_rate_mult;
+ }
+ 
++static void AudioTrack_diagSample(struct ao *ao, uint32_t raw, uint32_t smooth,
++                                  double delay)
++{
++    struct priv *p = ao->priv;
++    int64_t now = mp_time_ns();
++    double end_ns = now + delay * 1e9;
++    if (p->diag_last_ns) {
++        double dt_ms = (now - p->diag_last_ns) / 1e6;
++        int32_t step = (int32_t)(raw - p->diag_last_raw);
++        double dev_ms = step * 1000.0 / ao->samplerate - dt_ms;
++        uint32_t wrote = p->written_frames - p->diag_last_written;
++        double jump_ms = (end_ns - p->diag_last_end_ns) / 1e6 -
++                         wrote * 1000.0 / ao->samplerate;
++        if (!p->diag_n) {
++            p->diag_step_min = p->diag_step_max = step;
++            p->diag_dev_min = p->diag_dev_max = dev_ms;
++            p->diag_jump_min = p->diag_jump_max = jump_ms;
++            p->diag_window_ns = now;
++        } else {
++            p->diag_step_min = MPMIN(p->diag_step_min, step);
++            p->diag_step_max = MPMAX(p->diag_step_max, step);
++            p->diag_dev_min = MPMIN(p->diag_dev_min, dev_ms);
++            p->diag_dev_max = MPMAX(p->diag_dev_max, dev_ms);
++            p->diag_jump_min = MPMIN(p->diag_jump_min, jump_ms);
++            p->diag_jump_max = MPMAX(p->diag_jump_max, jump_ms);
++        }
++        p->diag_n++;
++        if (fabs(dev_ms) > 15 || fabs(jump_ms) > 15) {
++            MP_VERBOSE(ao, "clock2202 anomaly: raw step %d frames in %.1f ms "
++                       "(dev %+.1f ms), raw=%u smooth=%u written=%u "
++                       "delay=%.1f ms jump=%+.1f ms\n",
++                       step, dt_ms, dev_ms, raw, smooth, p->written_frames,
++                       delay * 1e3, jump_ms);
++        }
++        if (now - p->diag_window_ns >= MP_TIME_S_TO_NS(10)) {
++            MP_VERBOSE(ao, "clock2202 10s: n=%d raw step %d..%d frames, "
++                       "dev %+.1f..%+.1f ms, jump %+.1f..%+.1f ms, "
++                       "delay=%.1f ms, raw-smooth=%d\n",
++                       p->diag_n, p->diag_step_min, p->diag_step_max,
++                       p->diag_dev_min, p->diag_dev_max,
++                       p->diag_jump_min, p->diag_jump_max, delay * 1e3,
++                       (int32_t)(raw - smooth));
++            p->diag_n = 0;
++        }
++    }
++    p->diag_last_ns = now;
++    p->diag_last_raw = raw;
++    p->diag_last_written = p->written_frames;
++    p->diag_last_end_ns = end_ns;
++}
++
+ static double AudioTrack_getLatency(struct ao *ao)
+ {
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+@@ -643,6 +710,7 @@ static double AudioTrack_getLatency(struct ao *ao)
+     const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
+                              p->raw_passthrough;
+     uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
++    uint32_t raw = playhead;
+     if (passthrough)
+         playhead = AudioTrack_smoothPlayhead(ao, playhead);
+     uint32_t diff = p->written_frames - playhead;
+@@ -650,11 +718,15 @@ static double AudioTrack_getLatency(struct ao *ao)
+     if (!p->timestamp_set && !passthrough)
+         delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
+     if (delay > 2.0) {
+-        //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
++        MP_VERBOSE(ao, "clock2202 delay>2s: written=%u raw=%u smooth=%u diff=%u delay=%f\n",
++                   p->written_frames, raw, playhead, diff, delay);
+         p->timestamp_fetched = 0;
+-        return 0;
++        delay = 0;
+     }
+-    return MPCLAMP(delay, 0.0, 2.0);
++    delay = MPCLAMP(delay, 0.0, 2.0);
++    if (passthrough && raw)
++        AudioTrack_diagSample(ao, raw, playhead, delay);
++    return delay;
+ }
+ 
+ // IEC 61937 burst parser states
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c8cb30e..f520617 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -171,6 +171,7 @@ struct vo_internal {
+ 
+     bool rendering;                 // true if an image is being rendered
+     struct vo_frame *frame_queued;  // should be drawn next
++    int64_t queued_ns;              // when frame_queued was handed over (2202 diag)
+     int req_frames;                 // VO's requested value of num_frames
+     uint64_t current_frame_id;
+ 
+@@ -883,6 +884,7 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
+     in->hasframe = true;
+     frame->frame_id = ++(in->current_frame_id);
+     in->frame_queued = frame;
++    in->queued_ns = mp_time_ns();
+     in->wakeup_pts = frame->display_synced
+                    ? 0 : frame->pts + MPMAX(frame->duration, 0);
+     wakeup_locked(vo);
+@@ -992,6 +994,12 @@ static bool render_frame(struct vo *vo)
+ 
+     if (in->dropped_frame) {
+         in->drop_count += 1;
++        MP_VERBOSE(vo, "drop2202: #%"PRId64" end %.1f ms before now, queued %.1f ms "
++                   "before its pts, dur %.1f ms, wakeup %.1f ms after target, "
++                   "prev_vsync %.1f ms ago\n",
++                   in->drop_count, (now - end_time) / 1e6,
++                   (pts - in->queued_ns) / 1e6, duration / 1e6,
++                   (now - target) / 1e6, (now - in->prev_vsync) / 1e6);
+         wakeup_core(vo);
+     } else {
+         in->rendering = true;
