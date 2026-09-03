@@ -10,3 +10,4 @@
 0103-ao-audiotrack-route-change-reload.patch
 0104-ao-audiotrack-frame-aligned-pcm-buffer.patch
 0105-ao-audiotrack-smooth-passthrough-playhead.patch
+0106-ao-audiotrack-clamp-passthrough-playhead.patch
