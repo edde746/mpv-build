@@ -3,3 +3,4 @@
 # once a second platform needs the same pool file, instead of copying it into
 # another per-platform series -- the pool entry stays the single source of
 # truth and the resolved order stays series.common first.
+0201-aspect-sub-video-rect-aspect-option.patch

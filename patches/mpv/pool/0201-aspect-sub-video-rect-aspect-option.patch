@@ -1,0 +1,83 @@
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index fa71dc0d1..545b46efc 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -1751,6 +1751,21 @@ Video
+     more generally useful. The behavior of these options may change to fit
+     OSC requirements better, too.
+ 
++``--sub-video-rect-aspect=<no|ratio>``
++    Place subtitles against the largest centered rectangle of the given aspect
++    ratio inside the displayed video rectangle, instead of against the video
++    rectangle itself (default: no). Zero is identical to ``no``.
++
++    This is for a user shader that composites the true picture, centered and
++    at its own aspect ratio, inside a frame whose aspect ratio was changed with
++    ``--video-aspect-override`` (for example to fill the window with a blurred
++    ambient border). Without it, subtitles and image subtitles follow the
++    overridden frame: ASS events anchored to a corner land in the corner of the
++    window rather than the corner of the picture.
++
++    Text subtitles still may use the space outside this rectangle, depending on
++    ``--sub-use-margins`` and similar options.
++
+ ``--correct-pts=<yes|no>``
+     ``--correct-pts=no`` switches mpv to a mode where video timing is
+     determined using a fixed framerate value (either using the
+diff --git a/options/options.c b/options/options.c
+index 716c3e6f1..91c223a9e 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -166,6 +166,7 @@ static const m_option_t mp_vo_opt_list[] = {
+     {"video-margin-ratio-right", OPT_FLOAT(margin_x[1]), M_RANGE(0.0, 1.0)},
+     {"video-margin-ratio-top", OPT_FLOAT(margin_y[0]), M_RANGE(0.0, 1.0)},
+     {"video-margin-ratio-bottom", OPT_FLOAT(margin_y[1]), M_RANGE(0.0, 1.0)},
++    {"sub-video-rect-aspect", OPT_ASPECT(sub_video_rect_aspect), M_RANGE(0, 10)},
+     {"video-crop", OPT_RECT(video_crop), .flags = UPDATE_IMGPAR},
+     {"video-unscaled", OPT_CHOICE(unscaled,
+         {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
+diff --git a/options/options.h b/options/options.h
+index 12dafea1e..278c347c9 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -51,6 +51,7 @@ typedef struct mp_vo_opts {
+     float scale_x, scale_y;
+     float margin_x[2];
+     float margin_y[2];
++    double sub_video_rect_aspect;
+     int unscaled;
+ 
+     struct m_geometry geometry;
+diff --git a/video/out/aspect.c b/video/out/aspect.c
+index 55c595096..8623f29d7 100644
+--- a/video/out/aspect.c
++++ b/video/out/aspect.c
+@@ -198,6 +198,28 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
+     osd.mt += margin_y[0];
+     osd.mb += margin_y[1];
+ 
++    // Subtitles are placed against these margins, i.e. against the displayed
++    // video rect. When a user shader composites the true picture centered
++    // inside an aspect-overridden frame, that rect is the frame and not the
++    // picture: place them against the largest centered rect of the picture's
++    // aspect inside the (unclipped) video rect instead.
++    if (opts->sub_video_rect_aspect > 0) {
++        int vx0 = osd.ml, vy0 = osd.mt;
++        int vw = window_w - osd.mr - vx0;
++        int vh = window_h - osd.mb - vy0;
++        double aspect = opts->sub_video_rect_aspect * monitor_par;
++        int rw = vw, rh = vh;
++        if (vw > vh * aspect) {
++            rw = MPMAX(1, (int)(vh * aspect + 0.5));
++        } else {
++            rh = MPMAX(1, (int)(vw / aspect + 0.5));
++        }
++        osd.ml = vx0 + (vw - rw) / 2;
++        osd.mr = window_w - (osd.ml + rw);
++        osd.mt = vy0 + (vh - rh) / 2;
++        osd.mb = window_h - (osd.mt + rh);
++    }
++
+     *out_src = src;
+     *out_dst = dst;
+     *out_osd = osd;
