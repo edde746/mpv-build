@@ -211,13 +211,26 @@ with tempfile.TemporaryDirectory() as tmp:
     print("apply --check is sound for stacked series and unwinds on failure")
 
 # 5. This repository's own tree is valid, and the apple series are nonempty.
+# series.common resolves first; behind it, the migrated apple series keeps
+# the old lexicographic apply order and its patch count.
+def series_entries(path):
+    if not path.is_file():
+        return []
+    lines = (line.strip() for line in path.read_text(encoding="utf-8").splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
 result = run(root, "check")
-mpv = run(root, "resolve", "mpv", "apple").stdout.split()
-ffmpeg = run(root, "resolve", "ffmpeg", "apple").stdout.split()
-check(len(mpv) == 24, f"the real mpv apple series must resolve 24 patches, got {len(mpv)}")
-check(len(ffmpeg) == 13, f"the real ffmpeg apple series must resolve 13 patches, got {len(ffmpeg)}")
-check(mpv == sorted(mpv), "the migrated mpv series must preserve the old lexicographic order")
-check(ffmpeg == sorted(ffmpeg), "the migrated ffmpeg series must preserve the old lexicographic order")
+for component, migrated_count in (("mpv", 24), ("ffmpeg", 13)):
+    common = series_entries(root / "patches" / component / "series.common")
+    resolved = run(root, "resolve", component, "apple").stdout.split()
+    check(resolved[: len(common)] == common, f"the real {component} apple series must start with series.common")
+    migrated = resolved[len(common):]
+    check(
+        len(migrated) == migrated_count,
+        f"the real {component} apple series must resolve {migrated_count} apple patches, got {len(migrated)}",
+    )
+    check(migrated == sorted(migrated), f"the migrated {component} series must preserve the old lexicographic order")
 print("the repository's own patch tree passes check")
 
 if failures:
