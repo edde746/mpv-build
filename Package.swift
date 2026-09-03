@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "MPVKit",
-    platforms: [.macOS(.v11), .iOS(.v14), .tvOS(.v14)],
+    platforms: [.macOS(.v12), .iOS(.v15), .tvOS(.v15)],
     products: [
         .library(
             name: "MPVKit",
@@ -109,8 +109,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libuavs3d",
-            url: "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-xcode/Libuavs3d.xcframework.zip",
-            checksum: "1e69250279be9334cd2f6849abdc884c8e4bb29212467b6f071fdc1ac2010b6b"
+            url: "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-fix/Libuavs3d.xcframework.zip",
+            checksum: "bd5256081486d16c51c868d755bf70266c424b54c895269580de44ec6707f789"
         ),
 
         .binaryTarget(
