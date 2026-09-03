@@ -1,0 +1,104 @@
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -658,6 +658,52 @@ static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
+ }
+ #endif
+ 
++/*
++ * A MediaCodec input buffer must carry one complete access unit. Without
++ * "max-input-size" the decoder chooses its own buffer size, and some choose
++ * too small: the MediaTek OMX HEVC decoder on Fire TV allocates 1 MiB + 4 KiB,
++ * so a high-bitrate 1080p IDR (1.2-1.3 MB is ordinary for x265 at 15 Mbps)
++ * does not fit. ff_mediacodec_dec_send then splits the packet across two
++ * buffers, the VPU rejects the tail as a truncated NAL ("invalid
++ * u4BufferAccumulated") and conceals with lost-picture references: smeared
++ * and green frames until the next IDR.
++ *
++ * Size the buffers the way ExoPlayer's MediaCodecVideoRenderer
++ * .getCodecMaxInputSize() does, validated by every Android player: 3/4 byte
++ * per pixel (min compression ratio 2) for H.264 with macroblock-aligned
++ * dimensions, HEVC, MPEG-4, VP8 and AV1; 3/8 for VP9; and a 2 MiB floor for
++ * HEVC. Other codecs keep the decoder default.
++ */
++static int video_max_input_size(const AVCodecContext *avctx)
++{
++    int64_t pixels = (int64_t)avctx->width * avctx->height;
++    int64_t size;
++
++    if (avctx->width <= 0 || avctx->height <= 0)
++        return 0;
++
++    switch (avctx->codec_id) {
++    case AV_CODEC_ID_H264:
++        pixels = (int64_t)FFALIGN(avctx->width, 16) * FFALIGN(avctx->height, 16);
++        size = pixels * 3 / 4;
++        break;
++    case AV_CODEC_ID_HEVC:
++        size = FFMAX(2 * 1024 * 1024, pixels * 3 / 4);
++        break;
++    case AV_CODEC_ID_MPEG4:
++    case AV_CODEC_ID_VP8:
++    case AV_CODEC_ID_AV1:
++        size = pixels * 3 / 4;
++        break;
++    case AV_CODEC_ID_VP9:
++        size = pixels * 3 / 8;
++        break;
++    default:
++        return 0;
++    }
++    return size > INT32_MAX ? 0 : (int)size;
++}
++
+ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+ {
+     int ret;
+@@ -792,8 +838,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     ff_AMediaFormat_setString(format, "mime", codec_mime);
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
++        int max_input_size = video_max_input_size(avctx);
++
+         ff_AMediaFormat_setInt32(format, "width", avctx->width);
+         ff_AMediaFormat_setInt32(format, "height", avctx->height);
++        if (max_input_size > 0)
++            ff_AMediaFormat_setInt32(format, "max-input-size", max_input_size);
+     } else {
+         ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
+         ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -939,6 +939,18 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+             return AVERROR_EXTERNAL;
+         }
+ 
++        /* Splitting an access unit across input buffers is outside the
++         * MediaCodec contract; decoders that tolerate it decode the packet,
++         * others (MediaTek OMX HEVC) corrupt until the next IDR. The configure
++         * format sizes buffers so this stays exceptional; surface it when it
++         * does happen. */
++        if (offset == 0 && pkt->size > size && !s->split_warned) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Input packet of %d bytes exceeds the %zu-byte input buffer; "
++                   "splitting it across buffers\n", pkt->size, size);
++            s->split_warned = 1;
++        }
++
+         pts = pkt->pts;
+         if (pts == AV_NOPTS_VALUE) {
+             av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -66,6 +66,9 @@ typedef struct MediaCodecDecContext {
+ 
+     uint64_t output_buffer_count;
+     ssize_t current_input_buffer;
++    // Set after the first packet that did not fit one input buffer was
++    // logged, so a stream of oversized packets warns once.
++    int split_warned;
+ 
+     bool delay_flush;
+     atomic_int serial;

@@ -5,3 +5,4 @@
 0001-mediacodec-dolby-vision-decoder-selection.patch
 0002-mediacodec-dolby-vision-profile-7-conversion.patch
 0003-mediacodec-av1-refuse-non-main-profiles.patch
+0004-mediacodec-size-input-buffers-for-access-units.patch
