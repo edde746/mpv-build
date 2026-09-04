@@ -1,0 +1,14 @@
+diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+--- a/filters/f_output_chain.c
++++ b/filters/f_output_chain.c
+@@ -339,6 +339,10 @@
+         p->ao = NULL;
+         mp_autoconvert_clear(p->convert);
+     }
++
++    // Reset cleared this chain's internal demand while the AO consumer's
++    // request stays asserted; reschedule so process() re-propagates it.
++    mp_filter_wakeup(p->f);
+ }
+ 
+ static void output_chain_destroy(struct mp_filter *f)

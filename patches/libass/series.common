@@ -1,0 +1,4 @@
+# Patches applied on every platform, before series.<platform>. The libass pin
+# is shared by all four groups, so a fork-level defect lands here until the
+# fork ships a release containing it (then drop the pool entry with the bump).
+0001-ass-font-guard-mutex-destroy-for-failed-fonts.patch

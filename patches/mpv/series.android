@@ -16,3 +16,5 @@
 0110-vo-mediacodec-harden-buffer-and-surface-lifecycle.patch
 0111-vo-mediacodec-leave-display-mode-selection-to-embedder.patch
 0107-diag-2202-passthrough-clock-and-vo-drops.patch
+0112-ao-audiotrack-admit-only-advancing-timestamps.patch
+0113-f-output-chain-wake-after-reset-harder.patch

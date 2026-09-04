@@ -1,0 +1,25 @@
+diff --git a/libass/ass_font.c b/libass/ass_font.c
+--- a/libass/ass_font.c
++++ b/libass/ass_font.c
+@@ -590,6 +590,9 @@
+     ASS_FontDesc *desc = key;
+     ASS_Font *font = value;
+ 
++    // Cache values are malloc'd: settle the validity sentinel before any
++    // early return so a failed font never publishes indeterminate state.
++    font->library = NULL;
+     font->ftlibrary = render_priv->ftlibrary;
+     atomic_init(&font->n_faces, 0);
+     for (int i = 0; i < ASS_FONT_MAX_FACES; i++)
+@@ -887,7 +890,10 @@
+     }
+ 
+ #if ENABLE_THREADS
+-    pthread_mutex_destroy(&font->mutex);
++    // A failed construction already rolled its mutex back (library == NULL);
++    // only successfully constructed fonts hand mutex destruction to the cache.
++    if (font->library)
++        pthread_mutex_destroy(&font->mutex);
+ #endif
+ }
+ 
