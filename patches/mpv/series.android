@@ -11,4 +11,5 @@
 0104-ao-audiotrack-frame-aligned-pcm-buffer.patch
 0105-ao-audiotrack-smooth-passthrough-playhead.patch
 0106-ao-audiotrack-clamp-passthrough-playhead.patch
+0108-vo-mediacodec-async-osd-post.patch
 0107-diag-2202-passthrough-clock-and-vo-drops.patch

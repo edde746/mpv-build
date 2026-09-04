@@ -1,0 +1,264 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index d92f185..2d00f60 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -33,9 +33,17 @@
+  *    modified region into that surface. The OSD plane must be positioned by
+  *    the embedder directly on top of the video Surface and sized to the same
+  *    rectangle: OSD coordinate space == OSD surface == video rectangle.
+- *    The OSD buffer for a frame is posted immediately before the video
+- *    buffer's timed release, so both latch on the same vsync in the common
+- *    case. (A guaranteed pairing via ASurfaceControl transactions with
++ *    The whole OSD stage - rasterizing, compositing, locking the Surface
++ *    and posting - runs on its own thread, fed with the current video pts
++ *    at every flip. ANativeWindow_lock is a CPU wait for the compositor
++ *    (dequeue plus the release fence: one or two vsyncs, 42-83 ms on a
++ *    23.976 Hz display), and libass/PGS composition is not free either;
++ *    on Amlogic Fire TV every subtitle change held the VO thread for
++ *    90-100 ms and dropped two video frames (edde746/plezy#2240). Kodi,
++ *    VLC 4 and ExoPlayer all keep subtitle output off the presentation
++ *    thread; this does the same. The OSD latches on the same vsync as the
++ *    video buffer in the common case and one later when the lock waits.
++ *    (A guaranteed pairing via ASurfaceControl transactions with
+  *    setDesiredPresentTime is a possible future upgrade; it needs API 29.)
+  *
+  * The embedder owns all geometry: the video Surface must be sized to the
+@@ -65,6 +73,7 @@
+ #include "common/common.h"
+ #include "misc/jni.h"
+ #include "options/m_option.h"
++#include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "sub/draw_bmp.h"
+ #include "sub/osd.h"
+@@ -83,11 +92,19 @@ struct priv {
+     struct mp_hwdec_ctx hwctx;
+ 
+     ANativeWindow *osd_window;
+-    struct mp_draw_sub_cache *osd_cache;
+-    int osd_w, osd_h;
+-    bool osd_force_full;
+     bool osd_missing_logged;
+ 
++    // OSD thread. It owns the draw cache and the Surface; the VO thread only
++    // files a request (latest pts wins) under osd_lock.
++    mp_thread osd_thread;
++    bool osd_thread_created;
++    mp_mutex osd_lock;
++    mp_cond osd_wakeup;
++    bool osd_terminate;
++    bool osd_requested;
++    bool osd_request_full; // repaint everything (reconfig, resize)
++    double osd_request_pts;
++
+     // The wid Surface, for the frame-rate vote only. Never locked: a CPU
+     // producer connection would leave it unusable for EGL.
+     ANativeWindow *video_window;
+@@ -175,6 +192,8 @@ static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
+     return device_ref;
+ }
+ 
++static MP_THREAD_VOID osd_thread(void *arg);
++
+ static int preinit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -201,7 +220,18 @@ static int preinit(struct vo *vo)
+         if (p->osd_window) {
+             ANativeWindow_setBuffersGeometry(p->osd_window, 0, 0,
+                                              WINDOW_FORMAT_RGBA_8888);
+-            p->osd_force_full = true;
++            mp_mutex_init(&p->osd_lock);
++            mp_cond_init(&p->osd_wakeup);
++            if (mp_thread_create(&p->osd_thread, osd_thread, vo)) {
++                MP_ERR(vo, "Failed to start the OSD thread; "
++                           "subtitles/OSD will not render.\n");
++                mp_cond_destroy(&p->osd_wakeup);
++                mp_mutex_destroy(&p->osd_lock);
++                ANativeWindow_release(p->osd_window);
++                p->osd_window = NULL;
++            } else {
++                p->osd_thread_created = true;
++            }
+         } else {
+             MP_ERR(vo, "Failed to wrap the OSD surface; "
+                        "subtitles/OSD will not render.\n");
+@@ -240,27 +270,22 @@ static void copy_bgra_to_rgba(uint8_t *dst, ptrdiff_t dst_stride,
+     }
+ }
+ 
+-static void draw_osd(struct vo *vo)
++// One OSD pass for the given video pts: render, composite, and blit the
++// changed region into the OSD Surface. Runs on the OSD thread only.
++static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
++                     int *last_w, int *last_h, bool *force_full, double pts)
+ {
+     struct priv *p = vo->priv;
+-    if (!p->osd_window) {
+-        if (!p->osd_missing_logged) {
+-            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
+-                        "subtitles/OSD are not rendered.\n");
+-            p->osd_missing_logged = true;
+-        }
+-        return;
+-    }
+ 
+     int w = ANativeWindow_getWidth(p->osd_window);
+     int h = ANativeWindow_getHeight(p->osd_window);
+     if (w <= 0 || h <= 0)
+         return;
+ 
+-    if (w != p->osd_w || h != p->osd_h) {
+-        p->osd_w = w;
+-        p->osd_h = h;
+-        p->osd_force_full = true;
++    if (w != *last_w || h != *last_h) {
++        *last_w = w;
++        *last_h = h;
++        *force_full = true;
+     }
+ 
+     struct mp_osd_res res = {
+@@ -269,27 +294,26 @@ static void draw_osd(struct vo *vo)
+         .display_par = 1,
+     };
+ 
+-    double pts = p->cur_image ? p->cur_image->pts : 0;
+     struct sub_bitmap_list *sbs =
+         osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
+     if (!sbs)
+         return;
+ 
+-    if (!p->osd_cache)
+-        p->osd_cache = mp_draw_sub_alloc(p, vo->global);
++    if (!*cache)
++        *cache = mp_draw_sub_alloc(NULL, vo->global);
+ 
+     struct mp_rect act_rc[1], mod_rc[64];
+     int num_act_rc = 0, num_mod_rc = 0;
+-    struct mp_image *osd = mp_draw_sub_overlay(p->osd_cache, sbs,
++    struct mp_image *osd = mp_draw_sub_overlay(*cache, sbs,
+             act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
+             mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc);
+     if (!osd)
+         goto done;
+-    if (!num_mod_rc && !p->osd_force_full)
++    if (!num_mod_rc && !*force_full)
+         goto done; // OSD unchanged; keep the currently posted buffer
+ 
+     struct mp_rect dirty = {0, 0, w, h};
+-    if (!p->osd_force_full) {
++    if (!*force_full) {
+         dirty = mod_rc[0];
+         for (int n = 1; n < num_mod_rc; n++)
+             mp_rect_union(&dirty, &mod_rc[n]);
+@@ -301,7 +325,7 @@ static void draw_osd(struct vo *vo)
+     ANativeWindow_Buffer buffer;
+     if (ANativeWindow_lock(p->osd_window, &buffer, &bounds) != 0) {
+         MP_WARN(vo, "Failed to lock the OSD surface.\n");
+-        p->osd_force_full = true;
++        *force_full = true;
+         goto done;
+     }
+ 
+@@ -315,10 +339,7 @@ static void draw_osd(struct vo *vo)
+ 
+     // Mid-resize race: the buffer no longer matches the rendered overlay.
+     // Paint what we can and repaint fully on the next pass.
+-    if (buffer.width != w || buffer.height != h)
+-        p->osd_force_full = true;
+-    else
+-        p->osd_force_full = false;
++    *force_full = buffer.width != w || buffer.height != h;
+ 
+     int x0 = MPCLAMP(bounds.left, 0, buffer.width);
+     int y0 = MPCLAMP(bounds.top, 0, buffer.height);
+@@ -351,6 +372,59 @@ done:
+     talloc_free(sbs);
+ }
+ 
++static MP_THREAD_VOID osd_thread(void *arg)
++{
++    struct vo *vo = arg;
++    struct priv *p = vo->priv;
++    mp_thread_set_name("vo/osd");
++
++    struct mp_draw_sub_cache *cache = NULL;
++    int last_w = 0, last_h = 0;
++    bool force_full = true;
++
++    mp_mutex_lock(&p->osd_lock);
++    while (!p->osd_terminate) {
++        if (!p->osd_requested) {
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            continue;
++        }
++        double pts = p->osd_request_pts;
++        force_full |= p->osd_request_full;
++        p->osd_requested = false;
++        p->osd_request_full = false;
++        mp_mutex_unlock(&p->osd_lock);
++
++        osd_pass(vo, &cache, &last_w, &last_h, &force_full, pts);
++
++        mp_mutex_lock(&p->osd_lock);
++    }
++    mp_mutex_unlock(&p->osd_lock);
++
++    talloc_free(cache);
++    MP_THREAD_RETURN();
++}
++
++// Called on every flip: hand the OSD thread the pts to render for. Latest
++// request wins; a pass that is already running picks the next one up.
++static void draw_osd(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_window) {
++        if (!p->osd_missing_logged) {
++            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
++                        "subtitles/OSD are not rendered.\n");
++            p->osd_missing_logged = true;
++        }
++        return;
++    }
++
++    mp_mutex_lock(&p->osd_lock);
++    p->osd_request_pts = p->cur_image ? p->cur_image->pts : 0;
++    p->osd_requested = true;
++    mp_cond_signal(&p->osd_wakeup);
++    mp_mutex_unlock(&p->osd_lock);
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+@@ -413,7 +487,11 @@ static int control(struct vo *vo, uint32_t request, void *data)
+ static int reconfig(struct vo *vo, struct mp_image_params *params)
+ {
+     struct priv *p = vo->priv;
+-    p->osd_force_full = true;
++    if (p->osd_thread_created) {
++        mp_mutex_lock(&p->osd_lock);
++        p->osd_request_full = true;
++        mp_mutex_unlock(&p->osd_lock);
++    }
+ 
+     // Wrapped for the frame-rate vote only; MediaCodec stays the sole producer.
+     if (!p->video_window) {
+@@ -437,6 +515,15 @@ static void uninit(struct vo *vo)
+     hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
+     av_buffer_unref(&p->hwctx.av_device_ref);
+ 
++    if (p->osd_thread_created) {
++        mp_mutex_lock(&p->osd_lock);
++        p->osd_terminate = true;
++        mp_cond_signal(&p->osd_wakeup);
++        mp_mutex_unlock(&p->osd_lock);
++        mp_thread_join(p->osd_thread);
++        mp_cond_destroy(&p->osd_wakeup);
++        mp_mutex_destroy(&p->osd_lock);
++    }
+     if (p->osd_window)
+         ANativeWindow_release(p->osd_window);
+     if (p->video_window) {
