@@ -186,10 +186,10 @@ index c8cb30e..0bf4884 100644
          struct vo_vsync_info vsync = {
              .last_queue_display_time = -1,
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 080dc0b..f58e0ad 100644
+index 42e4a30..74d0280 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -694,6 +694,8 @@ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
+@@ -717,6 +717,8 @@ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
      }
  
      ANativeWindow_unlockAndPost(p->osd_window);
@@ -198,8 +198,8 @@ index 080dc0b..f58e0ad 100644
  
  done:
      talloc_free(sbs);
-@@ -777,18 +779,27 @@ static void flip_page(struct vo *vo)
-         get_release_target(vo, p->cur_presented ? 0 : p->cur_pts);
+@@ -822,18 +824,27 @@ static void flip_page(struct vo *vo)
+         get_release_target(vo, p->cur_image ? p->cur_pts : 0);
  
      // Rasterize early, but keep the OSD post near the video's timestamp.
 +    int64_t t_osd0 = mp_time_ns();
@@ -208,21 +208,21 @@ index 080dc0b..f58e0ad 100644
 +    if (t_osd1 - t_osd0 > MP_TIME_MS_TO_NS(10))
 +        MP_VERBOSE(vo, "flip2202: draw_osd %.1f ms\n", (t_osd1 - t_osd0) / 1e6);
  
-     if (!p->cur_image || p->cur_presented)
+     if (!p->cur_image)
          return;
  
      AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
- 
 +    int64_t t_rel0 = mp_time_ns();
-     if (target.timestamp) {
-         av_mediacodec_render_buffer_at_time(buffer, target.timestamp);
-     } else {
-         av_mediacodec_release_buffer(buffer, 1);
-     }
+     int ret = target.timestamp
+             ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
+             : av_mediacodec_release_buffer(buffer, 1);
 +    int64_t t_rel1 = mp_time_ns();
+     mp_image_unrefp(&p->cur_image);
+     p->cur_pts = 0;
+ 
 +    if (t_rel1 - t_rel0 > MP_TIME_MS_TO_NS(10))
 +        MP_VERBOSE(vo, "flip2202: releaseOutputBuffer %.1f ms (timed=%d)\n",
 +                   (t_rel1 - t_rel0) / 1e6, target.timestamp > 0);
-     p->cur_presented = true;
+     if (ret < 0)
+         MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
  }
- 
