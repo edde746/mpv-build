@@ -10,10 +10,11 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  #include "ao.h"
  #include "internal.h"
  #include "common/msg.h"
-@@ -77,6 +79,15 @@ struct priv {
+@@ -82,6 +84,15 @@
+     bool routing_lost;       // the observed route went away; rebind decides
      bool routing_reload_requested;
      int64_t routing_checked; // last poll, mp_time_ns
- 
++
 +    // Passthrough playback-position smoothing; see
 +    // AudioTrack_smoothPlayhead.
 +    double smooth_offset[10]; // head - clock, in ao->samplerate frames
@@ -22,11 +23,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    int64_t smooth_sampled;   // mp_time_ns of the last sample
 +    uint32_t smooth_last_head;
 +    int64_t smooth_head;      // smooth_last_head, unwrapped
-+
+ 
      void *chunk;
      int chunksize;
-     jbyteArray bytearray;
-@@ -437,6 +448,59 @@ static int AudioTrack_Recreate(struct ao *ao)
+@@ -443,6 +454,59 @@
      return AudioTrack_New(ao);
  }
  
@@ -86,7 +86,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
  {
      struct priv *p = ao->priv;
-@@ -508,6 +572,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -514,6 +578,7 @@
              MP_VERBOSE(ao, "IEC/playbackHeadPosition %d -> %d (flush)\n", p->playhead_pos, pos);
              p->playhead_offset = 0;
              p->playhead_pos = 0;
@@ -94,7 +94,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          }
  
          // sometimes on a new AudioTrack instance, playbackHeadPosition will reset
-@@ -517,6 +582,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -523,6 +588,7 @@
              p->playhead_offset = 0;
              p->playhead_pos = 0;
              p->written_frames = 0;
@@ -102,7 +102,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          }
      }
  
-@@ -533,11 +599,14 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -539,11 +605,14 @@
      if (!p->audiotrack)
          return 0;
  
@@ -119,11 +119,30 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -1193,6 +1262,7 @@ static void stop(struct ao *ao)
-     p->timestamp_set = false;
-     p->raw_state = RAW_SYNC_PA;
-     p->raw_payload_left = 0;
+@@ -1237,12 +1306,17 @@
+         return;
+     }
+ 
++    // Interrupt the Java blocking write before waiting for the worker lock.
++    // Pull-AO reset callers do not hold the core buffer lock here.
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+     MP_JNI_EXCEPTION_LOG(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+     MP_JNI_EXCEPTION_LOG(ao);
+ 
++    // The worker owns the parser, frame accounting and smoothing state.
++    // Wait for its interrupted write/latency update before resetting them.
++    mp_mutex_lock(&p->lock);
+     p->playhead_offset = 0;
+     p->reset_pending = true;
+     p->written_frames = 0;
+@@ -1254,6 +1328,8 @@
+     p->raw_have_byte = false;
+     p->raw_pending = 0;
+     p->raw_input_len = 0;
 +    AudioTrack_resetPlayheadSmoothing(p);
++    mp_mutex_unlock(&p->lock);
  }
  
  static void start(struct ao *ao)

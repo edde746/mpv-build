@@ -61,7 +61,7 @@ jobs:
           def fetch(component, group, dest):
             entry = components[component]
             override = (entry.get('overrides') or {}).get(group) or {}
-            kind = entry['kind']
+            kind = override.get('kind', entry['kind'])
             url = override.get('url', entry.get('url'))
             if kind == 'git':
               ref = override.get('ref', entry.get('ref'))

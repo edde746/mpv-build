@@ -1,5 +1,4 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index 6d23ca7..30ae7a7 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -22,6 +22,7 @@
@@ -10,7 +9,7 @@ index 6d23ca7..30ae7a7 100644
  
  #include "ao.h"
  #include "internal.h"
-@@ -87,6 +88,8 @@ struct priv {
+@@ -93,6 +94,8 @@
      int64_t smooth_sampled;   // mp_time_ns of the last sample
      uint32_t smooth_last_head;
      int64_t smooth_head;      // smooth_last_head, unwrapped
@@ -19,7 +18,7 @@ index 6d23ca7..30ae7a7 100644
  
      void *chunk;
      int chunksize;
-@@ -455,6 +458,8 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+@@ -461,6 +464,8 @@
      p->smooth_sampled = 0;
      p->smooth_last_head = 0;
      p->smooth_head = 0;
@@ -28,7 +27,7 @@ index 6d23ca7..30ae7a7 100644
  }
  
  // Passthrough tracks have no AudioTimestamp here, so their only clock is
-@@ -470,6 +475,20 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+@@ -476,6 +481,20 @@
  // (head - clock) offsets, taken at least 30 ms apart, and report
  // clock + mean offset, which spreads a period-sized step over the window.
  //
@@ -49,7 +48,7 @@ index 6d23ca7..30ae7a7 100644
  // `head` is the wrap-safe position relative to the post-flush origin, in
  // ao->samplerate frames; the return value is its smoothed equivalent.
  static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head)
-@@ -498,6 +517,28 @@ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head)
+@@ -504,6 +523,28 @@
      for (int n = 0; n < p->smooth_count; n++)
          sum += p->smooth_offset[n];
      int64_t est = llround(clock + sum / p->smooth_count);

@@ -119,6 +119,29 @@ make clean
 make help
 ```
 
+### Android
+
+Install [rustup](https://rustup.rs) as well as the Android host tools and pinned
+NDK (`bash platforms/android/include/download-sdk.sh`). Then build from the
+repository root:
+
+```bash
+bash platforms/android/download.sh
+bash platforms/android/build.sh --arch arm64
+```
+
+Other architectures are `armv7l`, `x86`, and `x86_64`. Android now builds libdovi
+from the pinned source and lockfile, including the malformed-RPU bounds fix;
+the build installs the Rust compiler pinned in `toolchain/android.txt` and the
+selected Android target.
+The old per-target libdovi prebuilts must not be reused.
+
+`download.sh` leaves existing dependency directories untouched. After changing
+patches or source pins, move the old `platforms/android/deps` and
+`platforms/android/prefix` directories aside before fetching and rebuilding.
+An obsolete prebuilt-only `deps/libdovi` is explicitly rejected. Use a fresh
+build before packaging; changing patch files does not update installed binaries.
+
 ## Make demo app using the local build version
 
 If you want the demo app to use the local build version, you need to modify `Package.swift` to reference the local build xcframework file.

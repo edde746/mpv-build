@@ -1,8 +1,7 @@
 diff --git a/configure b/configure
-index a0eed36..539747c 100755
 --- a/configure
 +++ b/configure
-@@ -1934,6 +1934,7 @@ EXTERNAL_LIBRARY_LIST="
+@@ -1934,6 +1934,7 @@
      libcelt
      libcodec2
      libdav1d
@@ -10,7 +9,7 @@ index a0eed36..539747c 100755
      libdc1394
      libflite
      libfontconfig
-@@ -7034,6 +7035,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
+@@ -7034,6 +7035,7 @@
  enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
  enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
  enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
@@ -19,7 +18,6 @@ index a0eed36..539747c 100755
  enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
  enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 4febddd..459ddb0 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
 @@ -37,6 +37,9 @@
@@ -32,7 +30,7 @@ index 4febddd..459ddb0 100644
  #include "h264_parse.h"
  #include "h264_ps.h"
  #include "hevc/parse.h"
-@@ -61,8 +64,29 @@ typedef struct MediaCodecH264DecContext {
+@@ -61,7 +64,28 @@
      // Ref. MediaFormat KEY_OPERATING_RATE
      int operating_rate;
      int dolby_vision;
@@ -46,7 +44,7 @@ index 4febddd..459ddb0 100644
 +    // dynamic metadata (Kodi xbmc#24584, androidx/media#3085).
 +    int dv_strip_hdr10plus;
  } MediaCodecH264DecContext;
- 
++
 +// Dolby Vision profile 7 packet filters: convert rewrites the RPU (UNSPEC62)
 +// to profile 8.1 and drops the enhancement layer (UNSPEC63); strip drops both.
 +#define DV_FILTER_NONE    0
@@ -58,11 +56,10 @@ index 4febddd..459ddb0 100644
 +#define DV_P7_NATIVE  1
 +#define DV_P7_CONVERT 2
 +#define DV_P7_STRIP   3
-+
+ 
  static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
  {
-     MediaCodecH264DecContext *s = avctx->priv_data;
-@@ -313,54 +337,264 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -313,54 +337,370 @@
   * only when a "video/dolby-vision" MediaCodec decodes the stream. For the
   * single-layer profiles (dvhe.05, dvhe.08) the HEVC bitstream - with its
   * in-band RPU NALs - is fed to the DV decoder unchanged; only the MIME and
@@ -81,20 +78,17 @@ index 4febddd..459ddb0 100644
 + *   - otherwise the plain HEVC decoder renders the base layer, optionally
 + *     with the DV NALs stripped (strip / fallback).
   */
-+static int dv_probe_profile(AVCodecContext *avctx, const char *mime, int profile)
++static char *dv_probe_profile(AVCodecContext *avctx, const char *mime, int profile)
 +{
-+    /* Requires a JVM (JNI MediaCodecList); returns NULL otherwise, which
-+     * keeps the plain HEVC decoder - as does the absence of a hardware DV
-+     * decoder advertising this profile. */
-+    char *codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
-+    if (!codec_name)
-+        return 0;
-+    av_freep(&codec_name);
-+    return 1;
++    /* Keep the exact advertised decoder through initialization. An empty
++     * profileLevels list is not evidence of Dolby Vision profile support. */
++    return ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, 1, avctx);
 +}
 +
  static void dolby_vision_override(AVCodecContext *avctx, FFAMediaFormat *format,
-                                   const char **mime, int *profile_override)
+-                                  const char **mime, int *profile_override)
++                                  const char **mime, int *profile_override,
++                                  char **codec_name)
  {
      static const char dv_mime[] = "video/dolby-vision";
 +    MediaCodecH264DecContext *s = avctx->priv_data;
@@ -110,10 +104,10 @@ index 4febddd..459ddb0 100644
          return;
      cfg = (const AVDOVIDecoderConfigurationRecord *)sd->data;
 -    if (!cfg->rpu_present_flag || cfg->el_present_flag)
--        return;
--    if (cfg->dv_profile != 5 && cfg->dv_profile != 8)
 +    if (!cfg->rpu_present_flag)
          return;
+-    if (cfg->dv_profile != 5 && cfg->dv_profile != 8)
+-        return;
 +    level = cfg->dv_level > 0 ? 1 << (cfg->dv_level - 1) : 0;
  
      /* MediaCodecInfo.CodecProfileLevel: DolbyVisionProfile* == 1 << dv_profile,
@@ -134,7 +128,8 @@ index 4febddd..459ddb0 100644
 +            return;
 +        if (cfg->dv_profile != 5 && cfg->dv_profile != 8)
 +            return;
-+        if (!dv_probe_profile(avctx, dv_mime, 1 << cfg->dv_profile)) {
++        *codec_name = dv_probe_profile(avctx, dv_mime, 1 << cfg->dv_profile);
++        if (!*codec_name) {
 +            av_log(avctx, AV_LOG_VERBOSE,
 +                   "No hardware decoder for %s profile 0x%x, using the base layer\n",
 +                   dv_mime, 1 << cfg->dv_profile);
@@ -155,12 +150,12 @@ index 4febddd..459ddb0 100644
 +            return;
 +        }
 +        if ((mode == DV_P7_AUTO || mode == DV_P7_NATIVE) &&
-+            dv_probe_profile(avctx, dv_mime, 1 << 7)) {
++            (*codec_name = dv_probe_profile(avctx, dv_mime, 1 << 7))) {
 +            profile = 1 << 7;
 +        }
 +#if CONFIG_LIBDOVI
 +        if (!profile && mode != DV_P7_NATIVE &&
-+            dv_probe_profile(avctx, dv_mime, 1 << 8)) {
++            (*codec_name = dv_probe_profile(avctx, dv_mime, 1 << 8))) {
 +            profile = 1 << 8;
 +            convert = 1;
 +        }
@@ -176,7 +171,8 @@ index 4febddd..459ddb0 100644
 -    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (%s)\n",
 -           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, codec_name);
 -    av_freep(&codec_name);
- 
+-
++
 +    av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d.%d: using %s (0x%x%s), filtering HDR10+ SEI\n",
 +           cfg->dv_profile, cfg->dv_bl_signal_compatibility_id, dv_mime, profile,
 +           convert ? ", converting RPU to profile 8.1" : "");
@@ -193,86 +189,183 @@ index 4febddd..459ddb0 100644
 +
 +static const uint8_t *dv_next_startcode(const uint8_t *p, const uint8_t *end)
 +{
-+    for (; p + 3 <= end; p++) {
++    for (; end - p >= 3; p++) {
 +        if (p[0] == 0 && p[1] == 0 && p[2] == 1)
 +            return p;
 +    }
 +    return end;
 +}
 +
-+/*
-+ * Returns whether an SEI NAL's RBSP (starting after the 2-byte HEVC NAL
-+ * header) begins with an HDR10+ message: user_data_registered_itu_t_t35 with
-+ * country code 0xB5 (United States), provider code 0x003C (Samsung), provider
-+ * oriented code 0x0001, application identifier 4 (ST 2094-40), application
-+ * version 0 or 1. Malformed or truncated data answers no so the NAL is kept.
-+ * The identifier bytes cannot contain the 0x000003 emulation prevention
-+ * pattern, so no RBSP unescaping is needed to read them.
-+ */
-+static int dv_is_hdr10plus_sei(const uint8_t *nal, const uint8_t *nal_end)
++/* All output paths, including unchanged NALs after expanded RPUs, share this
++ * capacity check. AVPacket.size and its required padding must fit in int. */
++static int dv_packet_reserve(AVBufferRef **buf, size_t used, size_t extra)
 +{
-+    const uint8_t *p = nal + 2;
-+    int payload_type = 0, payload_size = 0;
++    const size_t limit = INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE;
++    size_t needed, capacity;
 +
-+    while (p < nal_end) {
-+        int b = *p++;
-+        payload_type += b;
-+        if (b != 0xFF)
-+            break;
-+    }
-+    while (p < nal_end) {
-+        int b = *p++;
-+        payload_size += b;
-+        if (b != 0xFF)
-+            break;
-+    }
-+
-+    if (payload_type != 4 /* user_data_registered_itu_t_t35 */ ||
-+        payload_size < 7 || p + 7 > nal_end)
++    if (used > limit || extra > limit - used)
++        return AVERROR(ENOMEM);
++    needed = used + extra + AV_INPUT_BUFFER_PADDING_SIZE;
++    if (*buf && needed <= (*buf)->size)
 +        return 0;
++    capacity = *buf ? (*buf)->size : 0;
++    capacity = FFMAX(needed, FFMIN((size_t)INT_MAX, capacity + capacity / 2));
++    return av_buffer_realloc(buf, capacity);
++}
 +
-+    return p[0] == 0xB5 &&                    /* country code */
-+           p[1] == 0x00 && p[2] == 0x3C &&    /* provider code */
-+           p[3] == 0x00 && p[4] == 0x01 &&    /* provider oriented code */
-+           p[5] == 4 &&                       /* ST 2094-40 */
-+           (p[6] == 0 || p[6] == 1);          /* application version */
++static int dv_packet_append(AVBufferRef **buf, size_t *used,
++                            const uint8_t *data, size_t size)
++{
++    int ret = dv_packet_reserve(buf, *used, size);
++    if (ret < 0)
++        return ret;
++    memcpy((*buf)->data + *used, data, size);
++    *used += size;
++    return 0;
++}
++
++static int dv_sei_value(const uint8_t **p, const uint8_t *end, size_t *value)
++{
++    *value = 0;
++    while (*p < end) {
++        unsigned byte = *(*p)++;
++        if (*value > SIZE_MAX - byte)
++            return 0;
++        *value += byte;
++        if (byte != 255)
++            return 1;
++    }
++    return 0;
 +}
 +
 +/*
-+ * Rewrite one annex-B access unit: drop UNSPEC63 (enhancement layer) NALs and
-+ * either drop or convert-to-8.1 the UNSPEC62 (RPU) NALs per s->dv_filter, and
-+ * drop HDR10+ SEI NALs when s->dv_strip_hdr10plus is set. Runs on every
-+ * packet of a stream whose init armed either action; the packet buffer is
-+ * only replaced when something actually changed.
++ * Filter individual ST 2094-40 messages, not their enclosing prefix/suffix
++ * SEI NAL. Validate the complete RBSP before committing any output: malformed
++ * headers, sizes, trailing bits or emulation prevention preserve the original
++ * NAL, including messages after an otherwise recognizable HDR10+ payload.
++ * Return 1 when rewritten/removed, 0 when unchanged, or an allocation error.
++ */
++static int dv_filter_sei(AVBufferRef **buf, size_t *used,
++                         const uint8_t *region, const uint8_t *nal,
++                         const uint8_t *end)
++{
++    const uint8_t *p, *payload_end;
++    uint8_t *rbsp, *dst;
++    size_t rbsp_size = 0, kept = 0, escaped_size = 0;
++    unsigned zeros = 0;
++    int removed = 0, ret = 0;
++
++    if (end - nal < 3)
++        return 0;
++    /* Annex-B trailing_zero_8bits are outside the RBSP. */
++    while (end > nal + 2 && end[-1] == 0)
++        end--;
++    rbsp = av_malloc(end - nal);
++    if (!rbsp)
++        return AVERROR(ENOMEM);
++    for (p = nal + 2; p < end; p++) {
++        if (zeros == 2) {
++            if (*p == 3) {
++                if (end - p < 2 || p[1] > 3)
++                    goto done;
++                zeros = 0;
++                continue;
++            }
++            if (*p < 3)
++                goto done;
++        }
++        rbsp[rbsp_size++] = *p;
++        zeros = *p == 0 ? zeros + 1 : 0;
++    }
++    if (!rbsp_size || rbsp[rbsp_size - 1] != 0x80)
++        goto done;
++    p = rbsp;
++    payload_end = rbsp + rbsp_size - 1;
++    while (p < payload_end) {
++        const uint8_t *message = p;
++        size_t type, size;
++        if (!dv_sei_value(&p, payload_end, &type) ||
++            !dv_sei_value(&p, payload_end, &size) ||
++            size > (size_t)(payload_end - p))
++            goto done;
++        if (type == 4 && size >= 7 &&
++            p[0] == 0xB5 && p[1] == 0 && p[2] == 0x3C &&
++            p[3] == 0 && p[4] == 1 && p[5] == 4 &&
++            (p[6] == 0 || p[6] == 1)) {
++            removed = 1;
++        } else {
++            size_t message_size = p - message + size;
++            memmove(rbsp + kept, message, message_size);
++            kept += message_size;
++        }
++        p += size;
++    }
++    if (!removed)
++        goto done;
++    if (!kept) {
++        ret = 1;
++        goto done;
++    }
++    rbsp[kept++] = 0x80;
++    /* Re-escape across newly adjacent message boundaries as well. */
++    zeros = 0;
++    for (size_t i = 0; i < kept; i++) {
++        if (zeros == 2 && rbsp[i] <= 3) {
++            escaped_size++;
++            zeros = 0;
++        }
++        escaped_size++;
++        zeros = rbsp[i] == 0 ? zeros + 1 : 0;
++    }
++    ret = dv_packet_reserve(buf, *used, nal + 2 - region + escaped_size);
++    if (ret < 0)
++        goto done;
++    dst = (*buf)->data + *used;
++    memcpy(dst, region, nal + 2 - region);
++    dst += nal + 2 - region;
++    zeros = 0;
++    for (size_t i = 0; i < kept; i++) {
++        if (zeros == 2 && rbsp[i] <= 3) {
++            *dst++ = 3;
++            zeros = 0;
++        }
++        *dst++ = rbsp[i];
++        zeros = rbsp[i] == 0 ? zeros + 1 : 0;
++    }
++    *used = dst - (*buf)->data;
++    ret = 1;
++done:
++    av_free(rbsp);
++    return ret;
++}
++
++/*
++ * Rewrite an Annex-B access unit. Only convert/strip modes remove UNSPEC63;
++ * native DV preserves BL+EL+RPU even when HDR10+ SEI filtering is armed.
 + */
 +static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
 +{
 +    MediaCodecH264DecContext *s = avctx->priv_data;
-+    const uint8_t *data = pkt->data, *end = pkt->data + pkt->size;
-+    const uint8_t *sc;
-+    AVBufferRef *buf;
-+    uint8_t *out;
-+    size_t out_size = 0, out_cap;
-+    int changed = 0;
++    const uint8_t *data, *end, *sc;
++    AVBufferRef *buf = NULL;
++    size_t out_size = 0, head_size;
++    int changed = 0, ret;
 +
 +    if (!pkt->size)
 +        return 0;
-+
-+    /* Converted RPUs are ~2 KiB; generous headroom avoids a sizing pass. */
-+    out_cap = (size_t)pkt->size + 8192 + AV_INPUT_BUFFER_PADDING_SIZE;
-+    buf = av_buffer_alloc(out_cap);
-+    if (!buf)
-+        return AVERROR(ENOMEM);
-+    out = buf->data;
++    data = pkt->data;
++    end = data + pkt->size;
++    ret = dv_packet_reserve(&buf, 0, pkt->size);
++    if (ret < 0)
++        return ret;
 +
 +    sc = dv_next_startcode(data, end);
-+    /* Bytes before the first NAL's region. A 4-byte start code's leading
-+     * zero belongs to that region (the loop's region--), not to the head,
-+     * or it would be emitted twice. */
-+    out_size = sc - data;
++    head_size = sc - data;
 +    if (sc > data && sc < end && sc[-1] == 0)
-+        out_size--;
-+    memcpy(out, data, out_size);
++        head_size--;
++    ret = dv_packet_append(&buf, &out_size, data, head_size);
++    if (ret < 0)
++        goto fail;
 +
 +    while (sc < end) {
 +        const uint8_t *nal = sc + 3;
@@ -285,34 +378,35 @@ index 4febddd..459ddb0 100644
 +        next_region = next_sc;
 +        if (next_region > nal && next_region < end && next_region[-1] == 0)
 +            next_region--;
++        type = next_region - nal >= 2 ? (nal[0] >> 1) & 0x3f : -1;
 +
-+        type = nal < end ? (nal[0] >> 1) & 0x3f : -1;
-+
-+        if (type == 63) {
++        if ((type == 63 && s->dv_filter != DV_FILTER_NONE) ||
++            (type == 62 && s->dv_filter == DV_FILTER_STRIP)) {
 +            changed = 1;
-+        } else if (type == 62 && s->dv_filter == DV_FILTER_STRIP) {
-+            changed = 1;
-+        } else if ((type == 39 || type == 40) && s->dv_strip_hdr10plus &&
-+                   nal + 2 <= next_region && dv_is_hdr10plus_sei(nal, next_region)) {
-+            /* Prefix/suffix SEI carrying ST 2094-40 dynamic metadata. */
-+            changed = 1;
++        } else if ((type == 39 || type == 40) && s->dv_strip_hdr10plus) {
++            ret = dv_filter_sei(&buf, &out_size, region, nal, next_region);
++            if (ret < 0)
++                goto fail;
++            if (ret)
++                changed = 1;
++            else if ((ret = dv_packet_append(&buf, &out_size, region,
++                                             next_region - region)) < 0)
++                goto fail;
 +        } else if (type == 62 && s->dv_filter == DV_FILTER_CONVERT) {
 +#if CONFIG_LIBDOVI
 +            static const uint8_t sc4[4] = { 0, 0, 0, 1 };
 +            DoviRpuOpaque *rpu = dovi_parse_unspec62_nalu(nal, next_region - nal);
 +            const DoviData *rpu_out = NULL;
 +
-+            /* Mode 2: profile 8.1 compatible, mapping curves set to no-op -
-+             * the same conversion Plezy's ExoPlayer DoviBridge applies. */
++            /* Mode 2: profile 8.1 compatible, mapping curves set to no-op. */
 +            if (rpu && !dovi_rpu_get_error(rpu) && !dovi_convert_rpu_with_mode(rpu, 2))
 +                rpu_out = dovi_write_unspec62_nalu(rpu);
 +
-+            if (rpu_out && rpu_out->data && rpu_out->len &&
-+                out_size + 4 + rpu_out->len + AV_INPUT_BUFFER_PADDING_SIZE <= out_cap) {
-+                memcpy(out + out_size, sc4, 4);
-+                out_size += 4;
-+                memcpy(out + out_size, rpu_out->data, rpu_out->len);
-+                out_size += rpu_out->len;
++            ret = 0;
++            if (rpu_out && rpu_out->data && rpu_out->len) {
++                ret = dv_packet_append(&buf, &out_size, sc4, sizeof(sc4));
++                if (ret >= 0)
++                    ret = dv_packet_append(&buf, &out_size, rpu_out->data, rpu_out->len);
 +            } else if (!s->dv_filter_warned) {
 +                av_log(avctx, AV_LOG_WARNING,
 +                       "Dolby Vision RPU conversion failed, dropping RPU NAL\n");
@@ -322,14 +416,18 @@ index 4febddd..459ddb0 100644
 +                dovi_data_free(rpu_out);
 +            if (rpu)
 +                dovi_rpu_free(rpu);
++            if (ret < 0)
++                goto fail;
 +            changed = 1;
 +#else
-+            memcpy(out + out_size, region, next_region - region);
-+            out_size += next_region - region;
++            ret = dv_packet_append(&buf, &out_size, region, next_region - region);
++            if (ret < 0)
++                goto fail;
 +#endif
 +        } else {
-+            memcpy(out + out_size, region, next_region - region);
-+            out_size += next_region - region;
++            ret = dv_packet_append(&buf, &out_size, region, next_region - region);
++            if (ret < 0)
++                goto fail;
 +        }
 +        sc = next_sc;
 +    }
@@ -338,42 +436,84 @@ index 4febddd..459ddb0 100644
 +        av_buffer_unref(&buf);
 +        return 0;
 +    }
-+
-+    memset(out + out_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!out_size) {
++        av_buffer_unref(&buf);
++        av_packet_unref(pkt);
++        return 0;
++    }
++    memset(buf->data + out_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 +    av_buffer_unref(&pkt->buf);
 +    pkt->buf = buf;
-+    pkt->data = out;
++    pkt->data = buf->data;
 +    pkt->size = out_size;
 +    return 0;
++fail:
++    av_buffer_unref(&buf);
++    return ret;
 +}
  #endif
  
  static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
-@@ -410,7 +644,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -369,6 +709,7 @@
+     int sdk_int;
+ 
+     const char *codec_mime = NULL;
++    char *codec_name = NULL;
+     int profile_override = 0;
+ 
+     FFAMediaFormat *format = NULL;
+@@ -410,8 +751,9 @@
          ret = hevc_set_extradata(avctx, format);
          if (ret < 0)
              goto done;
 -        if (s->dolby_vision)
+-            dolby_vision_override(avctx, format, &codec_mime, &profile_override);
 +        if (s->dolby_vision || s->dv_p7_mode == DV_P7_STRIP)
-             dolby_vision_override(avctx, format, &codec_mime, &profile_override);
++            dolby_vision_override(avctx, format, &codec_mime, &profile_override,
++                                  &codec_name);
          break;
  #endif
-@@ -615,6 +849,14 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+ #if CONFIG_MPEG2_MEDIACODEC_DECODER
+@@ -512,6 +854,8 @@
+     s->ctx->delay_flush = s->delay_flush;
+     s->ctx->use_ndk_codec = s->use_ndk_codec;
+     s->ctx->profile_override = profile_override;
++    s->ctx->codec_name = codec_name;
++    codec_name = NULL;
+ 
+     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
+         s->ctx = NULL;
+@@ -537,6 +881,7 @@
+     }
+ 
+ done:
++    av_freep(&codec_name);
+     if (format) {
+         ff_AMediaFormat_delete(format);
+     }
+@@ -615,6 +960,21 @@
  
          /* fetch new packet or eof */
          ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
 +#if CONFIG_HEVC_MEDIACODEC_DECODER
 +        if (ret >= 0 && (s->dv_filter != DV_FILTER_NONE || s->dv_strip_hdr10plus)) {
 +            ret = dv_filter_packet(avctx, &s->buffered_pkt);
-+            if (ret < 0)
++            if (ret < 0) {
++                av_packet_unref(&s->buffered_pkt);
 +                return ret;
-+            ret = 0;
++            }
++            if (!s->buffered_pkt.size) {
++                /* A filtered access unit is not decoder EOS. Release its
++                 * buffer, side data and opaque_ref before fetching again. */
++                av_packet_unref(&s->buffered_pkt);
++                continue;
++            }
 +        }
 +#endif
          if (ret == AVERROR_EOF) {
              AVPacket null_pkt = { 0 };
              ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
-@@ -664,6 +906,16 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -664,6 +1024,16 @@
              OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
      { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
@@ -390,3 +530,70 @@ index 4febddd..459ddb0 100644
      { NULL }
  };
  
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -777,11 +777,15 @@
+         av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
+     }
+ 
+-    s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
++    /* DV probing already selected an exact-profile decoder. Do not replace
++     * it with the first MIME match when creating the codec. */
++    if (!s->codec_name)
++        s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0,
++                                                            s->profile_override > 0, avctx);
+     if (!s->codec_name) {
+         // getCodecNameByType() can fail due to missing JVM, while NDK
+         // mediacodec can be used without JVM.
+-        if (!s->use_ndk_codec) {
++        if (!s->use_ndk_codec || s->profile_override > 0) {
+             return AVERROR_EXTERNAL;
+         }
+         av_log(avctx, AV_LOG_INFO, "Failed to getCodecNameByType\n");
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -467,7 +467,8 @@
+     return -1;
+ }
+ 
+-char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx)
++char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder,
++                                          int exact_profile, void *log_ctx)
+ {
+     int ret;
+     int i;
+@@ -591,14 +592,14 @@
+                 goto done;
+             }
+ 
+-            profile_count = (*env)->GetArrayLength(env, profile_levels);
+-            if (!profile_count) {
++            profile_count = profile_levels ? (*env)->GetArrayLength(env, profile_levels) : 0;
++            if (!profile_count && !exact_profile) {
+                 found_codec = 1;
+             }
+             for (k = 0; k < profile_count; k++) {
+                 int supported_profile = 0;
+ 
+-                if (profile < 0) {
++                if (profile < 0 && !exact_profile) {
+                     found_codec = 1;
+                     break;
+                 }
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -57,7 +57,10 @@
+ 
+ int ff_AMediaCodecProfile_getProfileFromAVCodecContext(AVCodecContext *avctx);
+ 
+-char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder, void *log_ctx);
++/* exact_profile requires an explicitly advertised CodecProfileLevel, even
++ * when a codec reports an empty profileLevels list. */
++char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int encoder,
++                                          int exact_profile, void *log_ctx);
+ 
+ typedef struct FFAMediaFormat FFAMediaFormat;
+ struct FFAMediaFormat {

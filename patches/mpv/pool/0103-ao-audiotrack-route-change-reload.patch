@@ -1,9 +1,9 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -63,6 +63,20 @@
+@@ -69,6 +69,20 @@
      int raw_payload_left; // payload bytes still to emit for this burst
-     void *rawbuf;         // unwrapped payload, chunk-sized
+     void *rawbuf;         // chunk plus space for a fragmented DTS header
  
 +    // An HDMI display-mode switch renegotiates the link and can rebind the
 +    // audio route after a passthrough track was created against the old
@@ -22,7 +22,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      void *chunk;
      int chunksize;
      jbyteArray bytearray;
-@@ -72,6 +86,7 @@
+@@ -78,6 +92,7 @@
  
      bool cfg_pcm_float;
      bool cfg_raw_passthrough;
@@ -30,7 +30,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      int cfg_session_id;
  
      bool thread_terminate;
-@@ -114,6 +129,7 @@
+@@ -120,6 +135,7 @@
      jmethodID getLatency;
      jmethodID getMinBufferSize;
      jmethodID isDirectPlaybackSupported;
@@ -38,7 +38,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      jmethodID getNativeOutputSampleRate;
      jint STATE_INITIALIZED;
      jint PLAYSTATE_STOPPED;
-@@ -149,6 +165,7 @@
+@@ -155,6 +171,7 @@
      {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
      {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
      {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
@@ -46,7 +46,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
      {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
      {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
-@@ -285,6 +302,18 @@
+@@ -291,6 +308,18 @@
  };
  #undef OFFSET
  
@@ -65,7 +65,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  #define ENTRY(name) { &name, name ## _mapping }
  static const struct {
      void *fields;
-@@ -298,6 +327,7 @@
+@@ -304,6 +333,7 @@
      ENTRY(AudioFormatBuilder),
      ENTRY(AudioManager),
      ENTRY(AudioTimestamp),
@@ -73,7 +73,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  };
  #undef ENTRY
  
-@@ -400,6 +430,10 @@
+@@ -406,6 +436,10 @@
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
      MP_JNI_EXCEPTION_LOG(ao);
      MP_JNI_GLOBAL_FREEP(&p->audiotrack);
@@ -84,7 +84,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      return AudioTrack_New(ao);
  }
  
-@@ -768,6 +802,57 @@
+@@ -821,6 +855,57 @@
      return -1;
  }
  
@@ -142,7 +142,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -776,6 +861,7 @@
+@@ -829,6 +914,7 @@
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
      while (!p->thread_terminate) {
@@ -150,7 +150,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
              state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
-@@ -1133,10 +1219,12 @@
+@@ -1192,10 +1278,12 @@
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,
          .cfg_raw_passthrough = 1,

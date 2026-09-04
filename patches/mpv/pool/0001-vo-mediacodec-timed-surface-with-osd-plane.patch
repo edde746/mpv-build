@@ -68,7 +68,7 @@ new file mode 100644
 index 0000000..d92f185
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,475 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -278,6 +278,11 @@ index 0000000..d92f185
 +                       "subtitles/OSD will not render.\n");
 +        }
 +    }
++
++    // Like VDPAU, submit before the display deadline: vo.c otherwise waits
++    // until frame->pts before calling flip_page. Keep the lead bounded and
++    // request only the current frame, not interpolation lookahead.
++    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(50), 1);
 +
 +    return 0;
 +}

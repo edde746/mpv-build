@@ -1,7 +1,7 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -50,6 +50,19 @@
+@@ -50,6 +50,25 @@
      uint32_t playhead_offset;
      bool reset_pending;
  
@@ -15,13 +15,19 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    int raw_rate_mult;    // IEC carrier rate / raw track rate (4 for E-AC3)
 +    int raw_state;        // IEC burst parser state (RAW_*)
 +    int raw_data_type;    // Pc data type of the burst being unwrapped
++    uint8_t raw_dts_header[8];
++    int raw_dts_header_len;
++    uint8_t raw_byte;
++    bool raw_have_byte;
++    int raw_pending;      // bytes left in the current Java ByteBuffer
++    int raw_input_len;    // IEC bytes credited when raw_pending drains
 +    int raw_payload_left; // payload bytes still to emit for this burst
-+    void *rawbuf;         // unwrapped payload, chunk-sized
++    void *rawbuf;         // chunk plus space for a fragmented DTS header
 +
      void *chunk;
      int chunksize;
      jbyteArray bytearray;
-@@ -58,6 +71,7 @@
+@@ -58,6 +77,7 @@
      jobject bbuf;
  
      bool cfg_pcm_float;
@@ -29,7 +35,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      int cfg_session_id;
  
      bool thread_terminate;
-@@ -99,6 +113,7 @@
+@@ -99,6 +119,7 @@
      jmethodID getTimestamp;
      jmethodID getLatency;
      jmethodID getMinBufferSize;
@@ -37,7 +43,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      jmethodID getNativeOutputSampleRate;
      jint STATE_INITIALIZED;
      jint PLAYSTATE_STOPPED;
-@@ -132,6 +147,7 @@
+@@ -132,6 +153,7 @@
      {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
      {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
      {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
@@ -45,7 +51,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
      {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
      {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
-@@ -187,6 +203,9 @@
+@@ -187,6 +209,9 @@
      jint ENCODING_PCM_16BIT;
      jint ENCODING_PCM_FLOAT;
      jint ENCODING_IEC61937;
@@ -55,7 +61,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      jint CHANNEL_OUT_MONO;
      jint CHANNEL_OUT_STEREO;
      jint CHANNEL_OUT_FRONT_CENTER;
-@@ -202,6 +221,9 @@
+@@ -202,6 +227,9 @@
      {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
      {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
      {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
@@ -65,7 +71,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
      {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
      {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
-@@ -352,7 +374,9 @@
+@@ -352,7 +380,9 @@
          return -1;
      }
  
@@ -76,7 +82,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
          if (bufferSize > 0) {
              MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
-@@ -392,7 +416,8 @@
+@@ -392,7 +422,8 @@
      int stable_count = 20;
      int64_t wait = p->timestamp_stable < stable_count ? 50000000 : 3000000000;
  
@@ -86,7 +92,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          (p->timestamp_fetched == 0 || now - p->timestamp_fetched >= wait)) {
          if (!p->timestamp_fetched)
              p->timestamp_stable = 0;
-@@ -432,7 +457,7 @@
+@@ -432,7 +463,7 @@
      }
  
  
@@ -95,7 +101,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          if (p->reset_pending) {
              // after a flush(), playbackHeadPosition will not reset to 0 right away.
              // sometimes, it will never reset at all.
-@@ -462,7 +487,9 @@
+@@ -462,7 +493,9 @@
      }
  
      p->playhead_pos = pos;
@@ -106,7 +112,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  }
  
  static double AudioTrack_getLatency(struct ao *ao)
-@@ -476,7 +503,7 @@
+@@ -476,7 +509,7 @@
      uint32_t diff = p->written_frames - playhead;
      double delay = diff / (double)(ao->samplerate);
      if (!p->timestamp_set &&
@@ -115,12 +121,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -484,8 +511,169 @@
-         return 0;
-     }
+@@ -486,6 +519,210 @@
      return MPCLAMP(delay, 0.0, 2.0);
-+}
-+
+ }
+ 
 +// IEC 61937 burst parser states
 +enum {
 +    RAW_SYNC_PA = 0,
@@ -128,6 +132,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    RAW_PC,
 +    RAW_PD,
 +    RAW_PAYLOAD,
++    RAW_DTS_HEADER,
 +};
 +
 +// IEC 61937-2 data types carried by the stereo bursts we unwrap.
@@ -155,8 +160,8 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        // their raw forms are not trivially recoverable from the bursts.
 +        return 0;
 +    }
- }
- 
++}
++
 +// Whether the current route takes a direct AudioTrack of this exact raw
 +// tuple. getMinBufferSize alone can size formats the route cannot actually
 +// play, and a lying HAL then opens a raw track that renders silence - the
@@ -218,14 +223,25 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +// stream. Payload words are byte-swapped back to bitstream order; preambles
 +// and zero padding are dropped. Burst boundaries may fall anywhere inside
 +// [src, src+len), so parser state persists in priv across calls.
++// FFmpeg omits the preamble for full-carrier DTS (DTS CDs/DTS-in-WAV).
++// Its output is still word-swapped, including originally LE or 14-bit DTS.
++// Buffer only the eight header bytes needed to recover the carrier length.
++// dst needs len + sizeof(raw_dts_header) bytes for a header split across calls.
 +static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
 +                                     const uint8_t *src, int len)
 +{
 +    struct priv *p = ao->priv;
 +    int out = 0;
 +
-+    for (int i = 0; i + 1 < len; i += 2) {
-+        const uint8_t lo = src[i], hi = src[i + 1];
++    for (int i = 0; i < len;) {
++        if (!p->raw_have_byte) {
++            p->raw_byte = src[i++];
++            p->raw_have_byte = true;
++        }
++        if (i == len)
++            break;
++        const uint8_t lo = p->raw_byte, hi = src[i++];
++        p->raw_have_byte = false;
 +
 +        if (p->raw_state == RAW_PAYLOAD) {
 +            // spdifenc byte-swaps the payload into LE words; a lone final
@@ -241,11 +257,42 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +            continue;
 +        }
 +
++        if (p->raw_state == RAW_DTS_HEADER) {
++            uint8_t *h = p->raw_dts_header;
++            h[p->raw_dts_header_len++] = hi;
++            h[p->raw_dts_header_len++] = lo;
++            if (p->raw_dts_header_len < sizeof(p->raw_dts_header))
++                continue;
++
++            int blocks = 0;
++            if (h[0] == 0x7f && h[1] == 0xfe && h[2] == 0x80 && h[3] == 0x01)
++                blocks = (((h[4] << 8 | h[5]) >> 2) & 0x7f) + 1;
++            else if (h[0] == 0x1f && h[1] == 0xff && h[2] == 0xe8 && h[3] == 0x00)
++                blocks = ((h[5] & 7) << 4 | (h[6] & 0x3f) >> 2) + 1;
++
++            p->raw_state = RAW_SYNC_PA;
++            p->raw_dts_header_len = 0;
++            if (blocks == 16 || blocks == 32 || blocks == 64) {
++                memcpy(dst + out, h, sizeof(p->raw_dts_header));
++                out += sizeof(p->raw_dts_header);
++                p->raw_payload_left = blocks * 128 - sizeof(p->raw_dts_header);
++                p->raw_state = RAW_PAYLOAD;
++            }
++            continue;
++        }
++
 +        const uint16_t word = lo | (hi << 8);
 +        switch (p->raw_state) {
 +        case RAW_SYNC_PA:
 +            if (word == 0xf872)
 +                p->raw_state = RAW_SYNC_PB;
++            else if (ao->format == AF_FORMAT_S_DTS &&
++                     (word == 0x7ffe || word == 0x1fff)) {
++                p->raw_dts_header[0] = hi;
++                p->raw_dts_header[1] = lo;
++                p->raw_dts_header_len = 2;
++                p->raw_state = RAW_DTS_HEADER;
++            }
 +            break;
 +        case RAW_SYNC_PB:
 +            if (word == 0x4e1f)
@@ -285,30 +332,44 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +683,21 @@
+@@ -495,7 +732,25 @@
      void *buf = p->chunk;
  
      jint ret;
 -    if (p->format == AudioFormat.ENCODING_IEC61937) {
 +    if (p->raw_passthrough) {
-+        int payload = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
-+        if (payload == 0)
-+            return len; // only preamble/padding: consumed, nothing to write
-+        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
-+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-+        MP_JNI_LOCAL_FREEP(&bbuf);
-+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, payload, AudioTrack.WRITE_BLOCKING);
++        if (!p->raw_pending) {
++            p->raw_pending = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
++            if (!p->raw_pending)
++                return len; // only header/padding: consumed, nothing to write
++            p->raw_input_len = len;
++            jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++            MP_JNI_LOCAL_FREEP(&bbuf);
++        }
++        // AudioTrack advances ByteBuffer.position by the bytes accepted.
++        // Keep that position and do not consume new input after a short write.
++        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, p->raw_pending, AudioTrack.WRITE_BLOCKING);
 +        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
 +        if (ret < 0) return ret;
-+        if (ret != payload)
-+            MP_WARN(ao, "raw passthrough: short write (%d of %d bytes)\n", ret, payload);
++        p->raw_pending -= ret;
 +        // written_frames accounting stays in input (IEC frame) units.
-+        return len;
++        return p->raw_pending ? 0 : p->raw_input_len;
 +    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
          (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
          ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -657,11 +859,34 @@
+@@ -583,7 +838,8 @@
+             int64_t ts = mp_time_ns();
+             ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
+             ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+-            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
++            int samples = p->raw_pending ? 0 :
++                ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
+             int ret = AudioTrack_write(ao, samples * ao->sstride);
+             if (ret >= 0) {
+                 p->written_frames += ret / ao->sstride;
+@@ -657,11 +913,34 @@
      if (init_jni(ao) < 0)
          return -1;
  
@@ -345,7 +406,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              MP_ERR(ao, "spdif passthrough not supported by API\n");
              return -1;
          }
-@@ -690,6 +915,11 @@
+@@ -690,6 +969,11 @@
          }
      }
      p->samplerate = ao->samplerate;
@@ -357,7 +418,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -748,20 +978,51 @@
+@@ -748,20 +1032,51 @@
          p->channel_config,
          p->format
      );
@@ -417,31 +478,36 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      mp_assert(p->size % bps == 0);
      ao->device_buffer = p->size / bps;
  
-@@ -777,7 +1038,13 @@
+@@ -777,7 +1092,14 @@
      MP_JNI_LOCAL_FREEP(&timestamp);
  
      // decide and create buffer of right type
 -    if (p->format == AudioFormat.ENCODING_IEC61937) {
 +    if (p->raw_passthrough) {
 +        MP_VERBOSE(ao, "Using NIO ByteBuffer for raw passthrough\n");
-+        p->rawbuf = talloc_size(ao, p->chunksize);
-+        jobject bbuf = (*env)->NewDirectByteBuffer(env, p->rawbuf, p->chunksize);
++        int capacity = p->chunksize + sizeof(p->raw_dts_header);
++        p->rawbuf = talloc_size(ao, capacity);
++        jobject bbuf = (*env)->NewDirectByteBuffer(env, p->rawbuf, capacity);
 +        p->bbuf = (*env)->NewGlobalRef(env, bbuf);
 +        MP_JNI_LOCAL_FREEP(&bbuf);
 +    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
          jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
          p->shortarray = (*env)->NewGlobalRef(env, shortarray);
          MP_JNI_LOCAL_FREEP(&shortarray);
-@@ -834,6 +1101,8 @@
+@@ -834,6 +1156,12 @@
      p->written_frames = 0;
      p->timestamp_fetched = 0;
      p->timestamp_set = false;
 +    p->raw_state = RAW_SYNC_PA;
 +    p->raw_payload_left = 0;
++    p->raw_dts_header_len = 0;
++    p->raw_have_byte = false;
++    p->raw_pending = 0;
++    p->raw_input_len = 0;
  }
  
  static void start(struct ao *ao)
-@@ -863,9 +1132,11 @@
+@@ -863,9 +1191,11 @@
      .priv_size = sizeof(struct priv),
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,

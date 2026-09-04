@@ -1,0 +1,2 @@
+# Bounds fix for the source-built Android C API.
+0001-rpu-validate-trimmed-length-before-crc.patch

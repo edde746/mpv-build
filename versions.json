@@ -310,10 +310,12 @@
       ],
       "overrides": {
         "android": {
-          "kind": "prebuilt",
+          "kind": "git",
           "version": "2.3.1",
-          "url": "https://github.com/edde746/libdovi-builds/releases/download/v2.3.1/libdovi-{triple}.tar.gz",
-          "provenance": "TODO(provenance): per-Rust-triple static-library tarballs ({triple} is substituted per ABI: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android), the same edde746/libdovi-builds artifacts the Plezy Android ExoPlayer DV module consumes; the release publishes no checksums -- hash each audited tarball and pin per-triple sha256s before the next bump."
+          "url": "https://github.com/quietvoid/dovi_tool",
+          "ref": "2.3.1",
+          "commit": "b25558062e4a56973482ec70133bd7b891320e48",
+          "provenance": "Source for the former v2.3.1 prebuilts, now rebuilt with the Android parser bounds patch. Verified upstream release 2.3.1 and lightweight tag b25558062e4a56973482ec70133bd7b891320e48 via git ls-remote on 2026-09-04; reviewed dolby_vision/Cargo.lock (registry checksums, no git dependencies), used with --locked."
         }
       }
     },

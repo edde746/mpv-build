@@ -1,7 +1,7 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -1101,12 +1101,16 @@
+@@ -1155,12 +1155,18 @@
          MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d)\n", p->size, buffer_size);
      } else {
          // Choose double of the minimum buffer size suggested by the driver, but not
@@ -16,10 +16,11 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          int max = min * 2;
 -        min = MP_ALIGN_UP(min, bps);
 -        max = MP_ALIGN_UP(max, bps);
--        p->size = MPCLAMP(buffer_size * 2, min, max);
-+        min = MP_ALIGN_UP(min, frame);
-+        max = MP_ALIGN_UP(max, frame);
-+        p->size = MP_ALIGN_UP(MPCLAMP(buffer_size * 2, min, max), frame);
++        // Frame sizes such as 6, 12 and 24 are not powers of two.
++        min = (min + frame - 1) / frame * frame;
++        max = (max + frame - 1) / frame * frame;
+         p->size = MPCLAMP(buffer_size * 2, min, max);
++        p->size = (p->size + frame - 1) / frame * frame;
          MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
      }
      mp_assert(p->size % bps == 0);

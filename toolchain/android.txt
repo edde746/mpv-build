@@ -12,4 +12,6 @@
 # changes without changing any hashed source (runner image, a miscompile, a
 # sysroot fix).
 ndk=29.0.14206865
+# Source-built libdovi uses the release lockfile with this Rust compiler.
+rust=1.88.0
 generation=1

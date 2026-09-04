@@ -1,0 +1,40 @@
+diff --git a/dolby_vision/src/rpu/dovi_rpu.rs b/dolby_vision/src/rpu/dovi_rpu.rs
+index 55c1c41..3d17996 100644
+--- a/dolby_vision/src/rpu/dovi_rpu.rs
++++ b/dolby_vision/src/rpu/dovi_rpu.rs
+@@ -116,6 +116,10 @@ impl DoviRpu {
+ 
+         // Ignore trailing bytes
+         let rpu_end = data.len() - trailing_zeroes;
++        // The prefix, CRC32 and terminator must survive trimming. In
++        // particular, zero-padded malformed NALs can pass the input-length
++        // check above while leaving fewer than six bytes here.
++        ensure!(rpu_end >= 6, "Invalid trimmed RPU length: {}", rpu_end);
+         let last_byte = data[rpu_end - 1];
+ 
+         // Minus 4 bytes for the CRC32, 1 for the 0x80 ending byte
+@@ -619,3 +623,24 @@ impl DoviRpu {
+         self.replace_levels_from_rpu(src_rpu, levels)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::DoviRpu;
++
++    #[test]
++    fn rejects_truncated_crc_after_trimming() {
++        // Exercise empty input and every boundary before a complete
++        // prefix + CRC32 + terminator. These must be errors, not panics.
++        for len in 0..6 {
++            let mut data = vec![0x19; len];
++            data.extend_from_slice(&[0; 32]);
++            assert!(DoviRpu::parse(&data).is_err());
++        }
++
++        // This passes validated_trimmed_data()'s original length check.
++        let mut nal = vec![0x7c, 0x01, 0x19, 0x08, 0x09];
++        nal.extend_from_slice(&[0; 32]);
++        assert!(DoviRpu::parse_unspec62_nalu(&nal).is_err());
++    }
++}

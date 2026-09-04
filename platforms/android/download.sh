@@ -69,27 +69,18 @@ fetch_archive () {
 	apply_patches "$component"
 }
 
-# libdovi ships as prebuilt per-Rust-triple static libraries; the pinned URL
-# is a template with {triple}. The C API header is vendored at
-# include/libdovi/rpu_parser.h because the release tarballs carry only the
-# archive.
-fetch_libdovi () {
-	if [ -d deps/libdovi ]; then
-		return 0
-	fi
-	local template triple
-	template=$(pin libdovi url)
-	for triple in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
-		mkdir -p "deps/libdovi/$triple"
-		curl -fsSL "${template//\{triple\}/$triple}" | tar -xz -C "deps/libdovi/$triple"
-	done
-}
+# Refuse the obsolete prebuilt layout rather than silently retaining the
+# vulnerable archive when reusing an existing dependency checkout.
+if [ -d deps/libdovi ] && [ ! -f deps/libdovi/dolby_vision/Cargo.toml ]; then
+	echo >&2 "deps/libdovi contains obsolete prebuilts; move it aside and rerun download.sh"
+	exit 1
+fi
 
 mkdir -p deps
 
 fetch_git mbedtls --recurse-submodules
 fetch_git dav1d
-fetch_libdovi
+fetch_git libdovi
 fetch_git ffmpeg
 fetch_git freetype
 fetch_git fribidi

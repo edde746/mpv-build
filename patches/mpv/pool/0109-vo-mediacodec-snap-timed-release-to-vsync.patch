@@ -88,8 +88,8 @@ index 2d00f60..080dc0b 100644
 +    bool vsync_terminate;
 +    int64_t vsync_sample; // CLOCK_MONOTONIC
 +
-+    // VO-thread-owned queue state. Period changes disable early queueing until
-+    // Choreographer supplies a sample from the new display mode.
++    // VO-thread-owned queue state. Period changes invalidate the old phase
++    // until Choreographer supplies a sample from the new display mode.
 +    int64_t queue_period;
 +    int64_t queue_period_changed;
 +    int64_t queue_offset;
@@ -263,7 +263,7 @@ index 2d00f60..080dc0b 100644
  
      if (p->osd_surface && p->osd_surface != -1) {
          JNIEnv *env = mp_jni_get_env(vo->log);
-@@ -247,11 +442,123 @@ static int preinit(struct vo *vo)
+@@ -247,11 +442,120 @@ static int preinit(struct vo *vo)
  // reusing mp_raw_time_ns().
  static int64_t mp_time_to_monotonic_ns(int64_t mp_time)
  {
@@ -311,9 +311,9 @@ index 2d00f60..080dc0b 100644
 +}
 +
 +// MediaCodec's SurfaceView contract recommends releasing about two vsyncs
-+// before presentation. Delay early queueing until a Choreographer sample from
-+// the current display mode is available; otherwise a stale phase could snap a
-+// frame to the wrong boundary after a refresh-rate switch.
++// before presentation. Use a bounded 50 ms lead without display timing, as
++// established in preinit; missing/stale phase disables snapping, not timed
++// submission. display_period bounds a known mode's lead to at most 100 ms.
 +static void update_queue_timing(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
@@ -325,16 +325,13 @@ index 2d00f60..080dc0b 100644
 +        p->queue_period_changed = mono_now;
 +    }
 +
-+    int64_t sample = read_vsync_sample(p);
-+    bool ready = period > 0 && mono_now > 0 &&
-+                 vsync_sample_is_fresh(p, sample, mono_now);
-+    int64_t offset = ready ? 2 * period : 0;
++    int64_t offset = period > 0 ? 2 * period : MP_TIME_MS_TO_NS(50);
 +    if (offset == p->queue_offset)
 +        return;
 +
 +    p->queue_offset = offset;
 +    vo_set_queue_params(vo, offset, 1);
-+    if (offset) {
++    if (period) {
 +        MP_VERBOSE(vo, "Timed release: %.3f Hz, queue %.1f ms ahead.\n",
 +                   1e9 / period, offset / 1e6);
 +    }
@@ -368,7 +365,7 @@ index 2d00f60..080dc0b 100644
 +        target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
 +        return result;
 +
-+    if (p->queue_offset > 0) {
++    if (p->queue_period > 0) {
 +        int64_t sample = read_vsync_sample(p);
 +        if (vsync_sample_is_fresh(p, sample, mono_now)) {
 +            int64_t snapped =
