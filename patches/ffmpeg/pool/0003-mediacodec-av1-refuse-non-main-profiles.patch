@@ -1,4 +1,5 @@
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 416e62f..b1f42c7 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
 @@ -40,6 +40,7 @@
@@ -9,22 +10,15 @@ diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
  #include "h264_parse.h"
  #include "h264_ps.h"
  #include "hevc/parse.h"
-@@ -326,6 +327,66 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -326,6 +327,59 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
  }
  #endif
  
 +#if CONFIG_AV1_MEDIACODEC_DECODER
 +/*
-+ * Android defines MediaCodec profile constants only for AV1 Main
-+ * (AV1ProfileMain8/Main10 and the HDR variants): no decoder can advertise
-+ * High (4:4:4) or Professional (4:2:2 / 12-bit) support. Several TV
-+ * decoders (Amazon/MTK, Amlogic C2) still accept such streams at configure
-+ * time and then emit garbage frames or nothing at all, so a mismatch has to
-+ * be refused here, before MediaCodec is started, for the caller to fall
-+ * back to software decoding. The profile comes from the bitstream: the
-+ * sequence header OBU when the extradata carries one, otherwise the av1C
-+ * configuration record header. Without usable extradata nothing is
-+ * narrowed and init proceeds as before.
++ * MediaCodec has no AV1 High/Professional profile constants, yet several TV
++ * decoders accept such streams and emit garbage. Refuse them before start so
++ * the caller falls back to software.
 + */
 +static int av1_check_profile(AVCodecContext *avctx)
 +{
@@ -75,8 +69,8 @@ diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
 +
  #if CONFIG_HEVC_MEDIACODEC_DECODER
  /*
-  * Dolby Vision is decoder-led on Android: the display pipeline engages DV
-@@ -569,6 +630,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+  * Single-layer DV (profiles 5 and 8) goes to a "video/dolby-vision" decoder
+@@ -702,6 +756,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      case AV_CODEC_ID_AV1:
          codec_mime = "video/av01";
  

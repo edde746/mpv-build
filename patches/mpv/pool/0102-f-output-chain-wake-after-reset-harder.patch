@@ -1,13 +1,13 @@
 diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+index 43ec3db..4bbbdde 100644
 --- a/filters/f_output_chain.c
 +++ b/filters/f_output_chain.c
-@@ -339,6 +339,10 @@
+@@ -339,6 +339,9 @@ void mp_output_chain_reset_harder(struct mp_output_chain *c)
          p->ao = NULL;
          mp_autoconvert_clear(p->convert);
      }
 +
-+    // Reset cleared this chain's internal demand while the AO consumer's
-+    // request stays asserted; reschedule so process() re-propagates it.
++    // Re-propagate the still-asserted downstream request.
 +    mp_filter_wakeup(p->f);
  }
  

@@ -1,8 +1,5 @@
-# Android patch series for ffmpeg, migrated from edde746/libmpv-android
-# buildscripts/patches/ffmpeg (its patch.sh applied the directory glob, so
-# this order is that fork's lexicographic apply order).
-# One pool filename per line; order is authoritative and nothing is sorted.
-0001-mediacodec-dolby-vision-decoder-selection.patch
-0002-mediacodec-dolby-vision-profile-7-conversion.patch
+# Android patch series for ffmpeg. One pool filename per line; order is
+# authoritative and nothing is sorted.
+0001-mediacodec-dolby-vision.patch
 0003-mediacodec-av1-refuse-non-main-profiles.patch
 0004-mediacodec-size-input-buffers-for-access-units.patch

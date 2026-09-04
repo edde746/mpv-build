@@ -1,20 +1,7 @@
-# Android patch series for mpv, migrated from edde746/libmpv-android
-# buildscripts/patches/mpv (its patch.sh applied the directory glob, so this
-# order is that fork's lexicographic apply order).
-# One pool filename per line; order is authoritative and nothing is sorted.
+# Android patch series for mpv. One pool filename per line; order is
+# authoritative and nothing is sorted.
 0001-vo-mediacodec-timed-surface-with-osd-plane.patch
 0002-egl-android-bt2020-pq-surface.patch
 0003-opengl-treat-gles-direct-rendering-as-slow.patch
-0101-ao-audiotrack-multichannel-iec61937.patch
-0102-ao-audiotrack-raw-passthrough.patch
-0103-ao-audiotrack-route-change-reload.patch
-0104-ao-audiotrack-frame-aligned-pcm-buffer.patch
-0105-ao-audiotrack-smooth-passthrough-playhead.patch
-0106-ao-audiotrack-clamp-passthrough-playhead.patch
-0108-vo-mediacodec-async-osd-post.patch
-0109-vo-mediacodec-snap-timed-release-to-vsync.patch
-0110-vo-mediacodec-harden-buffer-and-surface-lifecycle.patch
-0111-vo-mediacodec-leave-display-mode-selection-to-embedder.patch
-0107-diag-2202-passthrough-clock-and-vo-drops.patch
-0112-ao-audiotrack-admit-only-advancing-timestamps.patch
-0113-f-output-chain-wake-after-reset-harder.patch
+0101-ao-audiotrack-passthrough-and-clock.patch
+0102-f-output-chain-wake-after-reset-harder.patch

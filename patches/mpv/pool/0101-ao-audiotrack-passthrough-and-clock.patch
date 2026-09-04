@@ -1,19 +1,33 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index f483ccc..f57da09 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -50,6 +50,25 @@
+@@ -21,6 +21,9 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <math.h>
++#include <stdlib.h>
++
+ #include "ao.h"
+ #include "internal.h"
+ #include "common/msg.h"
+@@ -44,12 +47,44 @@ struct priv {
+     int64_t timestamp_fetched;
+     bool timestamp_set;
+     int timestamp_stable;
++    uint32_t timestamp_last_fpos;
+ 
+     uint32_t written_frames; /* requires uint32_t rollover semantics */
+     uint32_t playhead_pos;
      uint32_t playhead_offset;
      bool reset_pending;
  
-+    // Raw bitstream passthrough: the IEC 61937 stream from ad_spdif is
-+    // unwrapped and fed to an AudioTrack opened with the codec's own
-+    // encoding (ENCODING_AC3/E_AC3/DTS) - the transport ExoPlayer and Kodi
-+    // use. An IEC 61937 track bypasses the platform's Dolby/DTS decoder, so
-+    // on routes whose sink cannot decode the codec itself (a Shield in
-+    // front of a Dolby-Digital-only receiver) it drains into silence.
++    // Raw passthrough: IEC 61937 bursts from ad_spdif unwrapped into a track
++    // opened with the codec's own encoding (ENCODING_AC3/E_AC3/DTS).
 +    bool raw_passthrough;
 +    int raw_rate_mult;    // IEC carrier rate / raw track rate (4 for E-AC3)
-+    int raw_state;        // IEC burst parser state (RAW_*)
++    int raw_state;        // RAW_*
 +    int raw_data_type;    // Pc data type of the burst being unwrapped
 +    uint8_t raw_dts_header[8];
 +    int raw_dts_header_len;
@@ -24,34 +38,54 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    int raw_payload_left; // payload bytes still to emit for this burst
 +    void *rawbuf;         // chunk plus space for a fragmented DTS header
 +
++    // Route polling for passthrough tracks (see AudioTrack_checkRouteChange)
++    jint routed_device;      // 0 = none observed yet
++    bool routing_lost;
++    bool routing_reload_requested;
++    int64_t routing_checked; // mp_time_ns of the last poll
++
++    // Passthrough playhead smoothing (see AudioTrack_smoothPlayhead)
++    double smooth_offset[10]; // head - clock, in ao->samplerate frames
++    int smooth_count;
++    int smooth_next;
++    int64_t smooth_sampled;
++    uint32_t smooth_last_head;
++    int64_t smooth_head;      // smooth_last_head, unwrapped
++    int64_t smooth_reported;  // last returned estimate, unwrapped
++    int64_t smooth_reported_ns;
++
      void *chunk;
      int chunksize;
      jbyteArray bytearray;
-@@ -58,6 +77,7 @@
+@@ -58,6 +93,8 @@ struct priv {
      jobject bbuf;
  
      bool cfg_pcm_float;
 +    bool cfg_raw_passthrough;
++    bool cfg_route_reload;
      int cfg_session_id;
  
      bool thread_terminate;
-@@ -99,6 +119,7 @@
+@@ -99,6 +136,8 @@ static struct JNIAudioTrack {
      jmethodID getTimestamp;
      jmethodID getLatency;
      jmethodID getMinBufferSize;
 +    jmethodID isDirectPlaybackSupported;
++    jmethodID getRoutedDevice;
      jmethodID getNativeOutputSampleRate;
      jint STATE_INITIALIZED;
      jint PLAYSTATE_STOPPED;
-@@ -132,6 +153,7 @@
+@@ -132,7 +171,9 @@ static const struct MPJniField AudioTrack_mapping[] = {
      {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
      {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
      {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
 +    {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
      {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
++    {"getRoutedDevice", "()Landroid/media/AudioDeviceInfo;", MP_JNI_METHOD, OFFSET(getRoutedDevice), 0},
      {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
      {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
-@@ -187,6 +209,9 @@
+     {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
+@@ -187,6 +228,9 @@ static struct JNIAudioFormat {
      jint ENCODING_PCM_16BIT;
      jint ENCODING_PCM_FLOAT;
      jint ENCODING_IEC61937;
@@ -61,7 +95,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      jint CHANNEL_OUT_MONO;
      jint CHANNEL_OUT_STEREO;
      jint CHANNEL_OUT_FRONT_CENTER;
-@@ -202,6 +227,9 @@
+@@ -202,6 +246,9 @@ static const struct MPJniField AudioFormat_mapping[] = {
      {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
      {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
      {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
@@ -71,18 +105,123 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
      {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
      {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
-@@ -352,7 +380,9 @@
+@@ -263,6 +310,18 @@ static const struct MPJniField AudioTimestamp_mapping[] = {
+ };
+ #undef OFFSET
+ 
++static struct JNIAudioDeviceInfo {
++    jclass clazz;
++    jmethodID getId;
++} AudioDeviceInfo;
++#define OFFSET(member) offsetof(struct JNIAudioDeviceInfo, member)
++static const struct MPJniField AudioDeviceInfo_mapping[] = {
++    {"android/media/AudioDeviceInfo", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"getId", "()I", MP_JNI_METHOD, OFFSET(getId), 0},
++    {0}
++};
++#undef OFFSET
++
+ #define ENTRY(name) { &name, name ## _mapping }
+ static const struct {
+     void *fields;
+@@ -276,6 +335,7 @@ static const struct {
+     ENTRY(AudioFormatBuilder),
+     ENTRY(AudioManager),
+     ENTRY(AudioTimestamp),
++    ENTRY(AudioDeviceInfo),
+ };
+ #undef ENTRY
+ 
+@@ -352,7 +412,8 @@ static int AudioTrack_New(struct ao *ao)
          return -1;
      }
  
 -    if (AudioTrack.getBufferSizeInFramesV23) {
-+    // For raw encodings getBufferSizeInFrames answers in bitstream bytes
-+    // (frame size 1), not mpv sample units; keep the size init computed.
++    // Raw encodings report the buffer size in bitstream bytes.
 +    if (!p->raw_passthrough && AudioTrack.getBufferSizeInFramesV23) {
          int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
          if (bufferSize > 0) {
              MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
-@@ -392,7 +422,8 @@
+@@ -376,9 +437,78 @@ static int AudioTrack_Recreate(struct ao *ao)
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+     MP_JNI_EXCEPTION_LOG(ao);
+     MP_JNI_GLOBAL_FREEP(&p->audiotrack);
++    p->routed_device = 0;
++    p->routing_lost = false;
+     return AudioTrack_New(ao);
+ }
+ 
++static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
++{
++    p->smooth_count = 0;
++    p->smooth_next = 0;
++    p->smooth_sampled = 0;
++    p->smooth_last_head = 0;
++    p->smooth_head = 0;
++    p->smooth_reported = 0;
++    p->smooth_reported_ns = 0;
++}
++
++// A direct/offload track's playback head advances in HAL-period steps (8192
++// frames at 192 kHz), larger than a 24p frame. Like media3's
++// AudioTrackPositionTracker: average the last (head - clock) offsets, bound
++// the estimate by what was written, and limit drift between reports to 10%
++// of elapsed time.
++static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head)
++{
++    struct priv *p = ao->priv;
++    if (!head) // not started, or just flushed: nothing to average yet
++        return head;
++
++    int64_t now = mp_time_ns();
++    double clock = MP_TIME_NS_TO_S(now) * ao->samplerate;
++
++    p->smooth_head += (int32_t)(head - p->smooth_last_head);
++    p->smooth_last_head = head;
++
++    if (!p->smooth_count ||
++        now - p->smooth_sampled >= MP_TIME_MS_TO_NS(30))
++    {
++        p->smooth_offset[p->smooth_next] = p->smooth_head - clock;
++        p->smooth_next = (p->smooth_next + 1) % MP_ARRAY_SIZE(p->smooth_offset);
++        p->smooth_count = MPMIN(p->smooth_count + 1,
++                                MP_ARRAY_SIZE(p->smooth_offset));
++        p->smooth_sampled = now;
++    }
++
++    double sum = 0;
++    for (int n = 0; n < p->smooth_count; n++)
++        sum += p->smooth_offset[n];
++    int64_t est = llround(clock + sum / p->smooth_count);
++
++    if (p->smooth_reported_ns) {
++        double elapsed = MP_TIME_NS_TO_S(now - p->smooth_reported_ns) *
++                         ao->samplerate;
++        int64_t expected = p->smooth_reported + llround(elapsed);
++        int64_t drift = est - expected;
++        if (drift && llabs(drift) < ao->samplerate) {
++            int64_t allowed = llround(elapsed * 0.1);
++            est = MPCLAMP(est, expected - allowed, expected + allowed);
++        }
++    }
++    p->smooth_reported = est;
++    p->smooth_reported_ns = now;
++
++    int32_t over = (int32_t)((uint32_t)est - p->written_frames);
++    if (over > 0) {
++        est -= over;
++        p->smooth_count = 0;
++        p->smooth_next = 0;
++        p->smooth_sampled = 0;
++        p->smooth_reported_ns = 0;
++    }
++    return (uint32_t)est;
++}
++
+ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -392,22 +522,28 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
      int stable_count = 20;
      int64_t wait = p->timestamp_stable < stable_count ? 50000000 : 3000000000;
  
@@ -92,7 +231,45 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          (p->timestamp_fetched == 0 || now - p->timestamp_fetched >= wait)) {
          if (!p->timestamp_fetched)
              p->timestamp_stable = 0;
-@@ -432,7 +463,7 @@
+ 
+-        int64_t time1 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+         if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
+-            p->timestamp_set = true;
++            uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
++            int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
++            // Some HALs (Shield after a flush) keep a frozen framePosition
++            // under a fresh nanoTime; only an advancing timestamp is trusted.
++            bool advancing = time2 != 0 && fpos != 0 &&
++                             p->timestamp_fetched != 0 && fpos != p->timestamp_last_fpos;
+             p->timestamp_fetched = now;
+-            if (p->timestamp_stable < stable_count) {
+-                uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
+-                int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+-                //MP_VERBOSE(ao, "getTimestamp: fpos= %u / time= %"PRId64" / now= %"PRId64" / stable= %d\n", fpos, time2, now, p->timestamp_stable);
+-                if (time1 != time2 && time2 != 0 && fpos != 0) {
++            p->timestamp_last_fpos = fpos;
++            if (advancing) {
++                p->timestamp_set = true;
++                if (p->timestamp_stable < stable_count)
+                     p->timestamp_stable++;
+-                }
++            } else {
++                p->timestamp_set = false;
++                p->timestamp_stable = 0;
+             }
+         }
+     }
+@@ -424,6 +560,9 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+         if (fpos != 0 && time != 0 && state == AudioTrack.PLAYSTATE_PLAYING) {
+             double diff = (double)(now - time) / 1e9;
+             pos += diff * ao->samplerate;
++            // Never ahead of written_frames, or the uint32 delay wraps.
++            if ((int32_t)(pos - p->written_frames) > 0)
++                pos = p->written_frames;
+         }
+         //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / fpos= %u / time= %"PRId64")\n", pos, state, fpos, time);
+     } else {
+@@ -432,7 +571,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
      }
  
  
@@ -101,31 +278,50 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          if (p->reset_pending) {
              // after a flush(), playbackHeadPosition will not reset to 0 right away.
              // sometimes, it will never reset at all.
-@@ -462,7 +493,9 @@
+@@ -449,6 +588,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+             MP_VERBOSE(ao, "IEC/playbackHeadPosition %d -> %d (flush)\n", p->playhead_pos, pos);
+             p->playhead_offset = 0;
+             p->playhead_pos = 0;
++            AudioTrack_resetPlayheadSmoothing(p);
+         }
+ 
+         // sometimes on a new AudioTrack instance, playbackHeadPosition will reset
+@@ -458,11 +598,13 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+             p->playhead_offset = 0;
+             p->playhead_pos = 0;
+             p->written_frames = 0;
++            AudioTrack_resetPlayheadSmoothing(p);
+         }
      }
  
      p->playhead_pos = pos;
 -    return p->playhead_pos - p->playhead_offset;
-+    // A raw track advances at the codec frame rate; scale back to the IEC
-+    // carrier rate the rest of the accounting uses (uint32 rollover-safe).
++    // Raw tracks count codec frames; scale back to the IEC carrier rate.
 +    return (p->playhead_pos - p->playhead_offset) * (uint32_t)p->raw_rate_mult;
  }
  
  static double AudioTrack_getLatency(struct ao *ao)
-@@ -476,7 +509,7 @@
+@@ -472,11 +614,14 @@ static double AudioTrack_getLatency(struct ao *ao)
+     if (!p->audiotrack)
+         return 0;
+ 
++    const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
++                             p->raw_passthrough;
+     uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
++    if (passthrough)
++        playhead = AudioTrack_smoothPlayhead(ao, playhead);
      uint32_t diff = p->written_frames - playhead;
      double delay = diff / (double)(ao->samplerate);
-     if (!p->timestamp_set &&
+-    if (!p->timestamp_set &&
 -        p->format != AudioFormat.ENCODING_IEC61937)
-+        p->format != AudioFormat.ENCODING_IEC61937 && !p->raw_passthrough)
++    if (!p->timestamp_set && !passthrough)
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -486,6 +519,210 @@
+@@ -486,6 +631,193 @@ static double AudioTrack_getLatency(struct ao *ao)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
-+// IEC 61937 burst parser states
 +enum {
 +    RAW_SYNC_PA = 0,
 +    RAW_SYNC_PB,
@@ -135,7 +331,6 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    RAW_DTS_HEADER,
 +};
 +
-+// IEC 61937-2 data types carried by the stereo bursts we unwrap.
 +#define IEC61937_AC3  0x01
 +#define IEC61937_DTS1 0x0b
 +#define IEC61937_DTS2 0x0c
@@ -149,26 +344,18 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    case AF_FORMAT_S_AC3:
 +        return AudioFormat.ENCODING_AC3;
 +    case AF_FORMAT_S_EAC3:
-+        // ad_spdif opens E-AC3 at the 192 kHz IEC carrier rate; the raw
-+        // track runs at the codec's 48 kHz frame rate.
++        // 192 kHz IEC carrier vs 48 kHz codec frames
 +        *rate_mult = 4;
 +        return AudioFormat.ENCODING_E_AC3;
 +    case AF_FORMAT_S_DTS:
 +        return AudioFormat.ENCODING_DTS;
 +    default:
-+        // TrueHD (MAT) and DTS-HD MA keep the 8-channel IEC 61937 carrier:
-+        // their raw forms are not trivially recoverable from the bursts.
 +        return 0;
 +    }
 +}
 +
-+// Whether the current route takes a direct AudioTrack of this exact raw
-+// tuple. getMinBufferSize alone can size formats the route cannot actually
-+// play, and a lying HAL then opens a raw track that renders silence - the
-+// failure class the raw path exists to fix. media3 gates its raw
-+// passthrough on the same probe. Below API 29 the probe does not exist;
-+// answering true there leaves the getMinBufferSize/init-failure fallbacks
-+// in charge, which is also media3's pre-29 behavior.
++// isDirectPlaybackSupported (API 29+): getMinBufferSize alone can accept a
++// format the route then renders as silence. Unknown counts as supported.
 +static bool AudioTrack_rawRouteSupported(struct ao *ao, jint format,
 +                                         jint samplerate, jint channel_config)
 +{
@@ -218,15 +405,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    return supported;
 +}
 +
-+// Incrementally unwraps an IEC 61937 stream (16-bit little-endian words as
-+// produced by libavformat's spdif muxer) back into the raw codec byte
-+// stream. Payload words are byte-swapped back to bitstream order; preambles
-+// and zero padding are dropped. Burst boundaries may fall anywhere inside
-+// [src, src+len), so parser state persists in priv across calls.
-+// FFmpeg omits the preamble for full-carrier DTS (DTS CDs/DTS-in-WAV).
-+// Its output is still word-swapped, including originally LE or 14-bit DTS.
-+// Buffer only the eight header bytes needed to recover the carrier length.
-+// dst needs len + sizeof(raw_dts_header) bytes for a header split across calls.
++// Unwraps IEC 61937 (LE words from libavformat's spdif muxer) back into the
++// codec byte stream; parser state persists across calls. Full-carrier DTS
++// arrives without a preamble, so the frame header supplies its length.
++// dst needs len + sizeof(raw_dts_header) bytes.
 +static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
 +                                     const uint8_t *src, int len)
 +{
@@ -244,9 +426,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        p->raw_have_byte = false;
 +
 +        if (p->raw_state == RAW_PAYLOAD) {
-+            // spdifenc byte-swaps the payload into LE words; a lone final
-+            // byte rides the high half of its word. Swapping each pair and
-+            // emitting only the bytes Pd promised undoes both.
++            // Payload words are byte-swapped; a lone final byte rides high.
 +            dst[out++] = hi;
 +            if (--p->raw_payload_left > 0) {
 +                dst[out++] = lo;
@@ -332,7 +512,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +732,25 @@
+@@ -495,7 +827,23 @@ static int AudioTrack_write(struct ao *ao, int len)
      void *buf = p->chunk;
  
      jint ret;
@@ -347,19 +527,81 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
 +            MP_JNI_LOCAL_FREEP(&bbuf);
 +        }
-+        // AudioTrack advances ByteBuffer.position by the bytes accepted.
-+        // Keep that position and do not consume new input after a short write.
++        // A short write leaves ByteBuffer.position on the unwritten tail.
 +        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, p->raw_pending, AudioTrack.WRITE_BLOCKING);
 +        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
 +        if (ret < 0) return ret;
 +        p->raw_pending -= ret;
-+        // written_frames accounting stays in input (IEC frame) units.
 +        return p->raw_pending ? 0 : p->raw_input_len;
 +    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
          (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
          ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -583,7 +838,8 @@
+@@ -566,6 +914,55 @@ error:
+     return -1;
+ }
+ 
++static jint AudioTrack_getRoutedDeviceId(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (!AudioTrack.getRoutedDevice || !AudioDeviceInfo.getId || !p->audiotrack)
++        return 0;
++    jobject device = MP_JNI_CALL_OBJECT(p->audiotrack, AudioTrack.getRoutedDevice);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !device)
++        return 0;
++    jint id = MP_JNI_CALL_INT(device, AudioDeviceInfo.getId);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        id = 0;
++    MP_JNI_LOCAL_FREEP(&device);
++    return id;
++}
++
++// An HDMI mode switch can rebind the route under a live passthrough track,
++// which then drains into silence; reload the AO like media3 does.
++static void AudioTrack_checkRouteChange(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->cfg_route_reload || p->routing_reload_requested)
++        return;
++    if (!p->raw_passthrough && p->format != AudioFormat.ENCODING_IEC61937)
++        return;
++    int64_t now = mp_time_ns();
++    if (p->routing_checked && now - p->routing_checked < MP_TIME_MS_TO_NS(250))
++        return;
++    p->routing_checked = now;
++    jint id = AudioTrack_getRoutedDeviceId(ao);
++    if (!id) {
++        // Unrouted (not started, or mid-renegotiation) is not a change yet.
++        if (p->routed_device)
++            p->routing_lost = true;
++        return;
++    }
++    if (!p->routed_device) {
++        p->routed_device = id;
++        return;
++    }
++    if (id != p->routed_device || p->routing_lost) {
++        MP_WARN(ao, "audio route changed under a passthrough track "
++                "(device %d -> %d), reloading AO\n",
++                (int)p->routed_device, (int)id);
++        p->routing_reload_requested = true;
++        ao_request_reload(ao);
++    }
++}
++
+ static MP_THREAD_VOID ao_thread(void *arg)
+ {
+     struct ao *ao = arg;
+@@ -574,6 +971,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     mp_thread_set_name("ao/audiotrack");
+     mp_mutex_lock(&p->lock);
+     while (!p->thread_terminate) {
++        AudioTrack_checkRouteChange(ao);
+         int state = AudioTrack.PLAYSTATE_PAUSED;
+         if (p->audiotrack) {
+             state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
+@@ -583,7 +981,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
              int64_t ts = mp_time_ns();
              ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
              ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
@@ -369,17 +611,18 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              int ret = AudioTrack_write(ao, samples * ao->sstride);
              if (ret >= 0) {
                  p->written_frames += ret / ao->sstride;
-@@ -657,11 +913,34 @@
+@@ -657,9 +1056,32 @@ static int init(struct ao *ao)
      if (init_jni(ao) < 0)
          return -1;
  
-+    p->raw_rate_mult = 1;
-+
-     const bool spdif = af_fmt_is_spdif(ao->format);
- 
-     if (spdif) {
+-    if (af_fmt_is_spdif(ao->format)) {
 -        p->format = AudioFormat.ENCODING_IEC61937;
 -        if (!p->format || !AudioTrack.writeShortV23) {
++    p->raw_rate_mult = 1;
++
++    const bool spdif = af_fmt_is_spdif(ao->format);
++
++    if (spdif) {
 +        int rate_mult = 1;
 +        jint raw_format = p->cfg_raw_passthrough
 +                        ? raw_encoding_for_format(ao->format, &rate_mult) : 0;
@@ -392,8 +635,6 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +            raw_format = 0;
 +        }
 +        if (raw_format && AudioTrack.writeBufferV21) {
-+            // Feed the codec bitstream itself and let the platform wrap or
-+            // transcode it; see the priv comment.
 +            p->format = raw_format;
 +            p->raw_passthrough = true;
 +            p->raw_rate_mult = rate_mult;
@@ -406,25 +647,51 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              MP_ERR(ao, "spdif passthrough not supported by API\n");
              return -1;
          }
-@@ -690,6 +969,11 @@
+@@ -673,7 +1095,8 @@ static int init(struct ao *ao)
+         p->format = AudioFormat.ENCODING_PCM_16BIT;
+     }
+ 
+-    if (AudioTrack.getNativeOutputSampleRate) {
++    // ad_spdif already picked the carrier rate.
++    if (AudioTrack.getNativeOutputSampleRate && !spdif) {
+         jint samplerate = MP_JNI_CALL_STATIC_INT(
+             AudioTrack.clazz,
+             AudioTrack.getNativeOutputSampleRate,
+@@ -685,6 +1108,10 @@ static int init(struct ao *ao)
          }
      }
      p->samplerate = ao->samplerate;
 +    if (p->raw_passthrough) {
-+        // The IEC rate is the burst carrier rate; the raw track runs at the
-+        // codec's frame rate (192 kHz E-AC3 bursts carry 48 kHz frames).
++        // The raw track runs at the codec frame rate, not the carrier rate.
 +        p->samplerate = ao->samplerate / p->raw_rate_mult;
 +    }
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -748,20 +1032,51 @@
+@@ -710,8 +1137,16 @@ static int init(struct ao *ao)
+         AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
+     };
+     static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
+-    if (p->format == AudioFormat.ENCODING_IEC61937) {
+-        p->channel_config = AudioFormat.CHANNEL_OUT_STEREO;
++    if (spdif) {
++        // TrueHD and DTS-HD MA bursts are 8-channel; forcing stereo would
++        // open a track that cannot carry them.
++        p->channel_config = ao->channels.num < MP_ARRAY_SIZE(layout_map)
++                          ? layout_map[ao->channels.num] : 0;
++        if (!p->channel_config) {
++            MP_ERR(ao, "no channel mask for a %d channel IEC 61937 burst\n",
++                   ao->channels.num);
++            goto error;
++        }
+     } else {
+         struct mp_chmap_sel sel = {0};
+         for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
+@@ -731,20 +1166,47 @@ static int init(struct ao *ao)
          p->channel_config,
          p->format
      );
 +    if (p->raw_passthrough && (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0)) {
-+        // The route rejected the raw encoding outright; fall back to the
-+        // IEC 61937 carrier rather than failing passthrough entirely.
 +        MP_WARN(ao, "raw passthrough rejected (buffer size %d), trying IEC 61937\n",
 +                buffer_size);
 +        p->raw_passthrough = false;
@@ -459,26 +726,24 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 -    MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
 +    if (p->raw_passthrough) {
 +        // getMinBufferSize answers in bitstream bytes for raw encodings.
-+        // Sizing by the IEC byte rate would buffer seconds of compressed
-+        // audio; twice the HAL minimum keeps the write cadence smooth while
-+        // the reported delay stays under mpv's 2 s sanity cap at real
-+        // bitrates.
 +        p->size = MP_ALIGN_UP(buffer_size * 2, bps);
 +        MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d)\n", p->size, buffer_size);
 +    } else {
-+        // Choose double of the minimum buffer size suggested by the driver, but not
-+        // less than 75ms or more than 150ms.
-+        int min = 0.075 * p->samplerate * bps * ao->channels.num;
++        // Double the driver minimum, clamped to 75-150 ms. AudioTrack rejects
++        // a PCM buffer that is not a whole number of frames.
++        const int frame = bps * ao->channels.num;
++        int min = 0.075 * p->samplerate * frame;
 +        int max = min * 2;
-+        min = MP_ALIGN_UP(min, bps);
-+        max = MP_ALIGN_UP(max, bps);
++        min = (min + frame - 1) / frame * frame;
++        max = (max + frame - 1) / frame * frame;
 +        p->size = MPCLAMP(buffer_size * 2, min, max);
++        p->size = (p->size + frame - 1) / frame * frame;
 +        MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
 +    }
      mp_assert(p->size % bps == 0);
      ao->device_buffer = p->size / bps;
  
-@@ -777,7 +1092,14 @@
+@@ -760,7 +1222,14 @@ static int init(struct ao *ao)
      MP_JNI_LOCAL_FREEP(&timestamp);
  
      // decide and create buffer of right type
@@ -494,7 +759,14 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
          p->shortarray = (*env)->NewGlobalRef(env, shortarray);
          MP_JNI_LOCAL_FREEP(&shortarray);
-@@ -834,6 +1156,12 @@
+@@ -812,11 +1281,21 @@ static void stop(struct ao *ao)
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+     MP_JNI_EXCEPTION_LOG(ao);
+ 
++    // pause() interrupts the worker's blocking write; the reset waits for it.
++    mp_mutex_lock(&p->lock);
+     p->playhead_offset = 0;
+     p->reset_pending = true;
      p->written_frames = 0;
      p->timestamp_fetched = 0;
      p->timestamp_set = false;
@@ -504,18 +776,22 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    p->raw_have_byte = false;
 +    p->raw_pending = 0;
 +    p->raw_input_len = 0;
++    AudioTrack_resetPlayheadSmoothing(p);
++    mp_mutex_unlock(&p->lock);
  }
  
  static void start(struct ao *ao)
-@@ -863,9 +1191,11 @@
+@@ -846,9 +1325,13 @@ const struct ao_driver audio_out_audiotrack = {
      .priv_size = sizeof(struct priv),
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,
 +        .cfg_raw_passthrough = 1,
++        .cfg_route_reload = 1,
      },
      .options   = (const struct m_option[]) {
          {"pcm-float", OPT_BOOL(cfg_pcm_float)},
 +        {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
++        {"route-reload", OPT_BOOL(cfg_route_reload)},
          {"session-id", OPT_INT(cfg_session_id)},
          {0}
      },
