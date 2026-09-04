@@ -125,7 +125,7 @@ index 30ae7a7..e5ebbff 100644
  
  // IEC 61937 burst parser states
 diff --git a/video/out/vo.c b/video/out/vo.c
-index c8cb30e..f520617 100644
+index c8cb30e..0bf4884 100644
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
 @@ -171,6 +171,7 @@ struct vo_internal {
@@ -157,3 +157,73 @@ index c8cb30e..f520617 100644
          wakeup_core(vo);
      } else {
          in->rendering = true;
+@@ -1008,7 +1016,9 @@ static bool render_frame(struct vo *vo)
+ 
+         stats_time_start(in->stats, "video-draw");
+ 
++        int64_t t_draw0 = mp_time_ns();
+         in->visible = vo->driver->draw_frame(vo, frame);
++        int64_t t_draw1 = mp_time_ns();
+ 
+         stats_time_end(in->stats, "video-draw");
+ 
+@@ -1016,7 +1026,17 @@ static bool render_frame(struct vo *vo)
+ 
+         stats_time_start(in->stats, "video-flip");
+ 
++        int64_t t_flip0 = mp_time_ns();
+         vo->driver->flip_page(vo);
++        int64_t t_flip1 = mp_time_ns();
++        if (t_draw1 - t_draw0 > MP_TIME_MS_TO_NS(20) ||
++            t_flip1 - t_flip0 > MP_TIME_MS_TO_NS(20))
++        {
++            MP_VERBOSE(vo, "flip2202: draw_frame %.1f ms, flip_page %.1f ms "
++                       "(flip started %.1f ms after target)\n",
++                       (t_draw1 - t_draw0) / 1e6, (t_flip1 - t_flip0) / 1e6,
++                       (t_flip0 - target) / 1e6);
++        }
+ 
+         struct vo_vsync_info vsync = {
+             .last_queue_display_time = -1,
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 2d00f60..add6129 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -367,6 +367,8 @@ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
+     }
+ 
+     ANativeWindow_unlockAndPost(p->osd_window);
++    MP_VERBOSE(vo, "osd2202: posted %d,%d-%d,%d (asked %d,%d-%d,%d)\n",
++               x0, y0, x1, y1, dirty.x0, dirty.y0, dirty.x1, dirty.y1);
+ 
+ done:
+     talloc_free(sbs);
+@@ -446,7 +448,11 @@ static void flip_page(struct vo *vo)
+ 
+     // Post the OSD first: an immediate post latches on the next vsync, which
+     // is the vsync the video buffer's (near-future) timestamp targets.
++    int64_t t_osd0 = mp_time_ns();
+     draw_osd(vo);
++    int64_t t_osd1 = mp_time_ns();
++    if (t_osd1 - t_osd0 > MP_TIME_MS_TO_NS(10))
++        MP_VERBOSE(vo, "flip2202: draw_osd %.1f ms\n", (t_osd1 - t_osd0) / 1e6);
+ 
+     if (!p->cur_image || p->cur_presented)
+         return;
+@@ -466,11 +472,16 @@ static void flip_page(struct vo *vo)
+             target = 0;
+     }
+ 
++    int64_t t_rel0 = mp_time_ns();
+     if (target > 0) {
+         av_mediacodec_render_buffer_at_time(buffer, target);
+     } else {
+         av_mediacodec_release_buffer(buffer, 1);
+     }
++    int64_t t_rel1 = mp_time_ns();
++    if (t_rel1 - t_rel0 > MP_TIME_MS_TO_NS(10))
++        MP_VERBOSE(vo, "flip2202: releaseOutputBuffer %.1f ms (timed=%d)\n",
++                   (t_rel1 - t_rel0) / 1e6, target > 0);
+     p->cur_presented = true;
+ }
+ 
