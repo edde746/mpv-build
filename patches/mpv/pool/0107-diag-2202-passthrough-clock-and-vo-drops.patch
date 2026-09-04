@@ -186,10 +186,10 @@ index c8cb30e..0bf4884 100644
          struct vo_vsync_info vsync = {
              .last_queue_display_time = -1,
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 42e4a30..74d0280 100644
+index b488032..fc0936e 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -717,6 +717,8 @@ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
+@@ -637,6 +637,8 @@ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
      }
  
      ANativeWindow_unlockAndPost(p->osd_window);
@@ -198,7 +198,7 @@ index 42e4a30..74d0280 100644
  
  done:
      talloc_free(sbs);
-@@ -822,18 +824,27 @@ static void flip_page(struct vo *vo)
+@@ -741,18 +743,27 @@ static void flip_page(struct vo *vo)
          get_release_target(vo, p->cur_image ? p->cur_pts : 0);
  
      // Rasterize early, but keep the OSD post near the video's timestamp.

@@ -14,4 +14,5 @@
 0108-vo-mediacodec-async-osd-post.patch
 0109-vo-mediacodec-snap-timed-release-to-vsync.patch
 0110-vo-mediacodec-harden-buffer-and-surface-lifecycle.patch
+0111-vo-mediacodec-leave-display-mode-selection-to-embedder.patch
 0107-diag-2202-passthrough-clock-and-vo-drops.patch
