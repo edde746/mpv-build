@@ -1,0 +1,44 @@
+sd_ass: match the ExoPlayer libass renderer setup
+
+Plezy's ExoPlayer subtitle path (android/libass AssKt.c) enables
+ASS_FEATURE_FAST_BLUR on the track and lets libass pick its render thread
+count with ass_set_threads(renderer, 0). The mpv path set neither, so the
+same file rendered with a fixed 9-tap minimum blur kernel and whatever
+the library defaulted to. On blur-heavy motion-tracked signs that is a
+large share of the per-frame cost behind late signs and post-cut bleed
+on Fire TV (edde746/plezy#2242).
+
+Only these two options: MOTION_CACHE and CACHE_LAYOUT stay off, as on
+the ExoPlayer path.
+
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index ece372a..81d9bef 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -240,6 +240,15 @@ static void enable_output(struct sd *sd, bool enable)
+     } else {
+         ctx->ass_renderer = ass_renderer_init(ctx->ass_library);
+ 
++        // Same renderer setup as Plezy's ExoPlayer libass path (AssKt.c):
++        // the pool size is autodetected from the core count. mpv's message
++        // callback is thread-safe, which ass_set_threads requires.
++        unsigned threads = ass_set_threads(ctx->ass_renderer, 0);
++        if (threads)
++            MP_VERBOSE(sd, "libass rendering threads: %u\n", threads);
++        else
++            MP_WARN(sd, "libass built without threading support\n");
++
+         mp_ass_configure_fonts(ctx->ass_renderer, sd->opts->sub_style,
+                                sd->global, sd->log);
+     }
+@@ -261,6 +270,10 @@ static void assobjects_init(struct sd *sd)
+ 
+     ctx->ass_track = ass_new_track(ctx->ass_library);
+     ctx->ass_track->track_type = TRACK_TYPE_ASS;
++    // Match the ExoPlayer path: kernels sized to the actual blur radius
++    // instead of the fixed 9-tap minimum. Sub-perceptual output change,
++    // large win on per-frame re-blurred motion-tracked signs.
++    ass_track_set_feature(ctx->ass_track, ASS_FEATURE_FAST_BLUR, 1);
+ 
+     ctx->shadow_track = ass_new_track(ctx->ass_library);
+     ctx->shadow_track->PlayResX = MP_ASS_FONT_PLAYRESX;
