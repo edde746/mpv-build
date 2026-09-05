@@ -1,0 +1,137 @@
+vo_mediacodec: report per-stage OSD pass cost at verbose level
+
+A slow subtitle frame on the mediacodec OSD plane has four suspects that
+logs could not tell apart: libass rasterization (held under osd->lock, so
+it also stalls the playloop), the software composite, the Surface lock
+wait, and the copy. Time each stage of osd_pass and log one line at -v
+when the pass took over 20 ms, with the outcome, the pts, the OSD object
+count, the modified-rect count and the dirty rect. Cheap when quiet: a
+handful of mp_time_ns calls per pass and no formatting under the
+threshold.
+
+On a Fire TV Stick 4K Max Gen 2 this put the edde746/plezy#2242 sign at
+render 741 ms + composite 1009 ms for one frame, which is what the two
+following changes act on.
+
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -477,6 +477,13 @@
+     return current;
+ }
+ 
++// Per-stage cost of one OSD pass, reported at verbose level when a pass is
++// slow enough to matter for a 24 fps title. Every stage is a suspect on TV
++// hardware: libass rasterization runs under osd->lock (and therefore stalls
++// the playloop), the composite touches every changed pixel in software, and
++// the Surface lock waits for the compositor.
++#define OSD_PASS_REPORT_NS MP_TIME_MS_TO_NS(20)
++
+ static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
+                      int *last_w, int *last_h, bool *force_full, double pts,
+                      int64_t deadline, uint64_t epoch)
+@@ -500,25 +507,37 @@
+         .display_par = 1,
+     };
+ 
++    int64_t t_start = mp_time_ns();
++    int64_t t_render = t_start, t_composite = t_start, t_wait = t_start,
++            t_lock = t_start, t_post = t_start;
++    int num_parts = 0, num_mod_rc = 0;
++    struct mp_rect dirty = {0};
++    const char *outcome = "no-render";
++
+     struct sub_bitmap_list *sbs =
+         osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
++    t_render = mp_time_ns();
+     if (!sbs)
+-        return;
++        goto report;
++    num_parts = sbs->num_items;
+ 
+     if (!*cache)
+         *cache = mp_draw_sub_alloc(NULL, vo->global);
+ 
+     struct mp_rect act_rc[1], mod_rc[64];
+-    int num_act_rc = 0, num_mod_rc = 0;
++    int num_act_rc = 0;
+     struct mp_image *osd = mp_draw_sub_overlay(*cache, sbs,
+             act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
+             mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc);
++    t_composite = mp_time_ns();
++    outcome = "no-overlay";
+     if (!osd)
+         goto done;
++    outcome = "unchanged";
+     if (!num_mod_rc && !*force_full)
+         goto done; // OSD unchanged; keep the currently posted buffer
+ 
+-    struct mp_rect dirty = {0, 0, w, h};
++    dirty = (struct mp_rect){0, 0, w, h};
+     if (!*force_full) {
+         dirty = mod_rc[0];
+         for (int n = 1; n < num_mod_rc; n++)
+@@ -526,15 +545,21 @@
+     }
+ 
+     // Post no earlier than the video's adjusted timestamp.
+-    if (!wait_to_post_osd(p, deadline, epoch))
++    outcome = "superseded";
++    bool current = wait_to_post_osd(p, deadline, epoch);
++    t_wait = mp_time_ns();
++    if (!current)
+         goto done;
+ 
+     // ANativeWindow_lock grows bounds to everything that must be repainted.
+     ARect bounds = {dirty.x0, dirty.y0, dirty.x1, dirty.y1};
+     ANativeWindow_Buffer buffer;
+-    if (ANativeWindow_lock(p->osd_window, &buffer, &bounds) != 0) {
++    int lock_ret = ANativeWindow_lock(p->osd_window, &buffer, &bounds);
++    t_lock = mp_time_ns();
++    if (lock_ret != 0) {
+         MP_WARN(vo, "Failed to lock the OSD surface.\n");
+         *force_full = true;
++        outcome = "lock-failed";
+         goto done;
+     }
+ 
+@@ -542,6 +567,7 @@
+         MP_ERR(vo, "Unexpected OSD buffer format %d.\n", buffer.format);
+         *force_full = true;
+         ANativeWindow_unlockAndPost(p->osd_window);
++        outcome = "bad-format";
+         goto done;
+     }
+ 
+@@ -572,9 +598,31 @@
+     }
+ 
+     ANativeWindow_unlockAndPost(p->osd_window);
++    t_post = mp_time_ns();
++    dirty = (struct mp_rect){x0, y0, x1, y1};
++    outcome = "posted";
+ 
+ done:
+     talloc_free(sbs);
++report:
++    if (mp_msg_test(vo->log, MSGL_V)) {
++        int64_t busy = (t_render - t_start) + (t_composite - t_render) +
++                       (t_lock - MPMAX(t_wait, t_composite)) +
++                       (t_post - t_lock);
++        if (busy >= OSD_PASS_REPORT_NS) {
++            MP_VERBOSE(vo, "osd pass %s @%.3f: render %.1f ms, composite %.1f ms, "
++                       "wait %.1f ms, lock %.1f ms, blit %.1f ms; %d parts, "
++                       "%d mod rects, dirty %d,%d-%d,%d\n",
++                       outcome, pts,
++                       (t_render - t_start) / 1e6,
++                       (t_composite - t_render) / 1e6,
++                       MPMAX(t_wait - t_composite, 0) / 1e6,
++                       MPMAX(t_lock - MPMAX(t_wait, t_composite), 0) / 1e6,
++                       MPMAX(t_post - t_lock, 0) / 1e6,
++                       num_parts, num_mod_rc,
++                       dirty.x0, dirty.y0, dirty.x1, dirty.y1);
++        }
++    }
+ }
+ 
+ static MP_THREAD_VOID osd_thread(void *arg)

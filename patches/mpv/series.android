@@ -6,5 +6,7 @@
 0004-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
 0005-demux-codec-profile-from-avcc.patch
 0006-sd-ass-fast-blur-and-render-threads.patch
+0007-vo-mediacodec-osd-pass-stage-timing.patch
+0008-draw-bmp-fast-libass-blend.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
 0102-f-output-chain-wake-after-reset-harder.patch

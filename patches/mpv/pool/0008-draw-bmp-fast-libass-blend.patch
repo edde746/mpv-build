@@ -1,0 +1,128 @@
+draw_bmp: blend libass glyphs without per-pixel divisions, NEON where available
+
+draw_ass_rgba composited every glyph coverage byte with four integer
+divisions by 255*255 per pixel in plain C. On a Cortex-A55 (32-bit) that
+is ~50 Mpx/s, and one frame of a motion-tracked sign with a hundred
+overlapping blurred events is ~50 Mpx: a full second per frame for every
+software-OSD VO (x11, wlshm, drm, the Android mediacodec OSD plane).
+
+Quantize the source alpha (coverage * color alpha) to 8 bits, which is
+within the precision libass hands out, so each channel is one
+(c * s + d * (255 - s)) / 255 multiply-add with the exact add-high-byte
+identity in place of the division. On ARM the row body runs eight pixels
+at a time with NEON (vld4/vst4 keep the channels separate); other
+targets get the same arithmetic scalar. Output is within 1 LSB of the
+old formula (round instead of floor), checked over 1.5 M random pixels
+for both paths.
+
+Measured on the same Fire TV Stick: 50.7 -> 199 Mpx/s (4.0x), and the
+edde746/plezy#2242 sign's composite stage drops from ~1 s to ~0.3 s per
+frame.
+
+diff --git a/sub/draw_bmp.c b/sub/draw_bmp.c
+index fe72a74..1cc6f87 100644
+--- a/sub/draw_bmp.c
++++ b/sub/draw_bmp.c
+@@ -21,6 +21,11 @@
+ #include <math.h>
+ #include <inttypes.h>
+ 
++#if defined(__ARM_NEON) || defined(__ARM_NEON__)
++#include <arm_neon.h>
++#define HAVE_DRAW_ASS_NEON 1
++#endif
++
+ #include "common/common.h"
+ #include "draw_bmp.h"
+ #include "img_convert.h"
+@@ -292,6 +297,21 @@ static void mark_rect(struct mp_draw_sub_cache *p, int x0, int y0, int x1, int y
+     }
+ }
+ 
++// Round(x / 255) for 0 <= x <= 255 * 255 + 128 without a division.
++static inline unsigned div255_round(unsigned x)
++{
++    x += 128;
++    return (x + (x >> 8)) >> 8;
++}
++
++// Blend one libass glyph bitmap (8-bit coverage, one straight color) over the
++// premultiplied BGRA overlay. The alpha of one source pixel is
++// coverage * color_alpha, quantized to 8 bits, which is within the precision
++// libass itself hands out and keeps every channel on a single
++// (c * s + d * (255 - s)) / 255 multiply-add. The reference formula did that
++// in 16-bit alpha with four divisions per pixel; on a Cortex-A55 that is
++// ~1 s for one frame of a motion-tracked sign with a hundred overlapping
++// blurred events (edde746/plezy#2242).
+ static void draw_ass_rgba(uint8_t *dst, ptrdiff_t dst_stride,
+                           uint8_t *src, ptrdiff_t src_stride,
+                           int w, int h, uint32_t color)
+@@ -300,21 +320,61 @@ static void draw_ass_rgba(uint8_t *dst, ptrdiff_t dst_stride,
+     const unsigned int g = (color >> 16) & 0xff;
+     const unsigned int b = (color >>  8) & 0xff;
+     const unsigned int a = 0xff - (color & 0xff);
++    if (!a)
++        return;
++
++#if HAVE_DRAW_ASS_NEON
++    const uint16x8_t va = vdupq_n_u16(a);
++    const uint16x8_t v255 = vdupq_n_u16(255);
++    const uint16x8_t v128 = vdupq_n_u16(128);
++    const uint8x8_t vb = vdup_n_u8(b), vg = vdup_n_u8(g), vr = vdup_n_u8(r);
++    const uint8x8_t vfull = vdup_n_u8(255);
++#endif
+ 
+     for (int y = 0; y < h; y++) {
+-        uint32_t *dstrow = (uint32_t *) dst;
+-        for (int x = 0; x < w; x++) {
++        int x = 0;
++#if HAVE_DRAW_ASS_NEON
++        for (; x + 8 <= w; x += 8) {
++            uint8x8_t cov = vld1_u8(src + x);
++            // s = round(coverage * a / 255): the 8-bit source alpha.
++            uint16x8_t aa = vaddq_u16(vmulq_u16(vmovl_u8(cov), va), v128);
++            uint16x8_t s = vshrq_n_u16(vaddq_u16(aa, vshrq_n_u16(aa, 8)), 8);
++            uint16x8_t inv = vsubq_u16(v255, s);
++            uint8x8_t s8 = vmovn_u16(s);
++            uint8x8_t inv8 = vmovn_u16(inv);
++
++            uint8x8x4_t px = vld4_u8(dst + (ptrdiff_t)x * 4);
++            // Per channel: (c * s + d * (255 - s) + 128) / 255, exact rounding
++            // through the add-high-byte identity (see div255_round).
++#define BLEND_CHANNEL(idx, c) do { \
++                uint16x8_t t = vmlal_u8(vmull_u8(c, s8), px.val[idx], inv8); \
++                t = vaddq_u16(t, v128); \
++                px.val[idx] = vshrn_n_u16(vaddq_u16(t, vshrq_n_u16(t, 8)), 8); \
++            } while (0)
++            BLEND_CHANNEL(0, vb);
++            BLEND_CHANNEL(1, vg);
++            BLEND_CHANNEL(2, vr);
++            BLEND_CHANNEL(3, vfull);
++#undef BLEND_CHANNEL
++            vst4_u8(dst + (ptrdiff_t)x * 4, px);
++        }
++#endif
++        uint32_t *dstrow = (uint32_t *)dst;
++        for (; x < w; x++) {
+             const unsigned int v = src[x];
+-            unsigned int aa = a * v;
++            if (!v)
++                continue;
++            const unsigned int s = div255_round(v * a);
++            const unsigned int inv = 255 - s;
+             uint32_t dstpix = dstrow[x];
+             unsigned int dstb =  dstpix        & 0xFF;
+             unsigned int dstg = (dstpix >>  8) & 0xFF;
+             unsigned int dstr = (dstpix >> 16) & 0xFF;
+             unsigned int dsta = (dstpix >> 24) & 0xFF;
+-            dstb = (v * b * a   + dstb * (255 * 255 - aa)) / (255 * 255);
+-            dstg = (v * g * a   + dstg * (255 * 255 - aa)) / (255 * 255);
+-            dstr = (v * r * a   + dstr * (255 * 255 - aa)) / (255 * 255);
+-            dsta = (aa * 255    + dsta * (255 * 255 - aa)) / (255 * 255);
++            dstb = div255_round(b * s + dstb * inv);
++            dstg = div255_round(g * s + dstg * inv);
++            dstr = div255_round(r * s + dstr * inv);
++            dsta = div255_round(255 * s + dsta * inv);
+             dstrow[x] = dstb | (dstg << 8) | (dstr << 16) | (dsta << 24);
+         }
+         dst += dst_stride;
