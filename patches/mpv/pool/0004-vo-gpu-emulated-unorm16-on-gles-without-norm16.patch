@@ -1,0 +1,218 @@
+vo_gpu: emulate 16-bit unorm plane textures on GLES without norm16
+
+GLES drivers without GL_EXT_texture_norm16 (the low-end Mali/Adreno TV
+class, e.g. Amlogic S905X4 / Mali-G31) get >8-bit planes as r16ui integer
+textures: an extra "use_integer fix" pass per plane and frame, twice the
+upload bytes for the driver to swizzle, and no dumb mode at all
+(check_dumb_mode refuses integer conversion). On a Mali-G31 that is 3 ms
+of GPU time and 3.5 ms of upload per 1080p frame, out of a 41.7 ms budget
+the device already cannot meet for 10-bit software-decoded video.
+
+Back r16/rg16 with rg8/rgba8 instead: the bytes on the wire are the same
+little-endian pairs, the texture stays filterable, and the renderer
+reconstructs dot(lo_hi, vec2(255, 65280)) / 65535 after sampling. The
+reconstruction is linear, so it commutes with every linear filter and
+scaler; measured bit-exact under hardware bilinear at mid- and
+quarter-texel positions. Only ra_get_imgfmt_desc hands the emulated
+formats out (plane textures); LUTs, dither matrices and FBOs never see
+them. Hooks read raw textures themselves and cannot reconstruct, so an
+emulated plane that hooks will read goes through the existing conversion
+pass, exactly as an integer texture would.
+
+Drivers that do expose norm16 are untouched.
+
+diff --git a/video/out/gpu/ra.c b/video/out/gpu/ra.c
+index bc872c0..518d841 100644
+--- a/video/out/gpu/ra.c
++++ b/video/out/gpu/ra.c
+@@ -203,7 +203,22 @@ const struct ra_format *ra_find_unorm_format(struct ra *ra,
+         if (fmt->ctype == RA_CTYPE_UNORM && fmt->num_components == n_components &&
+             fmt->pixel_size == bytes_per_component * n_components &&
+             fmt->component_depth[0] == bytes_per_component * 8 &&
+-            fmt->linear_filter && ra_format_is_regular(fmt))
++            fmt->linear_filter && !fmt->emulated_unorm16 &&
++            ra_format_is_regular(fmt))
++            return fmt;
++    }
++    return NULL;
++}
++
++// Like ra_find_unorm_format(), but only returns emulated 16-bit unorm formats
++// (see ra_format.emulated_unorm16). Plane textures only: everything else
++// (LUTs, dither matrices, FBOs) reads the raw bytes back and would break.
++static const struct ra_format *ra_find_emulated_unorm16_format(struct ra *ra,
++                                                               int n_components)
++{
++    for (int n = 0; n < ra->num_formats; n++) {
++        const struct ra_format *fmt = ra->formats[n];
++        if (fmt->emulated_unorm16 && fmt->num_components == n_components)
+             return fmt;
+     }
+     return NULL;
+@@ -275,6 +290,13 @@ static const struct ra_format *find_plane_format(struct ra *ra, int bytes,
+         const struct ra_format *f = ra_find_unorm_format(ra, bytes, n_channels);
+         if (f)
+             return f;
++        // An emulated unorm keeps the plane filterable, so the renderer can
++        // skip the integer conversion pass it would otherwise need per plane.
++        if (bytes == 2) {
++            f = ra_find_emulated_unorm16_format(ra, n_channels);
++            if (f)
++                return f;
++        }
+         return ra_find_uint_format(ra, bytes, n_channels);
+     }
+     case MP_COMPONENT_TYPE_FLOAT:
+diff --git a/video/out/gpu/ra.h b/video/out/gpu/ra.h
+index d87b566..168f36b 100644
+--- a/video/out/gpu/ra.h
++++ b/video/out/gpu/ra.h
+@@ -115,6 +115,14 @@ struct ra_format {
+     bool storable;          // can be used for storage images
+     bool dummy_format;      // is not a real ra_format but a fake one (e.g. FBO).
+                             // dummy formats cannot be used to create textures
++    bool emulated_unorm16;  // 16-bit unorm plane format emulated on top of an
++                            // 8-bit two-channel-per-sample texture (rg8 for one
++                            // component, rgba8 for two): the shader reads the
++                            // little-endian byte pair and reconstructs
++                            // dot(lo_hi, vec2(255, 65280)) / 65535. Linear
++                            // filtering stays exact because the reconstruction
++                            // is linear. Only ra_get_imgfmt_desc hands these
++                            // out, and only when no real 16-bit unorm exists.
+ 
+     // If not 0, the format represents some sort of packed fringe format, whose
+     // shader representation is given by the special_imgfmt_desc pointer.
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index c0a1be8..2782a7c 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -1408,6 +1408,21 @@ static const char *get_tex_swizzle(struct image *img)
+     return img->tex->params.format->ordered ? "rgba" : "bgra";
+ }
+ 
++// Whether the image's texture is an emulated 16-bit unorm plane
++// (ra_format.emulated_unorm16): every sample is a (lo, hi) byte pair per
++// component that has to be reconstructed after filtering.
++static bool image_is_emulated16(struct image img)
++{
++    return img.tex && img.tex->params.format->emulated_unorm16;
++}
++
++// GLSL expression turning a raw (lo0, hi0, lo1, hi1) sample of an emulated
++// 16-bit unorm texture into (v0, v1, 0, 1), normalized like a real unorm16.
++// Linear, so it is valid on the result of any linear filter/scaler as well.
++#define EMULATED16_UNPACK(t) \
++    "vec4(dot((" t ").rg, vec2(255.0/65535.0, 65280.0/65535.0)), " \
++         "dot((" t ").ba, vec2(255.0/65535.0, 65280.0/65535.0)), 0.0, 1.0)"
++
+ // Copy a texture to the vec4 color, while increasing offset. Also applies
+ // the texture multiplier to the sampled color
+ static void copy_image(struct gl_video *p, unsigned int *offset, struct image img)
+@@ -1433,8 +1448,14 @@ static void copy_image(struct gl_video *p, unsigned int *offset, struct image im
+         img.multiplier *= 1.0 / (tex_max - 1);
+     }
+ 
+-    GLSLF("color.%s = %f * vec4(texture(texture%d, texcoord%d)).%s;\n",
+-          dst, img.multiplier, id, id, src);
++    if (image_is_emulated16(img)) {
++        GLSLF("{ vec4 raw16 = texture(texture%d, texcoord%d);\n", id, id);
++        GLSLF("  color.%s = %f * " EMULATED16_UNPACK("raw16") ".%s; }\n",
++              dst, img.multiplier, src);
++    } else {
++        GLSLF("color.%s = %f * vec4(texture(texture%d, texcoord%d)).%s;\n",
++              dst, img.multiplier, id, id, src);
++    }
+ 
+     *offset += count;
+ }
+@@ -1890,6 +1911,8 @@ static void pass_sample_separated(struct gl_video *p, struct image src,
+     sampler_prelude(p->sc, pass_bind(p, src));
+     GLSLF("// first pass\n");
+     pass_sample_separated_gen(p->sc, scaler, 0, 1);
++    if (image_is_emulated16(src))
++        GLSLF("color = " EMULATED16_UNPACK("color") ";\n");
+     GLSLF("color *= %f;\n", src.multiplier);
+     finish_pass_tex(p, &scaler->sep_fbo, src.w, h);
+ 
+@@ -1995,8 +2018,11 @@ static void pass_sample(struct gl_video *p, struct image img,
+ 
+     // Apply any required multipliers. Separated scaling already does this in
+     // its first stage
+-    if (!is_separated)
++    if (!is_separated) {
++        if (image_is_emulated16(img))
++            GLSLF("color = " EMULATED16_UNPACK("color") ";\n");
+         GLSLF("color *= %f;\n", img.multiplier);
++    }
+ 
+     // Micro-optimization: Avoid scaling unneeded channels
+     skip_unused(p, img.components);
+@@ -2225,9 +2251,17 @@ static void pass_read_video(struct gl_video *p)
+     }
+ 
+     // If any textures are still in integer format by this point, we need
+-    // to introduce an explicit conversion pass to avoid breaking hooks/scaling
++    // to introduce an explicit conversion pass to avoid breaking hooks/scaling.
++    // Emulated 16-bit planes only need it when hooks (deband, user shaders)
++    // will read them: those sample the raw texture themselves and cannot
++    // reconstruct the byte pairs. The scalers and copy_image() can, so
++    // without hooks the plane stays inline and this pass is skipped.
+     for (int n = 0; n < 4; n++) {
+-        if (img[n].tex && img[n].tex->params.format->ctype == RA_CTYPE_UINT) {
++        if (!img[n].tex)
++            continue;
++        bool integer = img[n].tex->params.format->ctype == RA_CTYPE_UINT;
++        bool emulated = image_is_emulated16(img[n]) && p->num_tex_hooks > 0;
++        if (integer || emulated) {
+             GLSLF("// use_integer fix for plane %d\n", n);
+             copy_image(p, &(int){0}, img[n]);
+             pass_describe(p, "use_integer fix");
+diff --git a/video/out/opengl/ra_gl.c b/video/out/opengl/ra_gl.c
+index 0d38f82..0773d25 100644
+--- a/video/out/opengl/ra_gl.c
++++ b/video/out/opengl/ra_gl.c
+@@ -231,8 +231,43 @@ static int ra_init_gl(struct ra *ra, GL *gl)
+ 
+     gl->Disable(GL_DITHER);
+ 
+-    if (!ra_find_unorm_format(ra, 2, 1))
++    if (!ra_find_unorm_format(ra, 2, 1)) {
+         MP_VERBOSE(ra, "16 bit UNORM textures not available.\n");
++        // GLES without GL_EXT_texture_norm16 (the low-end Mali/Adreno TV
++        // class). Without this, >8-bit planes land in integer textures, cost
++        // an extra conversion pass per plane, double the upload bytes the
++        // driver has to swizzle, and rule out dumb mode. Emulate r16/rg16 on
++        // rg8/rgba8 instead: same bytes on the wire, and the renderer
++        // reconstructs the value after (linear) filtering.
++        static const struct { const char *name, *backing; int comps; }
++            emulated[] = {{"r16", "rg8", 1}, {"rg16", "rgba8", 2}};
++        for (int i = 0; i < MP_ARRAY_SIZE(emulated); i++) {
++            const struct ra_format *backing =
++                ra_find_named_format(ra, emulated[i].backing);
++            if (!backing || !backing->linear_filter || !backing->ordered)
++                continue;
++            struct ra_format *fmt = talloc_zero(ra, struct ra_format);
++            *fmt = (struct ra_format){
++                .name             = emulated[i].name,
++                .priv             = backing->priv,
++                .ctype            = RA_CTYPE_UNORM,
++                .ordered          = true,
++                .num_components   = emulated[i].comps,
++                .pixel_size       = backing->pixel_size,
++                .linear_filter    = true,
++                .renderable       = false,
++                .storable         = false,
++                .emulated_unorm16 = true,
++            };
++            for (int c = 0; c < fmt->num_components; c++) {
++                fmt->component_size[c] = 16;
++                fmt->component_depth[c] = 16;
++            }
++            MP_TARRAY_APPEND(ra, ra->formats, ra->num_formats, fmt);
++            MP_VERBOSE(ra, "Emulating %s plane textures with %s.\n",
++                       fmt->name, emulated[i].backing);
++        }
++    }
+ 
+     return 0;
+ }

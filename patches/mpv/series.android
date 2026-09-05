@@ -3,5 +3,7 @@
 0001-vo-mediacodec-timed-surface-with-osd-plane.patch
 0002-egl-android-bt2020-pq-surface.patch
 0003-opengl-treat-gles-direct-rendering-as-slow.patch
+0004-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
+0005-demux-codec-profile-from-avcc.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
 0102-f-output-chain-wake-after-reset-harder.patch

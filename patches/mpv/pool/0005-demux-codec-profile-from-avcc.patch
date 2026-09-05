@@ -1,0 +1,85 @@
+demux: publish the H.264 profile from the container's avcC record
+
+codec-profile on the track list was decoder-supplied, so a client could
+only learn that a stream is High 10 after the decoder produced a frame.
+Per-file decode routing (a High 10 stream on hardware whose MediaCodec
+has no such profile, which fails the decoder or, on some SoCs, renders
+garbage) has to be decided in on_preloaded, before the decoder exists.
+
+Fill codec_profile at demux time from the avcC record (MKV CodecPrivate,
+MP4 stsd; profile_idc is its second byte), or from lavf's own
+codecpar->profile when it knows one. The decoder still replaces it with
+its own answer once it runs.
+
+diff --git a/common/av_common.c b/common/av_common.c
+index af72b54..a457ace 100644
+--- a/common/av_common.c
++++ b/common/av_common.c
+@@ -411,6 +411,22 @@ void mp_free_av_packet(AVPacket **pkt)
+     av_packet_free(pkt);
+ }
+ 
++// Profile name for an H.264 stream from its avcC record (MKV CodecPrivate,
++// MP4 stsd): the second byte is profile_idc. Demuxers use this to publish
++// codec_profile before any decoder ran, so a client can decide the decode
++// path at file load (e.g. route High 10 to software on hardware that has no
++// such profile) instead of after a failed hardware init. NULL if unknown.
++const char *mp_codec_profile_from_avcc(const char *codec,
++                                       const unsigned char *extradata,
++                                       int extradata_size)
++{
++    if (!codec || strcmp(codec, "h264") != 0)
++        return NULL;
++    if (!extradata || extradata_size < 2 || extradata[0] != 1)
++        return NULL;
++    return avcodec_profile_name(AV_CODEC_ID_H264, extradata[1]);
++}
++
+ void mp_codec_info_from_av(const AVCodecContext *avctx, struct mp_codec_params *c)
+ {
+     c->codec_profile = av_get_profile_name(avctx->codec, avctx->profile);
+diff --git a/common/av_common.h b/common/av_common.h
+index b019aa8..a9be9ee 100644
+--- a/common/av_common.h
++++ b/common/av_common.h
+@@ -52,5 +52,8 @@ int mp_set_avopts(struct mp_log *log, void *avobj, char **kv);
+ int mp_set_avopts_pos(struct mp_log *log, void *avobj, void *posargs, char **kv);
+ void mp_free_av_packet(AVPacket **pkt);
+ void mp_codec_info_from_av(const AVCodecContext *avctx, struct mp_codec_params *c);
++const char *mp_codec_profile_from_avcc(const char *codec,
++                                       const unsigned char *extradata,
++                                       int extradata_size);
+ 
+ #endif
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..c8644d1 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -821,6 +821,14 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+         sh->ff_index = st->index;
+         sh->codec->codec = mp_codec_from_av_codec_id(codec->codec_id);
+         sh->codec->codec_tag = codec->codec_tag;
++        if (codec->codec_type == AVMEDIA_TYPE_VIDEO) {
++            // Known before decoding for containers that carry an avcC
++            // record; a decoder later replaces it with its own answer.
++            sh->codec->codec_profile = codec->profile != AV_PROFILE_UNKNOWN
++                ? avcodec_profile_name(codec->codec_id, codec->profile)
++                : mp_codec_profile_from_avcc(sh->codec->codec, codec->extradata,
++                                             codec->extradata_size);
++        }
+         sh->codec->lav_codecpar = avcodec_parameters_alloc();
+         if (sh->codec->lav_codecpar)
+             avcodec_parameters_copy(sh->codec->lav_codecpar, codec);
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index 501d20e..167fa87 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -1700,6 +1700,8 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track)
+ 
+     sh_v->extradata = talloc_memdup(sh_v, extradata, extradata_size);
+     sh_v->extradata_size = extradata_size;
++    sh_v->codec_profile = mp_codec_profile_from_avcc(sh_v->codec, sh_v->extradata,
++                                                     sh_v->extradata_size);
+     if (!sh_v->codec) {
+         MP_WARN(demuxer, "Unknown/unsupported CodecID (%s) or missing/bad "
+                 "CodecPrivate data (track %d).\n",
