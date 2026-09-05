@@ -59,11 +59,11 @@
     },
     "libass": {
       "kind": "git",
-      "version": "0.18.3",
+      "version": "0.18.4",
       "url": "https://github.com/edde746/libass",
-      "ref": "0.18.3",
-      "commit": "76cdb2bc174828aac74a458d38a0786cb7af922d",
-      "provenance": "Tag carried over from main.swift; 0.18.3 on the edde746 fork is a lightweight tag, so the ls-remote sha IS the commit (resolved 2026-09-01 with `git ls-remote https://github.com/edde746/libass 'refs/tags/0.18.3*'`; no peeled ^{} line exists).",
+      "ref": "0.18.4",
+      "commit": "9c936772ffdaabdd9dc271ef8fc800e5b025a71b",
+      "provenance": "Resolved 2026-09-05 with `git ls-remote https://github.com/edde746/libass 'refs/tags/0.18.4*'`; the annotated tag's peeled ^{} line is the commit.",
       "platforms": [
         "apple",
         "android",
