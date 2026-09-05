@@ -8,5 +8,6 @@
 0006-sd-ass-fast-blur-and-render-threads.patch
 0007-vo-mediacodec-osd-pass-stage-timing.patch
 0008-draw-bmp-fast-libass-blend.patch
+0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
 0102-f-output-chain-wake-after-reset-harder.patch

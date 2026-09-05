@@ -1,0 +1,377 @@
+sub: run the subtitle render outside osd->lock and dec_sub->lock
+
+osd_render held osd->lock, and sub_get_bitmaps held dec_sub->lock, across
+the decoder's whole render. The playloop takes both every iteration:
+osd_set_text through update_osd_msg, and sub_read_packets plus two
+sub_control calls through update_subtitle - which write_video also gates
+queuing a frame on. On heavy typesetting a libass render is hundreds of
+milliseconds to seconds on TV hardware, so for that long no audio was
+filled and no video queued: AudioTrack underran and every frame due in
+the window was dropped (edde746/plezy#2242, Fire TV Stick 4K Max Gen 2:
+3.0 s of video took 3.8-4.0 s with 3-5 underruns per sign).
+
+Release both locks around the render. dec_sub marks the decoder as
+rendering; while it is, sub_read_packets keeps draining the demuxer but
+queues packets (copies - cached_pkts may free the originals) instead of
+decoding, defers segment switches, and never blocks; the two per-frame
+controls (video params, animated check) are plain field writes and are
+stashed. Everything else that touches sd (reset, select, redecode,
+preload, get_text, get_times, other controls, a second get_bitmaps)
+waits on a condition, and the render applies the queue in order when it
+returns. osd marks the subtitle object as busy while its dec_sub is
+rendering with osd->lock released; osd_set_sub (the caller destroys the
+old dec_sub right after) and osd_free wait for it, and a second renderer
+of a subtitle object waits too, keeping today's serialization.
+
+Same device, same sign at 1080p: 3.0 s of video in 3.0 s, 0 underruns,
+0 VO drops; a seek or stop that lands inside a render waits for it once
+(1-2 s worst case), as before. ThreadSanitizer on a host build driving
+random seeks, track switches, visibility, overrides, sub-reload and
+loadfile-replace against Ex1/Ex2 with the render on the VO thread
+reports nothing. The sign is still late by the render time; that is
+libass cost, and no longer the player's.
+
+diff --git a/sub/dec_sub.c b/sub/dec_sub.c
+index 118221a..d60da5c 100644
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -73,6 +73,23 @@ struct dec_sub {
+     double last_vo_pts;
+     struct sd *sd;
+ 
++    // sub_get_bitmaps runs the decoder's render (libass, seconds on heavy
++    // typesetting on TV hardware) with the lock released, so the playloop's
++    // per-frame calls do not stall behind it. While it runs, nothing else
++    // may touch sd: mutations queue here and are applied when it returns.
++    bool rendering;
++    mp_cond render_done;
++    // Packets read during a render, not yet handed to the decoder (copies;
++    // cached_pkts owns the originals and may free them meanwhile).
++    struct demux_packet **pending_pkts;
++    int num_pending_pkts;
++    // The two per-frame controls the playloop sends; plain field writes in
++    // the decoder, so they just wait for the render to end.
++    bool have_pending_video_params;
++    struct mp_image_params pending_video_params;
++    bool have_pending_animated_check;
++    bool pending_animated_check;
++
+     struct demux_packet *new_segment;
+     struct demux_packet **cached_pkts;
+     int cached_pkt_pos;
+@@ -137,6 +154,38 @@ static void destroy_cached_pkts(struct dec_sub *sub)
+     sub->num_cached_pkts = 0;
+ }
+ 
++// Called locked. Block until no render holds the decoder. Every caller that
++// reads or mutates sd while a render may be in flight goes through this;
++// the exceptions are sub_read_packets and the two per-frame controls, which
++// defer instead so the playloop never waits on libass.
++static void wait_render_done(struct dec_sub *sub)
++{
++    while (sub->rendering)
++        mp_cond_wait(&sub->render_done, &sub->lock);
++}
++
++// Called locked, not rendering. Hand the decoder everything that queued up
++// while it was busy, in arrival order.
++static void apply_pending(struct dec_sub *sub)
++{
++    mp_assert(!sub->rendering);
++    for (int n = 0; n < sub->num_pending_pkts; n++) {
++        sub->sd->driver->decode(sub->sd, sub->pending_pkts[n]);
++        demux_packet_pool_push(sub->packet_pool, sub->pending_pkts[n]);
++    }
++    sub->num_pending_pkts = 0;
++    if (sub->have_pending_video_params && sub->sd->driver->control) {
++        sub->sd->driver->control(sub->sd, SD_CTRL_SET_VIDEO_PARAMS,
++                                 &sub->pending_video_params);
++    }
++    sub->have_pending_video_params = false;
++    if (sub->have_pending_animated_check && sub->sd->driver->control) {
++        sub->sd->driver->control(sub->sd, SD_CTRL_SET_ANIMATED_CHECK,
++                                 &sub->pending_animated_check);
++    }
++    sub->have_pending_animated_check = false;
++}
++
+ void sub_destroy(struct dec_sub *sub)
+ {
+     if (!sub)
+@@ -147,6 +196,7 @@ void sub_destroy(struct dec_sub *sub)
+         sub->sd->driver->uninit(sub->sd);
+     }
+     talloc_free(sub->sd);
++    mp_cond_destroy(&sub->render_done);
+     mp_mutex_destroy(&sub->lock);
+     talloc_free(sub);
+ }
+@@ -209,6 +259,7 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+     sub->opts = sub->opts_cache->opts;
+     sub->shared_opts = sub->shared_opts_cache->opts;
+     mp_mutex_init(&sub->lock);
++    mp_cond_init(&sub->render_done);
+ 
+     sub->sd = init_decoder(sub);
+     if (sub->sd) {
+@@ -261,6 +312,7 @@ bool sub_can_preload(struct dec_sub *sub)
+ void sub_preload(struct dec_sub *sub)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+ 
+     struct mp_dispatch_queue *demux_waiter = mp_dispatch_create(NULL);
+     demux_set_stream_wakeup_cb(sub->sh, wakeup_demux, demux_waiter);
+@@ -338,16 +390,25 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+ {
+     *packets_read = true;
+     mp_mutex_lock(&sub->lock);
++    // A render in flight owns sd: keep pulling packets off the demuxer (they
++    // are only queued), but hand nothing to the decoder and switch no
++    // segment until it returns. Never block the playloop here.
++    bool rendering = sub->rendering;
+     video_pts = pts_to_subtitle(sub, video_pts);
+     while (1) {
+         bool read_more = true;
+-        if (sub->sd->driver->accepts_packet)
++        if (sub->sd->driver->accepts_packet) {
++            if (rendering)
++                break;
+             read_more = sub->sd->driver->accepts_packet(sub->sd, video_pts);
++        }
+ 
+         if (!read_more)
+             break;
+ 
+-        if (sub->new_segment && sub->new_segment->start < video_pts) {
++        if (sub->new_segment && sub->new_segment->start < video_pts &&
++            !rendering)
++        {
+             sub->last_vo_pts = video_pts;
+             update_segment(sub);
+         }
+@@ -381,12 +442,20 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+         if (is_new_segment(sub, pkt)) {
+             sub->new_segment = demux_copy_packet(sub->packet_pool, pkt);
+             // Note that this can be delayed to a much later point in time.
+-            update_segment(sub);
++            if (!rendering)
++                update_segment(sub);
+             break;
+         }
+ 
+-        if (!(sub->preload_attempted && sub->sd->preload_ok))
+-            sub->sd->driver->decode(sub->sd, pkt);
++        if (!(sub->preload_attempted && sub->sd->preload_ok)) {
++            if (rendering) {
++                // cached_pkts may free this packet before the render ends.
++                MP_TARRAY_APPEND(sub, sub->pending_pkts, sub->num_pending_pkts,
++                                 demux_copy_packet(sub->packet_pool, pkt));
++            } else {
++                sub->sd->driver->decode(sub->sd, pkt);
++            }
++        }
+     }
+     if (sub->cached_pkts && sub->num_cached_pkts) {
+         bool visible = is_packet_visible(sub->cached_pkts[sub->cached_pkt_pos], video_pts);
+@@ -401,6 +470,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+ void sub_redecode_cached_packets(struct dec_sub *sub)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+     int index = sub->cached_pkt_pos;
+     while (index < sub->num_cached_pkts) {
+         sub->sd->driver->decode(sub->sd, sub->cached_pkts[index]);
+@@ -410,10 +480,18 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
+ }
+ 
+ // Unref sub_bitmaps.rc to free the result. May return NULL.
++//
++// The decoder's render runs with the lock released: on heavy typesetting
++// it is the one call here that takes seconds, and holding the lock across
++// it parks the playloop (which needs the lock every frame for
++// sub_read_packets and two controls) - no audio fill, no video, until the
++// render returns. sd is exclusively the renderer's meanwhile; see
++// wait_render_done / apply_pending for how everything else keeps out.
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+                                     int format, double pts)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+ 
+     pts = pts_to_subtitle(sub, pts);
+ 
+@@ -424,7 +502,18 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+ 
+     if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
+         sub->sd->driver->get_bitmaps)
+-        res = sub->sd->driver->get_bitmaps(sub->sd, dim, format, pts);
++    {
++        struct sd *sd = sub->sd;
++        sub->rendering = true;
++        mp_mutex_unlock(&sub->lock);
++
++        res = sd->driver->get_bitmaps(sd, dim, format, pts);
++
++        mp_mutex_lock(&sub->lock);
++        sub->rendering = false;
++        apply_pending(sub);
++        mp_cond_broadcast(&sub->render_done);
++    }
+ 
+     mp_mutex_unlock(&sub->lock);
+     return res;
+@@ -434,6 +523,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+     char *text = NULL;
+ 
+     pts = pts_to_subtitle(sub, pts);
+@@ -464,6 +554,7 @@ done:
+ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+     struct sd_times res = { .start = MP_NOPTS_VALUE, .end = MP_NOPTS_VALUE };
+ 
+     pts = pts_to_subtitle(sub, pts);
+@@ -481,6 +572,7 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+ void sub_reset(struct dec_sub *sub)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+     if (sub->sd->driver->reset)
+         sub->sd->driver->reset(sub->sd);
+     sub->last_pkt_pts = MP_NOPTS_VALUE;
+@@ -494,6 +586,7 @@ void sub_reset(struct dec_sub *sub)
+ void sub_select(struct dec_sub *sub, bool selected)
+ {
+     mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
+     if (sub->sd->driver->select)
+         sub->sd->driver->select(sub->sd, selected);
+     mp_mutex_unlock(&sub->lock);
+@@ -503,6 +596,22 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
+ {
+     int r = CONTROL_UNKNOWN;
+     mp_mutex_lock(&sub->lock);
++    // The playloop sends these two every frame; they are plain field writes
++    // in the decoder, so while a render owns sd they just wait their turn
++    // (apply_pending) instead of stalling the caller on libass.
++    if (sub->rendering && cmd == SD_CTRL_SET_VIDEO_PARAMS) {
++        sub->pending_video_params = *(struct mp_image_params *)arg;
++        sub->have_pending_video_params = true;
++        mp_mutex_unlock(&sub->lock);
++        return CONTROL_OK;
++    }
++    if (sub->rendering && cmd == SD_CTRL_SET_ANIMATED_CHECK) {
++        sub->pending_animated_check = *(bool *)arg;
++        sub->have_pending_animated_check = true;
++        mp_mutex_unlock(&sub->lock);
++        return CONTROL_OK;
++    }
++    wait_render_done(sub);
+     bool propagate = false;
+     switch (cmd) {
+     case SD_CTRL_SET_VIDEO_DEF_FPS:
+diff --git a/sub/osd.c b/sub/osd.c
+index 2788897..8c1d392 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -167,6 +167,7 @@ struct osd_state *osd_create(struct mpv_global *global)
+         .stats = stats_ctx_create(osd, global, "osd"),
+     };
+     mp_mutex_init(&osd->lock);
++    mp_cond_init(&osd->sub_render_done);
+     osd->opts = osd->opts_cache->opts;
+ 
+     for (int n = 0; n < MAX_OSD_PARTS; n++) {
+@@ -186,12 +187,25 @@ struct osd_state *osd_create(struct mpv_global *global)
+     return osd;
+ }
+ 
++// Called locked. Block while a subtitle object is rendering with the lock
++// released; callers that change which dec_sub an object points at (or free
++// the whole state) must not overtake that render.
++static void wait_sub_render_done(struct osd_state *osd)
++{
++    while (osd->sub_render_busy)
++        mp_cond_wait(&osd->sub_render_done, &osd->lock);
++}
++
+ void osd_free(struct osd_state *osd)
+ {
+     if (!osd)
+         return;
++    mp_mutex_lock(&osd->lock);
++    wait_sub_render_done(osd);
++    mp_mutex_unlock(&osd->lock);
+     osd_destroy_backend(osd);
+     talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
++    mp_cond_destroy(&osd->sub_render_done);
+     mp_mutex_destroy(&osd->lock);
+     talloc_free(osd);
+ }
+@@ -214,6 +228,9 @@ void osd_set_text(struct osd_state *osd, const char *text)
+ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+ {
+     mp_mutex_lock(&osd->lock);
++    // The caller destroys the previous dec_sub right after this returns;
++    // a render still holding it must finish first.
++    wait_sub_render_done(osd);
+     if (index >= 0 && index < 2) {
+         struct osd_object *obj = osd->objs[OSDTYPE_SUB + index];
+         obj->sub = dec_sub;
+@@ -324,12 +341,28 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+ 
+     check_obj_resize(osd, osdres, obj);
+ 
+-    if (obj->type == OSDTYPE_SUB) {
+-        if (obj->sub && sub_is_primary_visible(obj->sub))
+-            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
+-    } else if (obj->type == OSDTYPE_SUB2) {
+-        if (obj->sub && sub_is_secondary_visible(obj->sub))
+-            res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
++    if (obj->type == OSDTYPE_SUB || obj->type == OSDTYPE_SUB2) {
++        // Only one subtitle render at a time, and nobody swaps obj->sub
++        // under it (osd_set_sub waits on the same flag).
++        wait_sub_render_done(osd);
++        struct dec_sub *sub = obj->sub;
++        bool visible = sub && (obj->type == OSDTYPE_SUB ? sub_is_primary_visible(sub)
++                                                       : sub_is_secondary_visible(sub));
++        if (visible) {
++            // The libass render inside is the one expensive step of the OSD
++            // pass, and the playloop touches this lock every iteration
++            // (osd_set_text). Holding it across seconds of rendering starves
++            // audio and video; the render needs nothing from osd_state.
++            struct mp_osd_res vo_res = obj->vo_res;
++            osd->sub_render_busy = true;
++            mp_mutex_unlock(&osd->lock);
++
++            res = sub_get_bitmaps(sub, vo_res, format, video_pts);
++
++            mp_mutex_lock(&osd->lock);
++            osd->sub_render_busy = false;
++            mp_cond_broadcast(&osd->sub_render_done);
++        }
+     } else if (obj->type == OSDTYPE_EXTERNAL2) {
+         if (obj->external2 && obj->external2->format) {
+             res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
+diff --git a/sub/osd_state.h b/sub/osd_state.h
+index ef0ff20..1f8a8f9 100644
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -70,6 +70,11 @@ struct osd_state {
+ 
+     struct osd_object *objs[MAX_OSD_PARTS];
+ 
++    // A subtitle object is being rendered with the lock released (see
++    // render_object). objs[]->sub must not change while set.
++    bool sub_render_busy;
++    mp_cond sub_render_done;
++
+     bool render_subs_in_filter;
+     _Atomic double force_video_pts;
+ 
