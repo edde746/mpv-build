@@ -10,3 +10,4 @@
 0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
 0102-f-output-chain-wake-after-reset-harder.patch
+0010-player-pending-vid-property.patch

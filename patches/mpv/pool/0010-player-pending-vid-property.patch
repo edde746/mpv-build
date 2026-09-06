@@ -1,0 +1,102 @@
+player: publish the video track playback will select as pending-vid
+
+Inside the on_preloaded hook the track list is complete but nothing is
+selected yet: select_default_track runs right after the hook, and until
+playback is initialized the vid property answers with the option value,
+which is "auto" for every ordinary session. A client that must decide
+per-file decode routing inside the hook, before the decoder exists (High
+10 to software decode on hardware without that profile, Dolby Vision P5
+reshaping), cannot tell which of several video tracks it is deciding for
+and falls back to the first demuxed one -- wrong for attached pictures,
+dual-angle files, a default-flagged second track, --vlang, or an explicit
+vid=N.
+
+Add a read-only pending-vid property: before playback initializes it runs
+the same selection the player is about to run (honouring --no-stream-auto-sel
+and vid=no, with no side effects on the tracks), and afterwards it reports
+the selected track like vid. "no" when none will be selected, unavailable
+without a file.
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 24f9d7a..25b42c1 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -3551,6 +3551,16 @@ Property list
+     If tracks of the requested type are selected via ``--lavfi-complex``, the
+     first one is returned.
+ 
++``pending-vid``
++    The ID of the video track playback will select, or ``no``. Unlike ``vid``,
++    which returns the option value (``auto`` as often as not) until playback
++    is initialized, this is answered before the track is selected: inside the
++    ``on_preloaded`` hook it runs the same default selection the player runs
++    right after the hook, so a hook that decides per-file decode routing
++    before the decoder exists knows which track it is deciding for. Once
++    playback is initialized it returns the selected track, like ``vid``.
++    Unavailable when no file is loaded.
++
+ ``chapter-list`` (RW)
+     List of chapters, current entry marked.
+ 
+diff --git a/player/command.c b/player/command.c
+index 96bc06a..e75d144 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2314,6 +2314,38 @@ static int mp_property_hwdec_current(void *ctx, struct m_property *prop,
+     return m_property_strdup_ro(action, arg, current);
+ }
+ 
++// The video track playback will select, readable before it is selected.
++// Inside on_preloaded the track list is complete but no track is selected
++// yet (vid still answers with the option value, "auto" as often as not), so
++// a hook that must decide per-file decode routing before the decoder exists
++// cannot tell which track the routing is for. This runs the same selection
++// the player runs right after the hook, with no side effects. Once playback
++// is initialized it reports the selected track. "no" when none will be.
++static int mp_property_pending_vid(void *ctx, struct m_property *prop,
++                                   int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct MPOpts *opts = mpctx->opts;
++    struct track *track;
++
++    if (mpctx->playback_initialized) {
++        track = mpctx->current_track[0][STREAM_VIDEO];
++    } else {
++        if (!mpctx->demuxer)
++            return M_PROPERTY_UNAVAILABLE;
++        track = NULL;
++        if (opts->stream_auto_sel && opts->stream_id[0][STREAM_VIDEO] != -2)
++            track = select_default_track(mpctx, 0, STREAM_VIDEO);
++    }
++
++    if (!track)
++        return m_property_strdup_ro(action, arg, "no");
++    char *id = talloc_asprintf(NULL, "%d", track->user_tid);
++    int r = m_property_strdup_ro(action, arg, id);
++    talloc_free(id);
++    return r;
++}
++
+ static int mp_property_hwdec_interop(void *ctx, struct m_property *prop,
+                                      int action, void *arg)
+ {
+@@ -4463,6 +4495,7 @@ static const struct m_property mp_properties_base[] = {
+     {"estimated-vf-fps", mp_property_vf_fps},
+     {"video-aspect-override", mp_property_video_aspect_override},
+     {"vid", mp_property_switch_track, .priv = (void *)(const int[]){0, STREAM_VIDEO}},
++    {"pending-vid", mp_property_pending_vid},
+     {"hwdec-current", mp_property_hwdec_current},
+     {"hwdec-interop", mp_property_hwdec_interop},
+ 
+@@ -4578,8 +4611,8 @@ static const char *const *const mp_event_property_change[] = {
+     E(MPV_EVENT_END_FILE, "*"),
+     E(MPV_EVENT_FILE_LOADED, "*"),
+     E(MP_EVENT_CHANGE_ALL, "*"),
+-    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks"),
+-    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks"),
++    E(MP_EVENT_TRACKS_CHANGED, "track-list", "current-tracks", "pending-vid"),
++    E(MP_EVENT_TRACK_SWITCHED, "track-list", "current-tracks", "pending-vid"),
+     E(MPV_EVENT_IDLE, "*"),
+     E(MPV_EVENT_TICK, "time-pos", "audio-pts", "stream-pos", "avsync",
+       "percent-pos", "time-remaining", "playtime-remaining", "playback-time",
