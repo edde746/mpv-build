@@ -142,6 +142,11 @@ patches or source pins, move the old `platforms/android/deps` and
 An obsolete prebuilt-only `deps/libdovi` is explicitly rejected. Use a fresh
 build before packaging; changing patch files does not update installed binaries.
 
+Run the host-side MediaCodec timing regression with
+`bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
+It extracts the production timing core from its patch and covers cadence
+prediction, refresh hysteresis, clock drift, and reset boundaries without a device.
+
 ## Make demo app using the local build version
 
 If you want the demo app to use the local build version, you need to modify `Package.swift` to reference the local build xcframework file.

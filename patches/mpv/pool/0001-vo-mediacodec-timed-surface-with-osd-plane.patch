@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..1961c4e
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,778 @@
+@@ -0,0 +1,894 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -95,6 +95,7 @@ index 0000000..1961c4e
 +
 +#include <dlfcn.h>
 +#include <math.h>
++#include <stdbool.h>
 +#include <time.h>
 +#include <stdint.h>
 +
@@ -118,6 +119,100 @@ index 0000000..1961c4e
 +#include "video/mp_image.h"
 +#include "vo.h"
 +
++// --- mediacodec timing core
++
++struct mediacodec_timing {
++    uint64_t frame_id;
++    int64_t target_ns;
++    double frame_duration_ns;
++    int64_t vsync_hysteresis_offset_ns;
++};
++
++static void mediacodec_timing_reset(struct mediacodec_timing *timing)
++{
++    *timing = (struct mediacodec_timing){0};
++}
++
++static int64_t mediacodec_timing_predict(struct mediacodec_timing *timing,
++                                        int64_t raw_target_ns, uint64_t frame_id,
++                                        double frame_duration_ns)
++{
++    if (!frame_id || !isfinite(frame_duration_ns) || frame_duration_ns <= 0) {
++        mediacodec_timing_reset(timing);
++        return raw_target_ns;
++    }
++
++    int64_t target_ns = raw_target_ns;
++    bool predicted = false;
++    if (timing->frame_id && frame_id > timing->frame_id &&
++        fabs(frame_duration_ns - timing->frame_duration_ns) <= 1000000.0)
++    {
++        // vo_frame.duration already accounts for playback speed. The ID gap
++        // includes frames dropped by the VO, unlike a local frame counter.
++        double elapsed_ns = (frame_id - timing->frame_id) * frame_duration_ns;
++        // Bound the conversion and addition even after a very large ID gap.
++        if (elapsed_ns < 0x1p63) {
++            int64_t elapsed = (int64_t)elapsed_ns;
++            if (timing->target_ns <= INT64_MAX - elapsed) {
++                int64_t candidate = timing->target_ns + elapsed;
++                uint64_t deviation = candidate >= raw_target_ns
++                    ? (uint64_t)candidate - (uint64_t)raw_target_ns
++                    : (uint64_t)raw_target_ns - (uint64_t)candidate;
++                if (deviation <= 20000000) {
++                    target_ns = candidate;
++                    predicted = true;
++                }
++            }
++        }
++    }
++
++    if (!predicted)
++        mediacodec_timing_reset(timing);
++    timing->frame_id = frame_id;
++    timing->target_ns = target_ns;
++    timing->frame_duration_ns = frame_duration_ns;
++    return target_ns;
++}
++
++static int64_t mediacodec_timing_snap(struct mediacodec_timing *timing,
++                                     int64_t target_ns, int64_t sample_ns,
++                                     int64_t period_ns)
++{
++    if (period_ns <= 0) {
++        timing->vsync_hysteresis_offset_ns = 0;
++        return target_ns;
++    }
++
++    int64_t delta = target_ns - sample_ns;
++    int64_t count = delta / period_ns;
++    if (delta < 0 && delta % period_ns)
++        count--;
++    int64_t before = sample_ns + count * period_ns;
++    int64_t after = before + period_ns;
++    int64_t before_diff = target_ns - before;
++    int64_t after_diff = after - target_ns;
++    int64_t diff = after_diff >= before_diff
++                 ? after_diff - before_diff : before_diff - after_diff;
++
++    // Media3 1.11: retain the last ambiguous choice across clear matches
++    // (e.g. 60 fps on 90 Hz), but clear it in the intervening range.
++    if (diff < period_ns / 2) {
++        int64_t range = period_ns / 4;
++        if (diff < range) {
++            if (!timing->vsync_hysteresis_offset_ns)
++                timing->vsync_hysteresis_offset_ns =
++                    after_diff < before_diff ? -range : range;
++        } else {
++            timing->vsync_hysteresis_offset_ns = 0;
++        }
++    }
++
++    return after_diff + timing->vsync_hysteresis_offset_ns < before_diff
++         ? after : before;
++}
++
++// --- end mediacodec timing core
++
 +typedef AChoreographer *(*mp_get_choreographer_fn)(void);
 +typedef void (*mp_post_frame_callback_fn)(
 +    AChoreographer *, AChoreographer_frameCallback, void *);
@@ -131,6 +226,8 @@ index 0000000..1961c4e
 +struct priv {
 +    struct mp_image *cur_image;
 +    int64_t cur_pts; // mp_time_ns() display time, 0 = immediately
++    uint64_t cur_frame_id;
++    double cur_duration;
 +    double osd_pts;
 +
 +    struct mp_hwdec_ctx hwctx;
@@ -168,6 +265,7 @@ index 0000000..1961c4e
 +    int64_t vsync_sample; // CLOCK_MONOTONIC
 +
 +    // VO thread only
++    struct mediacodec_timing timing;
 +    int64_t queue_period;
 +    int64_t queue_period_changed;
 +    int64_t queue_offset;
@@ -437,7 +535,7 @@ index 0000000..1961c4e
 +static int64_t display_period(struct vo *vo)
 +{
 +    double period = vo_get_vsync_interval(vo);
-+    if (period < 1e9 / 240.0 || period > 1e9 / 20.0)
++    if (!isfinite(period) || period < 1e9 / 240.0 || period > 1e9 / 20.0)
 +        return 0;
 +    return llround(period);
 +}
@@ -451,6 +549,7 @@ index 0000000..1961c4e
 +    int64_t period = display_period(vo);
 +
 +    if (period != p->queue_period) {
++        mediacodec_timing_reset(&p->timing);
 +        p->queue_period = period;
 +        p->queue_period_changed = mono_now;
 +    }
@@ -467,37 +566,40 @@ index 0000000..1961c4e
 +    }
 +}
 +
-+static int64_t closest_vsync(int64_t target, int64_t sample, int64_t period)
-+{
-+    int64_t delta = target - sample;
-+    int64_t count = delta / period;
-+    if (delta < 0 && delta % period)
-+        count--;
-+    int64_t before = sample + count * period;
-+    int64_t after = before + period;
-+    return target - before <= after - target ? before : after;
-+}
-+
-+// Like ExoPlayer: snap to the nearest vsync and release 80% of a period
-+// before it, so SurfaceView latches on that vsync and not its neighbours.
++// Stabilize frame cadence, then snap with hysteresis and release 80% of a
++// period before the chosen vsync so SurfaceView can latch the buffer in time.
 +static struct release_target get_release_target(struct vo *vo, int64_t pts)
 +{
 +    struct priv *p = vo->priv;
 +    struct release_target result = {0};
-+    if (pts <= 0)
++    if (pts <= 0) {
++        mediacodec_timing_reset(&p->timing);
 +        return result;
++    }
 +
 +    int64_t mono_now = monotonic_now_ns();
-+    int64_t target = mp_time_to_monotonic_ns(pts);
-+    if (mono_now <= 0 || target <= mono_now ||
-+        target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
++    int64_t raw_target = mp_time_to_monotonic_ns(pts);
++    if (mono_now <= 0 || raw_target <= mono_now ||
++        raw_target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
++    {
++        mediacodec_timing_reset(&p->timing);
 +        return result;
++    }
++
++    int64_t target = mediacodec_timing_predict(
++        &p->timing, raw_target, p->cur_frame_id, p->cur_duration);
++    if (target <= mono_now || target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS) {
++        // A valid raw deadline must not become late or out of range solely
++        // because of cadence correction.
++        mediacodec_timing_reset(&p->timing);
++        target = raw_target;
++    }
 +
 +    if (p->queue_period > 0) {
 +        int64_t sample = read_vsync_sample(p);
 +        if (vsync_sample_is_fresh(p, sample, mono_now)) {
-+            int64_t snapped =
-+                closest_vsync(target, sample, p->queue_period);
++            int64_t snapped = mediacodec_timing_snap(
++                &p->timing, target, sample, p->queue_period);
 +            int64_t release = snapped - p->queue_period * 8 / 10;
 +            if (release > mono_now &&
 +                release <= mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
@@ -510,7 +612,7 @@ index 0000000..1961c4e
 +    if (!result.timestamp)
 +        result.timestamp = target;
 +
-+    result.osd_deadline = pts + result.timestamp - target;
++    result.osd_deadline = pts + (result.timestamp - raw_target);
 +    return result;
 +}
 +
@@ -725,6 +827,10 @@ index 0000000..1961c4e
 +        mp_image_unrefp(&p->cur_image);
 +        p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
 +        p->cur_pts = frame->pts;
++        p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
++        p->cur_duration = p->cur_image ? frame->duration : 0;
++        if (!p->cur_image)
++            mediacodec_timing_reset(&p->timing);
 +        p->osd_pts = p->cur_image ? p->cur_image->pts : MP_NOPTS_VALUE;
 +    }
 +
@@ -734,8 +840,10 @@ index 0000000..1961c4e
 +static void flip_page(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
-+    struct release_target target =
-+        get_release_target(vo, p->cur_image ? p->cur_pts : 0);
++    struct release_target target = {0};
++    // Repeats and OSD redraws have no new codec buffer or cadence sample.
++    if (p->cur_image)
++        target = get_release_target(vo, p->cur_pts);
 +
 +    draw_osd(vo, target.osd_deadline);
 +
@@ -748,6 +856,8 @@ index 0000000..1961c4e
 +            : av_mediacodec_release_buffer(buffer, 1);
 +    mp_image_unrefp(&p->cur_image);
 +    p->cur_pts = 0;
++    p->cur_frame_id = 0;
++    p->cur_duration = 0;
 +
 +    if (ret < 0)
 +        MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
@@ -765,6 +875,9 @@ index 0000000..1961c4e
 +    case VOCTRL_RESET:
 +        mp_image_unrefp(&p->cur_image);
 +        p->cur_pts = 0;
++        p->cur_frame_id = 0;
++        p->cur_duration = 0;
++        mediacodec_timing_reset(&p->timing);
 +        p->osd_pts = MP_NOPTS_VALUE;
 +        invalidate_osd(vo);
 +        return VO_TRUE;
@@ -778,6 +891,9 @@ index 0000000..1961c4e
 +    struct priv *p = vo->priv;
 +    mp_image_unrefp(&p->cur_image);
 +    p->cur_pts = 0;
++    p->cur_frame_id = 0;
++    p->cur_duration = 0;
++    mediacodec_timing_reset(&p->timing);
 +    p->osd_pts = MP_NOPTS_VALUE;
 +    invalidate_osd(vo);
 +

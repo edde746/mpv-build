@@ -66,6 +66,9 @@ jobs:
       - name: Test AVFoundation PiP frame-space OSD
         run: ./scripts/test_avf_pip_frame_space_osd.sh
 
+      - name: Test MediaCodec timing cadence
+        run: bash ./scripts/test_mediacodec_timing.sh
+
       - name: Test patch framework
         run: ./scripts/test_patches.sh
 
