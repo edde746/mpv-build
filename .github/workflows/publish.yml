@@ -69,6 +69,9 @@ jobs:
       - name: Test MediaCodec timing cadence
         run: bash ./scripts/test_mediacodec_timing.sh
 
+      - name: Test MediaCodec subtitle geometry
+        run: bash ./scripts/test_mediacodec_geometry.sh
+
       - name: Test patch framework
         run: ./scripts/test_patches.sh
 

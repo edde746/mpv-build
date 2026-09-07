@@ -2,7 +2,7 @@ diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
 index 814e1e4..68495bc 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
-@@ -723,6 +723,23 @@ Available video output drivers are:
+@@ -723,6 +723,30 @@ Available video output drivers are:
          :yes:   Attempt to enable VRR, whether the capability is reported or not.
          :auto:  Attempt to enable VRR if support is reported.
  
@@ -22,6 +22,13 @@ index 814e1e4..68495bc 100644
 +    must be stacked above the video. Since decoded buffers go straight to the
 +    system compositor, the decoder's dataspace (HDR) is preserved and no GPU
 +    pass runs, but video filters and screenshots are unavailable.
++
++    ``--vo-mediacodec-video-rect=<vw>,<vh>,<left>,<top>,<right>,<bottom>``
++    supplies the applied video rectangle relative to the full OSD view.
++    The six signed decimal integers are updated atomically at runtime.
++    Viewport dimensions must be positive and right/bottom are exclusive;
++    negative margins are supported for zoom. Empty (the default) means that
++    geometry is unavailable. Invalid updates retain the last valid geometry.
 +
  ``mediacodec_embed`` (Android)
      Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
@@ -63,7 +70,7 @@ new file mode 100644
 index 0000000..1961c4e
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,894 @@
+@@ -0,0 +1,1077 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -94,6 +101,7 @@ index 0000000..1961c4e
 + */
 +
 +#include <dlfcn.h>
++#include <limits.h>
 +#include <math.h>
 +#include <stdbool.h>
 +#include <time.h>
@@ -110,6 +118,7 @@ index 0000000..1961c4e
 +
 +#include "common/common.h"
 +#include "misc/jni.h"
++#include "options/m_config_core.h"
 +#include "options/m_option.h"
 +#include "osdep/threads.h"
 +#include "osdep/timer.h"
@@ -223,6 +232,110 @@ index 0000000..1961c4e
 +typedef void (*mp_post_frame_callback_delayed64_fn)(
 +    AChoreographer *, AChoreographer_frameCallback64, void *, uint32_t);
 +
++// --- mediacodec geometry core
++
++struct mediacodec_geometry {
++    int viewport_w, viewport_h;
++    struct mp_rect video;
++};
++
++// Strict, allocation-free parsing. Do not publish any part of an invalid tuple.
++static bool mediacodec_geometry_parse(const char *text,
++                                      struct mediacodec_geometry *out)
++{
++    struct mediacodec_geometry next = {0};
++    if (text && text[0]) {
++        int values[6];
++        for (int n = 0; n < 6; n++) {
++            bool negative = *text == '-';
++            if (*text == '-' || *text == '+')
++                text++;
++            if (*text < '0' || *text > '9')
++                return false;
++            int64_t value = 0;
++            do {
++                value = value * 10 + (*text++ - '0');
++                if (value > (int64_t)INT_MAX + negative)
++                    return false;
++            } while (*text >= '0' && *text <= '9');
++            values[n] = negative ? -value : value;
++            if (n < 5 ? *text++ != ',' : *text != '\0')
++                return false;
++        }
++        if (values[0] <= 0 || values[1] <= 0 ||
++            values[4] <= values[2] || values[5] <= values[3])
++            return false;
++        next = (struct mediacodec_geometry){
++            values[0], values[1],
++            {values[2], values[3], values[4], values[5]},
++        };
++    }
++    *out = next;
++    return true;
++}
++
++static bool mediacodec_geometry_equal(struct mediacodec_geometry a,
++                                      struct mediacodec_geometry b)
++{
++    return a.viewport_w == b.viewport_w && a.viewport_h == b.viewport_h &&
++           a.video.x0 == b.video.x0 && a.video.y0 == b.video.y0 &&
++           a.video.x1 == b.video.x1 && a.video.y1 == b.video.y1;
++}
++
++static int64_t mediacodec_scale_edge(int edge, int size, int reference)
++{
++    int64_t scaled = (int64_t)edge * size;
++    // Round signed edges, not margins or video size, to the nearest pixel.
++    return (scaled + (scaled < 0 ? -reference / 2 : reference / 2)) / reference;
++}
++
++static struct mp_osd_res mediacodec_osd_geometry(
++    struct mediacodec_geometry geometry, int w, int h)
++{
++    struct mp_osd_res res = {.w = w, .h = h, .display_par = 1};
++    if (!geometry.viewport_w || !geometry.viewport_h || w <= 0 || h <= 0)
++        return res;
++
++    // The two buffer dimensions can have different even-rounding errors.
++    int64_t left = mediacodec_scale_edge(geometry.video.x0, w, geometry.viewport_w);
++    int64_t right = mediacodec_scale_edge(geometry.video.x1, w, geometry.viewport_w);
++    int64_t top = mediacodec_scale_edge(geometry.video.y0, h, geometry.viewport_h);
++    int64_t bottom = mediacodec_scale_edge(geometry.video.y1, h, geometry.viewport_h);
++    // Keep libass/mpv's signed-int canvas arithmetic representable. A tiny
++    // rectangle may also collapse at reduced OSD resolution; use the safe canvas.
++    if (left < INT_MIN || left > INT_MAX || w - right < INT_MIN ||
++        w - right > INT_MAX || top < INT_MIN || top > INT_MAX ||
++        h - bottom < INT_MIN || h - bottom > INT_MAX ||
++        w - left > INT_MAX || h - top > INT_MAX ||
++        right <= left || right - left > INT_MAX ||
++        bottom <= top || bottom - top > INT_MAX ||
++        right < INT_MIN || right > INT_MAX ||
++        bottom < INT_MIN || bottom > INT_MAX)
++        return res;
++    res.ml = left;
++    res.mr = w - right;
++    res.mt = top;
++    res.mb = h - bottom;
++    return res;
++}
++
++// --- end mediacodec geometry core
++
++struct mediacodec_opts {
++    char *video_rect;
++};
++
++#define OPT_BASE_STRUCT struct mediacodec_opts
++static const struct m_sub_options mediacodec_conf = {
++    .opts = (const struct m_option[]){
++        {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
++        {0},
++    },
++    .size = sizeof(struct mediacodec_opts),
++    .defaults = &(const struct mediacodec_opts){.video_rect = ""},
++};
++#undef OPT_BASE_STRUCT
++
 +struct priv {
 +    struct mp_image *cur_image;
 +    int64_t cur_pts; // mp_time_ns() display time, 0 = immediately
@@ -248,6 +361,7 @@ index 0000000..1961c4e
 +    int64_t osd_request_deadline; // mp_time_ns(), 0 = post immediately
 +    uint64_t osd_epoch;
 +    uint64_t osd_request_epoch;
++    struct mediacodec_geometry osd_geometry; // protected by osd_lock
 +
 +    // Choreographer vsync sampler
 +    void *choreographer_lib;
@@ -269,6 +383,7 @@ index 0000000..1961c4e
 +    int64_t queue_period;
 +    int64_t queue_period_changed;
 +    int64_t queue_offset;
++    struct m_config_cache *geometry_cache;
 +
 +    int64_t osd_surface;
 +};
@@ -446,10 +561,20 @@ index 0000000..1961c4e
 +
 +static MP_THREAD_VOID osd_thread(void *arg);
 +
++static void geometry_wakeup(void *ctx)
++{
++    vo_wakeup(ctx);
++}
++
 +static int preinit(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
 +    p->osd_pts = MP_NOPTS_VALUE;
++    p->geometry_cache = m_config_cache_alloc(p, vo->global, &mediacodec_conf);
++    struct mediacodec_opts *opts = p->geometry_cache->opts;
++    if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
++        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
++    m_config_cache_set_wakeup_cb(p->geometry_cache, geometry_wakeup, vo);
 +    vo->hwdec_devs = hwdec_devices_create();
 +    p->hwctx = (struct mp_hwdec_ctx){
 +        .driver_name = "mediacodec",
@@ -645,16 +770,18 @@ index 0000000..1961c4e
 +    return current;
 +}
 +
-+static void osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
++static bool osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
 +                     int *last_w, int *last_h, bool *force_full, double pts,
-+                     int64_t deadline, uint64_t epoch)
++                     int64_t deadline, uint64_t epoch,
++                     struct mediacodec_geometry geometry)
 +{
 +    struct priv *p = vo->priv;
++    bool resized = false;
 +
 +    int w = ANativeWindow_getWidth(p->osd_window);
 +    int h = ANativeWindow_getHeight(p->osd_window);
 +    if (w <= 0 || h <= 0)
-+        return;
++        return false;
 +
 +    if (w != *last_w || h != *last_h) {
 +        *last_w = w;
@@ -662,16 +789,12 @@ index 0000000..1961c4e
 +        *force_full = true;
 +    }
 +
-+    struct mp_osd_res res = {
-+        .w = w,
-+        .h = h,
-+        .display_par = 1,
-+    };
++    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
 +
 +    struct sub_bitmap_list *sbs =
 +        osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
 +    if (!sbs)
-+        return;
++        return false;
 +
 +    if (!*cache)
 +        *cache = mp_draw_sub_alloc(NULL, vo->global);
@@ -713,8 +836,18 @@ index 0000000..1961c4e
 +        goto done;
 +    }
 +
-+    // Buffer resized under us: paint what fits, repaint fully next pass.
-+    *force_full = buffer.width != w || buffer.height != h;
++    // A resize can race getWidth/getHeight. Render for the actual locked buffer,
++    // not a guessed scale or the dimensions of the previous Surface generation.
++    resized = buffer.width != w || buffer.height != h;
++    *force_full = resized;
++    if (resized) {
++        talloc_free(sbs);
++        res = mediacodec_osd_geometry(geometry, buffer.width, buffer.height);
++        sbs = osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
++        osd = sbs ? mp_draw_sub_overlay(*cache, sbs,
++            act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
++            mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc) : NULL;
++    }
 +
 +    int x0 = MPCLAMP(bounds.left, 0, buffer.width);
 +    int y0 = MPCLAMP(bounds.top, 0, buffer.height);
@@ -724,8 +857,8 @@ index 0000000..1961c4e
 +    ptrdiff_t dst_stride = (ptrdiff_t)buffer.stride * 4;
 +    uint8_t *dst = (uint8_t *)buffer.bits + y0 * dst_stride + x0 * 4;
 +
-+    int ow = MPCLAMP(osd->w - x0, 0, x1 - x0);
-+    int oh = MPCLAMP(osd->h - y0, 0, y1 - y0);
++    int ow = osd ? MPCLAMP(osd->w - x0, 0, x1 - x0) : 0;
++    int oh = osd ? MPCLAMP(osd->h - y0, 0, y1 - y0) : 0;
 +    if (ow > 0 && oh > 0) {
 +        copy_bgra_to_rgba(dst, dst_stride,
 +                          (uint8_t *)osd->planes[0] +
@@ -738,11 +871,21 @@ index 0000000..1961c4e
 +        if (filled < x1 - x0)
 +            memset(row + (ptrdiff_t)filled * 4, 0, ((ptrdiff_t)(x1 - x0) - filled) * 4);
 +    }
++    // Do the potentially large copy without blocking the VO thread. Serialize
++    // only the final epoch check/post; discard pixels if geometry changed while
++    // libass, ANativeWindow_lock or the copy was running.
++    mp_mutex_lock(&p->osd_lock);
++    if (p->osd_terminate || p->osd_epoch != epoch) {
++        for (int y = 0; y < y1 - y0; y++)
++            memset(dst + y * dst_stride, 0, ((ptrdiff_t)x1 - x0) * 4);
++    }
 +
 +    ANativeWindow_unlockAndPost(p->osd_window);
 +
++    mp_mutex_unlock(&p->osd_lock);
 +done:
 +    talloc_free(sbs);
++    return resized;
 +}
 +
 +static MP_THREAD_VOID osd_thread(void *arg)
@@ -764,15 +907,25 @@ index 0000000..1961c4e
 +        double pts = p->osd_request_pts;
 +        int64_t deadline = p->osd_request_deadline;
 +        uint64_t epoch = p->osd_request_epoch;
++        struct mediacodec_geometry geometry = p->osd_geometry;
 +        force_full |= p->osd_request_full;
 +        p->osd_requested = false;
 +        p->osd_request_full = false;
 +        mp_mutex_unlock(&p->osd_lock);
 +
-+        osd_pass(vo, &cache, &last_w, &last_h, &force_full, pts,
-+                 deadline, epoch);
++        bool resized = osd_pass(vo, &cache, &last_w, &last_h, &force_full,
++                                pts, deadline, epoch, geometry);
 +
 +        mp_mutex_lock(&p->osd_lock);
++        // A raced resize may have expanded beyond the originally dirty bounds.
++        // Repaint the whole new buffer immediately, including while paused.
++        if (resized && !p->osd_requested && p->osd_epoch == epoch) {
++            p->osd_request_pts = pts;
++            p->osd_request_deadline = 0;
++            p->osd_request_epoch = epoch;
++            p->osd_request_full = true;
++            p->osd_requested = true;
++        }
 +    }
 +    mp_mutex_unlock(&p->osd_lock);
 +
@@ -809,13 +962,44 @@ index 0000000..1961c4e
 +
 +    mp_mutex_lock(&p->osd_lock);
 +    p->osd_epoch++;
-+    p->osd_request_pts = MP_NOPTS_VALUE;
++    p->osd_request_pts = p->osd_pts;
 +    p->osd_request_deadline = 0;
 +    p->osd_request_epoch = p->osd_epoch;
 +    p->osd_request_full = true;
 +    p->osd_requested = true;
 +    mp_cond_signal(&p->osd_wakeup);
 +    mp_mutex_unlock(&p->osd_lock);
++}
++
++static void update_geometry(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!m_config_cache_update(p->geometry_cache))
++        return;
++    struct mediacodec_opts *opts = p->geometry_cache->opts;
++    struct mediacodec_geometry geometry;
++    if (!mediacodec_geometry_parse(opts->video_rect, &geometry)) {
++        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; keeping previous geometry.\n");
++        return;
++    }
++    if (!p->osd_thread_created)
++        return;
++    mp_mutex_lock(&p->osd_lock);
++    bool changed = !mediacodec_geometry_equal(p->osd_geometry, geometry);
++    if (changed) {
++        p->osd_geometry = geometry;
++        // Publish the new geometry and invalidate in-flight work atomically.
++        p->osd_epoch++;
++        p->osd_request_pts = p->osd_pts;
++        p->osd_request_deadline = 0;
++        p->osd_request_epoch = p->osd_epoch;
++        p->osd_request_full = true;
++        p->osd_requested = true;
++        mp_cond_signal(&p->osd_wakeup);
++    }
++    mp_mutex_unlock(&p->osd_lock);
++    if (changed)
++        vo->want_redraw = true;
 +}
 +
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -872,6 +1056,9 @@ index 0000000..1961c4e
 +{
 +    struct priv *p = vo->priv;
 +    switch (request) {
++    case VOCTRL_CHECK_EVENTS:
++        update_geometry(vo);
++        return VO_TRUE;
 +    case VOCTRL_RESET:
 +        mp_image_unrefp(&p->cur_image);
 +        p->cur_pts = 0;
@@ -903,6 +1090,8 @@ index 0000000..1961c4e
 +static void uninit(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
++    talloc_free(p->geometry_cache);
++    p->geometry_cache = NULL;
 +    mp_image_unrefp(&p->cur_image);
 +
 +    if (p->osd_thread_created) {
@@ -957,4 +1146,5 @@ index 0000000..1961c4e
 +        {0}
 +    },
 +    .options_prefix = "vo-mediacodec",
++    .global_opts = &mediacodec_conf,
 +};
