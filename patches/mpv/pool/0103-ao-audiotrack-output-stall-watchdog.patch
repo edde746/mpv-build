@@ -1,0 +1,543 @@
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..896dd6a 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -384,6 +384,12 @@ void ao_request_reload(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_RELOAD);
+ }
+ 
++// Report that the device stopped consuming audio for good. Fully thread-safe.
++void ao_request_failure(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_FAILURE);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index ce044fd..fb697a5 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -43,6 +43,10 @@ enum aocontrol {
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
++    // The device stopped consuming audio and the driver's own bounded
++    // recovery did not bring it back. The player stops with an error instead
++    // of waiting on an audio clock that will never advance again.
++    AO_EVENT_FAILURE = 4,
+ };
+ 
+ enum {
+@@ -105,6 +109,7 @@ struct mp_async_queue;
+ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
++void ao_request_failure(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index f57da09..c9cb60d 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -22,6 +22,8 @@
+  */
+ 
+ #include <math.h>
++#include <stdatomic.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ 
+ #include "ao.h"
+@@ -36,6 +38,28 @@
+ static mp_static_mutex jni_static_lock = MP_STATIC_MUTEX_INITIALIZER;
+ static int jni_static_use_count = 0;
+ 
++// Output stall watchdog. A healthy blocking write returns within one buffer
++// duration (75-150 ms PCM, a few hundred ms passthrough); a device whose HAL
++// stopped consuming keeps the writer inside AudioTrack.write for good, and
++// with it the audio clock and the video waiting on it. Several seconds of
++// neither a completed write nor a moving playback head is far beyond any
++// route renegotiation, HDMI mode switch or receiver wake-up seen in the wild.
++#define STALL_TIMEOUT_NS MP_TIME_S_TO_NS(5)
++// Progress this long after a recreate closes the failure episode.
++#define STALL_RECOVERED_NS MP_TIME_S_TO_NS(30)
++// Track recreations per failure episode before the AO gives up.
++#define STALL_MAX_RECREATES 1
++#define STALL_POLL_NS MP_TIME_MS_TO_NS(250)
++
++enum {
++    RAW_SYNC_PA = 0,
++    RAW_SYNC_PB,
++    RAW_PC,
++    RAW_PD,
++    RAW_PAYLOAD,
++    RAW_DTS_HEADER,
++};
++
+ struct priv {
+     jobject audiotrack;
+     jint samplerate;
+@@ -97,11 +121,33 @@ struct priv {
+     bool cfg_route_reload;
+     int cfg_session_id;
+ 
+-    bool thread_terminate;
++    atomic_bool thread_terminate;
+     bool thread_created;
+     mp_thread thread;
+     mp_mutex lock;
+     mp_cond wakeup;
++
++    // Serializes p->audiotrack replacement against the callers that reach
++    // the track without p->lock (start/stop/uninit and the monitor), since
++    // the worker holds p->lock for the whole duration of a blocking write.
++    mp_mutex track_lock;
++
++    // Stall watchdog (see monitor_thread). The worker publishes whether a
++    // write is outstanding and when it last saw progress; the monitor adds
++    // playback-head movement and decides. All lock-free: the writer may be
++    // stuck inside JNI holding p->lock when the monitor needs to act.
++    atomic_bool play_requested;
++    atomic_bool write_outstanding;
++    atomic_llong write_progress_ns;
++    atomic_bool recreate_requested;
++    atomic_bool failed;
++    atomic_int recovery_attempts;
++
++    atomic_bool monitor_terminate;
++    bool monitor_created;
++    mp_thread monitor;
++    mp_mutex monitor_lock;
++    mp_cond monitor_wakeup;
+ };
+ 
+ static struct JNIByteBuffer {
+@@ -429,19 +475,6 @@ static int AudioTrack_New(struct ao *ao)
+     return 0;
+ }
+ 
+-static int AudioTrack_Recreate(struct ao *ao)
+-{
+-    struct priv *p = ao->priv;
+-    JNIEnv *env = MP_JNI_GET_ENV(ao);
+-
+-    MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+-    MP_JNI_EXCEPTION_LOG(ao);
+-    MP_JNI_GLOBAL_FREEP(&p->audiotrack);
+-    p->routed_device = 0;
+-    p->routing_lost = false;
+-    return AudioTrack_New(ao);
+-}
+-
+ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+ {
+     p->smooth_count = 0;
+@@ -453,6 +486,55 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+     p->smooth_reported_ns = 0;
+ }
+ 
++// Forget everything derived from the current track's buffer and clock: what
++// stop() needs after a flush, and what a replacement track needs from zero.
++static void AudioTrack_resetClock(struct priv *p)
++{
++    p->playhead_offset = 0;
++    p->written_frames = 0;
++    p->timestamp_fetched = 0;
++    p->timestamp_set = false;
++    p->timestamp_stable = 0;
++    p->raw_state = RAW_SYNC_PA;
++    p->raw_payload_left = 0;
++    p->raw_dts_header_len = 0;
++    p->raw_have_byte = false;
++    p->raw_pending = 0;
++    p->raw_input_len = 0;
++    AudioTrack_resetPlayheadSmoothing(p);
++    atomic_store(&p->write_outstanding, false);
++    atomic_store(&p->write_progress_ns, mp_time_ns());
++}
++
++// Replace the track from the worker (p->lock held). The old track's buffered
++// audio is lost; the core resyncs on the delay drop. Playback resumes at
++// once when the core still wants it, so a recreate never parks the worker
++// on a STOPPED track waiting for a start() that already happened.
++static int AudioTrack_Recreate(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++
++    mp_mutex_lock(&p->track_lock);
++    if (p->audiotrack) {
++        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
++        MP_JNI_EXCEPTION_LOG(ao);
++        MP_JNI_GLOBAL_FREEP(&p->audiotrack);
++    }
++    p->routed_device = 0;
++    p->routing_lost = false;
++    p->playhead_pos = 0;
++    p->reset_pending = false;
++    AudioTrack_resetClock(p);
++    int ret = AudioTrack_New(ao);
++    if (ret == 0 && atomic_load(&p->play_requested)) {
++        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
++        MP_JNI_EXCEPTION_LOG(ao);
++    }
++    mp_mutex_unlock(&p->track_lock);
++    return ret;
++}
++
+ // A direct/offload track's playback head advances in HAL-period steps (8192
+ // frames at 192 kHz), larger than a 24p frame. Like media3's
+ // AudioTrackPositionTracker: average the last (head - clock) offsets, bound
+@@ -631,15 +713,6 @@ static double AudioTrack_getLatency(struct ao *ao)
+     return MPCLAMP(delay, 0.0, 2.0);
+ }
+ 
+-enum {
+-    RAW_SYNC_PA = 0,
+-    RAW_SYNC_PB,
+-    RAW_PC,
+-    RAW_PD,
+-    RAW_PAYLOAD,
+-    RAW_DTS_HEADER,
+-};
+-
+ #define IEC61937_AC3  0x01
+ #define IEC61937_DTS1 0x0b
+ #define IEC61937_DTS2 0x0c
+@@ -963,6 +1036,35 @@ static void AudioTrack_checkRouteChange(struct ao *ao)
+     }
+ }
+ 
++// Charge one recovery against the current failure episode. Returns false
++// once the budget is spent, after asking the core to end playback.
++static bool AudioTrack_beginRecovery(struct ao *ao, const char *why)
++{
++    struct priv *p = ao->priv;
++    if (atomic_load(&p->failed))
++        return false;
++    int attempt = atomic_fetch_add(&p->recovery_attempts, 1) + 1;
++    if (attempt > STALL_MAX_RECREATES) {
++        MP_ERR(ao, "%s after recreating the AudioTrack; giving up\n", why);
++        atomic_store(&p->failed, true);
++        ao_request_failure(ao);
++        return false;
++    }
++    MP_WARN(ao, "%s; recreating the AudioTrack (attempt %d/%d)\n",
++            why, attempt, STALL_MAX_RECREATES);
++    return true;
++}
++
++static void AudioTrack_recreateOrFail(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (AudioTrack_Recreate(ao) == 0)
++        return;
++    MP_ERR(ao, "AudioTrack_Recreate failed; giving up\n");
++    atomic_store(&p->failed, true);
++    ao_request_failure(ao);
++}
++
+ static MP_THREAD_VOID ao_thread(void *arg)
+ {
+     struct ao *ao = arg;
+@@ -970,7 +1072,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     mp_thread_set_name("ao/audiotrack");
+     mp_mutex_lock(&p->lock);
+-    while (!p->thread_terminate) {
++    while (!atomic_load(&p->thread_terminate)) {
++        if (atomic_exchange(&p->recreate_requested, false)) {
++            AudioTrack_recreateOrFail(ao);
++            continue;
++        }
++        if (atomic_load(&p->failed)) {
++            // The core is ending the file; do not hammer a dead track.
++            mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
++            continue;
++        }
+         AudioTrack_checkRouteChange(ao);
+         int state = AudioTrack.PLAYSTATE_PAUSED;
+         if (p->audiotrack) {
+@@ -983,14 +1094,27 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+             int samples = p->raw_pending ? 0 :
+                 ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
+-            int ret = AudioTrack_write(ao, samples * ao->sstride);
++            int len = samples * ao->sstride;
++            // An outstanding write is one the device has not accepted yet;
++            // the window opens on the first attempt and stays open across
++            // zero/short returns, so a track that never takes bytes is
++            // caught whether it blocks or spins.
++            if ((len > 0 || p->raw_pending) &&
++                !atomic_load(&p->write_outstanding))
++            {
++                atomic_store(&p->write_progress_ns, mp_time_ns());
++                atomic_store(&p->write_outstanding, true);
++            }
++            int ret = AudioTrack_write(ao, len);
++            if (ret > 0) {
++                atomic_store(&p->write_progress_ns, mp_time_ns());
++                atomic_store(&p->write_outstanding, false);
++            }
+             if (ret >= 0) {
+                 p->written_frames += ret / ao->sstride;
+             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
+-                MP_WARN(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT. Recreating AudioTrack...\n");
+-                if (AudioTrack_Recreate(ao) < 0) {
+-                    MP_ERR(ao, "AudioTrack_Recreate failed\n");
+-                }
++                if (AudioTrack_beginRecovery(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT"))
++                    AudioTrack_recreateOrFail(ao);
+             } else {
+                 MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
+             }
+@@ -1002,25 +1126,127 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     MP_THREAD_RETURN();
+ }
+ 
++// Watches the worker from outside its lock. While the core wants playback
++// and a write is outstanding, a playback head that does not move for
++// STALL_TIMEOUT_NS means the device stopped consuming: pause the track to
++// pull the worker out of AudioTrack.write and have it rebuild the track, or
++// once that has been tried, tell the core to end playback. Head samples
++// also refresh the progress clock, so a slow device that still drains keeps
++// a long write out of the stall verdict.
++static MP_THREAD_VOID monitor_thread(void *arg)
++{
++    struct ao *ao = arg;
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    mp_thread_set_name("ao/at-monitor");
++    uint32_t last_head = 0;
++    bool have_head = false;
++    int64_t healthy_since = 0;
++    mp_mutex_lock(&p->monitor_lock);
++    while (!atomic_load(&p->monitor_terminate)) {
++        mp_cond_timedwait(&p->monitor_wakeup, &p->monitor_lock, STALL_POLL_NS);
++        if (atomic_load(&p->monitor_terminate))
++            break;
++        if (atomic_load(&p->failed) || !atomic_load(&p->play_requested)) {
++            have_head = false;
++            continue;
++        }
++
++        mp_mutex_lock(&p->track_lock);
++        uint32_t head = 0;
++        bool sampled = false;
++        if (p->audiotrack) {
++            head = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++            sampled = MP_JNI_EXCEPTION_LOG(ao) >= 0;
++        }
++        mp_mutex_unlock(&p->track_lock);
++        if (!sampled) {
++            have_head = false;
++            continue;
++        }
++
++        int64_t now = mp_time_ns();
++        if (!have_head || head != last_head) {
++            if (have_head) {
++                atomic_store(&p->write_progress_ns, now);
++                if (atomic_load(&p->recovery_attempts) > 0) {
++                    if (!healthy_since) {
++                        healthy_since = now;
++                    } else if (now - healthy_since >= STALL_RECOVERED_NS) {
++                        MP_VERBOSE(ao, "audio output recovered; clearing recovery budget\n");
++                        atomic_store(&p->recovery_attempts, 0);
++                        healthy_since = 0;
++                    }
++                }
++            }
++            last_head = head;
++            have_head = true;
++            continue;
++        }
++
++        if (!atomic_load(&p->write_outstanding))
++            continue;
++        int64_t stalled_ns = now - atomic_load(&p->write_progress_ns);
++        if (stalled_ns < STALL_TIMEOUT_NS)
++            continue;
++
++        healthy_since = 0;
++        char why[96];
++        snprintf(why, sizeof(why), "AudioTrack accepted no audio for %d ms",
++                 (int)(stalled_ns / 1000000));
++        if (!AudioTrack_beginRecovery(ao, why))
++            continue;
++        atomic_store(&p->write_progress_ns, now);
++        atomic_store(&p->recreate_requested, true);
++        mp_mutex_lock(&p->track_lock);
++        if (p->audiotrack) {
++            // Interrupts the blocking write like stop() does; the worker
++            // then sees recreate_requested at the top of its loop. Never
++            // take p->lock here: the worker holds it across the write, so
++            // a monitor waiting on it would hang once the replacement track
++            // stalls too. A paused worker polls every 300 ms regardless.
++            MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
++            MP_JNI_EXCEPTION_LOG(ao);
++        }
++        mp_mutex_unlock(&p->track_lock);
++    }
++    mp_mutex_unlock(&p->monitor_lock);
++    MP_THREAD_RETURN();
++}
++
+ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
++
++    // Terminate before interrupting the write: a worker released from a
++    // stuck track must find the flag rather than start another write.
++    atomic_store(&p->thread_terminate, true);
++    atomic_store(&p->monitor_terminate, true);
++
++    mp_mutex_lock(&p->track_lock);
+     if (p->audiotrack) {
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.stop);
+         MP_JNI_EXCEPTION_LOG(ao);
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+         MP_JNI_EXCEPTION_LOG(ao);
+     }
++    mp_mutex_unlock(&p->track_lock);
+ 
+     mp_mutex_lock(&p->lock);
+-    p->thread_terminate = true;
+     mp_cond_signal(&p->wakeup);
+     mp_mutex_unlock(&p->lock);
+ 
+     if (p->thread_created)
+         mp_thread_join(p->thread);
+ 
++    mp_mutex_lock(&p->monitor_lock);
++    mp_cond_signal(&p->monitor_wakeup);
++    mp_mutex_unlock(&p->monitor_lock);
++
++    if (p->monitor_created)
++        mp_thread_join(p->monitor);
++
+     if (p->audiotrack) {
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+         MP_JNI_EXCEPTION_LOG(ao);
+@@ -1037,6 +1263,9 @@ static void uninit(struct ao *ao)
+ 
+     MP_JNI_GLOBAL_FREEP(&p->timestamp);
+ 
++    mp_cond_destroy(&p->monitor_wakeup);
++    mp_mutex_destroy(&p->monitor_lock);
++    mp_mutex_destroy(&p->track_lock);
+     mp_cond_destroy(&p->wakeup);
+     mp_mutex_destroy(&p->lock);
+ 
+@@ -1052,6 +1281,10 @@ static int init(struct ao *ao)
+ 
+     mp_mutex_init(&p->lock);
+     mp_cond_init(&p->wakeup);
++    mp_mutex_init(&p->track_lock);
++    mp_mutex_init(&p->monitor_lock);
++    mp_cond_init(&p->monitor_wakeup);
++    atomic_store(&p->write_progress_ns, mp_time_ns());
+ 
+     if (init_jni(ao) < 0)
+         return -1;
+@@ -1260,6 +1493,12 @@ static int init(struct ao *ao)
+     }
+     p->thread_created = true;
+ 
++    if (mp_thread_create(&p->monitor, monitor_thread, ao)) {
++        MP_ERR(ao, "monitor thread creation failed\n");
++        goto error;
++    }
++    p->monitor_created = true;
++
+     return 1;
+ 
+ error:
+@@ -1270,45 +1509,44 @@ error:
+ static void stop(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
++    atomic_store(&p->play_requested, false);
++
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    mp_mutex_lock(&p->track_lock);
+     if (!p->audiotrack) {
++        mp_mutex_unlock(&p->track_lock);
+         MP_ERR(ao, "AudioTrack does not exist to stop!\n");
+         return;
+     }
+-
+-    JNIEnv *env = MP_JNI_GET_ENV(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
+     MP_JNI_EXCEPTION_LOG(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
+     MP_JNI_EXCEPTION_LOG(ao);
++    mp_mutex_unlock(&p->track_lock);
+ 
+     // pause() interrupts the worker's blocking write; the reset waits for it.
+     mp_mutex_lock(&p->lock);
+-    p->playhead_offset = 0;
+     p->reset_pending = true;
+-    p->written_frames = 0;
+-    p->timestamp_fetched = 0;
+-    p->timestamp_set = false;
+-    p->raw_state = RAW_SYNC_PA;
+-    p->raw_payload_left = 0;
+-    p->raw_dts_header_len = 0;
+-    p->raw_have_byte = false;
+-    p->raw_pending = 0;
+-    p->raw_input_len = 0;
+-    AudioTrack_resetPlayheadSmoothing(p);
++    AudioTrack_resetClock(p);
+     mp_mutex_unlock(&p->lock);
+ }
+ 
+ static void start(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
++    atomic_store(&p->write_progress_ns, mp_time_ns());
++    atomic_store(&p->play_requested, true);
++
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    mp_mutex_lock(&p->track_lock);
+     if (!p->audiotrack) {
++        mp_mutex_unlock(&p->track_lock);
+         MP_ERR(ao, "AudioTrack does not exist to start!\n");
+         return;
+     }
+-
+-    JNIEnv *env = MP_JNI_GET_ENV(ao);
+     MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
+     MP_JNI_EXCEPTION_LOG(ao);
++    mp_mutex_unlock(&p->track_lock);
+ 
+     mp_cond_signal(&p->wakeup);
+ }
+diff --git a/player/audio.c b/player/audio.c
+index b3e975d..40f2aa3 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -870,6 +870,19 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
++    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_FAILURE)) {
++        // Deselecting audio like an init failure would leave video running
++        // without its clock; ending the file with the AO error code lets the
++        // host tell an unresponsive audio device apart from a bad stream.
++        MP_ERR(mpctx, "Audio output stopped responding; stopping playback.\n");
++        if (mpctx->error_playing >= 0)
++            mpctx->error_playing = MPV_ERROR_AO_INIT_FAILED;
++        if (!mpctx->stop_play)
++            mpctx->stop_play = PT_ERROR;
++        mp_wakeup_core(mpctx);
++        return;
++    }
++
+     if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
+         reload_audio_output(mpctx);
+ 
