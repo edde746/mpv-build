@@ -147,6 +147,13 @@ Run the host-side MediaCodec timing regression with
 It extracts the production timing core from its patch and covers cadence
 prediction, refresh hysteresis, clock drift, and reset boundaries without a device.
 
+Run the AudioTrack deadline regression with
+`bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
+applies the Android series, and exercises the production clock and audio-buffer
+deadline code with deterministic JNI delays. Coverage includes passthrough,
+PCM timestamp/fallback paths, startup, and E-AC3 counter wrap. Pass an
+already-patched source directory as the first argument to run offline.
+
 ## Make demo app using the local build version
 
 If you want the demo app to use the local build version, you need to modify `Package.swift` to reference the local build xcframework file.

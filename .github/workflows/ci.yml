@@ -101,6 +101,11 @@ jobs:
                 [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest), '--check'],
                 check=True)
               checked += 1
+              if component == 'mpv' and group == 'android':
+                subprocess.run(
+                  [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest)],
+                  check=True)
+                subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
 
           if checked == 0:
             raise SystemExit('no (component, group) series resolved; expected at least mpv/apple')

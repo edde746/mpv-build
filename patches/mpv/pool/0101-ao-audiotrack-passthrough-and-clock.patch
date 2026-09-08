@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index f483ccc..f57da09 100644
+index f483ccc..122d8dc 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,6 +21,9 @@
@@ -142,7 +142,7 @@ index f483ccc..f57da09 100644
          int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
          if (bufferSize > 0) {
              MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
-@@ -376,9 +437,78 @@ static int AudioTrack_Recreate(struct ao *ao)
+@@ -376,10 +437,82 @@ static int AudioTrack_Recreate(struct ao *ao)
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
      MP_JNI_EXCEPTION_LOG(ao);
      MP_JNI_GLOBAL_FREEP(&p->audiotrack);
@@ -151,6 +151,7 @@ index f483ccc..f57da09 100644
      return AudioTrack_New(ao);
  }
  
+-static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
 +static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
 +{
 +    p->smooth_count = 0;
@@ -167,13 +168,15 @@ index f483ccc..f57da09 100644
 +// AudioTrackPositionTracker: average the last (head - clock) offsets, bound
 +// the estimate by what was written, and limit drift between reports to 10%
 +// of elapsed time.
-+static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head)
++static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
++                                        int64_t *sample_time)
 +{
 +    struct priv *p = ao->priv;
 +    if (!head) // not started, or just flushed: nothing to average yet
 +        return head;
 +
 +    int64_t now = mp_time_ns();
++    *sample_time = now;
 +    double clock = MP_TIME_NS_TO_S(now) * ao->samplerate;
 +
 +    p->smooth_head += (int32_t)(head - p->smooth_last_head);
@@ -218,10 +221,18 @@ index f483ccc..f57da09 100644
 +    return (uint32_t)est;
 +}
 +
- static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
++static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
++                                                 int64_t *sample_time)
  {
      struct priv *p = ao->priv;
-@@ -392,22 +522,28 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+     if (!p->audiotrack)
+@@ -387,27 +520,34 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     uint32_t pos = 0;
+     int64_t now = mp_raw_time_ns();
++    *sample_time = mp_time_ns_from_raw_time(now);
+     int state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
+ 
      int stable_count = 20;
      int64_t wait = p->timestamp_stable < stable_count ? 50000000 : 3000000000;
  
@@ -259,7 +270,7 @@ index f483ccc..f57da09 100644
              }
          }
      }
-@@ -424,6 +560,9 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -424,15 +564,19 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
          if (fpos != 0 && time != 0 && state == AudioTrack.PLAYSTATE_PLAYING) {
              double diff = (double)(now - time) / 1e9;
              pos += diff * ao->samplerate;
@@ -269,7 +280,9 @@ index f483ccc..f57da09 100644
          }
          //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / fpos= %u / time= %"PRId64")\n", pos, state, fpos, time);
      } else {
-@@ -432,7 +571,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+         pos = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++        *sample_time = mp_time_ns();
+         //MP_VERBOSE(ao, "playbackHeadPosition = %u (reset_pending=%d)\n", pos, p->reset_pending);
      }
  
  
@@ -278,7 +291,7 @@ index f483ccc..f57da09 100644
          if (p->reset_pending) {
              // after a flush(), playbackHeadPosition will not reset to 0 right away.
              // sometimes, it will never reset at all.
-@@ -449,6 +588,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -449,6 +593,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
              MP_VERBOSE(ao, "IEC/playbackHeadPosition %d -> %d (flush)\n", p->playhead_pos, pos);
              p->playhead_offset = 0;
              p->playhead_pos = 0;
@@ -286,7 +299,7 @@ index f483ccc..f57da09 100644
          }
  
          // sometimes on a new AudioTrack instance, playbackHeadPosition will reset
-@@ -458,11 +598,13 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -458,25 +603,31 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
              p->playhead_offset = 0;
              p->playhead_pos = 0;
              p->written_frames = 0;
@@ -300,16 +313,21 @@ index f483ccc..f57da09 100644
 +    return (p->playhead_pos - p->playhead_offset) * (uint32_t)p->raw_rate_mult;
  }
  
- static double AudioTrack_getLatency(struct ao *ao)
-@@ -472,11 +614,14 @@ static double AudioTrack_getLatency(struct ao *ao)
+-static double AudioTrack_getLatency(struct ao *ao)
++// Pair the delay with the instant its selected playhead represents, in mpv time.
++static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+ {
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     struct priv *p = ao->priv;
      if (!p->audiotrack)
          return 0;
  
+-    uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
 +    const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
 +                             p->raw_passthrough;
-     uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao);
++    uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao, sample_time);
 +    if (passthrough)
-+        playhead = AudioTrack_smoothPlayhead(ao, playhead);
++        playhead = AudioTrack_smoothPlayhead(ao, playhead, sample_time);
      uint32_t diff = p->written_frames - playhead;
      double delay = diff / (double)(ao->samplerate);
 -    if (!p->timestamp_set &&
@@ -318,7 +336,7 @@ index f483ccc..f57da09 100644
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -486,6 +631,193 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -486,6 +637,193 @@ static double AudioTrack_getLatency(struct ao *ao)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
@@ -512,7 +530,7 @@ index f483ccc..f57da09 100644
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +827,23 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -495,7 +833,23 @@ static int AudioTrack_write(struct ao *ao, int len)
      void *buf = p->chunk;
  
      jint ret;
@@ -537,7 +555,7 @@ index f483ccc..f57da09 100644
          (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
          ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -566,6 +914,55 @@ error:
+@@ -566,6 +920,55 @@ error:
      return -1;
  }
  
@@ -593,7 +611,7 @@ index f483ccc..f57da09 100644
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -574,6 +971,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -574,6 +977,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
      while (!p->thread_terminate) {
@@ -601,17 +619,23 @@ index f483ccc..f57da09 100644
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
              state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
-@@ -583,7 +981,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -581,9 +985,13 @@ static MP_THREAD_VOID ao_thread(void *arg)
+         if (state == AudioTrack.PLAYSTATE_PLAYING) {
+             int read_samples = p->chunksize / ao->sstride;
              int64_t ts = mp_time_ns();
++            // JNI queries can block. Use the playhead's reference instant,
++            // not the time before the query (or after a later latency query).
++            double delay = AudioTrack_getLatency(ao, &ts);
              ts += MP_TIME_S_TO_NS(read_samples / (double)(ao->samplerate));
-             ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+-            ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
 -            int samples = ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
++            ts += MP_TIME_S_TO_NS(delay);
 +            int samples = p->raw_pending ? 0 :
 +                ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
              int ret = AudioTrack_write(ao, samples * ao->sstride);
              if (ret >= 0) {
                  p->written_frames += ret / ao->sstride;
-@@ -657,9 +1056,32 @@ static int init(struct ao *ao)
+@@ -657,9 +1065,32 @@ static int init(struct ao *ao)
      if (init_jni(ao) < 0)
          return -1;
  
@@ -647,7 +671,7 @@ index f483ccc..f57da09 100644
              MP_ERR(ao, "spdif passthrough not supported by API\n");
              return -1;
          }
-@@ -673,7 +1095,8 @@ static int init(struct ao *ao)
+@@ -673,7 +1104,8 @@ static int init(struct ao *ao)
          p->format = AudioFormat.ENCODING_PCM_16BIT;
      }
  
@@ -657,7 +681,7 @@ index f483ccc..f57da09 100644
          jint samplerate = MP_JNI_CALL_STATIC_INT(
              AudioTrack.clazz,
              AudioTrack.getNativeOutputSampleRate,
-@@ -685,6 +1108,10 @@ static int init(struct ao *ao)
+@@ -685,6 +1117,10 @@ static int init(struct ao *ao)
          }
      }
      p->samplerate = ao->samplerate;
@@ -668,7 +692,7 @@ index f483ccc..f57da09 100644
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -710,8 +1137,16 @@ static int init(struct ao *ao)
+@@ -710,8 +1146,16 @@ static int init(struct ao *ao)
          AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
      };
      static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
@@ -687,7 +711,7 @@ index f483ccc..f57da09 100644
      } else {
          struct mp_chmap_sel sel = {0};
          for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
-@@ -731,20 +1166,47 @@ static int init(struct ao *ao)
+@@ -731,20 +1175,47 @@ static int init(struct ao *ao)
          p->channel_config,
          p->format
      );
@@ -743,7 +767,7 @@ index f483ccc..f57da09 100644
      mp_assert(p->size % bps == 0);
      ao->device_buffer = p->size / bps;
  
-@@ -760,7 +1222,14 @@ static int init(struct ao *ao)
+@@ -760,7 +1231,14 @@ static int init(struct ao *ao)
      MP_JNI_LOCAL_FREEP(&timestamp);
  
      // decide and create buffer of right type
@@ -759,7 +783,7 @@ index f483ccc..f57da09 100644
          jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
          p->shortarray = (*env)->NewGlobalRef(env, shortarray);
          MP_JNI_LOCAL_FREEP(&shortarray);
-@@ -812,11 +1281,21 @@ static void stop(struct ao *ao)
+@@ -812,11 +1290,21 @@ static void stop(struct ao *ao)
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
      MP_JNI_EXCEPTION_LOG(ao);
  
@@ -781,7 +805,7 @@ index f483ccc..f57da09 100644
  }
  
  static void start(struct ao *ao)
-@@ -846,9 +1325,13 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -846,9 +1334,13 @@ const struct ao_driver audio_out_audiotrack = {
      .priv_size = sizeof(struct priv),
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,

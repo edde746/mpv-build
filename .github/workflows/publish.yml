@@ -72,6 +72,9 @@ jobs:
       - name: Test MediaCodec subtitle geometry
         run: bash ./scripts/test_mediacodec_geometry.sh
 
+      - name: Test Android AudioTrack deadline timing
+        run: bash ./scripts/test_audiotrack_timing.sh
+
       - name: Test patch framework
         run: ./scripts/test_patches.sh
 

@@ -262,7 +262,7 @@ index f57da09..c9cb60d 100644
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
 @@ -983,14 +1094,27 @@ static MP_THREAD_VOID ao_thread(void *arg)
-             ts += MP_TIME_S_TO_NS(AudioTrack_getLatency(ao));
+             ts += MP_TIME_S_TO_NS(delay);
              int samples = p->raw_pending ? 0 :
                  ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
 -            int ret = AudioTrack_write(ao, samples * ao->sstride);
