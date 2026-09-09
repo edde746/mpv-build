@@ -3,3 +3,4 @@
 # each platform series. The resolved order is series.common first.
 0201-aspect-sub-video-rect-aspect-option.patch
 0026-ad-spdif-recreate-muxer-on-reset.patch
+0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch

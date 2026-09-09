@@ -362,7 +362,7 @@ index f483ccc..122d8dc 100644
 +    case AF_FORMAT_S_AC3:
 +        return AudioFormat.ENCODING_AC3;
 +    case AF_FORMAT_S_EAC3:
-+        // 192 kHz IEC carrier vs 48 kHz codec frames
++        // IEC carrier is 4x the codec rate (ad_spdif): 192 kHz for 48 kHz
 +        *rate_mult = 4;
 +        return AudioFormat.ENCODING_E_AC3;
 +    case AF_FORMAT_S_DTS:

@@ -1,0 +1,17 @@
+diff --git a/audio/decode/ad_spdif.c b/audio/decode/ad_spdif.c
+index a42bab0..e5a429a 100644
+--- a/audio/decode/ad_spdif.c
++++ b/audio/decode/ad_spdif.c
+@@ -286,7 +286,11 @@ static int init_filter(struct mp_filter *da)
+     }
+     case AV_CODEC_ID_EAC3:
+         sample_format                   = AF_FORMAT_S_EAC3;
+-        samplerate                      = 192000;
++        // IEC 61937-3 carries E-AC-3 at four times the codec rate: 192 kHz
++        // for 48 kHz streams, 176.4 kHz for 44.1 kHz ones. spdifenc repeats
++        // bursts every 6144 carrier frames either way, so a fixed 192 kHz
++        // clocks a 44.1 kHz stream ~9% fast and the audio pts runs ahead.
++        samplerate                      = (c_rate > 0 ? c_rate : 48000) * 4;
+         num_channels                    = 2;
+         break;
+     case AV_CODEC_ID_MP3:
