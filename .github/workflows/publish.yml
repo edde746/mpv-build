@@ -741,6 +741,9 @@ jobs:
       # fontconfig main already requires >= 1.11.0.
       - name: Install dependencies
         run: |
+          # The runner image ships Google's Chrome apt source, which has
+          # served a mismatching index more than once; nothing here uses it.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
           sudo apt-get update
           sudo apt-get install -y \
             git cmake ninja-build build-essential pkg-config curl unzip \
