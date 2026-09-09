@@ -1,5 +1,5 @@
 diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index 814e1e4..68495bc 100644
+index 814e1e4..e5357d6 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
 @@ -723,6 +723,30 @@ Available video output drivers are:
@@ -67,10 +67,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..1961c4e
+index 0000000..4057c56
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,1077 @@
+@@ -0,0 +1,1100 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -218,6 +218,44 @@ index 0000000..1961c4e
 +
 +    return after_diff + timing->vsync_hysteresis_offset_ns < before_diff
 +         ? after : before;
++}
++
++// Release timestamp, on now_ns's clock, for a frame due at raw_target_ns;
++// 0 releases untimed, i.e. at the next vsync. sample_ns is a vsync timestamp
++// on that clock, or 0 when none is fresh; period_ns is the display period, or
++// 0 when unknown. The surface presents a buffer at the first vsync at or after
++// its timestamp, so a timestamp in the near past still lands on the chosen
++// vsync: once cadence correction and snapping chose a vsync, the release is
++// that vsync minus 80% of a period even when the VO thread runs late. The
++// unsnapped target must never substitute for it: for half of all frames it
++// lies past its grid line and would round up to the following vsync. A late
++// raw deadline releases untimed but still advances the cadence anchor, so the
++// next frame predicts from cadence rather than a jittered raw deadline and
++// keeps its hysteresis choice (Media3 adjusts frames it then drops the same
++// way); only an unknown clock or a deadline beyond max_ahead_ns is a
++// discontinuity that resets.
++static int64_t mediacodec_timing_release(struct mediacodec_timing *timing,
++                                         int64_t raw_target_ns, int64_t now_ns,
++                                         uint64_t frame_id,
++                                         double frame_duration_ns,
++                                         int64_t sample_ns, int64_t period_ns,
++                                         int64_t max_ahead_ns)
++{
++    if (now_ns <= 0 || raw_target_ns > now_ns + max_ahead_ns) {
++        mediacodec_timing_reset(timing);
++        return 0;
++    }
++
++    int64_t target_ns = mediacodec_timing_predict(timing, raw_target_ns,
++                                                  frame_id, frame_duration_ns);
++    if (raw_target_ns <= now_ns)
++        return 0;
++    if (period_ns <= 0 || !sample_ns)
++        return target_ns;
++
++    int64_t snapped = mediacodec_timing_snap(timing, target_ns, sample_ns,
++                                             period_ns);
++    return snapped - period_ns * 8 / 10;
 +}
 +
 +// --- end mediacodec timing core
@@ -693,6 +731,8 @@ index 0000000..1961c4e
 +
 +// Stabilize frame cadence, then snap with hysteresis and release 80% of a
 +// period before the chosen vsync so SurfaceView can latch the buffer in time.
++// The policy lives in mediacodec_timing_release so the host regression can
++// drive it with an injected clock.
 +static struct release_target get_release_target(struct vo *vo, int64_t pts)
 +{
 +    struct priv *p = vo->priv;
@@ -704,40 +744,15 @@ index 0000000..1961c4e
 +
 +    int64_t mono_now = monotonic_now_ns();
 +    int64_t raw_target = mp_time_to_monotonic_ns(pts);
-+    if (mono_now <= 0 || raw_target <= mono_now ||
-+        raw_target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
-+    {
-+        mediacodec_timing_reset(&p->timing);
-+        return result;
-+    }
++    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
++    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
++        sample = 0;
 +
-+    int64_t target = mediacodec_timing_predict(
-+        &p->timing, raw_target, p->cur_frame_id, p->cur_duration);
-+    if (target <= mono_now || target > mono_now + TIMED_RELEASE_MAX_AHEAD_NS) {
-+        // A valid raw deadline must not become late or out of range solely
-+        // because of cadence correction.
-+        mediacodec_timing_reset(&p->timing);
-+        target = raw_target;
-+    }
-+
-+    if (p->queue_period > 0) {
-+        int64_t sample = read_vsync_sample(p);
-+        if (vsync_sample_is_fresh(p, sample, mono_now)) {
-+            int64_t snapped = mediacodec_timing_snap(
-+                &p->timing, target, sample, p->queue_period);
-+            int64_t release = snapped - p->queue_period * 8 / 10;
-+            if (release > mono_now &&
-+                release <= mono_now + TIMED_RELEASE_MAX_AHEAD_NS)
-+            {
-+                result.timestamp = release;
-+            }
-+        }
-+    }
-+
-+    if (!result.timestamp)
-+        result.timestamp = target;
-+
-+    result.osd_deadline = pts + (result.timestamp - raw_target);
++    result.timestamp = mediacodec_timing_release(
++        &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
++        sample, p->queue_period, TIMED_RELEASE_MAX_AHEAD_NS);
++    if (result.timestamp)
++        result.osd_deadline = pts + (result.timestamp - raw_target);
 +    return result;
 +}
 +
@@ -871,18 +886,24 @@ index 0000000..1961c4e
 +        if (filled < x1 - x0)
 +            memset(row + (ptrdiff_t)filled * 4, 0, ((ptrdiff_t)(x1 - x0) - filled) * 4);
 +    }
-+    // Do the potentially large copy without blocking the VO thread. Serialize
-+    // only the final epoch check/post; discard pixels if geometry changed while
-+    // libass, ANativeWindow_lock or the copy was running.
++    // The VO thread files its requests under osd_lock from flip_page, so
++    // nothing slow may run under that lock: unlockAndPost is a binder/BLAST
++    // round trip that can wait out a whole vsync during a SurfaceView
++    // relayout, and a stale full-canvas clear is tens of megabytes at 4K.
++    // Only the stale check needs the lock; this thread is the sole poster and
++    // uninit joins it before releasing the window, so the post itself
++    // synchronizes with nothing. An epoch bump that lands between the check
++    // and the post shows one stale frame, which the full repaint the bumper
++    // already filed replaces.
 +    mp_mutex_lock(&p->osd_lock);
-+    if (p->osd_terminate || p->osd_epoch != epoch) {
++    bool stale = p->osd_terminate || p->osd_epoch != epoch;
++    mp_mutex_unlock(&p->osd_lock);
++    if (stale) {
 +        for (int y = 0; y < y1 - y0; y++)
 +            memset(dst + y * dst_stride, 0, ((ptrdiff_t)x1 - x0) * 4);
 +    }
 +
 +    ANativeWindow_unlockAndPost(p->osd_window);
-+
-+    mp_mutex_unlock(&p->osd_lock);
 +done:
 +    talloc_free(sbs);
 +    return resized;
@@ -1026,25 +1047,27 @@ index 0000000..1961c4e
 +    struct priv *p = vo->priv;
 +    struct release_target target = {0};
 +    // Repeats and OSD redraws have no new codec buffer or cadence sample.
-+    if (p->cur_image)
++    if (p->cur_image) {
 +        target = get_release_target(vo, p->cur_pts);
 +
++        // Hand the frame to the codec first: the OSD request needs nothing
++        // from the release, and filing it takes osd_lock, which the OSD
++        // thread may hold for a moment. The release timestamp is what keeps
++        // the two in step, not their submission order.
++        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
++        int ret = target.timestamp
++                ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
++                : av_mediacodec_release_buffer(buffer, 1);
++        mp_image_unrefp(&p->cur_image);
++        p->cur_pts = 0;
++        p->cur_frame_id = 0;
++        p->cur_duration = 0;
++
++        if (ret < 0)
++            MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
++    }
++
 +    draw_osd(vo, target.osd_deadline);
-+
-+    if (!p->cur_image)
-+        return;
-+
-+    AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
-+    int ret = target.timestamp
-+            ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
-+            : av_mediacodec_release_buffer(buffer, 1);
-+    mp_image_unrefp(&p->cur_image);
-+    p->cur_pts = 0;
-+    p->cur_frame_id = 0;
-+    p->cur_duration = 0;
-+
-+    if (ret < 0)
-+        MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
 +}
 +
 +static int query_format(struct vo *vo, int format)

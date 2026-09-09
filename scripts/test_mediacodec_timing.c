@@ -202,6 +202,147 @@ static void test_cadence_boundaries(void)
              base + period + MS, "duration change at 1ms retains cadence");
 }
 
+#define MAX_AHEAD (500 * MS)
+
+// The vsync a SurfaceView shows a buffer on: the first grid line at or after
+// its timestamp (an untimed release has none) that is still after now.
+static int64_t presented_vsync(int64_t release, int64_t now, int64_t sample,
+                               int64_t period)
+{
+    int64_t earliest = release > now ? release : now + 1;
+    int64_t count = (earliest - sample + period - 1) / period;
+    return sample + count * period;
+}
+
+// 23.976 fps content on a fixed 2-period queue: a frame is presented on the
+// vsync cadence chose no matter how late the VO thread runs, as long as that
+// vsync is still ahead, and on the next vsync once it is not. A release that
+// has already passed is still that vsync minus 80% of a period, never the
+// unsnapped target, which would round a still-reachable vsync up to the next.
+static void test_release_survives_late_submission(void)
+{
+    const int64_t duration = 41708333;
+    const struct { int64_t period; int gap_min, gap_max; const char *name; }
+    displays[] = {
+        {16666667, 2, 3, "23.976 on 60 Hz"},
+        {20833333, 2, 2, "23.976 on 48 Hz"},
+    };
+    enum { frames = 48 };
+    for (size_t d = 0; d < sizeof(displays) / sizeof(displays[0]); d++) {
+        const int64_t period = displays[d].period;
+        int64_t reference[frames];
+        for (int64_t late = 0; late < 2 * period; late += MS) {
+            struct mediacodec_timing timing = {0};
+            for (int i = 0; i < frames; i++) {
+                int64_t raw = EPOCH + 100 * period + i * duration + 5 * MS +
+                              (i % 2 ? MS : -MS);
+                int64_t now = raw - 2 * period + late;
+                int64_t release = mediacodec_timing_release(
+                    &timing, raw, now, 1000 + i, duration, EPOCH, period,
+                    MAX_AHEAD);
+                int64_t shown = presented_vsync(release, now, EPOCH, period);
+                if (late == 0) {
+                    reference[i] = shown;
+                    if (i) {
+                        int64_t gap = (shown - reference[i - 1]) / period;
+                        if (gap < displays[d].gap_min || gap > displays[d].gap_max) {
+                            fprintf(stderr, "FAIL: %s cadence gap %" PRId64
+                                    " at frame %d\n", displays[d].name, gap, i);
+                            exit(1);
+                        }
+                    }
+                } else {
+                    int64_t expected = reference[i] > now
+                        ? reference[i] : presented_vsync(0, now, EPOCH, period);
+                    if (shown != expected) {
+                        fprintf(stderr, "FAIL: %s: frame %d submitted %" PRId64
+                                "ms late presents %" PRId64 " periods after the "
+                                "reachable vsync\n", displays[d].name, i,
+                                late / MS, (shown - expected) / period);
+                        exit(1);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A frame whose raw deadline already passed releases untimed, but the next
+// frame still predicts from cadence and keeps its snap preference; the same
+// holds when only the cadence-corrected target is behind the clock.
+static void test_late_frames_keep_cadence(void)
+{
+    const int64_t period = 40 * MS;
+    const int64_t base = EPOCH + 100 * period;
+    const int64_t on_time = 2 * period;
+    const struct { int64_t now_offset; const char *name; } cases[] = {
+        {MS, "raw deadline behind the clock"},
+        {0, "raw deadline on the clock"},
+        {-MS, "predicted target behind the clock, raw ahead"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct mediacodec_timing timing = {0};
+        int64_t raw = base + period / 2 - MS;
+        CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - on_time, 10,
+                                           period, EPOCH, period, MAX_AHEAD),
+                 base - period * 8 / 10, "prime cadence and snap preference");
+
+        raw = base + period + period / 2 + MS;
+        int64_t now = raw + cases[i].now_offset;
+        int64_t release = mediacodec_timing_release(
+            &timing, raw, now, 11, period, EPOCH, period, MAX_AHEAD);
+        CHECK_EQ(release, cases[i].now_offset >= 0 ? 0 : base + period / 5,
+                 cases[i].name);
+        CHECK_EQ(presented_vsync(release, now, EPOCH, period), base + 2 * period,
+                 cases[i].name);
+
+        // Raw is 1ms past the midpoint: a reset would snap it to base + 3p.
+        raw = base + 2 * period + period / 2 + MS;
+        CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - on_time, 12,
+                                           period, EPOCH, period, MAX_AHEAD),
+                 base + 2 * period - period * 8 / 10, cases[i].name);
+    }
+}
+
+static void test_release_discontinuities(void)
+{
+    const int64_t period = 40 * MS;
+    const int64_t base = EPOCH + 100 * period;
+    struct mediacodec_timing timing = {0};
+    int64_t raw = base + period / 2 - MS;
+    CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 10,
+                                       period, EPOCH, period, MAX_AHEAD),
+             base - period * 8 / 10, "prime before discontinuities");
+
+    raw = base + period + period / 2 + MS;
+    CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - MAX_AHEAD - MS, 11,
+                                       period, EPOCH, period, MAX_AHEAD),
+             0, "deadline beyond the surface window releases untimed");
+    CHECK_EQ(mediacodec_timing_snap(&timing, raw, EPOCH, period),
+             base + 2 * period, "deadline beyond the surface window resets");
+
+    timing = (struct mediacodec_timing){0};
+    raw = base + period / 2 - MS;
+    mediacodec_timing_release(&timing, raw, raw - 2 * period, 10, period,
+                              EPOCH, period, MAX_AHEAD);
+    raw = base + period + period / 2 + MS;
+    CHECK_EQ(mediacodec_timing_release(&timing, raw, 0, 11, period, EPOCH,
+                                       period, MAX_AHEAD),
+             0, "unknown clock releases untimed");
+    CHECK_EQ(mediacodec_timing_snap(&timing, raw, EPOCH, period),
+             base + 2 * period, "unknown clock resets");
+
+    timing = (struct mediacodec_timing){0};
+    raw = base + period / 2 - MS;
+    CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 10,
+                                       period, EPOCH, 0, MAX_AHEAD),
+             raw, "unknown display period releases at the target");
+    raw = base + period + period / 2 + MS;
+    CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 11,
+                                       period, 0, period, MAX_AHEAD),
+             raw - 2 * MS, "stale vsync sample releases at the cadence target");
+}
+
 int main(void)
 {
     test_raw_deadline_jitter();
@@ -212,6 +353,10 @@ int main(void)
     test_skipped_frame_ids();
     test_explicit_reset();
     test_cadence_boundaries();
-    puts("PASS: MediaCodec timing cadence, hysteresis, drift and reset boundaries");
+    test_release_survives_late_submission();
+    test_late_frames_keep_cadence();
+    test_release_discontinuities();
+    puts("PASS: MediaCodec timing cadence, hysteresis, drift, reset boundaries "
+         "and late release");
     return 0;
 }
