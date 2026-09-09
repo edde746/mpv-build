@@ -85,7 +85,7 @@ jobs:
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 
-      # The one harness that builds a dependency: the libass fork's layout
+      # The one harness that builds a dependency: the libass series' layout
       # cache is only observable through ass_render_frame itself.
       - name: Install libass host dependencies
         run: brew install autoconf automake libtool pkgconf freetype fribidi harfbuzz libunibreak

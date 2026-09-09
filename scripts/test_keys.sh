@@ -153,7 +153,7 @@ def make_repo(directory):
     (build_scripts / "XCFrameworkBuild" / "main.swift").write_text("// main\n", encoding="utf-8")
 
     # mpv and ffmpeg carry patches; libass deliberately has no patches/ dir at
-    # all, mirroring the real tree.
+    # all in this fixture, so a component without one stays covered.
     for component in ("mpv", "ffmpeg"):
         pool = repo / "patches" / component / "pool"
         pool.mkdir(parents=True)

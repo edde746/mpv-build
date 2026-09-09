@@ -1,5 +1,18 @@
 # Patches applied on every platform, before series.<platform>. The libass pin
-# is shared by all four groups, so a fork-level defect lands here until the
-# fork ships a release containing it (then drop the pool entry with the bump).
-0001-ass-font-guard-mutex-destroy-for-failed-fonts.patch
-0002-ass-render-share-owned-image-buffers-with-the-layout-cache.patch
+# is shared by all four groups. This series is what used to be the
+# edde746/libass fork, re-rooted on upstream: the fork's history had no
+# common ancestor with libass/libass, so a pin bump was a tree diff either
+# way, and a fork-level fix had to wait for a fork release before it could
+# ship. Keep the split: a bump that conflicts tells you which feature it
+# conflicts with. In order:
+#   fast blur          ASS_FEATURE_FAST_BLUR: kernels sized to the blur radius
+#   parse/rasterize    parser and rasterizer speedups, no API change
+#   threads            thread-safe caches, per-event threaded rendering
+#                      (ass_set_threads), the image pool, the static-event
+#                      layout cache (ASS_FEATURE_CACHE_LAYOUT,
+#                      ASS_FEATURE_MOTION_CACHE), and the build-system
+#                      threading option; the fork's font-guard and
+#                      layout-cache fixes are folded in
+0001-ass-fast-blur-kernels.patch
+0002-ass-parse-and-rasterize-faster.patch
+0003-ass-threaded-rendering-image-pool-and-layout-cache.patch

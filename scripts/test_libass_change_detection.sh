@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Build the pinned, patched libass fork for the host and check that a static
-# frame rendered twice is reported unchanged the second time (the layout cache
-# must not hand the next frame a copy with a fresh bitmap pointer). Pass an
-# already-patched libass tree for offline use; otherwise fetch and patch the
-# pinned source in a temporary directory. Needs the host's freetype, fribidi,
-# harfbuzz and libunibreak via pkg-config, autotools, and a system font.
+# Build the pinned libass with its series for the host and check that a static
+# frame rendered twice is reported unchanged the second time (the series'
+# layout cache must not hand the next frame a copy with a fresh bitmap
+# pointer). Pass an already-patched libass tree for offline use; otherwise
+# fetch and patch the pinned source in a temporary directory. Needs the host's
+# freetype, fribidi, harfbuzz and libunibreak via pkg-config, autotools, and a
+# system font.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${1:-}"

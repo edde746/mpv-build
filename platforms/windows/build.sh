@@ -8,8 +8,7 @@
 #      versions.json component `mpv-winbuild-cmake`
 #   2. pin packages/{mpv,ffmpeg,libass}.cmake and toolchain/mingw-w64.cmake
 #      to versions.json, stage the resolved windows patch series and
-#      neutralize the check-git cache cascade (pin_packages.py; libass then
-#      builds from our edde746/libass fork)
+#      neutralize the check-git cache cascade (pin_packages.py)
 #   3. cmake configure with the clang toolchain (aarch64 REQUIRES clang:
 #      gcc + aarch64 is a configure-time FATAL_ERROR upstream) and ccache
 #      baked into the cross-compiler wrappers. winbuild's

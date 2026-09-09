@@ -17,9 +17,9 @@ This helper rewrites the payload package files (and toolchain/mingw-w64.cmake,
 see EXTRA_COMPONENTS) in a winbuild checkout to that idiom, driven by
 versions.json resolved pins (overrides.windows folded in):
 
-  * GIT_REPOSITORY is rewritten to the pinned url -- libass builds from our
-    edde746/libass fork, not upstream libass/libass, which is the windows
-    parity win of this pinning pass;
+  * GIT_REPOSITORY is rewritten to the pinned url, so a component whose
+    pin lives elsewhere than winbuild's default remote builds from the
+    pinned repository;
   * GIT_REMOTE_NAME origin / GIT_TAG <commit> / GIT_RESET <commit> # <human>
     are injected directly after UPDATE_COMMAND "", like mbedtls -- except the
     GIT_TAG carries the resolved commit, because the tag value is what lands

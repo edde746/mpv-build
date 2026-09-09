@@ -1,0 +1,410 @@
+diff --git a/checkasm/blur.c b/checkasm/blur.c
+index bd5a9f3..574270a 100644
+--- a/checkasm/blur.c
++++ b/checkasm/blur.c
+@@ -189,9 +189,9 @@ void checkasm_check_blur(unsigned cpu_flag)
+         check_fixed_filter(engine[i].shrink_vert, "shrink_vert%d", align);
+         check_fixed_filter(engine[i].expand_horz, "expand_horz%d", align);
+         check_fixed_filter(engine[i].expand_vert, "expand_vert%d", align);
+-        for (int n = 4; n <= 8; n++) {
+-            check_param_filter(engine[i].blur_horz[n - 4], "blur%d_horz%d", n, align);
+-            check_param_filter(engine[i].blur_vert[n - 4], "blur%d_vert%d", n, align);
++        for (int n = 1; n <= 8; n++) {
++            check_param_filter(engine[i].blur_horz[n - 1], "blur%d_horz%d", n, align);
++            check_param_filter(engine[i].blur_vert[n - 1], "blur%d_vert%d", n, align);
+         }
+     }
+ }
+diff --git a/libass/aarch64/blur.S b/libass/aarch64/blur.S
+index 292ee84..8ac55fc 100644
+--- a/libass/aarch64/blur.S
++++ b/libass/aarch64/blur.S
+@@ -424,6 +424,9 @@ function blur\n\()_horz16_neon, export=1
+ endfunc
+ .endm
+ 
++blur_horz 1
++blur_horz 2
++blur_horz 3
+ blur_horz 4
+ blur_horz 5
+ blur_horz 6
+@@ -478,6 +481,9 @@ function blur\n\()_vert16_neon, export=1
+ endfunc
+ .endm
+ 
++blur_vert 1
++blur_vert 2
++blur_vert 3
+ blur_vert 4
+ blur_vert 5
+ blur_vert 6
+diff --git a/libass/ass.c b/libass/ass.c
+index b9ce811..3805a3d 100644
+--- a/libass/ass.c
++++ b/libass/ass.c
+@@ -1824,6 +1824,11 @@ int ass_track_set_feature(ASS_Track *track, ASS_Feature feature, int enable)
+     case ASS_FEATURE_INCOMPATIBLE_EXTENSIONS:
+         requested = supported;
+         break;
++    case ASS_FEATURE_FAST_BLUR:
++        // A performance/quality knob, opted into on its own rather than
++        // bundled with the incompatible-extensions umbrella above.
++        requested = FEATURE_MASK(ASS_FEATURE_FAST_BLUR);
++        break;
+     default:
+         if (!(FEATURE_MASK(feature) & supported))
+             return -1;
+diff --git a/libass/ass.h b/libass/ass.h
+index 851ca7c..13fae57 100644
+--- a/libass/ass.h
++++ b/libass/ass.h
+@@ -286,6 +286,22 @@ typedef enum {
+      */
+     ASS_FEATURE_WRAP_UNICODE,
+ 
++    /**
++     * Use faster, approximate Gaussian blur kernels.
++     *
++     * The default blur always uses a kernel of at least radius 4 (a 9-tap
++     * filter), which is far wider than necessary for the small blur radii that
++     * dominate typical subtitles and signs. When this feature is enabled, the
++     * blur picks a kernel sized to the actual standard deviation, refitting the
++     * filter coefficients to the smaller radius. This is noticeably faster for
++     * blur-heavy content (e.g. per-frame re-blurred motion-tracked signs) at
++     * the cost of a small, sub-perceptual change to the blurred output
++     * (bounded well within the renderer's own blur precision budget).
++     *
++     * This is incompatible with VSFilter and disabled by default.
++     */
++    ASS_FEATURE_FAST_BLUR,
++
+     // New enum values can be added here in new ABI-compatible library releases.
+ } ASS_Feature;
+ 
+diff --git a/libass/ass_bitmap.c b/libass/ass_bitmap.c
+index 41df5e1..f8c7cb5 100644
+--- a/libass/ass_bitmap.c
++++ b/libass/ass_bitmap.c
+@@ -66,14 +66,14 @@ static void be_blur_post(uint8_t *buf, intptr_t stride, intptr_t width, intptr_t
+ }
+ 
+ void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
+-                    int be, double blur_r2x, double blur_r2y)
++                    int be, bool fast_blur, double blur_r2x, double blur_r2y)
+ {
+     if (!bm->buffer)
+         return;
+ 
+     // Apply gaussian blur
+     if (blur_r2x > 0.001 || blur_r2y > 0.001)
+-        ass_gaussian_blur(engine, bm, blur_r2x, blur_r2y);
++        ass_gaussian_blur(engine, bm, fast_blur, blur_r2x, blur_r2y);
+ 
+     if (!be)
+         return;
+diff --git a/libass/ass_bitmap.h b/libass/ass_bitmap.h
+index c337bf1..ae7017e 100644
+--- a/libass/ass_bitmap.h
++++ b/libass/ass_bitmap.h
+@@ -45,9 +45,10 @@ bool ass_outline_to_bitmap(struct render_context *state, Bitmap *bm,
+                            ASS_Outline *outline1, ASS_Outline *outline2);
+ 
+ void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
+-                    int be, double blur_r2x, double blur_r2y);
++                    int be, bool fast_blur, double blur_r2x, double blur_r2y);
+ 
+-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y);
++bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
++                       bool fast_blur, double r2x, double r2y);
+ void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
+ void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
+ 
+diff --git a/libass/ass_bitmap_engine.c b/libass/ass_bitmap_engine.c
+index 847adc4..10961f9 100644
+--- a/libass/ass_bitmap_engine.c
++++ b/libass/ass_bitmap_engine.c
+@@ -60,6 +60,9 @@
+ 
+ 
+ #define PARAM_BLUR_SET(suffix) \
++    ass_blur1_ ## suffix, \
++    ass_blur2_ ## suffix, \
++    ass_blur3_ ## suffix, \
+     ass_blur4_ ## suffix, \
+     ass_blur5_ ## suffix, \
+     ass_blur6_ ## suffix, \
+@@ -79,12 +82,38 @@
+ #define BLUR_FUNCTION(name, alignment, suffix) \
+     engine.name = ass_ ## name ## alignment ## _ ## suffix;
+ 
++// Radius 4..8 kernels (SIMD on every target).
+ #define PARAM_BLUR_FUNCTION(dir, alignment, suffix) \
+-    engine.blur_ ## dir[0] = ass_blur4_ ## dir ## alignment ## _ ## suffix; \
+-    engine.blur_ ## dir[1] = ass_blur5_ ## dir ## alignment ## _ ## suffix; \
+-    engine.blur_ ## dir[2] = ass_blur6_ ## dir ## alignment ## _ ## suffix; \
+-    engine.blur_ ## dir[3] = ass_blur7_ ## dir ## alignment ## _ ## suffix; \
+-    engine.blur_ ## dir[4] = ass_blur8_ ## dir ## alignment ## _ ## suffix;
++    engine.blur_ ## dir[3] = ass_blur4_ ## dir ## alignment ## _ ## suffix; \
++    engine.blur_ ## dir[4] = ass_blur5_ ## dir ## alignment ## _ ## suffix; \
++    engine.blur_ ## dir[5] = ass_blur6_ ## dir ## alignment ## _ ## suffix; \
++    engine.blur_ ## dir[6] = ass_blur7_ ## dir ## alignment ## _ ## suffix; \
++    engine.blur_ ## dir[7] = ass_blur8_ ## dir ## alignment ## _ ## suffix;
++
++// Narrow radius 1..3 kernels, used by the ASS_FEATURE_FAST_BLUR path. NEON
++// implements both directions; the x86 SIMD horizontal blur only covers radius
++// >= 4, so on x86 the narrow *horizontal* kernels fall back to the C versions
++// (always built). The vertical SIMD kernels are available for all radii.
++#if CONFIG_ASM && ARCH_X86
++#define PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
++    engine.blur_horz[0] = ass_blur1_horz ## alignment ## _c; \
++    engine.blur_horz[1] = ass_blur2_horz ## alignment ## _c; \
++    engine.blur_horz[2] = ass_blur3_horz ## alignment ## _c;
++#else
++#define PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
++    engine.blur_horz[0] = ass_blur1_horz ## alignment ## _ ## suffix; \
++    engine.blur_horz[1] = ass_blur2_horz ## alignment ## _ ## suffix; \
++    engine.blur_horz[2] = ass_blur3_horz ## alignment ## _ ## suffix;
++#endif
++
++#define PARAM_BLUR_NARROW_VERT(alignment, suffix) \
++    engine.blur_vert[0] = ass_blur1_vert ## alignment ## _ ## suffix; \
++    engine.blur_vert[1] = ass_blur2_vert ## alignment ## _ ## suffix; \
++    engine.blur_vert[2] = ass_blur3_vert ## alignment ## _ ## suffix;
++
++#define PARAM_BLUR_NARROW(alignment, suffix) \
++    PARAM_BLUR_NARROW_HORZ(alignment, suffix) \
++    PARAM_BLUR_NARROW_VERT(alignment, suffix)
+ 
+ #define BLUR_FUNCTIONS(align_order_, alignment, suffix) \
+     BLUR_FUNCTION(stripe_unpack, alignment, suffix) \
+@@ -93,6 +122,7 @@
+     BLUR_FUNCTION(shrink_vert,   alignment, suffix) \
+     BLUR_FUNCTION(expand_horz,   alignment, suffix) \
+     BLUR_FUNCTION(expand_vert,   alignment, suffix) \
++    PARAM_BLUR_NARROW(alignment, suffix) \
+     PARAM_BLUR_FUNCTION(horz, alignment, suffix) \
+     PARAM_BLUR_FUNCTION(vert, alignment, suffix) \
+     engine.align_order = align_order_;
+diff --git a/libass/ass_bitmap_engine.h b/libass/ass_bitmap_engine.h
+index 68d7aa8..b3b75b8 100644
+--- a/libass/ass_bitmap_engine.h
++++ b/libass/ass_bitmap_engine.h
+@@ -84,7 +84,8 @@ typedef struct {
+     Convert16to8Func *stripe_pack;
+     FilterFunc *shrink_horz, *shrink_vert;
+     FilterFunc *expand_horz, *expand_vert;
+-    ParamFilterFunc *blur_horz[5], *blur_vert[5];
++    // indexed by radius-1, i.e. blur_horz[0] is the radius-1 (3-tap) kernel
++    ParamFilterFunc *blur_horz[8], *blur_vert[8];
+ } BitmapEngine;
+ 
+ enum {
+diff --git a/libass/ass_blur.c b/libass/ass_blur.c
+index ec91a92..8af6138 100644
+--- a/libass/ass_blur.c
++++ b/libass/ass_blur.c
+@@ -145,24 +145,50 @@ typedef struct {
+     int16_t coeff[8];
+ } BlurMethod;
+ 
+-static void find_best_method(BlurMethod *blur, double r2)
++static void find_best_method(BlurMethod *blur, double r2, bool fast)
+ {
+     double mu[8];
++
++    // The cascade blur always uses at least a radius-4 (9-tap) kernel, but for
++    // small sigma the gaussian's support is far below that, so most of those
++    // taps are near-zero.  In "fast blur" mode (ASS_FEATURE_FAST_BLUR) pick a
++    // kernel radius matched to the actual support (max_radius = ceil(2*sigma));
++    // this only applies at level 0, where the kernel radius maps directly to
++    // output pixels.  The dropped tail stays well within the renderer's blur
++    // precision budget (measured <= 2/255 on real content).
++    int max_radius = 8;
++    if (fast)
++        max_radius = FFMINMAX((int) ceil(2.0 * sqrt(r2)), 1, 8);
++
+     if (r2 < 0.5) {
+         blur->level = 0;
+         blur->radius = 4;
+         mu[1] = 0.085 * r2 * r2 * r2;
+         mu[0] = 0.5 * r2 - 4 * mu[1];
+         mu[2] = mu[3] = 0;
++        // The closed form above already has mu[2] = mu[3] = 0, so trimming to
++        // radius 2 is exact; the fast cap may take it down to radius 1.
++        if (max_radius < blur->radius)
++            blur->radius = max_radius;
+     } else {
+         double frac = frexp(sqrt(0.11569 * r2 + 0.20591047), &blur->level);
+         double mul = pow(0.25, blur->level);
+         blur->radius = 8 - (int) ((10.1525 + 0.8335 * mul) * (1 - frac));
+         blur->radius = FFMAX(blur->radius, 4);
++        // Refit the least-squares coefficients to the reduced radius.
++        if (blur->level == 0 && max_radius < blur->radius)
++            blur->radius = max_radius;
+         calc_coeff(mu, blur->radius, r2, mul);
+     }
+     for (int i = 0; i < blur->radius; i++)
+         blur->coeff[i] = (int) (0x10000 * mu[i] + 0.5);
++
++    // Drop outer taps whose quantized coefficient is zero: pixel-identical
++    // (the kernel is unchanged), it just shrinks the otherwise transparent
++    // padding border.  Only in fast mode, so the default output is untouched.
++    if (fast)
++        while (blur->radius > 1 && blur->coeff[blur->radius - 1] == 0)
++            blur->radius--;
+ }
+ 
+ /**
+@@ -170,13 +196,14 @@ static void find_best_method(BlurMethod *blur, double r2)
+  * \param r2x in: desired standard deviation along X axis squared
+  * \param r2y in: desired standard deviation along Y axis squared
+  */
+-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, double r2y)
++bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
++                       bool fast_blur, double r2x, double r2y)
+ {
+     BlurMethod blur_x, blur_y;
+-    find_best_method(&blur_x, r2x);
++    find_best_method(&blur_x, r2x, fast_blur);
+     if (r2y == r2x)
+         memcpy(&blur_y, &blur_x, sizeof(blur_y));
+-    else find_best_method(&blur_y, r2y);
++    else find_best_method(&blur_y, r2y, fast_blur);
+ 
+     uint32_t w = bm->w, h = bm->h;
+     int offset_x = ((2 * blur_x.radius + 9) << blur_x.level) - 5;
+@@ -207,12 +234,12 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm, double r2x, doubl
+         w = (w + 5) >> 1;
+         index ^= 1;
+     }
+-    assert(blur_x.radius >= 4 && blur_x.radius <= 8);
+-    engine->blur_horz[blur_x.radius - 4](buf[index ^ 1], buf[index], w, h, blur_x.coeff);
++    assert(blur_x.radius >= 1 && blur_x.radius <= 8);
++    engine->blur_horz[blur_x.radius - 1](buf[index ^ 1], buf[index], w, h, blur_x.coeff);
+     w += 2 * blur_x.radius;
+     index ^= 1;
+-    assert(blur_y.radius >= 4 && blur_y.radius <= 8);
+-    engine->blur_vert[blur_y.radius - 4](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
++    assert(blur_y.radius >= 1 && blur_y.radius <= 8);
++    engine->blur_vert[blur_y.radius - 1](buf[index ^ 1], buf[index], w, h, blur_y.coeff);
+     h += 2 * blur_y.radius;
+     index ^= 1;
+     for (int i = 0; i < blur_x.level; i++) {
+diff --git a/libass/ass_cache.h b/libass/ass_cache.h
+index 53eac20..244f540 100644
+--- a/libass/ass_cache.h
++++ b/libass/ass_cache.h
+@@ -76,6 +76,7 @@ enum {
+     FILTER_NONZERO_SHADOW = 0x04,
+     FILTER_FILL_IN_SHADOW = 0x08,
+     FILTER_FILL_IN_BORDER = 0x10,
++    FILTER_FAST_BLUR      = 0x20,
+ };
+ 
+ // ass_cache_get() takes ownership of the bitmaps array and either frees it
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 18f856a..b80ed87 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -2464,6 +2464,9 @@ static void render_and_combine_glyphs(RenderContext *state,
+ 
+         for (; info; info = info->next) {
+             int flags = 0;
++            if (render_priv->track->parser_priv->feature_flags &
++                FEATURE_MASK(ASS_FEATURE_FAST_BLUR))
++                flags |= FILTER_FAST_BLUR;
+             if (info->border_style == 3)
+                 flags |= FILTER_BORDER_STYLE_3;
+             if (info->border_x || info->border_y)
+@@ -2720,11 +2723,12 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
+     }
+ 
+     int flags = k->filter.flags;
++    bool fast_blur = flags & FILTER_FAST_BLUR;
+     double r2x = restore_blur(k->filter.blur_x);
+     double r2y = restore_blur(k->filter.blur_y);
+     if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
+-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
+-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
++        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, fast_blur, r2x, r2y);
++    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, fast_blur, r2x, r2y);
+ 
+     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
+         ass_fix_outline(&v->bm, &v->bm_o);
+diff --git a/libass/c/blur_template.h b/libass/c/blur_template.h
+index 7597b48..1509968 100644
+--- a/libass/c/blur_template.h
++++ b/libass/c/blur_template.h
+@@ -299,6 +299,48 @@ static inline void SUFFIX(blur_vert)(int16_t *restrict dst, const int16_t *restr
+     }
+ }
+ 
++void SUFFIX(ass_blur1_horz)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 1);
++}
++
++void SUFFIX(ass_blur1_vert)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 1);
++}
++
++void SUFFIX(ass_blur2_horz)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 2);
++}
++
++void SUFFIX(ass_blur2_vert)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 2);
++}
++
++void SUFFIX(ass_blur3_horz)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_horz)(dst, src, src_width, src_height, param, 3);
++}
++
++void SUFFIX(ass_blur3_vert)(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height,
++                            const int16_t *restrict param)
++{
++    SUFFIX(blur_vert)(dst, src, src_width, src_height, param, 3);
++}
++
+ void SUFFIX(ass_blur4_horz)(int16_t *restrict dst, const int16_t *restrict src,
+                             size_t src_width, size_t src_height,
+                             const int16_t *restrict param)
+diff --git a/libass/x86/blur.asm b/libass/x86/blur.asm
+index 90ecbc9..30cc0c4 100644
+--- a/libass/x86/blur.asm
++++ b/libass/x86/blur.asm
+@@ -1071,12 +1071,18 @@ cglobal blur%1_vert%2, 5,7,8, -mmsize
+ %endmacro
+ 
+ INIT_XMM sse2
++BLUR_VERT 1,16
++BLUR_VERT 2,16
++BLUR_VERT 3,16
+ BLUR_VERT 4,16
+ BLUR_VERT 5,16
+ BLUR_VERT 6,16
+ BLUR_VERT 7,16
+ BLUR_VERT 8,16
+ INIT_YMM avx2
++BLUR_VERT 1,32
++BLUR_VERT 2,32
++BLUR_VERT 3,32
+ BLUR_VERT 4,32
+ BLUR_VERT 5,32
+ BLUR_VERT 6,32

@@ -11,7 +11,7 @@ pinned as the versions.json component `mpv-winbuild-cmake`.
 to rewrite `packages/{mpv,ffmpeg,libass}.cmake` onto the versions.json pins
 (upstream tracks master for all three; the rewrite uses upstream's own
 `GIT_REMOTE_NAME origin` / `GIT_TAG` / `GIT_RESET` idiom from
-`packages/mbedtls.cmake`, and points libass at our edde746/libass fork), then
+`packages/mbedtls.cmake`), then
 configures with `-DCOMPILER_TOOLCHAIN=clang` (mandatory for aarch64),
 bootstraps the toolchain (`ninja llvm`, `ninja rustup`, `ninja llvm-clang`)
 and runs `ninja mpv`. Full builds need a Linux host with the winbuild README
@@ -140,6 +140,6 @@ the winbuild checkout itself pristine.
 
 runs `pin_packages.py` against byte-exact fixture copies of the real package
 files (`testdata/`, provenance in `testdata/PROVENANCE`) and asserts the
-injected block matches the mbedtls idiom, idempotency, the edde746/libass
-repoint, and that a PATCH_COMMAND is only injected for a non-empty resolved
-windows series.
+injected block matches the mbedtls idiom, idempotency, that GIT_REPOSITORY
+follows the pinned url, and that a PATCH_COMMAND is only injected for a
+non-empty resolved windows series.

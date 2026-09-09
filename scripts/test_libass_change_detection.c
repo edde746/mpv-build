@@ -1,4 +1,4 @@
-// Behavioral regression for the libass fork's static-event layout cache:
+// Behavioral regression for the libass series' static-event layout cache:
 // rendering the same static frame twice must report the second render as
 // unchanged (ass_render_frame's detect_change == 0). The cache captures
 // owned-buffer images (opaque boxes, vector clips) on the miss frame; a copy

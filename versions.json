@@ -59,11 +59,11 @@
     },
     "libass": {
       "kind": "git",
-      "version": "0.18.4",
-      "url": "https://github.com/edde746/libass",
-      "ref": "0.18.4",
-      "commit": "9c936772ffdaabdd9dc271ef8fc800e5b025a71b",
-      "provenance": "Resolved 2026-09-05 with `git ls-remote https://github.com/edde746/libass 'refs/tags/0.18.4*'`; the annotated tag's peeled ^{} line is the commit.",
+      "version": "0.17.5",
+      "url": "https://github.com/libass/libass",
+      "ref": "0.17.5",
+      "commit": "4a05d8127f525943ebf45fdc6497c9e665947f0d",
+      "provenance": "Resolved 2026-09-09 with `git ls-remote https://github.com/libass/libass 'refs/tags/0.17.5*'`; the annotated tag's peeled ^{} line is the commit. Upstream libass; everything the edde746/libass fork carried on top now lives in patches/libass/series.common.",
       "platforms": [
         "apple",
         "android",
