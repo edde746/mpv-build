@@ -148,6 +148,12 @@ It extracts the production timing core from its patch and covers cadence
 prediction, refresh hysteresis, clock drift, reset boundaries, and the release
 timestamp handed to MediaCodec when the VO thread runs late, without a device.
 
+Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
+It extracts the freestanding scheduler core of the same patch and covers the
+frame-cadence estimator that predicts the next pts, the single-use pre-render
+and its match tolerance, the subtitle read-horizon cap, the latency shift, the
+swap lead, and dirty-region folding.
+
 Run the Dolby Vision packet-filter regression with
 `bash scripts/test_mediacodec_dv_filter.sh`. It extracts the production
 access-unit filter from the ffmpeg patch and checks that unchanged access units

@@ -1,8 +1,8 @@
 diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index 814e1e4..e5357d6 100644
+index 814e1e4..3cafbee 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
-@@ -723,6 +723,30 @@ Available video output drivers are:
+@@ -723,6 +723,47 @@ Available video output drivers are:
          :yes:   Attempt to enable VRR, whether the capability is reported or not.
          :auto:  Attempt to enable VRR if support is reported.
  
@@ -21,7 +21,18 @@ index 814e1e4..e5357d6 100644
 +    Surface), while the OSD Surface's bounds define its independent canvas and
 +    must be stacked above the video. Since decoded buffers go straight to the
 +    system compositor, the decoder's dataspace (HDR) is preserved and no GPU
-+    pass runs, but video filters and screenshots are unavailable.
++    pass runs on the video, but video filters and screenshots are unavailable.
++
++    Subtitles/OSD are rasterized on their own thread as soon as a frame is
++    known to the VO, pre-rendered for the next frame from the observed frame
++    cadence while the current one waits for its deadline (never past what the
++    subtitle decoders have read), and presented through a GLES2 surface over
++    the OSD Surface with the same presentation timestamp the video buffer got,
++    so both latch on one vsync. The video is never held back for the OSD:
++    under load subtitle updates are skipped or shown late instead. A
++    ``osd-sync`` line in the verbose log every 120 frames and at exit reports
++    render times, pre-render hits, late swaps and, where the compositor
++    supports ``EGL_ANDROID_get_frame_timestamps``, where swaps actually landed.
 +
 +    ``--vo-mediacodec-video-rect=<vw>,<vh>,<left>,<top>,<right>,<bottom>``
 +    supplies the applied video rectangle relative to the full OSD view.
@@ -29,6 +40,12 @@ index 814e1e4..e5357d6 100644
 +    Viewport dimensions must be positive and right/bottom are exclusive;
 +    negative margins are supported for zoom. Empty (the default) means that
 +    geometry is unavailable. Invalid updates retain the last valid geometry.
++
++    ``--vo-mediacodec-osd-latency-frames=<-2..2>`` (default 0) renders the
++    OSD that many frames earlier in content time. Some hardware codec paths
++    reach the display a vsync after a GL layer given the same timestamp; the
++    embedder supplies the offset it measured. The presentation time is never
++    shifted, only the rendered pts.
 +
  ``mediacodec_embed`` (Android)
      Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
@@ -67,10 +84,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..4057c56
+index 0000000..806b83a
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,1100 @@
+@@ -0,0 +1,2107 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -94,16 +111,43 @@ index 0000000..4057c56
 + * Decoded buffers go straight to the --wid Surface (no GPU pass, decoder
 + * dataspace intact) and are released with a presentation timestamp about
 + * two vsyncs ahead, snapped to the Choreographer vsync grid when a fresh
-+ * sample exists. OSD/subtitles are rasterized on a separate thread into the
-+ * transparent --vo-mediacodec-osd-surface Surface, which the embedder stacks
-+ * above the video. The embedder owns all geometry; software frames are
++ * sample exists. The embedder owns all geometry; software frames are
 + * refused so the Surface never becomes a CPU producer.
++ *
++ * OSD/subtitles go to the transparent --vo-mediacodec-osd-surface Surface,
++ * which the embedder stacks above the video, through a two-stage pipeline
++ * that never holds the video back:
++ *
++ *  - The render stage (thread "vo/osd-render") rasterizes the OSD for a
++ *    media pts into a CPU slot. It is asked to as soon as draw_frame knows
++ *    the frame, up to --video-timing-offset plus the queue lead before the
++ *    frame is due, and between requests it pre-renders the next frame's pts
++ *    from the observed cadence so a regular request is served without
++ *    calling libass at all. Pre-rendering never runs past the subtitle
++ *    decoders' read horizon, where an undecoded event or a pending segment
++ *    switch would make the result wrong.
++ *  - The present stage (thread "vo/osd-present") uploads slots into a GL
++ *    texture on an EGL surface over the OSD Surface and swaps with
++ *    eglPresentationTimeANDROID set to the exact release timestamp the video
++ *    buffer got, so the compositor latches both on one vsync regardless of
++ *    how long the copy took. Swaps are scheduled half a frame before that
++ *    timestamp, and EGL_ANDROID_get_frame_timestamps reports where they
++ *    actually landed.
++ *
++ * Both hand-offs are latest-wins mailboxes: under load the render stage
++ * services the newest frame and the intermediate ones are skipped, a
++ * pinned result is presented late rather than dropped, and the dirty region
++ * of anything skipped is folded into the next result so the texture never
++ * misses an update. The scheduler core is freestanding and covered by the
++ * host regression in scripts/test_mediacodec_osd.sh.
 + */
 +
 +#include <dlfcn.h>
 +#include <limits.h>
 +#include <math.h>
 +#include <stdbool.h>
++#include <string.h>
++#include <sys/resource.h>
 +#include <time.h>
 +#include <stdint.h>
 +
@@ -111,6 +155,9 @@ index 0000000..4057c56
 +#include <android/looper.h>
 +#include <android/native_window.h>
 +#include <android/native_window_jni.h>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
 +
 +#include <libavcodec/mediacodec.h>
 +#include <libavutil/hwcontext.h>
@@ -126,6 +173,8 @@ index 0000000..4057c56
 +#include "sub/osd.h"
 +#include "video/hwdec.h"
 +#include "video/mp_image.h"
++#include "video/out/opengl/common.h"
++#include "video/out/opengl/egl_helpers.h"
 +#include "vo.h"
 +
 +// --- mediacodec timing core
@@ -359,14 +408,240 @@ index 0000000..4057c56
 +
 +// --- end mediacodec geometry core
 +
++// --- mediacodec osd scheduler core
++
++#define OSD_CADENCE_SAMPLES 8
++#define OSD_CADENCE_MIN_SAMPLES 4
++#define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
++#define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
++
++// Media-pts cadence of the frames the VO flips, as the ExoPlayer overlay
++// estimates it: median of the last eight consecutive deltas, trusted after
++// four. A frame_id gap (frames the VO dropped), a non-positive delta (seek,
++// backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
++struct osd_cadence {
++    double deltas[OSD_CADENCE_SAMPLES];
++    int count;
++    int next;
++    bool have_last;
++    uint64_t last_frame_id;
++    double last_pts;
++};
++
++static void osd_cadence_reset(struct osd_cadence *c)
++{
++    *c = (struct osd_cadence){0};
++}
++
++static void osd_cadence_observe(struct osd_cadence *c, uint64_t frame_id,
++                                double pts)
++{
++    if (c->have_last) {
++        double delta = pts - c->last_pts;
++        if (frame_id != c->last_frame_id + 1 || !(delta > 0) ||
++            delta > OSD_CADENCE_MAX_DELTA)
++        {
++            osd_cadence_reset(c);
++        } else {
++            c->deltas[c->next] = delta;
++            c->next = (c->next + 1) % OSD_CADENCE_SAMPLES;
++            if (c->count < OSD_CADENCE_SAMPLES)
++                c->count++;
++        }
++    }
++    c->have_last = true;
++    c->last_frame_id = frame_id;
++    c->last_pts = pts;
++}
++
++// Median delta in seconds, 0 until enough consecutive frames were seen.
++static double osd_cadence_delta(const struct osd_cadence *c)
++{
++    if (c->count < OSD_CADENCE_MIN_SAMPLES)
++        return 0;
++    double sorted[OSD_CADENCE_SAMPLES];
++    for (int n = 0; n < c->count; n++) {
++        double v = c->deltas[n];
++        int i = n;
++        while (i > 0 && sorted[i - 1] > v) {
++            sorted[i] = sorted[i - 1];
++            i--;
++        }
++        sorted[i] = v;
++    }
++    return c->count & 1 ? sorted[c->count / 2]
++                        : (sorted[c->count / 2 - 1] + sorted[c->count / 2]) / 2;
++}
++
++// Content-time shift for the codec->display latency the embedder measured
++// (--vo-mediacodec-osd-latency-frames): render the OSD for the frame that is
++// on screen when this one's release timestamp passes. Applied to the render
++// pts only, never to the presentation time.
++static double osd_cadence_shift(const struct osd_cadence *c, double pts,
++                                int latency_frames)
++{
++    double delta = osd_cadence_delta(c);
++    return delta > 0 ? pts - latency_frames * delta : pts;
++}
++
++// Single-use pre-render bookkeeping, owned by the render thread.
++struct osd_spec {
++    bool valid;
++    double pts;
++    uint64_t epoch;
++    int slot; // -1: the pre-render found the OSD unchanged, nothing to post
++    uint32_t hits, misses, skips, horizon_skips;
++};
++
++enum osd_spec_result {
++    OSD_SPEC_MISS,     // render on demand
++    OSD_SPEC_HIT,      // post spec->slot (or nothing when it is -1)
++};
++
++// A request for pts arrived. The speculation is consumed either way. A match
++// tolerates container timestamp rounding (1 ms alternation at 23.976 in
++// Matroska) but never half a frame: ASS times have 10 ms resolution and a
++// few ms of \move are sub-pixel, while the wrong frame is not.
++static enum osd_spec_result osd_spec_service(struct osd_spec *s, double pts,
++                                             uint64_t epoch, bool full,
++                                             double delta)
++{
++    if (!s->valid)
++        return OSD_SPEC_MISS;
++    s->valid = false;
++    double tolerance = OSD_SPEC_TOLERANCE;
++    if (delta > 0 && delta / 4 < tolerance)
++        tolerance = delta / 4;
++    if (full || epoch != s->epoch || !(fabs(pts - s->pts) <= tolerance)) {
++        s->misses++;
++        return OSD_SPEC_MISS;
++    }
++    s->hits++;
++    return OSD_SPEC_HIT;
++}
++
++// Whether to pre-render after serving last_pts, and for which pts.
++//  delta:    cadence from osd_cadence_delta(), 0 when unknown
++//  horizon:  furthest pts the subtitle decoders can render correctly;
++//            NAN when unknown, INFINITY when unbounded
++//  eligible: playing, last request was a real frame, no request pending,
++//            a slot is free
++static bool osd_spec_plan(struct osd_spec *s, double last_pts, double delta,
++                          double horizon, bool eligible, double *out_pts)
++{
++    if (s->valid)
++        return false;
++    if (!eligible || !(delta > 0)) {
++        s->skips++;
++        return false;
++    }
++    double pts = last_pts + delta;
++    if (!(pts <= horizon)) { // also rejects NAN
++        s->horizon_skips++;
++        return false;
++    }
++    *out_pts = pts;
++    return true;
++}
++
++static void osd_spec_store(struct osd_spec *s, double pts, uint64_t epoch,
++                           int slot)
++{
++    s->valid = true;
++    s->pts = pts;
++    s->epoch = epoch;
++    s->slot = slot;
++}
++
++// Swap lead of the present stage: half the median of the last eight release
++// intervals, clamped to 6..18 ms, so the buffer is queued inside the latch
++// window of its vsync but never so early that it sits in the queue across
++// the previous one.
++#define OSD_SWAP_LEAD_SAMPLES 8
++#define OSD_SWAP_LEAD_MIN_NS INT64_C(6000000)
++#define OSD_SWAP_LEAD_MAX_NS INT64_C(18000000)
++#define OSD_SWAP_LEAD_MAX_INTERVAL_NS INT64_C(250000000)
++
++struct osd_swap_lead {
++    int64_t intervals[OSD_SWAP_LEAD_SAMPLES];
++    int count;
++    int next;
++    int64_t last_release;
++    int64_t lead; // current lead in ns
++};
++
++static void osd_swap_lead_reset(struct osd_swap_lead *l)
++{
++    *l = (struct osd_swap_lead){.lead = OSD_SWAP_LEAD_MAX_NS};
++}
++
++static void osd_swap_lead_observe(struct osd_swap_lead *l, int64_t release_ns)
++{
++    if (l->last_release) {
++        int64_t interval = release_ns - l->last_release;
++        if (interval <= 0 || interval > OSD_SWAP_LEAD_MAX_INTERVAL_NS) {
++            osd_swap_lead_reset(l);
++        } else {
++            l->intervals[l->next] = interval;
++            l->next = (l->next + 1) % OSD_SWAP_LEAD_SAMPLES;
++            if (l->count < OSD_SWAP_LEAD_SAMPLES)
++                l->count++;
++        }
++    }
++    l->last_release = release_ns;
++    if (l->count < OSD_CADENCE_MIN_SAMPLES)
++        return;
++    int64_t sorted[OSD_SWAP_LEAD_SAMPLES];
++    for (int n = 0; n < l->count; n++) {
++        int64_t v = l->intervals[n];
++        int i = n;
++        while (i > 0 && sorted[i - 1] > v) {
++            sorted[i] = sorted[i - 1];
++            i--;
++        }
++        sorted[i] = v;
++    }
++    int64_t median = l->count & 1 ? sorted[l->count / 2]
++        : (sorted[l->count / 2 - 1] + sorted[l->count / 2]) / 2;
++    int64_t lead = median / 2;
++    l->lead = lead < OSD_SWAP_LEAD_MIN_NS ? OSD_SWAP_LEAD_MIN_NS
++            : lead > OSD_SWAP_LEAD_MAX_NS ? OSD_SWAP_LEAD_MAX_NS : lead;
++}
++
++// Fold a skipped result's region into the next one so the texture, which
++// only ever receives what results carry, never misses pixels.
++struct osd_dirty {
++    bool any;
++    int x0, y0, x1, y1;
++};
++
++static void osd_dirty_add(struct osd_dirty *d, int x0, int y0, int x1, int y1)
++{
++    if (x1 <= x0 || y1 <= y0)
++        return;
++    if (!d->any) {
++        *d = (struct osd_dirty){true, x0, y0, x1, y1};
++        return;
++    }
++    if (x0 < d->x0) d->x0 = x0;
++    if (y0 < d->y0) d->y0 = y0;
++    if (x1 > d->x1) d->x1 = x1;
++    if (y1 > d->y1) d->y1 = y1;
++}
++
++// --- end mediacodec osd scheduler core
++
 +struct mediacodec_opts {
 +    char *video_rect;
++    int osd_latency_frames;
 +};
 +
 +#define OPT_BASE_STRUCT struct mediacodec_opts
 +static const struct m_sub_options mediacodec_conf = {
 +    .opts = (const struct m_option[]){
 +        {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
++        {"vo-mediacodec-osd-latency-frames", OPT_INT(osd_latency_frames),
++            M_RANGE(-2, 2)},
 +        {0},
 +    },
 +    .size = sizeof(struct mediacodec_opts),
@@ -374,32 +649,115 @@ index 0000000..4057c56
 +};
 +#undef OPT_BASE_STRUCT
 +
++#define OSD_SLOTS 3
++#define OSD_STATS_INTERVAL_FRAMES 120
++#define OSD_LATE_THRESHOLD_NS MP_TIME_MS_TO_NS(4)
++#define OSD_RELEASE_HISTORY 4
++#define OSD_PRESENT_PROBES 16
++
++// One rendered OSD update: the pixels of `rect` on a canvas_w x canvas_h
++// canvas, premultiplied RGBA, rows of (x1 - x0) * 4 bytes.
++struct osd_slot {
++    uint8_t *pixels;
++    size_t capacity;
++    struct mp_rect rect;
++    int canvas_w, canvas_h;
++    bool full;
++};
++
++struct osd_request {
++    double pts;      // render pts (already latency-shifted), MP_NOPTS_VALUE ok
++    double delta;    // cadence at filing time, 0 when unknown
++    uint64_t seq;    // frame sequence, 0 for an unpinned repaint
++    uint64_t epoch;
++    bool full;
++};
++
++struct osd_result {
++    int slot;        // -1: none
++    uint64_t seq;
++    uint64_t epoch;
++};
++
++// Release timestamp of a flipped frame, by sequence number.
++struct osd_release {
++    uint64_t seq;
++    int64_t timestamp;  // CLOCK_MONOTONIC handed to MediaCodec, 0 = untimed
++    int64_t vsync;      // the vsync that timestamp targets, 0 = unknown
++    int64_t period;     // display period at release, 0 = unknown
++};
++
++struct osd_present_probe {
++    EGLuint64KHR frame_id;
++    int64_t target_ns;
++    int64_t period_ns;
++};
++
++// Every field the three threads share lives under osd_lock; osd_wakeup is
++// broadcast for any change.
++struct osd_shared {
++    bool terminate;
++    bool present_failed; // the present stage could not bring up EGL
++    bool paused;
++    uint64_t epoch;
++    struct mediacodec_geometry geometry;
++    int latency_frames;
++
++    // VO -> render
++    bool requested;
++    struct osd_request request;
++    // VO -> present
++    struct osd_release releases[OSD_RELEASE_HISTORY];
++    int release_next;
++    uint64_t release_seq; // newest published
++    // render -> present
++    struct osd_result result;
++    int present_slot;     // slot the present stage holds, -1 none
++
++    // Statistics (writer noted per field; the VO thread reads them all).
++    uint32_t frames;            // VO: pinned requests filed
++    uint32_t coalesced;         // VO: requests replaced before service
++    uint32_t renders, renders_changed; // render
++    int64_t render_ns_last, render_ns_max; // render
++    uint32_t render_hist[5];    // render: <=10, <=25, <=42, <=84, >84 ms
++    uint32_t superseded;        // render: results replaced before taken
++    uint32_t stale;             // present: results discarded on epoch change
++    uint32_t swaps, late;       // present
++    int64_t late_ns_max;        // present
++    int64_t lead_ns_last, lead_ns_min; // present: release - queued
++    bool have_lead_min;
++    int64_t swap_ns_last, swap_ns_max; // present: eglSwapBuffers duration
++    int64_t swap_lead_ns;       // present
++    const char *present_source; // present: which timestamp is measured
++    int64_t present_err_last, present_err_worst;
++    uint32_t present_hist[5];   // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
++    uint32_t present_measured, present_invalid, present_dropped;
++    struct osd_spec spec;       // render (counters read by the VO thread)
++};
++
 +struct priv {
 +    struct mp_image *cur_image;
 +    int64_t cur_pts; // mp_time_ns() display time, 0 = immediately
 +    uint64_t cur_frame_id;
 +    double cur_duration;
-+    double osd_pts;
++    uint64_t cur_seq;    // sequence of the frame draw_frame received
++    double osd_pts;      // render pts of the last real frame
 +
 +    struct mp_hwdec_ctx hwctx;
 +
 +    ANativeWindow *osd_window;
 +    bool osd_missing_logged;
-+
-+    // OSD thread owns the draw cache and the Surface; the VO thread files
-+    // requests under osd_lock, latest wins.
-+    mp_thread osd_thread;
-+    bool osd_thread_created;
++    mp_thread osd_render_thread, osd_present_thread;
++    bool osd_threads_created;
 +    mp_mutex osd_lock;
 +    mp_cond osd_wakeup;
-+    bool osd_terminate;
-+    bool osd_requested;
-+    bool osd_request_full;
-+    double osd_request_pts;
-+    int64_t osd_request_deadline; // mp_time_ns(), 0 = post immediately
-+    uint64_t osd_epoch;
-+    uint64_t osd_request_epoch;
-+    struct mediacodec_geometry osd_geometry; // protected by osd_lock
++    struct osd_shared osd;
++    struct osd_slot osd_slots[OSD_SLOTS];
++
++    // VO thread only
++    struct osd_cadence cadence;
++    uint64_t frame_seq;
++    uint32_t stats_frames;
 +
 +    // Choreographer vsync sampler
 +    void *choreographer_lib;
@@ -421,7 +779,7 @@ index 0000000..4057c56
 +    int64_t queue_period;
 +    int64_t queue_period_changed;
 +    int64_t queue_offset;
-+    struct m_config_cache *geometry_cache;
++    struct m_config_cache *opts_cache;
 +
 +    int64_t osd_surface;
 +};
@@ -597,9 +955,886 @@ index 0000000..4057c56
 +    return device_ref;
 +}
 +
-+static MP_THREAD_VOID osd_thread(void *arg);
++// mp_time_ns() -> CLOCK_MONOTONIC (System.nanoTime, MediaCodec's domain).
++static int64_t mp_time_to_monotonic_ns(int64_t mp_time)
++{
++    int64_t mono_now = monotonic_now_ns();
++    return mono_now ? mp_time - mp_time_ns() + mono_now : 0;
++}
 +
-+static void geometry_wakeup(void *ctx)
++static int64_t monotonic_to_mp_time_ns(int64_t mono)
++{
++    int64_t mono_now = monotonic_now_ns();
++    return mono_now ? mono - mono_now + mp_time_ns() : 0;
++}
++
++// premultiplied BGRA -> RGBA_8888
++static void copy_bgra_to_rgba(uint8_t *dst, ptrdiff_t dst_stride,
++                              const uint8_t *src, ptrdiff_t src_stride,
++                              int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        uint32_t *d = (uint32_t *)(dst + y * dst_stride);
++        const uint32_t *s = (const uint32_t *)(src + y * src_stride);
++        for (int x = 0; x < w; x++) {
++            uint32_t c = s[x];
++            d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
++        }
++    }
++}
++
++// --- OSD render stage --------------------------------------------------------
++
++struct osd_render_state {
++    struct mp_draw_sub_cache *cache;
++    int last_w, last_h;
++    bool force_full;
++    // Region of results that never reached the texture: a replaced result
++    // (read at render start, replaced at post) or a discarded pre-render.
++    struct osd_dirty carry;
++    struct osd_request last; // last serviced request
++    uint64_t planned_seq;    // last.seq whose pre-render was decided
++};
++
++// Locked. A slot that is neither the untaken result, nor held by the present
++// stage, nor `keep`. With three slots this only fails while a valid
++// pre-render is kept.
++static int osd_free_slot(struct priv *p, int keep)
++{
++    for (int n = 0; n < OSD_SLOTS; n++) {
++        if (n != p->osd.result.slot && n != p->osd.present_slot && n != keep)
++            return n;
++    }
++    return -1;
++}
++
++static void osd_record_render(struct priv *p, int64_t render_ns, bool changed)
++{
++    struct osd_shared *s = &p->osd;
++    s->renders++;
++    if (changed)
++        s->renders_changed++;
++    s->render_ns_last = render_ns;
++    if (render_ns > s->render_ns_max)
++        s->render_ns_max = render_ns;
++    int64_t ms = render_ns / 1000000;
++    s->render_hist[ms <= 10 ? 0 : ms <= 25 ? 1 : ms <= 42 ? 2 : ms <= 84 ? 3 : 4]++;
++}
++
++// Render the OSD for pts into slot. Returns whether the slot holds an update.
++static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
++                            double pts, struct mediacodec_geometry geometry,
++                            int slot)
++{
++    struct priv *p = vo->priv;
++
++    int w = ANativeWindow_getWidth(p->osd_window);
++    int h = ANativeWindow_getHeight(p->osd_window);
++    if (w <= 0 || h <= 0)
++        return false;
++    if (w != rs->last_w || h != rs->last_h) {
++        rs->last_w = w;
++        rs->last_h = h;
++        rs->force_full = true;
++    }
++
++    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
++
++    int64_t t0 = mp_time_ns();
++    struct sub_bitmap_list *sbs =
++        osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
++    if (!sbs)
++        return false;
++
++    if (!rs->cache)
++        rs->cache = mp_draw_sub_alloc(NULL, vo->global);
++
++    struct mp_rect act_rc[1], mod_rc[64];
++    int num_act_rc = 0, num_mod_rc = 0;
++    struct mp_image *osd = mp_draw_sub_overlay(rs->cache, sbs,
++            act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
++            mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc);
++    int64_t render_ns = mp_time_ns() - t0;
++    bool changed = osd && (num_mod_rc > 0 || rs->force_full);
++
++    mp_mutex_lock(&p->osd_lock);
++    osd_record_render(p, render_ns, changed);
++    mp_mutex_unlock(&p->osd_lock);
++
++    bool posted = false;
++    if (!osd || (!changed && !rs->carry.any))
++        goto done;
++
++    struct osd_dirty dirty = rs->carry;
++    if (rs->force_full) {
++        dirty = (struct osd_dirty){true, 0, 0, osd->w, osd->h};
++    } else {
++        for (int n = 0; n < num_mod_rc; n++)
++            osd_dirty_add(&dirty, mod_rc[n].x0, mod_rc[n].y0,
++                          mod_rc[n].x1, mod_rc[n].y1);
++    }
++    int x0 = MPCLAMP(dirty.x0, 0, osd->w);
++    int y0 = MPCLAMP(dirty.y0, 0, osd->h);
++    int x1 = MPCLAMP(dirty.x1, x0, osd->w);
++    int y1 = MPCLAMP(dirty.y1, y0, osd->h);
++    if (x1 <= x0 || y1 <= y0)
++        goto done;
++
++    struct osd_slot *dst = &p->osd_slots[slot];
++    size_t bytes = (size_t)(x1 - x0) * (y1 - y0) * 4;
++    if (dst->capacity < bytes) {
++        // Not a child of priv: talloc parents are not thread-safe and the VO
++        // thread allocates on it too. osd_uninit frees the slots after join.
++        dst->pixels = talloc_realloc(NULL, dst->pixels, uint8_t, bytes);
++        dst->capacity = bytes;
++    }
++    copy_bgra_to_rgba(dst->pixels, (ptrdiff_t)(x1 - x0) * 4,
++                      (uint8_t *)osd->planes[0] +
++                          (ptrdiff_t)y0 * osd->stride[0] + (ptrdiff_t)x0 * 4,
++                      osd->stride[0], x1 - x0, y1 - y0);
++    dst->rect = (struct mp_rect){x0, y0, x1, y1};
++    dst->canvas_w = osd->w;
++    dst->canvas_h = osd->h;
++    dst->full = x0 == 0 && y0 == 0 && x1 == osd->w && y1 == osd->h;
++    rs->force_full = false;
++    rs->carry = (struct osd_dirty){0};
++    posted = true;
++
++done:
++    talloc_free(sbs);
++    return posted;
++}
++
++// Locked. Hand a slot to the present stage; a result it has not taken yet is
++// replaced (its region was folded into this one at render start).
++static void osd_post_result(struct priv *p, int slot, const struct osd_request *req)
++{
++    struct osd_shared *s = &p->osd;
++    if (s->result.slot >= 0)
++        s->superseded++;
++    s->result = (struct osd_result){.slot = slot, .seq = req->seq, .epoch = req->epoch};
++    mp_cond_broadcast(&p->osd_wakeup);
++}
++
++// Locked. Remember the region of a result that will never be presented.
++static void osd_carry_slot(struct priv *p, struct osd_render_state *rs, int slot)
++{
++    struct osd_slot *src = &p->osd_slots[slot];
++    if (src->full) {
++        rs->force_full = true;
++    } else {
++        osd_dirty_add(&rs->carry, src->rect.x0, src->rect.y0,
++                      src->rect.x1, src->rect.y1);
++    }
++}
++
++static void osd_service_request(struct vo *vo, struct osd_render_state *rs,
++                                struct osd_request req,
++                                struct mediacodec_geometry geometry)
++{
++    struct priv *p = vo->priv;
++    struct osd_shared *s = &p->osd;
++
++    rs->force_full |= req.full;
++
++    mp_mutex_lock(&p->osd_lock);
++    bool had_spec = s->spec.valid;
++    int spec_slot = s->spec.slot;
++    enum osd_spec_result hit = osd_spec_service(&s->spec, req.pts, req.epoch,
++                                                rs->force_full, req.delta);
++    s->spec.slot = -1;
++    if (hit == OSD_SPEC_HIT) {
++        if (spec_slot >= 0)
++            osd_post_result(p, spec_slot, &req);
++        mp_mutex_unlock(&p->osd_lock);
++        rs->last = req;
++        return;
++    }
++    // A pre-render that missed left the draw cache one step ahead of the
++    // texture; whatever it changed must ride along with this render.
++    if (had_spec && spec_slot >= 0)
++        osd_carry_slot(p, rs, spec_slot);
++    if (s->result.slot >= 0)
++        osd_carry_slot(p, rs, s->result.slot);
++    // Three slots, two of which the mailbox and the present stage can hold:
++    // one is always free here.
++    int slot = osd_free_slot(p, -1);
++    mp_mutex_unlock(&p->osd_lock);
++    if (slot < 0) {
++        rs->last = req;
++        return;
++    }
++
++    bool posted = osd_render_pass(vo, rs, req.pts, geometry, slot);
++
++    mp_mutex_lock(&p->osd_lock);
++    if (posted)
++        osd_post_result(p, slot, &req);
++    mp_mutex_unlock(&p->osd_lock);
++    rs->last = req;
++}
++
++static void osd_speculate(struct vo *vo, struct osd_render_state *rs,
++                          double pts, uint64_t epoch,
++                          struct mediacodec_geometry geometry, int slot)
++{
++    struct priv *p = vo->priv;
++
++    mp_mutex_lock(&p->osd_lock);
++    if (p->osd.result.slot >= 0)
++        osd_carry_slot(p, rs, p->osd.result.slot);
++    mp_mutex_unlock(&p->osd_lock);
++
++    bool rendered = osd_render_pass(vo, rs, pts, geometry, slot);
++
++    mp_mutex_lock(&p->osd_lock);
++    if (p->osd.epoch == epoch) {
++        osd_spec_store(&p->osd.spec, pts, epoch, rendered ? slot : -1);
++    } else if (rendered) {
++        osd_carry_slot(p, rs, slot);
++    }
++    mp_mutex_unlock(&p->osd_lock);
++}
++
++static MP_THREAD_VOID osd_render_thread(void *arg)
++{
++    struct vo *vo = arg;
++    struct priv *p = vo->priv;
++    struct osd_shared *s = &p->osd;
++    mp_thread_set_name("vo/osd-render");
++
++    struct osd_render_state rs = {.force_full = true};
++
++    mp_mutex_lock(&p->osd_lock);
++    while (!s->terminate) {
++        if (s->present_failed) {
++            // Nothing will consume results; do not burn CPU on libass.
++            s->requested = false;
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            continue;
++        }
++        if (s->requested) {
++            struct osd_request req = s->request;
++            struct mediacodec_geometry geometry = s->geometry;
++            s->requested = false;
++            mp_mutex_unlock(&p->osd_lock);
++            osd_service_request(vo, &rs, req, geometry);
++            mp_mutex_lock(&p->osd_lock);
++            continue;
++        }
++
++        // Pre-render the frame the cadence predicts next, once per request,
++        // while the present stage may still be waiting on this one's deadline.
++        if (rs.last.seq == rs.planned_seq) {
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            continue;
++        }
++        rs.planned_seq = rs.last.seq;
++        int spec_slot = osd_free_slot(p, -1);
++        bool eligible = !s->paused && rs.last.seq && rs.last.epoch == s->epoch &&
++                        spec_slot >= 0 && !s->spec.valid;
++        double delta = rs.last.delta;
++        double last_pts = rs.last.pts;
++        uint64_t epoch = s->epoch;
++        struct mediacodec_geometry geometry = s->geometry;
++        double horizon = NAN;
++        if (eligible && delta > 0) {
++            // osd_get_sub_render_horizon takes the OSD and decoder locks;
++            // never under osd_lock.
++            mp_mutex_unlock(&p->osd_lock);
++            horizon = osd_get_sub_render_horizon(vo->osd);
++            mp_mutex_lock(&p->osd_lock);
++            eligible = !s->requested && !s->terminate && s->epoch == epoch;
++        }
++        double pts;
++        if (!osd_spec_plan(&s->spec, last_pts, delta, horizon, eligible, &pts))
++            continue;
++        mp_mutex_unlock(&p->osd_lock);
++        osd_speculate(vo, &rs, pts, epoch, geometry, spec_slot);
++        mp_mutex_lock(&p->osd_lock);
++    }
++    mp_mutex_unlock(&p->osd_lock);
++
++    talloc_free(rs.cache);
++    MP_THREAD_RETURN();
++}
++
++// --- OSD present stage -------------------------------------------------------
++
++struct osd_gl {
++    EGLDisplay display;
++    EGLSurface surface;
++    EGLContext context;
++    struct GL gl;
++    GLuint program, texture;
++    GLint a_pos;
++    int tex_w, tex_h;
++    PFNEGLPRESENTATIONTIMEANDROIDPROC presentation_time;
++    PFNEGLGETNEXTFRAMEIDANDROIDPROC next_frame_id;
++    PFNEGLGETFRAMETIMESTAMPSANDROIDPROC frame_timestamps;
++    EGLint ts_kind;
++    const char *ts_source;
++    struct osd_present_probe probes[OSD_PRESENT_PROBES];
++    int num_probes;
++    struct osd_swap_lead swap_lead;
++};
++
++static const char *const osd_vertex_shader =
++    "attribute vec2 a_pos;\n"
++    "varying vec2 v_uv;\n"
++    "void main() {\n"
++    "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
++    "  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);\n"
++    "}\n";
++
++static const char *const osd_fragment_shader =
++    "precision mediump float;\n"
++    "uniform sampler2D u_tex;\n"
++    "varying vec2 v_uv;\n"
++    "void main() {\n"
++    "  gl_FragColor = texture2D(u_tex, v_uv);\n"
++    "}\n";
++
++static GLuint osd_gl_compile(struct vo *vo, struct GL *gl, GLenum type,
++                             const char *source)
++{
++    GLuint shader = gl->CreateShader(type);
++    gl->ShaderSource(shader, 1, &source, NULL);
++    gl->CompileShader(shader);
++    GLint status = 0;
++    gl->GetShaderiv(shader, GL_COMPILE_STATUS, &status);
++    if (!status) {
++        char log[512] = {0};
++        gl->GetShaderInfoLog(shader, sizeof(log) - 1, NULL, log);
++        MP_ERR(vo, "OSD shader compilation failed: %s\n", log);
++        gl->DeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++static bool osd_gl_has_extension(const char *exts, const char *name)
++{
++    size_t len = strlen(name);
++    while (exts && *exts) {
++        const char *end = strchr(exts, ' ');
++        size_t n = end ? (size_t)(end - exts) : strlen(exts);
++        if (n == len && !strncmp(exts, name, len))
++            return true;
++        exts = end ? end + 1 : NULL;
++    }
++    return false;
++}
++
++static void osd_gl_uninit(struct osd_gl *g)
++{
++    if (g->display == EGL_NO_DISPLAY)
++        return;
++    if (g->context != EGL_NO_CONTEXT) {
++        if (g->program)
++            g->gl.DeleteProgram(g->program);
++        if (g->texture)
++            g->gl.DeleteTextures(1, &g->texture);
++        eglMakeCurrent(g->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        eglDestroyContext(g->display, g->context);
++    }
++    if (g->surface != EGL_NO_SURFACE)
++        eglDestroySurface(g->display, g->surface);
++    // The display is process-wide; leave it initialized for the GL VOs.
++    *g = (struct osd_gl){.display = EGL_NO_DISPLAY, .surface = EGL_NO_SURFACE,
++                         .context = EGL_NO_CONTEXT};
++}
++
++static bool osd_gl_init(struct vo *vo, struct osd_gl *g)
++{
++    struct priv *p = vo->priv;
++    *g = (struct osd_gl){.display = EGL_NO_DISPLAY, .surface = EGL_NO_SURFACE,
++                         .context = EGL_NO_CONTEXT};
++    osd_swap_lead_reset(&g->swap_lead);
++
++    g->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++    if (g->display == EGL_NO_DISPLAY || !eglInitialize(g->display, NULL, NULL)) {
++        MP_ERR(vo, "OSD: eglInitialize failed (0x%x).\n", eglGetError());
++        g->display = EGL_NO_DISPLAY;
++        return false;
++    }
++
++    const EGLint config_attribs[] = {
++        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
++        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
++        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
++        EGL_NONE,
++    };
++    EGLConfig config;
++    EGLint num_configs = 0;
++    if (!eglChooseConfig(g->display, config_attribs, &config, 1, &num_configs) ||
++        num_configs < 1)
++    {
++        MP_ERR(vo, "OSD: no RGBA8 ES2 EGL config (0x%x).\n", eglGetError());
++        goto fail;
++    }
++
++    g->surface = eglCreateWindowSurface(g->display, config, p->osd_window, NULL);
++    if (g->surface == EGL_NO_SURFACE) {
++        MP_ERR(vo, "OSD: eglCreateWindowSurface failed (0x%x).\n", eglGetError());
++        goto fail;
++    }
++
++    eglBindAPI(EGL_OPENGL_ES_API);
++    const EGLint context_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
++    g->context = eglCreateContext(g->display, config, EGL_NO_CONTEXT,
++                                  context_attribs);
++    if (g->context == EGL_NO_CONTEXT ||
++        !eglMakeCurrent(g->display, g->surface, g->surface, g->context))
++    {
++        MP_ERR(vo, "OSD: EGL context creation failed (0x%x).\n", eglGetError());
++        goto fail;
++    }
++
++    mpegl_load_functions(&g->gl, vo->log);
++    struct GL *gl = &g->gl;
++    if (!gl->CreateShader || !gl->TexSubImage2D || !gl->DrawArrays) {
++        MP_ERR(vo, "OSD: GLES2 function table incomplete.\n");
++        goto fail;
++    }
++
++    GLuint vs = osd_gl_compile(vo, gl, GL_VERTEX_SHADER, osd_vertex_shader);
++    GLuint fs = osd_gl_compile(vo, gl, GL_FRAGMENT_SHADER, osd_fragment_shader);
++    if (!vs || !fs) {
++        if (vs) gl->DeleteShader(vs);
++        if (fs) gl->DeleteShader(fs);
++        goto fail;
++    }
++    g->program = gl->CreateProgram();
++    gl->AttachShader(g->program, vs);
++    gl->AttachShader(g->program, fs);
++    gl->LinkProgram(g->program);
++    gl->DeleteShader(vs);
++    gl->DeleteShader(fs);
++    GLint linked = 0;
++    gl->GetProgramiv(g->program, GL_LINK_STATUS, &linked);
++    if (!linked) {
++        MP_ERR(vo, "OSD: shader program link failed.\n");
++        goto fail;
++    }
++    gl->UseProgram(g->program);
++    g->a_pos = gl->GetAttribLocation(g->program, "a_pos");
++    gl->Uniform1i(gl->GetUniformLocation(g->program, "u_tex"), 0);
++
++    gl->GenTextures(1, &g->texture);
++    gl->ActiveTexture(GL_TEXTURE0);
++    gl->BindTexture(GL_TEXTURE_2D, g->texture);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
++
++    static const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
++    gl->EnableVertexAttribArray(g->a_pos);
++    gl->VertexAttribPointer(g->a_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
++    gl->Enable(GL_BLEND);
++    // The overlay is premultiplied, as the compositor expects the layer.
++    gl->BlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
++                          GL_ONE_MINUS_SRC_ALPHA);
++    gl->ClearColor(0, 0, 0, 0);
++
++    const char *exts = eglQueryString(g->display, EGL_EXTENSIONS);
++    if (osd_gl_has_extension(exts, "EGL_ANDROID_presentation_time")) {
++        g->presentation_time = (PFNEGLPRESENTATIONTIMEANDROIDPROC)
++            eglGetProcAddress("eglPresentationTimeANDROID");
++    }
++    if (!g->presentation_time) {
++        MP_WARN(vo, "OSD: EGL_ANDROID_presentation_time unavailable; the OSD "
++                    "plane cannot be pinned to the video's vsync.\n");
++    }
++    g->ts_source = "off:no-ext";
++    if (osd_gl_has_extension(exts, "EGL_ANDROID_get_frame_timestamps")) {
++        g->next_frame_id = (PFNEGLGETNEXTFRAMEIDANDROIDPROC)
++            eglGetProcAddress("eglGetNextFrameIdANDROID");
++        g->frame_timestamps = (PFNEGLGETFRAMETIMESTAMPSANDROIDPROC)
++            eglGetProcAddress("eglGetFrameTimestampsANDROID");
++        PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC supported =
++            (PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC)
++            eglGetProcAddress("eglGetFrameTimestampSupportedANDROID");
++        if (g->next_frame_id && g->frame_timestamps && supported &&
++            eglSurfaceAttrib(g->display, g->surface, EGL_TIMESTAMPS_ANDROID,
++                             EGL_TRUE))
++        {
++            // TV compositors often lack a present fence; the composition
++            // stamps are a vsync earlier, a constant bias.
++            static const struct { EGLint kind; const char *name; } kinds[] = {
++                {EGL_DISPLAY_PRESENT_TIME_ANDROID, "present"},
++                {EGL_FIRST_COMPOSITION_START_TIME_ANDROID, "comp-start"},
++                {EGL_COMPOSITION_LATCH_TIME_ANDROID, "comp-latch"},
++            };
++            g->ts_source = "off:unsupported";
++            for (int n = 0; n < MP_ARRAY_SIZE(kinds); n++) {
++                if (supported(g->display, g->surface, kinds[n].kind)) {
++                    g->ts_kind = kinds[n].kind;
++                    g->ts_source = kinds[n].name;
++                    break;
++                }
++            }
++        } else {
++            g->ts_source = "off:enable-failed";
++        }
++    }
++    MP_VERBOSE(vo, "OSD plane: GLES2 on EGL, presentation time %s, "
++                   "frame timestamps %s.\n",
++               g->presentation_time ? "yes" : "no", g->ts_source);
++    return true;
++
++fail:
++    osd_gl_uninit(g);
++    return false;
++}
++
++// Resolve the presentation feedback of earlier swaps.
++static void osd_gl_resolve_probes(struct vo *vo, struct osd_gl *g)
++{
++    struct priv *p = vo->priv;
++    if (!g->ts_kind || !g->num_probes)
++        return;
++
++    int n = 0;
++    while (n < g->num_probes) {
++        struct osd_present_probe *probe = &g->probes[n];
++        EGLnsecsANDROID value = EGL_TIMESTAMP_INVALID_ANDROID;
++        bool ok = g->frame_timestamps(g->display, g->surface, probe->frame_id,
++                                      1, &g->ts_kind, &value);
++        if (ok && value == EGL_TIMESTAMP_PENDING_ANDROID)
++            break; // later probes are pending too
++        mp_mutex_lock(&p->osd_lock);
++        if (!ok || value == EGL_TIMESTAMP_INVALID_ANDROID) {
++            p->osd.present_invalid++;
++        } else {
++            int64_t err = (int64_t)value - probe->target_ns;
++            p->osd.present_measured++;
++            p->osd.present_err_last = err;
++            if (llabs(err) > llabs(p->osd.present_err_worst))
++                p->osd.present_err_worst = err;
++            if (probe->period_ns > 0) {
++                double vsyncs = (double)err / probe->period_ns;
++                p->osd.present_hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
++                                  : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
++            }
++        }
++        mp_mutex_unlock(&p->osd_lock);
++        n++;
++    }
++    if (n) {
++        memmove(g->probes, g->probes + n, (g->num_probes - n) * sizeof(g->probes[0]));
++        g->num_probes -= n;
++    }
++}
++
++static void osd_gl_upload(struct osd_gl *g, const struct osd_slot *slot)
++{
++    struct GL *gl = &g->gl;
++    if (slot->canvas_w != g->tex_w || slot->canvas_h != g->tex_h) {
++        gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, slot->canvas_w, slot->canvas_h,
++                       0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        g->tex_w = slot->canvas_w;
++        g->tex_h = slot->canvas_h;
++    }
++    gl->TexSubImage2D(GL_TEXTURE_2D, 0, slot->rect.x0, slot->rect.y0,
++                      slot->rect.x1 - slot->rect.x0,
++                      slot->rect.y1 - slot->rect.y0,
++                      GL_RGBA, GL_UNSIGNED_BYTE, slot->pixels);
++}
++
++static void osd_gl_draw(struct osd_gl *g)
++{
++    struct GL *gl = &g->gl;
++    EGLint w = 0, h = 0;
++    eglQuerySurface(g->display, g->surface, EGL_WIDTH, &w);
++    eglQuerySurface(g->display, g->surface, EGL_HEIGHT, &h);
++    gl->Viewport(0, 0, w, h);
++    gl->Clear(GL_COLOR_BUFFER_BIT);
++    gl->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++}
++
++// Locked. Wait until mono deadline (CLOCK_MONOTONIC) unless the result goes
++// stale first. Returns whether it is still current.
++static bool osd_park(struct priv *p, int64_t deadline_mono, uint64_t epoch)
++{
++    struct osd_shared *s = &p->osd;
++    int64_t until = monotonic_to_mp_time_ns(deadline_mono);
++    while (!s->terminate && s->epoch == epoch && until > mp_time_ns())
++        mp_cond_timedwait_until(&p->osd_wakeup, &p->osd_lock, until);
++    return !s->terminate && s->epoch == epoch;
++}
++
++// Locked. The release for seq, or an untimed one when it was never published
++// or has already rolled out of the history.
++static struct osd_release osd_find_release(struct priv *p, uint64_t seq)
++{
++    for (int n = 0; n < OSD_RELEASE_HISTORY; n++) {
++        if (p->osd.releases[n].seq == seq)
++            return p->osd.releases[n];
++    }
++    return (struct osd_release){.seq = seq};
++}
++
++static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
++                        struct osd_release release)
++{
++    struct priv *p = vo->priv;
++    struct osd_shared *s = &p->osd;
++
++    osd_gl_resolve_probes(vo, g);
++    osd_gl_upload(g, &p->osd_slots[r.slot]);
++    osd_gl_draw(g);
++
++    bool pinned = release.timestamp && g->presentation_time;
++    if (pinned)
++        osd_swap_lead_observe(&g->swap_lead, release.timestamp);
++
++    mp_mutex_lock(&p->osd_lock);
++    bool current = pinned
++        ? osd_park(p, release.timestamp - g->swap_lead.lead, r.epoch)
++        : !s->terminate && s->epoch == r.epoch;
++    if (!current)
++        s->stale++;
++    mp_mutex_unlock(&p->osd_lock);
++    if (!current)
++        return;
++
++    if (g->presentation_time)
++        g->presentation_time(g->display, g->surface, pinned ? release.timestamp : 0);
++
++    EGLuint64KHR frame_id = 0;
++    bool probe = pinned && g->ts_kind && release.vsync &&
++                 g->next_frame_id(g->display, g->surface, &frame_id);
++
++    int64_t t_swap = monotonic_now_ns();
++    eglSwapBuffers(g->display, g->surface);
++    int64_t t_done = monotonic_now_ns();
++
++    if (probe) {
++        if (g->num_probes == OSD_PRESENT_PROBES) {
++            memmove(g->probes, g->probes + 1, (OSD_PRESENT_PROBES - 1) * sizeof(g->probes[0]));
++            g->num_probes--;
++            mp_mutex_lock(&p->osd_lock);
++            s->present_dropped++;
++            mp_mutex_unlock(&p->osd_lock);
++        }
++        g->probes[g->num_probes++] = (struct osd_present_probe){
++            .frame_id = frame_id, .target_ns = release.vsync,
++            .period_ns = release.period,
++        };
++    }
++
++    mp_mutex_lock(&p->osd_lock);
++    s->swaps++;
++    s->swap_ns_last = t_done - t_swap;
++    if (s->swap_ns_last > s->swap_ns_max)
++        s->swap_ns_max = s->swap_ns_last;
++    s->swap_lead_ns = g->swap_lead.lead;
++    s->present_source = g->ts_source;
++    if (pinned) {
++        int64_t lead = release.timestamp - t_done;
++        s->lead_ns_last = lead;
++        if (!s->have_lead_min || lead < s->lead_ns_min) {
++            s->lead_ns_min = lead;
++            s->have_lead_min = true;
++        }
++        if (-lead > OSD_LATE_THRESHOLD_NS) {
++            s->late++;
++            if (-lead > s->late_ns_max)
++                s->late_ns_max = -lead;
++        }
++    }
++    mp_mutex_unlock(&p->osd_lock);
++}
++
++static MP_THREAD_VOID osd_present_thread(void *arg)
++{
++    struct vo *vo = arg;
++    struct priv *p = vo->priv;
++    struct osd_shared *s = &p->osd;
++    mp_thread_set_name("vo/osd-present");
++    // ANDROID_PRIORITY_DISPLAY, as the platform gives its own UI threads.
++    setpriority(PRIO_PROCESS, 0, -4);
++
++    struct osd_gl g;
++    bool ok = osd_gl_init(vo, &g);
++
++    mp_mutex_lock(&p->osd_lock);
++    if (!ok) {
++        MP_ERR(vo, "OSD plane unavailable; subtitles/OSD will not render.\n");
++        s->present_failed = true;
++        mp_cond_broadcast(&p->osd_wakeup);
++    }
++    while (ok && !s->terminate) {
++        if (s->result.slot < 0) {
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            continue;
++        }
++        struct osd_result r = s->result;
++        s->result.slot = -1;
++        s->present_slot = r.slot;
++
++        // A real frame's release timestamp is published by flip_page, which
++        // may still be waiting for its queue slot.
++        while (r.seq > s->release_seq && !s->terminate && s->epoch == r.epoch)
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++        bool current = !s->terminate && s->epoch == r.epoch;
++        struct osd_release release = current && r.seq
++            ? osd_find_release(p, r.seq) : (struct osd_release){0};
++        if (!current)
++            s->stale++;
++        mp_mutex_unlock(&p->osd_lock);
++
++        if (current)
++            osd_present(vo, &g, r, release);
++
++        mp_mutex_lock(&p->osd_lock);
++        s->present_slot = -1;
++        mp_cond_broadcast(&p->osd_wakeup);
++    }
++    mp_mutex_unlock(&p->osd_lock);
++
++    osd_gl_uninit(&g);
++    MP_THREAD_RETURN();
++}
++
++// --- VO thread side of the OSD pipeline -------------------------------------
++
++// Locked.
++static void osd_file_request(struct priv *p, struct osd_request req)
++{
++    struct osd_shared *s = &p->osd;
++    if (s->requested) {
++        s->coalesced++;
++        // A pending full repaint must not be lost to a later partial one, and
++        // a repaint of the frame that is still pending keeps its deadline.
++        req.full |= s->request.full;
++        if (!req.seq && s->request.seq && req.pts == s->request.pts) {
++            req.seq = s->request.seq;
++            req.delta = s->request.delta;
++        }
++    }
++    s->request = req;
++    s->requested = true;
++    mp_cond_broadcast(&p->osd_wakeup);
++}
++
++// Locked. Discard everything in flight and repaint at the current pts.
++static void osd_invalidate_locked(struct priv *p)
++{
++    struct osd_shared *s = &p->osd;
++    s->epoch++;
++    osd_file_request(p, (struct osd_request){
++        .pts = p->osd_pts, .epoch = s->epoch, .full = true,
++    });
++}
++
++static void osd_log_stats(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_threads_created)
++        return;
++    mp_mutex_lock(&p->osd_lock);
++    struct osd_shared s = p->osd;
++    mp_mutex_unlock(&p->osd_lock);
++    MP_VERBOSE(vo, "osd-sync %s frames=%u render=%u/%u renderMs=%d/%d "
++               "renderHist=%u,%u,%u,%u,%u spec=%u/%u/%u horizonSkips=%u "
++               "coalesced=%u superseded=%u stale=%u swaps=%u late=%u "
++               "maxLateMs=%d leadMs=%d minLeadMs=%s swapLeadMs=%d "
++               "swapMs=%d/%d present=%s presentErrMs=%s worstPresentMs=%s "
++               "presentHist=%u,%u,%u,%u,%u presentMeasured=%u "
++               "presentInvalid=%u presentDropped=%u\n",
++               why, s.frames, s.renders_changed, s.renders,
++               (int)(s.render_ns_last / 1000000), (int)(s.render_ns_max / 1000000),
++               s.render_hist[0], s.render_hist[1], s.render_hist[2],
++               s.render_hist[3], s.render_hist[4],
++               s.spec.hits, s.spec.misses, s.spec.skips, s.spec.horizon_skips,
++               s.coalesced, s.superseded, s.stale, s.swaps, s.late,
++               (int)(s.late_ns_max / 1000000), (int)(s.lead_ns_last / 1000000),
++               s.have_lead_min ? mp_tprintf(16, "%d", (int)(s.lead_ns_min / 1000000)) : "n/a",
++               (int)(s.swap_lead_ns / 1000000),
++               (int)(s.swap_ns_last / 1000000), (int)(s.swap_ns_max / 1000000),
++               s.present_source ? s.present_source : "off:no-pipeline",
++               s.present_measured ? mp_tprintf(16, "%d", (int)(s.present_err_last / 1000000)) : "n/a",
++               s.present_measured ? mp_tprintf(16, "%d", (int)(s.present_err_worst / 1000000)) : "n/a",
++               s.present_hist[0], s.present_hist[1], s.present_hist[2],
++               s.present_hist[3], s.present_hist[4],
++               s.present_measured, s.present_invalid, s.present_dropped);
++}
++
++static void osd_init(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_surface || p->osd_surface == -1)
++        return;
++
++    JNIEnv *env = mp_jni_get_env(vo->log);
++    if (env) {
++        p->osd_window = ANativeWindow_fromSurface(env,
++                (jobject)(intptr_t)p->osd_surface);
++    }
++    if (!p->osd_window) {
++        MP_ERR(vo, "Failed to wrap the OSD surface; "
++                   "subtitles/OSD will not render.\n");
++        return;
++    }
++
++    p->osd.result.slot = -1;
++    p->osd.present_slot = -1;
++    p->osd.present_source = NULL;
++    mp_mutex_init(&p->osd_lock);
++    mp_cond_init(&p->osd_wakeup);
++    if (mp_thread_create(&p->osd_render_thread, osd_render_thread, vo)) {
++        MP_ERR(vo, "Failed to start the OSD render thread; "
++                   "subtitles/OSD will not render.\n");
++        goto fail;
++    }
++    if (mp_thread_create(&p->osd_present_thread, osd_present_thread, vo)) {
++        MP_ERR(vo, "Failed to start the OSD present thread; "
++                   "subtitles/OSD will not render.\n");
++        mp_mutex_lock(&p->osd_lock);
++        p->osd.terminate = true;
++        mp_cond_broadcast(&p->osd_wakeup);
++        mp_mutex_unlock(&p->osd_lock);
++        mp_thread_join(p->osd_render_thread);
++        goto fail;
++    }
++    p->osd_threads_created = true;
++    return;
++
++fail:
++    mp_cond_destroy(&p->osd_wakeup);
++    mp_mutex_destroy(&p->osd_lock);
++    ANativeWindow_release(p->osd_window);
++    p->osd_window = NULL;
++}
++
++static void osd_uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd_lock);
++        p->osd.terminate = true;
++        p->osd.epoch++;
++        mp_cond_broadcast(&p->osd_wakeup);
++        mp_mutex_unlock(&p->osd_lock);
++        mp_thread_join(p->osd_render_thread);
++        mp_thread_join(p->osd_present_thread);
++        osd_log_stats(vo, "final");
++        mp_cond_destroy(&p->osd_wakeup);
++        mp_mutex_destroy(&p->osd_lock);
++        p->osd_threads_created = false;
++    }
++    for (int n = 0; n < OSD_SLOTS; n++)
++        talloc_free(p->osd_slots[n].pixels);
++    if (p->osd_window)
++        ANativeWindow_release(p->osd_window);
++    p->osd_window = NULL;
++}
++
++static void opts_wakeup(void *ctx)
 +{
 +    vo_wakeup(ctx);
 +}
@@ -608,11 +1843,12 @@ index 0000000..4057c56
 +{
 +    struct priv *p = vo->priv;
 +    p->osd_pts = MP_NOPTS_VALUE;
-+    p->geometry_cache = m_config_cache_alloc(p, vo->global, &mediacodec_conf);
-+    struct mediacodec_opts *opts = p->geometry_cache->opts;
-+    if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
++    p->opts_cache = m_config_cache_alloc(p, vo->global, &mediacodec_conf);
++    struct mediacodec_opts *opts = p->opts_cache->opts;
++    if (!mediacodec_geometry_parse(opts->video_rect, &p->osd.geometry))
 +        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
-+    m_config_cache_set_wakeup_cb(p->geometry_cache, geometry_wakeup, vo);
++    p->osd.latency_frames = opts->osd_latency_frames;
++    m_config_cache_set_wakeup_cb(p->opts_cache, opts_wakeup, vo);
 +    vo->hwdec_devs = hwdec_devices_create();
 +    p->hwctx = (struct mp_hwdec_ctx){
 +        .driver_name = "mediacodec",
@@ -627,33 +1863,7 @@ index 0000000..4057c56
 +
 +    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
 +    init_vsync_sampler(vo);
-+
-+    if (p->osd_surface && p->osd_surface != -1) {
-+        JNIEnv *env = mp_jni_get_env(vo->log);
-+        if (env) {
-+            p->osd_window = ANativeWindow_fromSurface(env,
-+                    (jobject)(intptr_t)p->osd_surface);
-+        }
-+        if (p->osd_window) {
-+            ANativeWindow_setBuffersGeometry(p->osd_window, 0, 0,
-+                                             WINDOW_FORMAT_RGBA_8888);
-+            mp_mutex_init(&p->osd_lock);
-+            mp_cond_init(&p->osd_wakeup);
-+            if (mp_thread_create(&p->osd_thread, osd_thread, vo)) {
-+                MP_ERR(vo, "Failed to start the OSD thread; "
-+                           "subtitles/OSD will not render.\n");
-+                mp_cond_destroy(&p->osd_wakeup);
-+                mp_mutex_destroy(&p->osd_lock);
-+                ANativeWindow_release(p->osd_window);
-+                p->osd_window = NULL;
-+            } else {
-+                p->osd_thread_created = true;
-+            }
-+        } else {
-+            MP_ERR(vo, "Failed to wrap the OSD surface; "
-+                       "subtitles/OSD will not render.\n");
-+        }
-+    }
++    osd_init(vo);
 +
 +    // vo.c would otherwise wait until frame->pts before calling flip_page.
 +    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(50), 1);
@@ -661,19 +1871,12 @@ index 0000000..4057c56
 +    return 0;
 +}
 +
-+// mp_time_ns() -> CLOCK_MONOTONIC (System.nanoTime, MediaCodec's domain).
-+static int64_t mp_time_to_monotonic_ns(int64_t mp_time)
-+{
-+    int64_t mono_now = monotonic_now_ns();
-+    return mono_now ? mp_time - mp_time_ns() + mono_now : 0;
-+}
-+
 +#define VSYNC_SAMPLE_MAX_AGE_NS MP_TIME_S_TO_NS(1)
 +#define TIMED_RELEASE_MAX_AHEAD_NS MP_TIME_MS_TO_NS(500)
 +
 +struct release_target {
 +    int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
-+    int64_t osd_deadline; // mp_time_ns() at which the OSD may be posted
++    int64_t vsync;     // the vsync the timestamp targets, 0 when not snapped
 +};
 +
 +static int64_t read_vsync_sample(struct priv *p)
@@ -751,272 +1954,31 @@ index 0000000..4057c56
 +    result.timestamp = mediacodec_timing_release(
 +        &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
 +        sample, p->queue_period, TIMED_RELEASE_MAX_AHEAD_NS);
-+    if (result.timestamp)
-+        result.osd_deadline = pts + (result.timestamp - raw_target);
++    if (result.timestamp && sample && raw_target > mono_now)
++        result.vsync = result.timestamp + p->queue_period * 8 / 10;
 +    return result;
 +}
 +
-+// premultiplied BGRA -> RGBA_8888
-+static void copy_bgra_to_rgba(uint8_t *dst, ptrdiff_t dst_stride,
-+                              const uint8_t *src, ptrdiff_t src_stride,
-+                              int w, int h)
-+{
-+    for (int y = 0; y < h; y++) {
-+        uint32_t *d = (uint32_t *)(dst + y * dst_stride);
-+        const uint32_t *s = (const uint32_t *)(src + y * src_stride);
-+        for (int x = 0; x < w; x++) {
-+            uint32_t c = s[x];
-+            d[x] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
-+        }
-+    }
-+}
-+
-+static bool wait_to_post_osd(struct priv *p, int64_t deadline,
-+                             uint64_t epoch)
-+{
-+    mp_mutex_lock(&p->osd_lock);
-+    while (!p->osd_terminate && p->osd_epoch == epoch &&
-+           deadline > mp_time_ns())
-+    {
-+        mp_cond_timedwait_until(&p->osd_wakeup, &p->osd_lock, deadline);
-+    }
-+    bool current = !p->osd_terminate && p->osd_epoch == epoch;
-+    mp_mutex_unlock(&p->osd_lock);
-+    return current;
-+}
-+
-+static bool osd_pass(struct vo *vo, struct mp_draw_sub_cache **cache,
-+                     int *last_w, int *last_h, bool *force_full, double pts,
-+                     int64_t deadline, uint64_t epoch,
-+                     struct mediacodec_geometry geometry)
++static void update_opts(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
-+    bool resized = false;
-+
-+    int w = ANativeWindow_getWidth(p->osd_window);
-+    int h = ANativeWindow_getHeight(p->osd_window);
-+    if (w <= 0 || h <= 0)
-+        return false;
-+
-+    if (w != *last_w || h != *last_h) {
-+        *last_w = w;
-+        *last_h = h;
-+        *force_full = true;
-+    }
-+
-+    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-+
-+    struct sub_bitmap_list *sbs =
-+        osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
-+    if (!sbs)
-+        return false;
-+
-+    if (!*cache)
-+        *cache = mp_draw_sub_alloc(NULL, vo->global);
-+
-+    struct mp_rect act_rc[1], mod_rc[64];
-+    int num_act_rc = 0, num_mod_rc = 0;
-+    struct mp_image *osd = mp_draw_sub_overlay(*cache, sbs,
-+            act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
-+            mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc);
-+    if (!osd)
-+        goto done;
-+    if (!num_mod_rc && !*force_full)
-+        goto done; // OSD unchanged; keep the currently posted buffer
-+
-+    struct mp_rect dirty = {0, 0, w, h};
-+    if (!*force_full) {
-+        dirty = mod_rc[0];
-+        for (int n = 1; n < num_mod_rc; n++)
-+            mp_rect_union(&dirty, &mod_rc[n]);
-+    }
-+
-+    // Post no earlier than the video's adjusted timestamp.
-+    if (!wait_to_post_osd(p, deadline, epoch))
-+        goto done;
-+
-+    // ANativeWindow_lock grows bounds to everything that must be repainted.
-+    ARect bounds = {dirty.x0, dirty.y0, dirty.x1, dirty.y1};
-+    ANativeWindow_Buffer buffer;
-+    if (ANativeWindow_lock(p->osd_window, &buffer, &bounds) != 0) {
-+        MP_WARN(vo, "Failed to lock the OSD surface.\n");
-+        *force_full = true;
-+        goto done;
-+    }
-+
-+    if (buffer.format != WINDOW_FORMAT_RGBA_8888) {
-+        MP_ERR(vo, "Unexpected OSD buffer format %d.\n", buffer.format);
-+        *force_full = true;
-+        ANativeWindow_unlockAndPost(p->osd_window);
-+        goto done;
-+    }
-+
-+    // A resize can race getWidth/getHeight. Render for the actual locked buffer,
-+    // not a guessed scale or the dimensions of the previous Surface generation.
-+    resized = buffer.width != w || buffer.height != h;
-+    *force_full = resized;
-+    if (resized) {
-+        talloc_free(sbs);
-+        res = mediacodec_osd_geometry(geometry, buffer.width, buffer.height);
-+        sbs = osd_render(vo->osd, res, pts, 0, mp_draw_sub_formats);
-+        osd = sbs ? mp_draw_sub_overlay(*cache, sbs,
-+            act_rc, MP_ARRAY_SIZE(act_rc), &num_act_rc,
-+            mod_rc, MP_ARRAY_SIZE(mod_rc), &num_mod_rc) : NULL;
-+    }
-+
-+    int x0 = MPCLAMP(bounds.left, 0, buffer.width);
-+    int y0 = MPCLAMP(bounds.top, 0, buffer.height);
-+    int x1 = MPCLAMP(bounds.right, x0, buffer.width);
-+    int y1 = MPCLAMP(bounds.bottom, y0, buffer.height);
-+
-+    ptrdiff_t dst_stride = (ptrdiff_t)buffer.stride * 4;
-+    uint8_t *dst = (uint8_t *)buffer.bits + y0 * dst_stride + x0 * 4;
-+
-+    int ow = osd ? MPCLAMP(osd->w - x0, 0, x1 - x0) : 0;
-+    int oh = osd ? MPCLAMP(osd->h - y0, 0, y1 - y0) : 0;
-+    if (ow > 0 && oh > 0) {
-+        copy_bgra_to_rgba(dst, dst_stride,
-+                          (uint8_t *)osd->planes[0] +
-+                              (ptrdiff_t)y0 * osd->stride[0] + (ptrdiff_t)x0 * 4,
-+                          osd->stride[0], ow, oh);
-+    }
-+    for (int y = 0; y < y1 - y0; y++) {
-+        uint8_t *row = dst + y * dst_stride;
-+        int filled = y < oh ? ow : 0;
-+        if (filled < x1 - x0)
-+            memset(row + (ptrdiff_t)filled * 4, 0, ((ptrdiff_t)(x1 - x0) - filled) * 4);
-+    }
-+    // The VO thread files its requests under osd_lock from flip_page, so
-+    // nothing slow may run under that lock: unlockAndPost is a binder/BLAST
-+    // round trip that can wait out a whole vsync during a SurfaceView
-+    // relayout, and a stale full-canvas clear is tens of megabytes at 4K.
-+    // Only the stale check needs the lock; this thread is the sole poster and
-+    // uninit joins it before releasing the window, so the post itself
-+    // synchronizes with nothing. An epoch bump that lands between the check
-+    // and the post shows one stale frame, which the full repaint the bumper
-+    // already filed replaces.
-+    mp_mutex_lock(&p->osd_lock);
-+    bool stale = p->osd_terminate || p->osd_epoch != epoch;
-+    mp_mutex_unlock(&p->osd_lock);
-+    if (stale) {
-+        for (int y = 0; y < y1 - y0; y++)
-+            memset(dst + y * dst_stride, 0, ((ptrdiff_t)x1 - x0) * 4);
-+    }
-+
-+    ANativeWindow_unlockAndPost(p->osd_window);
-+done:
-+    talloc_free(sbs);
-+    return resized;
-+}
-+
-+static MP_THREAD_VOID osd_thread(void *arg)
-+{
-+    struct vo *vo = arg;
-+    struct priv *p = vo->priv;
-+    mp_thread_set_name("vo/osd");
-+
-+    struct mp_draw_sub_cache *cache = NULL;
-+    int last_w = 0, last_h = 0;
-+    bool force_full = true;
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    while (!p->osd_terminate) {
-+        if (!p->osd_requested) {
-+            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-+            continue;
-+        }
-+        double pts = p->osd_request_pts;
-+        int64_t deadline = p->osd_request_deadline;
-+        uint64_t epoch = p->osd_request_epoch;
-+        struct mediacodec_geometry geometry = p->osd_geometry;
-+        force_full |= p->osd_request_full;
-+        p->osd_requested = false;
-+        p->osd_request_full = false;
-+        mp_mutex_unlock(&p->osd_lock);
-+
-+        bool resized = osd_pass(vo, &cache, &last_w, &last_h, &force_full,
-+                                pts, deadline, epoch, geometry);
-+
-+        mp_mutex_lock(&p->osd_lock);
-+        // A raced resize may have expanded beyond the originally dirty bounds.
-+        // Repaint the whole new buffer immediately, including while paused.
-+        if (resized && !p->osd_requested && p->osd_epoch == epoch) {
-+            p->osd_request_pts = pts;
-+            p->osd_request_deadline = 0;
-+            p->osd_request_epoch = epoch;
-+            p->osd_request_full = true;
-+            p->osd_requested = true;
-+        }
-+    }
-+    mp_mutex_unlock(&p->osd_lock);
-+
-+    talloc_free(cache);
-+    MP_THREAD_RETURN();
-+}
-+
-+static void draw_osd(struct vo *vo, int64_t deadline)
-+{
-+    struct priv *p = vo->priv;
-+    if (!p->osd_window) {
-+        if (!p->osd_missing_logged) {
-+            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
-+                        "subtitles/OSD are not rendered.\n");
-+            p->osd_missing_logged = true;
-+        }
++    if (!m_config_cache_update(p->opts_cache))
 +        return;
-+    }
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    p->osd_request_pts = p->osd_pts;
-+    p->osd_request_deadline = deadline;
-+    p->osd_request_epoch = p->osd_epoch;
-+    p->osd_requested = true;
-+    mp_cond_signal(&p->osd_wakeup);
-+    mp_mutex_unlock(&p->osd_lock);
-+}
-+
-+static void invalidate_osd(struct vo *vo)
-+{
-+    struct priv *p = vo->priv;
-+    if (!p->osd_thread_created)
-+        return;
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    p->osd_epoch++;
-+    p->osd_request_pts = p->osd_pts;
-+    p->osd_request_deadline = 0;
-+    p->osd_request_epoch = p->osd_epoch;
-+    p->osd_request_full = true;
-+    p->osd_requested = true;
-+    mp_cond_signal(&p->osd_wakeup);
-+    mp_mutex_unlock(&p->osd_lock);
-+}
-+
-+static void update_geometry(struct vo *vo)
-+{
-+    struct priv *p = vo->priv;
-+    if (!m_config_cache_update(p->geometry_cache))
-+        return;
-+    struct mediacodec_opts *opts = p->geometry_cache->opts;
++    struct mediacodec_opts *opts = p->opts_cache->opts;
 +    struct mediacodec_geometry geometry;
-+    if (!mediacodec_geometry_parse(opts->video_rect, &geometry)) {
++    bool geometry_ok = mediacodec_geometry_parse(opts->video_rect, &geometry);
++    if (!geometry_ok)
 +        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; keeping previous geometry.\n");
-+        return;
-+    }
-+    if (!p->osd_thread_created)
++    if (!p->osd_threads_created)
 +        return;
 +    mp_mutex_lock(&p->osd_lock);
-+    bool changed = !mediacodec_geometry_equal(p->osd_geometry, geometry);
++    p->osd.latency_frames = opts->osd_latency_frames;
++    bool changed = geometry_ok &&
++                   !mediacodec_geometry_equal(p->osd.geometry, geometry);
 +    if (changed) {
-+        p->osd_geometry = geometry;
 +        // Publish the new geometry and invalidate in-flight work atomically.
-+        p->osd_epoch++;
-+        p->osd_request_pts = p->osd_pts;
-+        p->osd_request_deadline = 0;
-+        p->osd_request_epoch = p->osd_epoch;
-+        p->osd_request_full = true;
-+        p->osd_requested = true;
-+        mp_cond_signal(&p->osd_wakeup);
++        p->osd.geometry = geometry;
++        osd_invalidate_locked(p);
 +    }
 +    mp_mutex_unlock(&p->osd_lock);
 +    if (changed)
@@ -1027,17 +1989,48 @@ index 0000000..4057c56
 +{
 +    struct priv *p = vo->priv;
 +
-+    if (!frame->redraw && !frame->repeat) {
-+        update_queue_timing(vo);
-+        mp_image_unrefp(&p->cur_image);
-+        p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
-+        p->cur_pts = frame->pts;
-+        p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
-+        p->cur_duration = p->cur_image ? frame->duration : 0;
-+        if (!p->cur_image)
-+            mediacodec_timing_reset(&p->timing);
-+        p->osd_pts = p->cur_image ? p->cur_image->pts : MP_NOPTS_VALUE;
++    if (frame->redraw || frame->repeat)
++        return VO_TRUE;
++
++    update_queue_timing(vo);
++    mp_image_unrefp(&p->cur_image);
++    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
++    p->cur_pts = frame->pts;
++    p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
++    p->cur_duration = p->cur_image ? frame->duration : 0;
++    if (!p->cur_image) {
++        mediacodec_timing_reset(&p->timing);
++        osd_cadence_reset(&p->cadence);
++        p->osd_pts = MP_NOPTS_VALUE;
++        return VO_TRUE;
 +    }
++
++    p->cur_seq = ++p->frame_seq;
++    double pts = p->cur_image->pts;
++    if (pts == MP_NOPTS_VALUE) {
++        osd_cadence_reset(&p->cadence);
++    } else {
++        osd_cadence_observe(&p->cadence, frame->frame_id, pts);
++    }
++
++    if (!p->osd_threads_created) {
++        p->osd_pts = pts;
++        return VO_TRUE;
++    }
++
++    // Ask for this frame's OSD now, up to --video-timing-offset plus the
++    // queue lead before it is due; flip_page publishes where it will land.
++    mp_mutex_lock(&p->osd_lock);
++    pts = osd_cadence_shift(&p->cadence, pts, p->osd.latency_frames);
++    p->osd_pts = pts;
++    osd_file_request(p, (struct osd_request){
++        .pts = pts,
++        .delta = osd_cadence_delta(&p->cadence),
++        .seq = p->cur_seq,
++        .epoch = p->osd.epoch,
++    });
++    p->osd.frames++;
++    mp_mutex_unlock(&p->osd_lock);
 +
 +    return VO_TRUE;
 +}
@@ -1045,29 +2038,57 @@ index 0000000..4057c56
 +static void flip_page(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
-+    struct release_target target = {0};
-+    // Repeats and OSD redraws have no new codec buffer or cadence sample.
-+    if (p->cur_image) {
-+        target = get_release_target(vo, p->cur_pts);
 +
-+        // Hand the frame to the codec first: the OSD request needs nothing
-+        // from the release, and filing it takes osd_lock, which the OSD
-+        // thread may hold for a moment. The release timestamp is what keeps
-+        // the two in step, not their submission order.
-+        AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
-+        int ret = target.timestamp
-+                ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
-+                : av_mediacodec_release_buffer(buffer, 1);
-+        mp_image_unrefp(&p->cur_image);
-+        p->cur_pts = 0;
-+        p->cur_frame_id = 0;
-+        p->cur_duration = 0;
-+
-+        if (ret < 0)
-+            MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
++    if (!p->cur_image) {
++        // OSD redraw without a new codec buffer: repaint at the last pts,
++        // unpinned, and let the present stage swap at once.
++        if (p->osd_threads_created) {
++            mp_mutex_lock(&p->osd_lock);
++            osd_file_request(p, (struct osd_request){
++                .pts = p->osd_pts, .epoch = p->osd.epoch,
++            });
++            mp_mutex_unlock(&p->osd_lock);
++        } else if (!p->osd_missing_logged) {
++            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
++                        "subtitles/OSD are not rendered.\n");
++            p->osd_missing_logged = true;
++        }
++        return;
 +    }
 +
-+    draw_osd(vo, target.osd_deadline);
++    struct release_target target = get_release_target(vo, p->cur_pts);
++
++    AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
++    int ret = target.timestamp
++            ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
++            : av_mediacodec_release_buffer(buffer, 1);
++    mp_image_unrefp(&p->cur_image);
++    p->cur_pts = 0;
++    p->cur_frame_id = 0;
++    p->cur_duration = 0;
++    if (ret < 0)
++        MP_WARN(vo, "Failed to release MediaCodec output buffer (%d).\n", ret);
++
++    if (!p->osd_threads_created)
++        return;
++
++    // The release timestamp is what keeps the OSD in step with the video;
++    // the present stage waits for it before it schedules the swap.
++    mp_mutex_lock(&p->osd_lock);
++    struct osd_shared *s = &p->osd;
++    s->releases[s->release_next] = (struct osd_release){
++        .seq = p->cur_seq, .timestamp = target.timestamp, .vsync = target.vsync,
++        .period = p->queue_period,
++    };
++    s->release_next = (s->release_next + 1) % OSD_RELEASE_HISTORY;
++    s->release_seq = p->cur_seq;
++    mp_cond_broadcast(&p->osd_wakeup);
++    mp_mutex_unlock(&p->osd_lock);
++
++    if (++p->stats_frames >= OSD_STATS_INTERVAL_FRAMES) {
++        p->stats_frames = 0;
++        osd_log_stats(vo, "periodic");
++    }
 +}
 +
 +static int query_format(struct vo *vo, int format)
@@ -1075,21 +2096,48 @@ index 0000000..4057c56
 +    return format == IMGFMT_MEDIACODEC;
 +}
 +
-+static int control(struct vo *vo, uint32_t request, void *data)
++static void reset_video(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
++    mp_image_unrefp(&p->cur_image);
++    p->cur_pts = 0;
++    p->cur_frame_id = 0;
++    p->cur_duration = 0;
++    mediacodec_timing_reset(&p->timing);
++    osd_cadence_reset(&p->cadence);
++    p->osd_pts = MP_NOPTS_VALUE;
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd_lock);
++        osd_invalidate_locked(p);
++        mp_mutex_unlock(&p->osd_lock);
++    }
++}
++
++static void set_paused(struct vo *vo, bool paused)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_threads_created)
++        return;
++    mp_mutex_lock(&p->osd_lock);
++    p->osd.paused = paused;
++    mp_cond_broadcast(&p->osd_wakeup);
++    mp_mutex_unlock(&p->osd_lock);
++}
++
++static int control(struct vo *vo, uint32_t request, void *data)
++{
 +    switch (request) {
 +    case VOCTRL_CHECK_EVENTS:
-+        update_geometry(vo);
++        update_opts(vo);
 +        return VO_TRUE;
 +    case VOCTRL_RESET:
-+        mp_image_unrefp(&p->cur_image);
-+        p->cur_pts = 0;
-+        p->cur_frame_id = 0;
-+        p->cur_duration = 0;
-+        mediacodec_timing_reset(&p->timing);
-+        p->osd_pts = MP_NOPTS_VALUE;
-+        invalidate_osd(vo);
++        reset_video(vo);
++        return VO_TRUE;
++    case VOCTRL_PAUSE:
++        set_paused(vo, true);
++        return VO_TRUE;
++    case VOCTRL_RESUME:
++        set_paused(vo, false);
 +        return VO_TRUE;
 +    default:
 +        return VO_NOTIMPL;
@@ -1098,54 +2146,30 @@ index 0000000..4057c56
 +
 +static int reconfig(struct vo *vo, struct mp_image_params *params)
 +{
-+    struct priv *p = vo->priv;
-+    mp_image_unrefp(&p->cur_image);
-+    p->cur_pts = 0;
-+    p->cur_frame_id = 0;
-+    p->cur_duration = 0;
-+    mediacodec_timing_reset(&p->timing);
-+    p->osd_pts = MP_NOPTS_VALUE;
-+    invalidate_osd(vo);
-+
++    reset_video(vo);
 +    return 0;
 +}
 +
 +static void uninit(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
-+    talloc_free(p->geometry_cache);
-+    p->geometry_cache = NULL;
++    talloc_free(p->opts_cache);
++    p->opts_cache = NULL;
 +    mp_image_unrefp(&p->cur_image);
 +
-+    if (p->osd_thread_created) {
-+        mp_mutex_lock(&p->osd_lock);
-+        p->osd_terminate = true;
-+        p->osd_epoch++;
-+        mp_cond_signal(&p->osd_wakeup);
-+        mp_mutex_unlock(&p->osd_lock);
-+    }
++    osd_uninit(vo);
++
 +    if (p->vsync_thread_created) {
 +        mp_mutex_lock(&p->vsync_lock);
 +        p->vsync_terminate = true;
 +        if (p->vsync_looper)
 +            ALooper_wake(p->vsync_looper);
 +        mp_mutex_unlock(&p->vsync_lock);
-+    }
-+
-+    if (p->osd_thread_created) {
-+        mp_thread_join(p->osd_thread);
-+        mp_cond_destroy(&p->osd_wakeup);
-+        mp_mutex_destroy(&p->osd_lock);
-+    }
-+    if (p->vsync_thread_created) {
 +        mp_thread_join(p->vsync_thread);
 +        mp_mutex_destroy(&p->vsync_lock);
 +    }
 +    if (p->choreographer_lib)
 +        dlclose(p->choreographer_lib);
-+
-+    if (p->osd_window)
-+        ANativeWindow_release(p->osd_window);
 +
 +    hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
 +    av_buffer_unref(&p->hwctx.av_device_ref);

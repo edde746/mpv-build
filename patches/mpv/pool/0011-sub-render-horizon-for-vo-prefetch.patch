@@ -1,0 +1,179 @@
+sub: expose how far ahead a renderer may ask for subtitles
+
+vo_mediacodec pre-renders the OSD for the frame its cadence predicts next,
+which means calling osd_render() for a pts the playloop has not reached.
+That is only correct once every subtitle packet up to that pts is in the
+decoder and no ordered-chapter segment switch lies before it: sd_ass renders
+what it has, and sub_get_bitmaps() performs a pending segment switch as a
+side effect of being asked for a later pts.
+
+dec_sub now records, each time sub_read_packets() drains its stream, the
+demuxer's buffered-range end at that moment: the demuxer reads interleaved
+files sequentially, so every subtitle packet up to that position has been
+handed to the decoder (or queued for the render in flight, which applies
+them before it returns). sub_get_render_horizon() reports that position in
+video time, capped at a pending segment start, INFINITY after demuxer EOF
+and MP_NOPTS_VALUE before anything was read; osd_get_sub_render_horizon()
+takes the minimum over the active subtitle objects, NAN when one is unknown.
+
+A refresh seek after a track switch clears every queue and refills them
+from the refresh point, so the bound stays valid while a newly enabled
+track catches up. Sparse tracks are the reason the demuxer position is used
+rather than the last subtitle packet: with a minute between two events the
+latter would forbid pre-rendering for that whole minute.
+
+diff --git a/sub/dec_sub.c b/sub/dec_sub.c
+index d60da5c..a658df5 100644
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -59,9 +59,14 @@ struct dec_sub {
+     struct attachment_list *attachments;
+ 
+     struct sh_stream *sh;
++    struct demuxer *demuxer;
+     int play_dir;
+     int order;
+     double last_pkt_pts;
++    // How far the demuxer had read (subtitle time) when sub_read_packets
++    // last drained this stream: every packet up to here is in the decoder.
++    double read_horizon;
++    bool demux_eof;
+     bool preload_attempted;
+     double video_fps;
+     double sub_speed;
+@@ -247,11 +252,13 @@ struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
+         .opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_sub_opts),
+         .shared_opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_shared_sub_opts),
+         .sh = track->stream,
++        .demuxer = track->demuxer,
+         .codec = track->stream->codec,
+         .attachments = talloc_steal(sub, attachments),
+         .play_dir = 1,
+         .order = order,
+         .last_pkt_pts = MP_NOPTS_VALUE,
++        .read_horizon = MP_NOPTS_VALUE,
+         .last_vo_pts = MP_NOPTS_VALUE,
+         .start = MP_NOPTS_VALUE,
+         .end = MP_NOPTS_VALUE,
+@@ -430,6 +437,16 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+         if (st <= 0) {
+             *packets_read = st < 0 || (sub->last_pkt_pts != MP_NOPTS_VALUE &&
+                                        sub->last_pkt_pts > video_pts);
++            if (st < 0) {
++                sub->demux_eof = true;
++            } else if (sub->demuxer) {
++                // The stream is drained: everything the demuxer has read so
++                // far is in the decoder. Its buffered range end is a lower
++                // bound of that position in packet time.
++                struct demux_reader_state state;
++                demux_get_reader_state(sub->demuxer, &state);
++                sub->read_horizon = state.ts_info.end;
++            }
+             break;
+         }
+ 
+@@ -569,6 +586,29 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+     return res;
+ }
+ 
++// The furthest video pts a renderer may ask sub_get_bitmaps() for ahead of
++// the playloop and still get the right answer: every packet up to it has
++// been handed to the decoder, and no pending segment switch lies before it
++// (sub_get_bitmaps would perform the switch). MP_NOPTS_VALUE while nothing
++// has been read, INFINITY once the demuxer reached EOF. Packets are assumed
++// to arrive in pts order, as interleaved muxers emit them.
++double sub_get_render_horizon(struct dec_sub *sub)
++{
++    mp_mutex_lock(&sub->lock);
++    double horizon = MP_NOPTS_VALUE;
++    if (sub->demux_eof) {
++        horizon = INFINITY;
++    } else {
++        horizon = MP_PTS_MAX(sub->read_horizon, sub->last_pkt_pts);
++    }
++    if (sub->new_segment && horizon != MP_NOPTS_VALUE)
++        horizon = MPMIN(horizon, sub->new_segment->start);
++    if (horizon != MP_NOPTS_VALUE && isfinite(horizon))
++        horizon = pts_from_subtitle(sub, horizon);
++    mp_mutex_unlock(&sub->lock);
++    return horizon;
++}
++
+ void sub_reset(struct dec_sub *sub)
+ {
+     mp_mutex_lock(&sub->lock);
+@@ -576,6 +616,8 @@ void sub_reset(struct dec_sub *sub)
+     if (sub->sd->driver->reset)
+         sub->sd->driver->reset(sub->sd);
+     sub->last_pkt_pts = MP_NOPTS_VALUE;
++    sub->read_horizon = MP_NOPTS_VALUE;
++    sub->demux_eof = false;
+     sub->last_vo_pts = MP_NOPTS_VALUE;
+     destroy_cached_pkts(sub);
+     demux_packet_pool_push(sub->packet_pool, sub->new_segment);
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index 476e83a..c99ee58 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -52,6 +52,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+ char *sub_ass_get_extradata(struct dec_sub *sub);
+ struct sd_times sub_get_times(struct dec_sub *sub, double pts);
++double sub_get_render_horizon(struct dec_sub *sub);
+ void sub_reset(struct dec_sub *sub);
+ void sub_select(struct dec_sub *sub, bool selected);
+ void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);
+diff --git a/sub/osd.c b/sub/osd.c
+index 8c1d392..bf7227b 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -15,6 +15,7 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <assert.h>
+@@ -273,6 +274,29 @@ double osd_get_force_video_pts(struct osd_state *osd)
+     return atomic_load(&osd->force_video_pts);
+ }
+ 
++// The furthest video pts osd_render() can be asked for ahead of the playloop
++// with every subtitle decoder still answering correctly: the minimum of the
++// decoders' read horizons (see sub_get_render_horizon). INFINITY without
++// subtitles, NAN while one decoder has read nothing yet.
++double osd_get_sub_render_horizon(struct osd_state *osd)
++{
++    double horizon = INFINITY;
++    mp_mutex_lock(&osd->lock);
++    for (int n = OSDTYPE_SUB; n <= OSDTYPE_SUB2; n++) {
++        struct dec_sub *sub = osd->objs[n]->sub;
++        if (!sub)
++            continue;
++        double h = sub_get_render_horizon(sub);
++        if (h == MP_NOPTS_VALUE) {
++            horizon = NAN;
++            break;
++        }
++        horizon = MPMIN(horizon, h);
++    }
++    mp_mutex_unlock(&osd->lock);
++    return horizon;
++}
++
+ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
+ {
+     mp_mutex_lock(&osd->lock);
+diff --git a/sub/osd.h b/sub/osd.h
+index 8bb6b90..8d6c444 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -191,6 +191,7 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
+ void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
+ void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
+ double osd_get_force_video_pts(struct osd_state *osd);
++double osd_get_sub_render_horizon(struct osd_state *osd);
+ 
+ struct osd_progbar_state {
+     int type;           // <0: disabled, 1-255: symbol, else: no symbol
