@@ -150,9 +150,18 @@ timestamp handed to MediaCodec when the VO thread runs late, without a device.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core of the same patch and covers the
-frame-cadence estimator that predicts the next pts, the single-use pre-render
-and its match tolerance, the subtitle read-horizon cap, the latency shift, the
-swap lead, and dirty-region folding.
+frame-cadence estimator that predicts the next pts, the single-use next-frame
+pre-render and its match tolerance, the subtitle read-horizon cap, the event
+pre-render planner (its per-event cost estimate, the visible-end guard and the
+serve window), and the swap lead.
+
+Run the libass change-detection regression with
+`bash scripts/test_libass_change_detection.sh`. It fetches the pinned libass
+fork, applies its series, builds it for the host (freetype, fribidi, harfbuzz
+and libunibreak via pkg-config) and checks that a static frame rendered twice
+is reported unchanged the second time, which mpv's subtitle packer relies on
+to skip re-packing the frame. Pass an already-patched source directory as the
+first argument to run offline.
 
 Run the Dolby Vision packet-filter regression with
 `bash scripts/test_mediacodec_dv_filter.sh`. It extracts the production

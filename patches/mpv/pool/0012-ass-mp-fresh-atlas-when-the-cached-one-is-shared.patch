@@ -1,0 +1,32 @@
+diff --git a/sub/ass_mp.c b/sub/ass_mp.c
+index c8b1bd0..16516b6 100644
+--- a/sub/ass_mp.c
++++ b/sub/ass_mp.c
+@@ -226,9 +226,14 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+     res->packed_w = bb[1].x;
+     res->packed_h = bb[1].y;
+ 
++    // A consumer still holding the previous atlas (a VO keeps frames in
++    // flight) makes it read-only. Nothing reads an atlas outside the parts
++    // packed into it, so start a fresh one rather than copy tens of
++    // megabytes to unshare it.
+     if (!p->cached_img || p->cached_img->w < res->packed_w ||
+                           p->cached_img->h < res->packed_h ||
+-                          p->cached_img->imgfmt != imgfmt)
++                          p->cached_img->imgfmt != imgfmt ||
++                          !mp_image_is_writeable(p->cached_img))
+     {
+         talloc_free(p->cached_img);
+         p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
+@@ -239,11 +244,6 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+         talloc_steal(p, p->cached_img);
+     }
+ 
+-    if (!mp_image_make_writeable(p->cached_img)) {
+-        packer_reset(p->packer);
+-        return false;
+-    }
+-
+     res->packed = p->cached_img;
+ 
+     for (int n = 0; n < res->num_parts; n++) {

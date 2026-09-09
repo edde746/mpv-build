@@ -1,29 +1,5 @@
-sub: expose how far ahead a renderer may ask for subtitles
-
-vo_mediacodec pre-renders the OSD for the frame its cadence predicts next,
-which means calling osd_render() for a pts the playloop has not reached.
-That is only correct once every subtitle packet up to that pts is in the
-decoder and no ordered-chapter segment switch lies before it: sd_ass renders
-what it has, and sub_get_bitmaps() performs a pending segment switch as a
-side effect of being asked for a later pts.
-
-dec_sub now records, each time sub_read_packets() drains its stream, the
-demuxer's buffered-range end at that moment: the demuxer reads interleaved
-files sequentially, so every subtitle packet up to that position has been
-handed to the decoder (or queued for the render in flight, which applies
-them before it returns). sub_get_render_horizon() reports that position in
-video time, capped at a pending segment start, INFINITY after demuxer EOF
-and MP_NOPTS_VALUE before anything was read; osd_get_sub_render_horizon()
-takes the minimum over the active subtitle objects, NAN when one is unknown.
-
-A refresh seek after a track switch clears every queue and refills them
-from the refresh point, so the bound stays valid while a newly enabled
-track catches up. Sparse tracks are the reason the demuxer position is used
-rather than the last subtitle packet: with a minute between two events the
-latter would forbid pre-rendering for that whole minute.
-
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
-index d60da5c..a658df5 100644
+index d60da5c..3b094a6 100644
 --- a/sub/dec_sub.c
 +++ b/sub/dec_sub.c
 @@ -59,9 +59,14 @@ struct dec_sub {
@@ -72,10 +48,51 @@ index d60da5c..a658df5 100644
              break;
          }
  
-@@ -569,6 +586,29 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+@@ -569,6 +586,70 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
      return res;
  }
  
++// Video pts at which the first event starting after `after` begins, or
++// MP_NOPTS_VALUE, and how many events start there (a measure of the work the
++// frame will take). A renderer with idle time uses it to rasterize a heavy
++// upcoming event into the decoder's caches before it is due.
++double sub_get_next_event_start(struct dec_sub *sub, double after, int *num_events)
++{
++    mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
++    double next = MP_NOPTS_VALUE;
++    *num_events = 0;
++    double spts = pts_to_subtitle(sub, after);
++    struct sd *sd = sub->sd;
++    if (spts != MP_NOPTS_VALUE && sd->driver->control) {
++        double ev[2] = {spts, 0};
++        if (sd->driver->control(sd, SD_CTRL_NEXT_EVENT, ev) == CONTROL_OK) {
++            next = pts_from_subtitle(sub, ev[0]);
++            *num_events = (int)ev[1];
++        }
++    }
++    mp_mutex_unlock(&sub->lock);
++    return next;
++}
++
++// Video pts at which the events visible at pts end, or MP_NOPTS_VALUE when
++// nothing is visible or the duration is unknown.
++double sub_get_visible_end(struct dec_sub *sub, double pts)
++{
++    mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
++    double end = MP_NOPTS_VALUE;
++    double spts = pts_to_subtitle(sub, pts);
++    struct sd *sd = sub->sd;
++    if (spts != MP_NOPTS_VALUE && sd->driver->get_times) {
++        struct sd_times times = sd->driver->get_times(sd, spts);
++        if (times.end != MP_NOPTS_VALUE && times.end > spts)
++            end = pts_from_subtitle(sub, times.end);
++    }
++    mp_mutex_unlock(&sub->lock);
++    return end;
++}
++
 +// The furthest video pts a renderer may ask sub_get_bitmaps() for ahead of
 +// the playloop and still get the right answer: every packet up to it has
 +// been handed to the decoder, and no pending segment switch lies before it
@@ -102,7 +119,7 @@ index d60da5c..a658df5 100644
  void sub_reset(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
-@@ -576,6 +616,8 @@ void sub_reset(struct dec_sub *sub)
+@@ -576,6 +657,8 @@ void sub_reset(struct dec_sub *sub)
      if (sub->sd->driver->reset)
          sub->sd->driver->reset(sub->sd);
      sub->last_pkt_pts = MP_NOPTS_VALUE;
@@ -112,19 +129,29 @@ index d60da5c..a658df5 100644
      destroy_cached_pkts(sub);
      demux_packet_pool_push(sub->packet_pool, sub->new_segment);
 diff --git a/sub/dec_sub.h b/sub/dec_sub.h
-index 476e83a..c99ee58 100644
+index 476e83a..cb18ae2 100644
 --- a/sub/dec_sub.h
 +++ b/sub/dec_sub.h
-@@ -52,6 +52,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+@@ -16,6 +16,7 @@ struct sd;
+ 
+ enum sd_ctrl {
+     SD_CTRL_SUB_STEP,
++    SD_CTRL_NEXT_EVENT, // double[2]: in {after, -}; out {start, event count}
+     SD_CTRL_SET_ANIMATED_CHECK,
+     SD_CTRL_SET_VIDEO_PARAMS,
+     SD_CTRL_SET_VIDEO_DEF_FPS,
+@@ -52,6 +53,9 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
  char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
  char *sub_ass_get_extradata(struct dec_sub *sub);
  struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 +double sub_get_render_horizon(struct dec_sub *sub);
++double sub_get_next_event_start(struct dec_sub *sub, double after, int *num_events);
++double sub_get_visible_end(struct dec_sub *sub, double pts);
  void sub_reset(struct dec_sub *sub);
  void sub_select(struct dec_sub *sub, bool selected);
  void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);
 diff --git a/sub/osd.c b/sub/osd.c
-index 8c1d392..bf7227b 100644
+index 8c1d392..dec9b8b 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
 @@ -15,6 +15,7 @@
@@ -135,7 +162,7 @@ index 8c1d392..bf7227b 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <assert.h>
-@@ -273,6 +274,29 @@ double osd_get_force_video_pts(struct osd_state *osd)
+@@ -273,6 +274,60 @@ double osd_get_force_video_pts(struct osd_state *osd)
      return atomic_load(&osd->force_video_pts);
  }
  
@@ -162,18 +189,88 @@ index 8c1d392..bf7227b 100644
 +    return horizon;
 +}
 +
++// The earliest event start after `after`, how many events start there, and
++// the earliest end of what is visible at pts, over the active subtitle
++// objects (see sub_get_next_event_start, sub_get_visible_end);
++// MP_NOPTS_VALUE when unknown.
++void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
++                          double *next_start, int *next_events,
++                          double *visible_end)
++{
++    *next_start = MP_NOPTS_VALUE;
++    *next_events = 0;
++    *visible_end = MP_NOPTS_VALUE;
++    mp_mutex_lock(&osd->lock);
++    for (int n = OSDTYPE_SUB; n <= OSDTYPE_SUB2; n++) {
++        struct dec_sub *sub = osd->objs[n]->sub;
++        if (!sub)
++            continue;
++        int events = 0;
++        double start = sub_get_next_event_start(sub, after, &events);
++        if (start != MP_NOPTS_VALUE) {
++            if (*next_start == MP_NOPTS_VALUE || start < *next_start - 0.0005) {
++                *next_start = start;
++                *next_events = events;
++            } else if (fabs(start - *next_start) <= 0.0005) {
++                *next_events += events;
++            }
++        }
++        *visible_end = MP_PTS_MIN(*visible_end, sub_get_visible_end(sub, pts));
++    }
++    mp_mutex_unlock(&osd->lock);
++}
++
  void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
  {
      mp_mutex_lock(&osd->lock);
 diff --git a/sub/osd.h b/sub/osd.h
-index 8bb6b90..8d6c444 100644
+index 8bb6b90..327f6a3 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -191,6 +191,7 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
+@@ -191,6 +191,10 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
  void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
  void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
  double osd_get_force_video_pts(struct osd_state *osd);
 +double osd_get_sub_render_horizon(struct osd_state *osd);
++void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
++                          double *next_start, int *next_events,
++                          double *visible_end);
  
  struct osd_progbar_state {
      int type;           // <0: disabled, 1-255: symbol, else: no symbol
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 81d9bef..555b5af 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -1042,6 +1042,31 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+         a[0] += res / 1000.0 + SUB_SEEK_OFFSET;
+         return true;
+     }
++    case SD_CTRL_NEXT_EVENT: {
++        // The earliest event start after a[0], exact, and the number of
++        // events sharing it; unlike SD_CTRL_SUB_STEP no seek slack is added.
++        double *a = arg;
++        long long after = llrint(a[0] * 1000.0);
++        ASS_Track *track = ctx->ass_track;
++        long long best = -1;
++        int count = 0;
++        for (int n = 0; n < track->n_events; n++) {
++            long long start = track->events[n].Start;
++            if (start <= after)
++                continue;
++            if (best < 0 || start < best) {
++                best = start;
++                count = 1;
++            } else if (start == best) {
++                count++;
++            }
++        }
++        if (best < 0)
++            return CONTROL_FALSE;
++        a[0] = best / 1000.0;
++        a[1] = count;
++        return CONTROL_OK;
++    }
+     case SD_CTRL_SET_ANIMATED_CHECK:
+         ctx->check_animated = *(bool *)arg;
+         return CONTROL_OK;

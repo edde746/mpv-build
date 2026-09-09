@@ -43,7 +43,8 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[skip binaries]') }}
     permissions:
       contents: read
-    # The harnesses need only bash, python3 and cc, but not a Linux cc:
+    # The harnesses need only bash, python3 and cc (plus libass's host
+    # dependencies for one of them), but not a Linux cc:
     # test_avf_timebase_servo.c uses M_PI under -std=c11, which glibc hides in
     # strict ISO mode (gcc 13 on ubuntu-24.04: "'M_PI' undeclared"), while
     # Apple libc exposes it. Keep them on the compiler they are written for.
@@ -83,6 +84,14 @@ jobs:
 
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
+
+      # The one harness that builds a dependency: the libass fork's layout
+      # cache is only observable through ass_render_frame itself.
+      - name: Install libass host dependencies
+        run: brew install autoconf automake libtool pkgconf freetype fribidi harfbuzz libunibreak
+
+      - name: Test libass change detection
+        run: bash ./scripts/test_libass_change_detection.sh
 
       - name: Test patch framework
         run: ./scripts/test_patches.sh
