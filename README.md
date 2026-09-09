@@ -155,6 +155,13 @@ are neither allocated nor copied, that HDR10+ SEI messages and profile 7
 layers are removed or converted as configured, that malformed SEI is left
 verbatim, and that the output buffer is reused.
 
+Run the MediaCodec input regression with `bash scripts/test_mediacodec_input.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and
+exercises the production input-buffer sizing and packet submission: an access
+unit that does not fit its input buffer is dropped whole and the decoder
+flushed, never split across buffers. Pass an already-patched source directory
+as the first argument to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer

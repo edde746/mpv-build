@@ -1,15 +1,16 @@
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index b1f42c7..f2f5d4c 100644
+index 1c1394d..d120023 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -729,6 +729,41 @@ fail:
- }
+@@ -769,6 +769,42 @@ static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
+ // --- end mediacodec dv filter
  #endif
  
 +/*
 + * Some decoders (MediaTek OMX HEVC) default to input buffers too small for a
-+ * high-bitrate IDR and corrupt until the next one when the packet is split.
-+ * Size them like ExoPlayer's getCodecMaxInputSize().
++ * high-bitrate IDR. Size them like ExoPlayer's getCodecMaxInputSize(); an
++ * access unit that still does not fit is dropped by ff_mediacodec_dec_send
++ * rather than split.
 + */
 +static int video_max_input_size(const AVCodecContext *avctx)
 +{
@@ -44,7 +45,7 @@ index b1f42c7..f2f5d4c 100644
  static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
  {
      int ret;
-@@ -865,8 +900,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -905,8 +941,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      ff_AMediaFormat_setString(format, "mime", codec_mime);
  
      if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -57,34 +58,49 @@ index b1f42c7..f2f5d4c 100644
      } else {
          ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
          ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
+@@ -1020,6 +1060,11 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+                 return ret;
+             }
+ 
++            /* An oversized access unit was dropped and the flush it needs
++             * waits on retained frames: give them back before feeding on. */
++            if (s->delay_flush && ff_mediacodec_dec_is_flushing(avctx, s->ctx))
++                return AVERROR(EAGAIN);
++
+             if (s->amlogic_mpeg2_api23_workaround && s->buffered_pkt.size <= 0) {
+                 /* fallthrough to fetch next packet regardless of input buffer space */
+             } else {
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index 79dfd2b..dfd69ce 100644
+index 79dfd2b..f0eba4c 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -941,6 +941,14 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -941,6 +941,29 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
              return AVERROR_EXTERNAL;
          }
  
-+        /* Outside the MediaCodec contract; some decoders corrupt on it. */
-+        if (offset == 0 && pkt->size > size && !s->split_warned) {
-+            av_log(avctx, AV_LOG_WARNING,
++        /*
++         * One input buffer is one access unit (ACodec flags every buffer
++         * ENDOFFRAME); splitting a packet across buffers hands the decoder
++         * fragments it treats as whole access units, and MediaTek-class
++         * decoders corrupt until the next IDR on them. Like Media3 on
++         * InsufficientCapacityException: drop the access unit and flush, so
++         * decoding resumes at the next keyframe instead of smearing this
++         * one. The flush reclaims the dequeued input buffer; the packet is
++         * reported consumed so the caller discards it. No error reaches the
++         * caller: an mpv-style software fallback on decode errors would turn
++         * one oversized IDR into an unplayable session.
++         */
++        if (!need_draining && (size_t)pkt->size > size) {
++            av_log(avctx, AV_LOG_ERROR,
 +                   "Input packet of %d bytes exceeds the %zu-byte input buffer; "
-+                   "splitting it across buffers\n", pkt->size, size);
-+            s->split_warned = 1;
++                   "dropping the access unit and flushing the decoder\n",
++                   pkt->size, size);
++            status = ff_mediacodec_dec_flush(avctx, s);
++            if (status < 0)
++                return status;
++            return pkt->size;
 +        }
 +
          pts = pkt->pts;
          if (pts == AV_NOPTS_VALUE) {
              av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
-diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 50123ef..958327c 100644
---- a/libavcodec/mediacodecdec_common.h
-+++ b/libavcodec/mediacodecdec_common.h
-@@ -66,6 +66,7 @@ typedef struct MediaCodecDecContext {
- 
-     uint64_t output_buffer_count;
-     ssize_t current_input_buffer;
-+    int split_warned;
- 
-     bool delay_flush;
-     atomic_int serial;
