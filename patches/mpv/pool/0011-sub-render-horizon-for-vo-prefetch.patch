@@ -1,5 +1,5 @@
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
-index d60da5c..3b094a6 100644
+index d60da5c..3acf9dd 100644
 --- a/sub/dec_sub.c
 +++ b/sub/dec_sub.c
 @@ -59,9 +59,14 @@ struct dec_sub {
@@ -48,7 +48,7 @@ index d60da5c..3b094a6 100644
              break;
          }
  
-@@ -569,6 +586,70 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
+@@ -569,6 +586,102 @@ struct sd_times sub_get_times(struct dec_sub *sub, double pts)
      return res;
  }
  
@@ -93,6 +93,38 @@ index d60da5c..3b094a6 100644
 +    return end;
 +}
 +
++// The events around a video pts (struct sub_event_load), times as video pts.
++// A renderer that cannot finish a frame inside its interval uses them to
++// render the frame that will be current when it does finish instead.
++void sub_get_event_load(struct dec_sub *sub, double pts, double ref,
++                        struct sub_event_load *load)
++{
++    *load = (struct sub_event_load){
++        .boundary = MP_NOPTS_VALUE, .next_boundary = MP_NOPTS_VALUE,
++        .visible_end = MP_NOPTS_VALUE,
++    };
++    mp_mutex_lock(&sub->lock);
++    wait_render_done(sub);
++    double spts = pts_to_subtitle(sub, pts);
++    double sref = ref == MP_NOPTS_VALUE ? MP_NOPTS_VALUE : pts_to_subtitle(sub, ref);
++    struct sd *sd = sub->sd;
++    if (spts != MP_NOPTS_VALUE && sd->driver->control) {
++        double ev[6] = {spts, sref, 0, 0, 0, 0};
++        if (sd->driver->control(sd, SD_CTRL_EVENT_LOAD, ev) == CONTROL_OK) {
++            load->active = (int)ev[0];
++            load->cold = (int)ev[1];
++            load->next_starting = (int)ev[4];
++            if (ev[2] != MP_NOPTS_VALUE)
++                load->boundary = pts_from_subtitle(sub, ev[2]);
++            if (ev[3] != MP_NOPTS_VALUE)
++                load->next_boundary = pts_from_subtitle(sub, ev[3]);
++            if (ev[5] != MP_NOPTS_VALUE)
++                load->visible_end = pts_from_subtitle(sub, ev[5]);
++        }
++    }
++    mp_mutex_unlock(&sub->lock);
++}
++
 +// The furthest video pts a renderer may ask sub_get_bitmaps() for ahead of
 +// the playloop and still get the right answer: every packet up to it has
 +// been handed to the decoder, and no pending segment switch lies before it
@@ -119,7 +151,7 @@ index d60da5c..3b094a6 100644
  void sub_reset(struct dec_sub *sub)
  {
      mp_mutex_lock(&sub->lock);
-@@ -576,6 +657,8 @@ void sub_reset(struct dec_sub *sub)
+@@ -576,6 +689,8 @@ void sub_reset(struct dec_sub *sub)
      if (sub->sd->driver->reset)
          sub->sd->driver->reset(sub->sd);
      sub->last_pkt_pts = MP_NOPTS_VALUE;
@@ -129,29 +161,44 @@ index d60da5c..3b094a6 100644
      destroy_cached_pkts(sub);
      demux_packet_pool_push(sub->packet_pool, sub->new_segment);
 diff --git a/sub/dec_sub.h b/sub/dec_sub.h
-index 476e83a..cb18ae2 100644
+index 476e83a..3e7efac 100644
 --- a/sub/dec_sub.h
 +++ b/sub/dec_sub.h
-@@ -16,6 +16,7 @@ struct sd;
+@@ -16,6 +16,8 @@ struct sd;
  
  enum sd_ctrl {
      SD_CTRL_SUB_STEP,
 +    SD_CTRL_NEXT_EVENT, // double[2]: in {after, -}; out {start, event count}
++    SD_CTRL_EVENT_LOAD, // double[6]: in {pts, ref}; out: see struct sub_event_load
      SD_CTRL_SET_ANIMATED_CHECK,
      SD_CTRL_SET_VIDEO_PARAMS,
      SD_CTRL_SET_VIDEO_DEF_FPS,
-@@ -52,6 +53,9 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+@@ -52,6 +54,23 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
  char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
  char *sub_ass_get_extradata(struct dec_sub *sub);
  struct sd_times sub_get_times(struct dec_sub *sub, double pts);
 +double sub_get_render_horizon(struct dec_sub *sub);
 +double sub_get_next_event_start(struct dec_sub *sub, double after, int *num_events);
 +double sub_get_visible_end(struct dec_sub *sub, double pts);
++// The subtitle events around a video pts, for a renderer scheduling its work.
++// `ref` is the pts of the frame the renderer rendered last: events visible
++// at pts but not at ref have not been rasterized yet and cost accordingly.
++struct sub_event_load {
++    int active;          // events visible at pts
++    int cold;            // of active, those not visible at ref
++    double boundary;     // last event start or end <= pts: the frame's content
++                         // has been these events since then; MP_NOPTS_VALUE unknown
++    double next_boundary; // first event start or end > pts, or MP_NOPTS_VALUE
++    int next_starting;   // events starting at next_boundary
++    double visible_end;  // latest end among active, or MP_NOPTS_VALUE
++};
++void sub_get_event_load(struct dec_sub *sub, double pts, double ref,
++                        struct sub_event_load *load);
  void sub_reset(struct dec_sub *sub);
  void sub_select(struct dec_sub *sub, bool selected);
  void sub_set_recorder_sink(struct dec_sub *sub, struct mp_recorder_sink *sink);
 diff --git a/sub/osd.c b/sub/osd.c
-index 8c1d392..dec9b8b 100644
+index 8c1d392..bef16ce 100644
 --- a/sub/osd.c
 +++ b/sub/osd.c
 @@ -15,6 +15,7 @@
@@ -162,7 +209,7 @@ index 8c1d392..dec9b8b 100644
  #include <stdio.h>
  #include <stdlib.h>
  #include <assert.h>
-@@ -273,6 +274,60 @@ double osd_get_force_video_pts(struct osd_state *osd)
+@@ -273,6 +274,96 @@ double osd_get_force_video_pts(struct osd_state *osd)
      return atomic_load(&osd->force_video_pts);
  }
  
@@ -220,14 +267,50 @@ index 8c1d392..dec9b8b 100644
 +    mp_mutex_unlock(&osd->lock);
 +}
 +
++// The events around pts over the active subtitle objects (see
++// sub_get_event_load): counts summed, the last boundary the latest, the next
++// boundary the earliest, the visible end the latest.
++void osd_get_sub_load(struct osd_state *osd, double pts, double ref,
++                      struct sub_event_load *load)
++{
++    *load = (struct sub_event_load){
++        .boundary = MP_NOPTS_VALUE, .next_boundary = MP_NOPTS_VALUE,
++        .visible_end = MP_NOPTS_VALUE,
++    };
++    mp_mutex_lock(&osd->lock);
++    for (int n = OSDTYPE_SUB; n <= OSDTYPE_SUB2; n++) {
++        struct dec_sub *sub = osd->objs[n]->sub;
++        if (!sub)
++            continue;
++        struct sub_event_load l;
++        sub_get_event_load(sub, pts, ref, &l);
++        load->active += l.active;
++        load->cold += l.cold;
++        if (l.boundary != MP_NOPTS_VALUE &&
++            (load->boundary == MP_NOPTS_VALUE || l.boundary > load->boundary))
++            load->boundary = l.boundary;
++        if (l.next_boundary != MP_NOPTS_VALUE &&
++            (load->next_boundary == MP_NOPTS_VALUE || l.next_boundary < load->next_boundary))
++        {
++            load->next_boundary = l.next_boundary;
++            load->next_starting = l.next_starting;
++        } else if (l.next_boundary != MP_NOPTS_VALUE &&
++                   fabs(l.next_boundary - load->next_boundary) <= 0.0005) {
++            load->next_starting += l.next_starting;
++        }
++        load->visible_end = MP_PTS_MAX(load->visible_end, l.visible_end);
++    }
++    mp_mutex_unlock(&osd->lock);
++}
++
  void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
  {
      mp_mutex_lock(&osd->lock);
 diff --git a/sub/osd.h b/sub/osd.h
-index 8bb6b90..327f6a3 100644
+index 8bb6b90..7b6a96d 100644
 --- a/sub/osd.h
 +++ b/sub/osd.h
-@@ -191,6 +191,10 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
+@@ -191,6 +191,13 @@ bool osd_get_render_subs_in_filter(struct osd_state *osd);
  void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
  void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
  double osd_get_force_video_pts(struct osd_state *osd);
@@ -235,14 +318,17 @@ index 8bb6b90..327f6a3 100644
 +void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
 +                          double *next_start, int *next_events,
 +                          double *visible_end);
++struct sub_event_load;
++void osd_get_sub_load(struct osd_state *osd, double pts, double ref,
++                      struct sub_event_load *load);
  
  struct osd_progbar_state {
      int type;           // <0: disabled, 1-255: symbol, else: no symbol
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index 81d9bef..555b5af 100644
+index 81d9bef..349ba41 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
-@@ -1042,6 +1042,31 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+@@ -1042,6 +1042,73 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
          a[0] += res / 1000.0 + SUB_SEEK_OFFSET;
          return true;
      }
@@ -269,6 +355,48 @@ index 81d9bef..555b5af 100644
 +            return CONTROL_FALSE;
 +        a[0] = best / 1000.0;
 +        a[1] = count;
++        return CONTROL_OK;
++    }
++    case SD_CTRL_EVENT_LOAD: {
++        // The events around a[0], in subtitle time (see struct
++        // sub_event_load): how many are active and how many of those are
++        // not active at a[1], the last event start or end at or before
++        // a[0], the first boundary after it and how many events start
++        // there, and the latest end among the active ones.
++        double *a = arg;
++        long long at = llrint(a[0] * 1000.0);
++        long long ref = a[1] == MP_NOPTS_VALUE ? LLONG_MIN : llrint(a[1] * 1000.0);
++        ASS_Track *track = ctx->ass_track;
++        long long boundary = -1, next = -1, visible_end = -1;
++        int active = 0, cold = 0;
++        for (int n = 0; n < track->n_events; n++) {
++            ASS_Event *e = &track->events[n];
++            long long end = e->Start + e->Duration;
++            if (e->Start > at) {
++                if (next < 0 || e->Start < next)
++                    next = e->Start;
++                continue;
++            }
++            if (at < end) {
++                active++;
++                cold += !(e->Start <= ref && ref < end);
++                boundary = MPMAX(boundary, e->Start);
++                visible_end = MPMAX(visible_end, end);
++                if (next < 0 || end < next)
++                    next = end;
++            } else {
++                boundary = MPMAX(boundary, end);
++            }
++        }
++        int next_starting = 0;
++        for (int n = 0; n < track->n_events; n++)
++            next_starting += next >= 0 && track->events[n].Start == next;
++        a[0] = active;
++        a[1] = cold;
++        a[2] = boundary < 0 ? MP_NOPTS_VALUE : boundary / 1000.0;
++        a[3] = next < 0 ? MP_NOPTS_VALUE : next / 1000.0;
++        a[4] = next_starting;
++        a[5] = visible_end < 0 ? MP_NOPTS_VALUE : visible_end / 1000.0;
 +        return CONTROL_OK;
 +    }
      case SD_CTRL_SET_ANIMATED_CHECK:

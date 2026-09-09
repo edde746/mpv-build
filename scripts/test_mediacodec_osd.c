@@ -10,10 +10,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// The macros the core takes from mpv's common/common.h.
+#define MP_NOPTS_VALUE (-0x1p+63)
+#define MPMAX(a, b) ((a) > (b) ? (a) : (b))
+#define MPMIN(a, b) ((a) > (b) ? (b) : (a))
+#define MPCLAMP(a, min, max) (((a) < (min)) ? (min) : (((a) > (max)) ? (max) : (a)))
+
 #include "mediacodec_osd_core.inc"
 
 #define FRAME 0.041708333 // 23.976 fps
-#define MP_NOPTS_VALUE (-0x1p+63)
 
 static void fail(const char *scenario, int line)
 {
@@ -176,75 +181,186 @@ static struct osd_prefetch static_prefetch(void)
 static void test_prefetch_plan_gates(void)
 {
     struct osd_prefetch p = static_prefetch();
-    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "a static OSD plans the next event");
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, INFINITY, false),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, INFINITY, false),
           "ineligible");
     p.unchanged_streak = OSD_PREFETCH_STATIC_RENDERS - 1;
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "an OSD still changing is not pre-rendered ahead");
     p = static_prefetch();
     p.valid = true;
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "one kept pre-render at a time");
     p = static_prefetch();
-    CHECK(!osd_prefetch_plan(&p, 10.0, 10.0 + OSD_PREFETCH_MIN_LEAD / 2, 1,
+    CHECK(!osd_prefetch_plan(&p, 10.0, 10.0 + OSD_PREFETCH_MIN_LEAD / 2, 0.05,
                              MP_NOPTS_VALUE, INFINITY, true),
           "too close to render ahead of");
-    CHECK(!osd_prefetch_plan(&p, 10.0, 10.0 + OSD_PREFETCH_MAX_LEAD + 1, 1,
+    CHECK(!osd_prefetch_plan(&p, 10.0, 10.0 + OSD_PREFETCH_MAX_LEAD + 1, 0.05,
                              MP_NOPTS_VALUE, INFINITY, true),
           "too far to hold a slot for");
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, 11.0, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, 11.0, true),
           "beyond the decoders' horizon");
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 1, MP_NOPTS_VALUE, NAN, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 0.05, MP_NOPTS_VALUE, NAN, true),
           "unknown horizon");
-    CHECK(!osd_prefetch_plan(&p, 10.0, MP_NOPTS_VALUE, 0, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, MP_NOPTS_VALUE, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "no next event");
-    osd_prefetch_store(&p, 12.0, 1, 3, 1, 0.01);
+    osd_prefetch_store(&p, 12.0, false, 3, 1);
     CHECK(p.valid && p.slot == 1 && p.count == 1, "stored");
     p.valid = false;
-    CHECK(!osd_prefetch_plan(&p, 10.5, 12.0, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(!osd_prefetch_plan(&p, 10.5, 12.0, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "the same event is not rendered twice");
-    CHECK(osd_prefetch_plan(&p, 12.5, 14.0, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 12.5, 14.0, 0.05, MP_NOPTS_VALUE, INFINITY, true),
           "the following event is");
 }
 
-static void test_prefetch_estimate_scales_with_events(void)
+static struct osd_frame_load load_of(int active, int cold)
 {
-    struct osd_prefetch p = static_prefetch();
-    CHECK_NEAR(osd_prefetch_estimate(&p, 1), 0.05, "floor before any measurement");
-    CHECK_NEAR(osd_prefetch_estimate(&p, 100), 0.125, "typesetting is many events");
-    osd_prefetch_store(&p, 12.0, 100, 3, 1, 0.4); // a 100-event sign took 0.4 s
-    CHECK_NEAR(osd_prefetch_estimate(&p, 1), 0.05, "a dialogue line stays cheap");
-    CHECK_NEAR(osd_prefetch_estimate(&p, 100), 0.5, "the measured rate with margin");
-    CHECK_NEAR(osd_prefetch_estimate(&p, 10000), 1.5, "capped");
-    osd_prefetch_store(&p, 14.0, 100, 3, 1, 0.2);
-    CHECK_NEAR(osd_prefetch_estimate(&p, 100), 0.5, "the rate is a worst case, it does not shrink");
+    return (struct osd_frame_load){
+        .active = active, .cold = cold,
+        .boundary = MP_NOPTS_VALUE, .next_boundary = MP_NOPTS_VALUE,
+        .visible_end = MP_NOPTS_VALUE,
+    };
+}
+
+static void test_cost_separates_fixed_cold_and_warm(void)
+{
+    struct osd_cost c = {0};
+    struct osd_frame_load line = load_of(1, 1);
+    struct osd_frame_load sign_cold = load_of(1735, 1735);
+    struct osd_frame_load sign_warm = load_of(1735, 0); // rendered a frame ago
+    CHECK_NEAR(osd_cost_estimate(&c, &line, 1.0), OSD_COST_DEFAULT_FIXED + OSD_COST_DEFAULT_COLD,
+               "defaults before any measurement");
+    osd_cost_observe(&c, &line, 0.022); // a dialogue line took 22 ms
+    CHECK_NEAR(osd_cost_estimate(&c, &line, 1.0), 0.022 + OSD_COST_DEFAULT_COLD,
+               "a light render sets the fixed part");
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_cold, 1.0), 0.022 + 1735 * OSD_COST_DEFAULT_COLD,
+               "and not the per-event rate: 22 ms is not 22 ms per event");
+    osd_cost_observe(&c, &sign_cold, 0.022 + 1735 * 0.00013); // 0.13 ms per cold event
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_cold, 1.0), 0.022 + 1735 * 0.00013,
+               "a cold render sets the cold rate");
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_cold, 1.25), 0.022 + 1.25 * 1735 * 0.00013,
+               "the margin scales the per-event part only");
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_warm, 1.0), 0.022 + 1735 * OSD_COST_DEFAULT_WARM,
+               "the same sign a frame later is charged the warm rate");
+    struct osd_frame_load w131 = load_of(131, 0);
+    osd_cost_observe(&c, &w131, 0.022 + 131 * 0.00001); // re-rendering a sign: 0.01 ms per event
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_cold, 1.0), 0.022 + 1735 * 0.00013,
+               "a warm render leaves the cold rate alone");
+    CHECK_NEAR(osd_cost_estimate(&c, &sign_warm, 1.0), 0.022 + 1735 * 0.00001,
+               "and sets the warm one");
+    struct osd_frame_load cached = load_of(100, 100);
+    for (int n = 0; n < 3; n++)
+        osd_cost_observe(&c, &cached, 0.022); // 100 "cold" events libass had cached: free
+    CHECK(osd_cost_estimate(&c, &sign_cold, 1.0) > 0.022 + 1735 * 0.00013 * 0.75,
+          "three free 100-event renders barely move a rate set by a 1735-event one");
+    struct osd_cost fresh = {0};
+    osd_cost_observe(&fresh, &line, 0.022);
+    osd_cost_observe(&fresh, &sign_cold, 0.022 + 1735 * 0.00013);
+    osd_cost_observe(&fresh, &sign_cold, 0.022 + 1735 * 0.00026); // twice the rate
+    double rate = osd_cost_rate(&fresh, true);
+    CHECK(rate > 0.00013 && rate < 0.00026, "recent cold renders are averaged, not maxed");
+    struct osd_frame_load mixed = load_of(1178, 626); // 626 new over a 552-event sign
+    CHECK_NEAR(osd_cost_estimate(&fresh, &mixed, 1.0),
+               0.022 + 626 * rate + 552 * OSD_COST_DEFAULT_WARM,
+               "only the events the last render lacked are charged cold");
+    struct osd_frame_load few = load_of(8, 8);
+    osd_cost_observe(&fresh, &few, 0.5); // neither light nor heavy: not attributable
+    CHECK_NEAR(osd_cost_rate(&fresh, true), rate, "unchanged");
+    struct osd_frame_load fast = load_of(100, 100);
+    osd_cost_observe(&fresh, &fast, 0.001); // faster than the fixed part
+    CHECK(osd_cost_rate(&fresh, true) >= 0, "the cold rate never goes negative");
+    struct osd_frame_load huge = load_of(1000000, 1000000);
+    CHECK_NEAR(osd_cost_estimate(&fresh, &huge, 1.0), OSD_COST_MAX, "capped");
+}
+
+static void test_ahead_plan(void)
+{
+    double target = 0;
+    CHECK(osd_ahead_plan(0.5 * FRAME, FRAME, 10.0, MP_NOPTS_VALUE, false, INFINITY, &target)
+          == OSD_AHEAD_NONE, "a render that fits its frame is rendered as asked");
+    CHECK(osd_ahead_plan(0.25, 0, 10.0, MP_NOPTS_VALUE, false, INFINITY, &target)
+          == OSD_AHEAD_NONE, "no cadence, no prediction");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, MP_NOPTS_VALUE, false, INFINITY, &target)
+          == OSD_AHEAD_TARGET && target == 10.25,
+          "a hopeless one renders a frame current when it finishes");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, MP_NOPTS_VALUE, false, 10.2, &target)
+          == OSD_AHEAD_NONE, "unless that frame is past the decoders' horizon");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, MP_NOPTS_VALUE, false, NAN, &target)
+          == OSD_AHEAD_NONE, "or the horizon is unknown");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, 10.25, false, INFINITY, &target)
+          == OSD_AHEAD_SKIP, "a held frame at the target is already the answer");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, 10.4, false, INFINITY, &target)
+          == OSD_AHEAD_SKIP, "or past it");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, 10.1, false, INFINITY, &target)
+          == OSD_AHEAD_TARGET, "a held frame inside the run is replaced");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, 10.1, true, INFINITY, &target)
+          == OSD_AHEAD_SKIP, "unless it persists: the sign the run leads to");
+    CHECK(osd_ahead_plan(0.25, FRAME, 10.0, 9.9, true, INFINITY, &target)
+          == OSD_AHEAD_TARGET, "a held frame already due is not waited for");
+}
+
+static void test_ahead_hold_wants_a_frame_ready_in_time_that_persists(void)
+{
+    // Ex1's zoom-out: playing at 16.267 with an 86 ms render ahead. The
+    // window reaches a quarter second out, past the intro to the sign.
+    const double pts = 16.267;
+    const double window = osd_ahead_window(pts, 0.086);
+    CHECK_NEAR(window, pts + OSD_AHEAD_MIN_WINDOW, "a short estimate still looks a quarter second ahead");
+    CHECK_NEAR(osd_ahead_window(pts, 0.3), pts + 0.6, "a long one twice its length");
+    struct osd_frame_load intro = load_of(552, 552);
+    intro.visible_end = 16.37; intro.next_boundary = 16.35; intro.next_starting = 4;
+    struct osd_frame_load sign = load_of(1178, 1178);
+    sign.visible_end = 18.14; sign.next_boundary = 16.5; sign.next_starting = 1;
+    CHECK(!osd_ahead_hold(pts, FRAME, window, 16.33, 0.089, INFINITY, &intro),
+          "an intro frame that lasts 40 ms is not worth holding");
+    CHECK(osd_ahead_hold(pts, FRAME, window, 16.43, 0.134, INFINITY, &sign),
+          "the sign after it is: ready in time, stays, light boundary next");
+    CHECK(!osd_ahead_hold(pts, FRAME, window, 16.43, 0.25, INFINITY, &sign),
+          "not when it cannot be ready within a frame of its start");
+    CHECK(osd_ahead_hold(pts, FRAME, window, 16.43, 0.19, INFINITY, &sign),
+          "one frame late is accepted");
+    CHECK(!osd_ahead_hold(pts, FRAME, window, 16.43, 0.134, 16.4, &sign),
+          "not past the decoders' horizon");
+    struct osd_frame_load half = sign;
+    half.next_boundary = 16.43; half.next_starting = 626;
+    CHECK(!osd_ahead_hold(pts, FRAME, window, 16.41, 0.089, INFINITY, &half),
+          "not a frame the next boundary redoes with 626 new events");
+    CHECK(!osd_ahead_hold(pts, FRAME, window, window + 0.01, 0.134, INFINITY, &sign),
+          "not past the window");
+    CHECK(!osd_ahead_hold(pts, FRAME, window, pts, 0.01, INFINITY, &sign),
+          "not the request's own frame");
+    struct osd_frame_load open = sign;
+    open.next_boundary = MP_NOPTS_VALUE;
+    CHECK(osd_ahead_hold(pts, FRAME, window, 16.43, 0.134, INFINITY, &open), "no boundary after is fine");
+    struct osd_frame_load brief = sign;
+    brief.visible_end = 16.43 + OSD_AHEAD_MIN_LIFE / 2;
+    CHECK(!osd_ahead_hold(pts, FRAME, window, 16.43, 0.134, INFINITY, &brief),
+          "a sign gone within the minimum life is not");
 }
 
 static void test_prefetch_plan_fits_before_visible_end_but_may_overrun_start(void)
 {
     struct osd_prefetch p = static_prefetch();
-    osd_prefetch_store(&p, 5.0, 100, 3, 1, 0.4); // estimate for 100 events: 0.5 s
-    p.valid = false;
-    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, 100, 10.3, INFINITY, true),
+    const double sign = 0.5, line = 0.05; // estimates
+    CHECK(!osd_prefetch_plan(&p, 10.0, 12.0, sign, 10.3, INFINITY, true),
           "a line ending mid-render would wait for it");
-    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, 100, 10.9, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, sign, 10.9, INFINITY, true),
           "a line ending after the render, with margin, does not");
-    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, 100, 13.0, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 10.0, 12.0, sign, 13.0, INFINITY, true),
           "a line outliving the event is no constraint");
-    CHECK(osd_prefetch_plan(&p, 10.0, 10.3, 100, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 10.0, 10.3, sign, MP_NOPTS_VALUE, INFINITY, true),
           "a render that may overrun the start by less than its lead is attempted");
-    CHECK(!osd_prefetch_plan(&p, 10.0, 10.24, 100, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(!osd_prefetch_plan(&p, 10.0, 10.24, sign, MP_NOPTS_VALUE, INFINITY, true),
           "a hopeless one is not");
-    CHECK(osd_prefetch_plan(&p, 10.0, 10.24, 1, MP_NOPTS_VALUE, INFINITY, true),
+    CHECK(osd_prefetch_plan(&p, 10.0, 10.24, line, MP_NOPTS_VALUE, INFINITY, true),
           "a dialogue line that close is");
 }
 
 static void test_prefetch_service_window(void)
 {
     struct osd_prefetch p = static_prefetch();
-    osd_prefetch_store(&p, 10.0, 1, 3, 2, 0.01);
+    osd_prefetch_store(&p, 10.0, false, 3, 2);
     CHECK(osd_prefetch_service(&p, 10.0 - FRAME, 3, FRAME) == OSD_PREFETCH_NONE,
           "the frame before the event keeps the pre-render");
     CHECK(p.valid, "still kept");
@@ -256,14 +372,14 @@ static void test_prefetch_service_window(void)
     CHECK(osd_prefetch_service(&p, 10.0 + FRAME, 3, FRAME) == OSD_PREFETCH_NONE,
           "nothing kept afterwards");
 
-    osd_prefetch_store(&p, 20.0, 1, 3, 2, 0.01);
+    osd_prefetch_store(&p, 20.0, false, 3, 2);
     CHECK(osd_prefetch_service(&p, 20.0 + (OSD_PREFETCH_SERVE_FRAMES - 1) * FRAME, 3, FRAME)
           == OSD_PREFETCH_HIT, "a request coalesced past the start is still served");
-    osd_prefetch_store(&p, 30.0, 1, 3, 2, 0.01);
+    osd_prefetch_store(&p, 30.0, false, 3, 2);
     CHECK(osd_prefetch_service(&p, 30.0 + OSD_PREFETCH_SERVE_FRAMES * FRAME, 3, FRAME)
           == OSD_PREFETCH_EXPIRED, "too late to show the first frame");
     CHECK(!p.valid, "dropped");
-    osd_prefetch_store(&p, 40.0, 1, 3, 2, 0.01);
+    osd_prefetch_store(&p, 40.0, false, 3, 2);
     CHECK(osd_prefetch_service(&p, 40.0, 4, FRAME) == OSD_PREFETCH_EXPIRED,
           "a seek invalidates it");
     CHECK(p.hits == 2, "hits counted");
@@ -288,7 +404,9 @@ int main(void)
     test_spec_plan_respects_horizon_and_eligibility();
     test_swap_lead_is_half_the_release_interval_clamped();
     test_prefetch_plan_gates();
-    test_prefetch_estimate_scales_with_events();
+    test_cost_separates_fixed_cold_and_warm();
+    test_ahead_plan();
+    test_ahead_hold_wants_a_frame_ready_in_time_that_persists();
     test_prefetch_plan_fits_before_visible_end_but_may_overrun_start();
     test_prefetch_service_window();
     test_prefetch_streak_counts_unchanged_renders();
