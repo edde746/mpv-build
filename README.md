@@ -151,9 +151,11 @@ timestamp handed to MediaCodec when the VO thread runs late, without a device.
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core of the same patch and covers the
 frame-cadence estimator that predicts the next pts, the single-use next-frame
-pre-render and its match tolerance, the subtitle read-horizon cap, the event
-pre-render planner (its per-event cost estimate, the visible-end guard and the
-serve window), and the swap lead.
+pre-render and its match tolerance, the subtitle read-horizon cap, the render
+cost model (fixed, cold and warm parts, size-weighted), the skip-ahead for a
+frame that cannot be rendered inside its interval and the criteria for the
+frame held in its place, the event pre-render planner (the visible-end guard
+and the serve window), and the swap lead.
 
 Run the libass change-detection regression with
 `bash scripts/test_libass_change_detection.sh`. It fetches the pinned upstream
