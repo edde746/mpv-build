@@ -65,11 +65,14 @@ for name in functions:
 cadence = source[source.index("#define OSD_CADENCE_SAMPLES"):
                  source.index("struct osd_spec {")]
 (directory / "mediacodec_timing_cadence.inc").write_text(cadence)
-match = re.search(r"^static bool prepare_queued_frame\([^;{]*\{.*?^\}\n",
-                  core, re.MULTILINE | re.DOTALL)
-if not match:
-    raise SystemExit("FAIL: production VO preparation admission not found")
-(directory / "mediacodec_timing_admission.inc").write_text(match.group(0))
+admission = ""
+for name in ("prepare_queued_frame", "vo_wakeup_deadline"):
+    match = re.search(r"^static [^\n]*\b" + name + r"\([^;{]*\{.*?^\}\n",
+                      core, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise SystemExit(f"FAIL: production VO admission function {name} not found")
+    admission += match.group(0) + "\n"
+(directory / "mediacodec_timing_admission.inc").write_text(admission)
 PY
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \

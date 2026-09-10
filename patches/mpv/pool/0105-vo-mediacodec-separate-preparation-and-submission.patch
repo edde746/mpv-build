@@ -1,7 +1,7 @@
 diff --git a/video/out/vo.c b/video/out/vo.c
 --- a/video/out/vo.c
 +++ b/video/out/vo.c
-@@ -915,6 +915,26 @@
+@@ -915,6 +915,45 @@
      mp_mutex_unlock(&in->lock);
  }
  
@@ -25,10 +25,29 @@ diff --git a/video/out/vo.c b/video/out/vo.c
 +    return true;
 +}
 +
++// Called locked. The VO's next wake, given the deadline preparation asked for.
++// A deadline that expired between prepare_queued_frame's own check and this
++// sample must not retire into an idle sleep: the frame it belongs to is still
++// queued, only render_frame can admit it, and wakeup_core wakes the playback
++// core rather than this thread -- which cannot hand over another frame while
++// frame_queued is occupied. The VO would sleep out the caller's fallback,
++// stop releasing decoder buffers, and come back only on an unrelated wakeup.
++static int64_t vo_wakeup_deadline(struct vo *vo, int64_t now, int64_t wait_until)
++{
++    struct vo_internal *in = vo->in;
++    if (!in->wakeup_pts)
++        return wait_until;
++    if (in->wakeup_pts > now)
++        return MPMIN(wait_until, in->wakeup_pts);
++    in->wakeup_pts = 0;
++    wakeup_core(vo);
++    return in->frame_queued ? now : wait_until;
++}
++
  static bool render_frame(struct vo *vo)
  {
      struct vo_internal *in = vo->in;
-@@ -924,6 +944,9 @@
+@@ -924,6 +963,9 @@
      update_display_fps(vo);
  
      mp_mutex_lock(&in->lock);
@@ -38,7 +57,7 @@ diff --git a/video/out/vo.c b/video/out/vo.c
  
      if (in->frame_queued) {
          talloc_free(in->current_frame);
-@@ -950,7 +973,8 @@
+@@ -950,7 +992,8 @@
      int64_t end_time = pts + duration;
  
      // Time at which we should flip_page on the VO.
@@ -48,7 +67,7 @@ diff --git a/video/out/vo.c b/video/out/vo.c
  
      // "normal" strict drop threshold.
      in->dropped_frame = duration >= 0 && end_time < now;
-@@ -992,6 +1016,11 @@
+@@ -992,6 +1035,11 @@
  
      if (in->dropped_frame) {
          in->drop_count += 1;
@@ -60,6 +79,20 @@ diff --git a/video/out/vo.c b/video/out/vo.c
          wakeup_core(vo);
      } else {
          in->rendering = true;
+@@ -1183,12 +1231,5 @@
+         mp_mutex_lock(&in->lock);
+-        if (in->wakeup_pts) {
+-            if (in->wakeup_pts > now) {
+-                wait_until = MPMIN(wait_until, in->wakeup_pts);
+-            } else {
+-                in->wakeup_pts = 0;
+-                wakeup_core(vo);
+-            }
+-        }
++        wait_until = vo_wakeup_deadline(vo, now, wait_until);
+         if (vo->want_redraw && !in->want_redraw) {
+             in->want_redraw = true;
+             wakeup_core(vo);
 diff --git a/video/out/vo.h b/video/out/vo.h
 --- a/video/out/vo.h
 +++ b/video/out/vo.h

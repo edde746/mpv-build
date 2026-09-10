@@ -444,6 +444,9 @@ static int64_t monotonic_to_mp_time_ns(int64_t mono) { return mono - clock_offse
 static void mp_mutex_lock(int *lock) { (*lock)++; }
 static void mp_mutex_unlock(int *lock) { (*lock)--; }
 static void mp_cond_broadcast(int *cond) { (void)cond; }
+static unsigned core_wakeups;
+static void wakeup_core(struct vo *vo) { (void)vo; core_wakeups++; }
+#define MPMIN(a, b) ((a) < (b) ? (a) : (b))
 static double vo_get_vsync_interval(struct vo *vo) { return vo->period; }
 static void vo_set_queue_params(struct vo *vo, int64_t offset, int count)
 {
@@ -876,6 +879,56 @@ static void test_seek_during_preparation(void)
     CHECK_EQ(image.refs, 1, "balanced image ownership across the discard");
 }
 
+// The deadline preparation asks for can expire between prepare_queued_frame's
+// own check and the VO loop's clock sample, which is taken after render_frame
+// returns. Retiring it into an idle sleep while the frame is still queued is
+// how the VO stops presenting for minutes: only render_frame can admit that
+// frame, wakeup_core wakes the playback core rather than this thread, and the
+// core cannot hand over another frame while frame_queued is occupied.
+static void test_expired_deadline_does_not_idle_the_vo(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {0};
+    struct mp_image image = {.pts = 9, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+                             .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 300 * MS;
+    p.vsync_sample = frame.pts - 2 * 40 * MS;
+    CHECK_EQ(present_queued(&vo), false, "the frame is deferred, not submitted");
+    CHECK_EQ(in.wakeup_pts != 0, 1, "preparation armed a deadline");
+
+    // The VO thread is preempted between prepare_queued_frame's check and the
+    // loop's own mp_time_ns(), so the deadline is already in the past here.
+    clock_ns = in.wakeup_pts + MS;
+    int64_t now = mp_time_ns();
+    const int64_t idle = now + 1000 * 1000 * MS; // render_frame returned false
+    unsigned wakeups = core_wakeups;
+    CHECK_EQ(vo_wakeup_deadline(&vo, now, idle), now,
+             "an expired deadline with a frame still queued re-runs at once");
+    CHECK_EQ(in.wakeup_pts, 0, "the expired deadline is retired");
+    CHECK_EQ(core_wakeups, wakeups + 1, "the playback core is still woken");
+    CHECK_EQ(buffer.releases, 0, "nothing was submitted by the deadline itself");
+    CHECK_EQ(present_queued(&vo), true, "the immediate re-run admits the frame");
+    CHECK_EQ(buffer.releases, 1, "and submits it exactly once");
+
+    // With nothing queued the same expiry must still fall through to the idle
+    // sleep; turning that into a busy loop would burn the VO thread.
+    in.wakeup_pts = now - MS;
+    CHECK_EQ(vo_wakeup_deadline(&vo, now, idle), idle,
+             "an expired deadline with no queued frame keeps the idle sleep");
+    CHECK_EQ(in.wakeup_pts, 0, "and is retired too");
+
+    // An unexpired deadline is the ordinary case and must simply shorten it.
+    in.wakeup_pts = now + 5 * MS;
+    CHECK_EQ(vo_wakeup_deadline(&vo, now, idle), now + 5 * MS,
+             "a live deadline shortens the wait");
+    CHECK_EQ(in.wakeup_pts, now + 5 * MS, "and is kept");
+    CHECK_EQ(image.refs, 1, "balanced image ownership");
+}
+
 int main(void)
 {
     test_raw_deadline_jitter();
@@ -896,6 +949,7 @@ int main(void)
     test_clock_domain_drift();
     test_speed_change_admission();
     test_seek_during_preparation();
+    test_expired_deadline_does_not_idle_the_vo();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
          "and dropped still redraw/resume");
