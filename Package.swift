@@ -86,8 +86,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libass",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libass-20b888de2d51.xcframework.zip",
-            checksum: "a688a15d7dc4fd0680c034bdae1b3a41ae24025930af9ed750c2c75033298626"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libass-dcf94c1d6ebe.xcframework.zip",
+            checksum: "7f4aa426e94193b8b5f6a7edd0d6033e14a1b61ecba28e4631b4cadad610e414"
         ),
 
         .binaryTarget(
