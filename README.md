@@ -146,9 +146,12 @@ Run the host-side MediaCodec timing regression with
 `bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
 It applies the full Android series to pinned mpv and extracts the production
 timing and prepare/draw/flip paths. Coverage includes cadence prediction,
-refresh hysteresis, clock drift, bounded nonzero codec submission lead, and
-dropped-frame still redraws without resetting cadence. Pass an already-patched
-source directory as the first argument to run offline.
+refresh hysteresis, clock drift across the mp_time/CLOCK_MONOTONIC boundary,
+playback-speed changes, seek during preparation, dropped-frame still redraws
+without resetting cadence, and the invariant the codec submission lead exists
+for: every frame reaches MediaCodec at least two display periods before the
+presentation timestamp it is given, not before its raw deadline. Pass an
+already-patched source directory as the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core and request dispatcher of the

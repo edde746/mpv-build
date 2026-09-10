@@ -429,13 +429,18 @@ struct vo {
 };
 
 static int64_t clock_ns;
+// CLOCK_MONOTONIC minus mp_time. Zero for every test that does not care;
+// a non-zero, moving value is the only way to see that admission and the
+// presentation timestamp are computed in different domains.
+static int64_t clock_offset_ns;
 static struct osd_request requested;
 static struct osd_release published;
 static unsigned requests;
 
-static int64_t monotonic_now_ns(void) { return clock_ns; }
+static int64_t monotonic_now_ns(void) { return clock_ns + clock_offset_ns; }
 static int64_t mp_time_ns(void) { return clock_ns; }
-static int64_t mp_time_to_monotonic_ns(int64_t pts) { return pts; }
+static int64_t mp_time_to_monotonic_ns(int64_t pts) { return pts + clock_offset_ns; }
+static int64_t monotonic_to_mp_time_ns(int64_t mono) { return mono - clock_offset_ns; }
 static void mp_mutex_lock(int *lock) { (*lock)++; }
 static void mp_mutex_unlock(int *lock) { (*lock)--; }
 static void mp_cond_broadcast(int *cond) { (void)cond; }
@@ -490,11 +495,19 @@ static int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
     return av_mediacodec_render_buffer_at_time(buffer, 0);
 }
 
+// Armed by the seek regression: the core discards the queued frame while
+// preparation runs with the VO lock released.
+static struct vo_internal *seek_victim;
+
 static void osd_file_request(struct priv *p, struct osd_request request)
 {
     (void)p;
     requested = request;
     requests++;
+    if (seek_victim) {
+        seek_victim->frame_queued = NULL;
+        seek_victim = NULL;
+    }
 }
 
 static void osd_result_publish_release(int *results, struct osd_release release)
@@ -542,12 +555,18 @@ static void test_preparation_does_not_submit_early(void)
     struct vo_frame frame = {.current = &image, .frame_id = 1,
                               .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
     in.frame_queued = &frame;
-    clock_ns = frame.pts - 120 * MS; // old 25 fps/25 Hz queue budget
+    clock_ns = frame.pts - 120 * MS;
+    // A Choreographer grid whose lines fall on the frame's own deadline.
+    p.vsync_sample = frame.pts - 2 * 40 * MS;
     CHECK_EQ(present_queued(&vo), false, "120ms preparation cannot submit");
     CHECK_EQ(buffer.releases, 0, "no immediate release at the old budget");
-    CHECK_EQ(vo.admission_offset, 120 * MS, "retain the full OSD horizon");
+    CHECK_EQ(vo.admission_offset, 140 * MS,
+             "OSD horizon still reaches past the codec window");
     CHECK_EQ(requested.pts * 1000, 12500, "OSD is prepared before admission");
-    CHECK_EQ(in.wakeup_pts, frame.pts - 50 * MS, "50ms codec admission");
+    // Two display periods before the timestamp the codec is actually given
+    // (the chosen vsync minus 80% of a period), not before the raw deadline.
+    CHECK_EQ(in.wakeup_pts, frame.pts - 32 * MS - 80 * MS,
+             "admission counts back from the presentation timestamp");
     unsigned prepared = requests;
     in.paused = true;
     CHECK_EQ(present_queued(&vo), false, "pause wakeup cannot release too early");
@@ -557,10 +576,11 @@ static void test_preparation_does_not_submit_early(void)
     CHECK_EQ(present_queued(&vo), false, "one ns before admission stays queued");
     CHECK_EQ(requests, prepared, "unrelated wakeups do not restart OSD work");
     clock_ns++;
-    p.vsync_sample = clock_ns - 30 * MS;
     CHECK_EQ(present_queued(&vo), true, "admit at the codec boundary");
     CHECK_EQ(buffer.releases, 1, "submit once");
     CHECK_EQ(buffer.timestamp, frame.pts - 32 * MS, "preserve minus 0.8P snap");
+    CHECK_EQ(monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns, 80 * MS,
+             "the codec gets two display periods of notice");
     CHECK_EQ(published.seq, requested.seq, "OSD gets its matching video release");
     CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
@@ -599,8 +619,22 @@ static void test_driver_refresh_and_cadence(void)
                 exit(1);
             }
             int64_t expected = mediacodec_timing_release(&reference, frame.pts,
-                clock_ns, frame.frame_id, duration, p.vsync_sample, period, MAX_AHEAD);
+                clock_ns, frame.frame_id, duration, p.vsync_sample, period,
+                mediacodec_release_horizon(period));
             CHECK_EQ(buffer.timestamp, expected, "admission preserves cadence/snap");
+            // The whole point of admitting against the corrected timestamp:
+            // MediaCodec must still get its two display periods of notice.
+            // The first frame after a period change has no grid yet, so its
+            // deadline is set from the raw pts and the 80% pull-back eats
+            // into the window until a Choreographer sample is trusted.
+            int64_t window = monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns;
+            if (i && window < 2 * period) {
+                fprintf(stderr, "FAIL: %.3f fps / %.3f Hz submitted %" PRId64
+                        "us before its timestamp, needs %" PRId64 "us\n",
+                        rates[r].fps, rates[r].hz, window / 1000,
+                        2 * period / 1000);
+                exit(1);
+            }
             int64_t shown = presented_vsync(buffer.timestamp, clock_ns, EPOCH, period);
             if (i && rates[r].fps <= rates[r].hz) {
                 int64_t gap = (shown - previous_vsync) / period;
@@ -692,7 +726,10 @@ static void test_drop_pause_redraw_resume(void)
     frame = (struct vo_frame){.current = &images[1], .frame_id = 11,
         .pts = base + period + period / 2 + MS, .duration = period};
     in.frame_queued = &frame;
-    CHECK_EQ(present_queued(&vo), false, "prepare B without submitting it");
+    // At 25 Hz the codec window is wider than one frame, so B's window is
+    // already open when A is submitted. Preparation on its own must still
+    // never touch the codec: the core can drop this frame before draw/flip.
+    CHECK_EQ(prepare_frame(&vo, &frame) > 0, 1, "prepare B without submitting it");
     // Exercise the production cancellation notification used by the core drop
     // branch. There must be no codec release until the later full redraw.
     in.frame_queued = NULL;
@@ -726,7 +763,7 @@ static void test_drop_pause_redraw_resume(void)
     frame = (struct vo_frame){.current = &images[2], .frame_id = 12,
         .pts = base + 2 * period + period / 2 + MS, .duration = period};
     in.frame_queued = &frame;
-    clock_ns = frame.pts - 120 * MS;
+    clock_ns = frame.pts - 160 * MS;
     CHECK_EQ(present_queued(&vo), false, "resume prepares C");
     clock_ns = in.wakeup_pts;
     p.vsync_sample = base;
@@ -738,6 +775,105 @@ static void test_drop_pause_redraw_resume(void)
     reset_video(&vo);
     CHECK_EQ(p.timing.frame_id, 0, "real seek/reconfig still resets timing");
     CHECK_EQ(p.cadence.have_last, false, "real seek/reconfig resets OSD cadence");
+}
+
+// Admission is decided in mp_time, the presentation timestamp in
+// CLOCK_MONOTONIC. mpv reads CLOCK_MONOTONIC_RAW where it can, so the two
+// are neither equal nor rate-locked; the codec window has to survive the
+// conversion with the offset moving in either direction.
+static void test_clock_domain_drift(void)
+{
+    const int64_t period = 16666667, duration = 41708333;
+    const int64_t drifts[] = {37 * MS, -37 * MS};
+    for (size_t d = 0; d < sizeof(drifts) / sizeof(drifts[0]); d++) {
+        struct priv p = {.vsync_thread_created = true};
+        struct vo_internal in = {0};
+        struct vo vo = {&p, &in, &driver, period, 0};
+        for (int i = 0; i < 24; i++) {
+            AVMediaCodecBuffer buffer = {0};
+            struct mp_image image = {.pts = i * 0.0417,
+                                     .planes[3] = &buffer, .refs = 1};
+            struct vo_frame frame = {.current = &image, .frame_id = 500 + i,
+                .pts = EPOCH + 1000 * period + i * duration, .duration = duration};
+            in.frame_queued = &frame;
+            clock_offset_ns = drifts[d] + (d ? -i : i) * INT64_C(1000);
+            if (!i)
+                clock_ns = frame.pts - 500 * MS;
+            CHECK_EQ(present_queued(&vo), false, "drifting clocks still wait");
+            clock_ns = in.wakeup_pts;
+            int64_t mono = monotonic_now_ns();
+            p.vsync_sample = EPOCH + ((mono - EPOCH) / period) * period;
+            CHECK_EQ(present_queued(&vo), true, "drifting clocks admit");
+            CHECK_EQ(buffer.releases, 1, "one submission per frame");
+            int64_t window = monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns;
+            if (!buffer.timestamp || (i && window < 2 * period)) {
+                fprintf(stderr, "FAIL: drift %+" PRId64 "ms frame %d submitted %"
+                        PRId64 "us before its timestamp\n",
+                        drifts[d] / MS, i, window / 1000);
+                exit(1);
+            }
+        }
+    }
+    clock_offset_ns = 0;
+}
+
+// Playback speed reaches the VO only as vo_frame.duration. A change past the
+// cadence tolerance re-anchors the prediction mid-stream; admission must
+// re-evaluate with it and keep the codec window on both sides.
+static void test_speed_change_admission(void)
+{
+    const int64_t period = 16666667;
+    const int64_t durations[] = {41708333, 41708333, 41708333, 41708333,
+                                 20854166, 20854166, 20854166, 20854166};
+    struct priv p = {.vsync_thread_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, period, 0};
+    int64_t pts = EPOCH + 1000 * period;
+    clock_ns = pts - 500 * MS;
+    for (size_t i = 0; i < sizeof(durations) / sizeof(durations[0]); i++) {
+        AVMediaCodecBuffer buffer = {0};
+        struct mp_image image = {.pts = 30 + 0.04 * (double)i,
+                                 .planes[3] = &buffer, .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 700 + i,
+            .pts = pts, .duration = (double)durations[i]};
+        in.frame_queued = &frame;
+        CHECK_EQ(present_queued(&vo), false, "speed change still waits");
+        clock_ns = in.wakeup_pts;
+        p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period) * period;
+        CHECK_EQ(present_queued(&vo), true, "speed change admits");
+        int64_t window = monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns;
+        if (!buffer.timestamp || (i && window < 2 * period)) {
+            fprintf(stderr, "FAIL: %" PRId64 "us frame submitted %" PRId64
+                    "us before its timestamp\n", durations[i] / 1000,
+                    window / 1000);
+            exit(1);
+        }
+        pts += durations[i];
+    }
+}
+
+// Preparation runs with the VO lock released, so a seek can discard the
+// queued frame inside that window. The core must not arm a wakeup for a
+// frame that no longer exists, and nothing may reach the codec.
+static void test_seek_during_preparation(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {0};
+    struct mp_image image = {.pts = 5, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+                             .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 300 * MS;
+    seek_victim = &in;
+    mp_mutex_lock(&in.lock);
+    CHECK_EQ(prepare_queued_frame(&vo), 1, "a discarded frame cannot hold the core");
+    mp_mutex_unlock(&in.lock);
+    CHECK_EQ(in.wakeup_pts, 0, "no wakeup is armed for a frame that was dropped");
+    CHECK_EQ(buffer.releases, 0, "nothing is submitted for a discarded frame");
+    CHECK_EQ(in.lock, 0, "balanced locking across the discard");
+    CHECK_EQ(image.refs, 1, "balanced image ownership across the discard");
 }
 
 int main(void)
@@ -757,7 +893,11 @@ int main(void)
     test_driver_refresh_and_cadence();
     test_refresh_transition_and_late_frame();
     test_drop_pause_redraw_resume();
-    puts("PASS: MediaCodec cadence, production admission/draw/flip, bounded codec "
-         "lead, refresh transitions, and dropped still redraw/resume");
+    test_clock_domain_drift();
+    test_speed_change_admission();
+    test_seek_during_preparation();
+    puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
+         "window across clock drift and speed changes, refresh transitions, "
+         "and dropped still redraw/resume");
     return 0;
 }

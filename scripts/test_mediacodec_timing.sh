@@ -49,8 +49,9 @@ timing = source[source.index(start):source.index(end) + len(end)]
 # Only platform/codec/OSD side effects are replaced by the host harness.
 functions = [
     "read_vsync_sample", "vsync_sample_is_fresh", "display_period",
-    "update_queue_timing", "get_release_target", "prepare_osd", "prepare_frame",
-    "draw_frame", "flip_page", "reset_video",
+    "update_queue_timing", "get_release_target", "prepare_osd",
+    "submit_deadline", "prepare_frame", "draw_frame", "flip_page",
+    "reset_video",
 ]
 driver = source[source.index("#define VSYNC_SAMPLE_MAX_AGE_NS"):
                 source.index("static int64_t read_vsync_sample")]

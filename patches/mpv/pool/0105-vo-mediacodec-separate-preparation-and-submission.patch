@@ -83,20 +83,21 @@ diff --git a/video/out/vo.h b/video/out/vo.h
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -19,9 +19,9 @@
+@@ -19,9 +19,10 @@
   * Timed MediaCodec Surface output with a sibling OSD plane.
   *
   * Decoded buffers go straight to the --wid Surface (no GPU pass, decoder
 - * dataspace intact) and are released with a presentation timestamp about
 - * two vsyncs ahead, snapped to the Choreographer vsync grid when a fresh
 - * sample exists. The embedder owns all geometry; software frames are
-+ * dataspace intact) and are submitted no more than two vsyncs or 50 ms ahead,
-+ * snapped to the Choreographer vsync grid when a fresh sample exists. The
-+ * embedder owns all geometry; software frames are
++ * dataspace intact) and are released with a presentation timestamp snapped
++ * to the Choreographer vsync grid when a fresh sample exists, and are handed
++ * to the codec about two display periods before that timestamp.
++ * The embedder owns all geometry; software frames are
   * refused so the Surface never becomes a CPU producer.
   *
   * OSD/subtitles go to the transparent --vo-mediacodec-osd-surface Surface,
-@@ -29,8 +29,8 @@
+@@ -29,8 +30,8 @@
   * that never holds the video back:
   *
   *  - The render stage (thread "vo/osd-render") rasterizes the OSD for a
@@ -107,21 +108,49 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
   *    frame is due, and between requests it pre-renders the next frame's pts
   *    from the observed cadence so a regular request is served without
   *    calling libass at all. Pre-rendering never runs past the subtitle
-@@ -217,6 +217,31 @@
+@@ -217,6 +218,59 @@
      return snapped - period_ns * 8 / 10;
  }
  
-+// OSD work needs the current/next render plus composition time, independently
-+// of how long a decoder-owned output buffer is held by SurfaceView.
++// How far before the presentation timestamp the buffer has to reach the
++// codec. MediaCodec.releaseOutputBuffer(int, long) asks for about two display
++// periods, and does not return the buffer to the decoder until the timestamp
++// passes, so the lead is capped. An unknown period keeps a fixed budget.
 +static int64_t mediacodec_codec_lead(int64_t period_ns)
 +{
-+    return period_ns > 0 && period_ns < 25000000
-+         ? 2 * period_ns : 50000000;
++    if (period_ns <= 0)
++        return 50000000;
++    int64_t lead = 2 * period_ns;
++    return lead < 100000000 ? lead : 100000000;
 +}
 +
++// The timestamp mediacodec_timing_release would choose, evaluated without
++// committing the cadence anchor or the snap preference and without the
++// submission-time guards. Preparation needs the decision to know when the
++// codec may have the buffer; only the single release at flip commits it, so
++// repeated preparation wakeups cannot advance the anchor.
++static int64_t mediacodec_timing_preview(const struct mediacodec_timing *timing,
++                                        int64_t raw_target_ns, uint64_t frame_id,
++                                        double frame_duration_ns,
++                                        int64_t sample_ns, int64_t period_ns)
++{
++    struct mediacodec_timing scratch = *timing;
++    int64_t target_ns = mediacodec_timing_predict(&scratch, raw_target_ns,
++                                                  frame_id, frame_duration_ns);
++    if (period_ns <= 0 || !sample_ns)
++        return target_ns;
++    return mediacodec_timing_snap(&scratch, target_ns, sample_ns, period_ns)
++         - period_ns * 8 / 10;
++}
++
++// OSD work needs the current/next render plus composition time, and the core
++// has to wake early enough that the codec window is still reachable: one
++// codec lead, the 80% pull-back, and the cadence-correction bound.
 +static int64_t mediacodec_prepare_lead(int64_t period_ns, double duration_ns)
 +{
-+    int64_t lead = period_ns * 2 > 50000000 ? period_ns * 2 : 50000000;
++    int64_t lead = mediacodec_codec_lead(period_ns) + period_ns + 20000000;
++    if (lead < 50000000)
++        lead = 50000000;
 +    if (period_ns > 0 && isfinite(duration_ns) && duration_ns > 0) {
 +        int64_t render = llround(fmin(2 * duration_ns + period_ns, 500000000));
 +        if (render > lead)
@@ -139,7 +168,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // --- end mediacodec timing core
  
  typedef AChoreographer *(*mp_get_choreographer_fn)(void);
-@@ -325,9 +350,9 @@
+@@ -325,9 +379,9 @@
  #define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
  #define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
  
@@ -152,7 +181,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
  struct osd_cadence {
      double deltas[OSD_CADENCE_SAMPLES];
-@@ -771,6 +796,9 @@
+@@ -771,6 +825,9 @@
      uint64_t cur_frame_id;
      double cur_duration;
      uint64_t cur_seq;    // sequence of the frame draw_frame received
@@ -162,7 +191,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      double osd_pts;      // render pts of the last real frame
  
      struct mp_hwdec_ctx hwctx;
-@@ -977,7 +1005,7 @@
+@@ -977,7 +1034,7 @@
  
      AVHWDeviceContext *ctx = (void *)device_ref->data;
      AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
@@ -171,7 +200,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  
      if (av_hwdevice_ctx_init(device_ref) < 0)
          av_buffer_unref(&device_ref);
-@@ -2761,7 +2789,7 @@
+@@ -2761,7 +2818,7 @@
      JNIEnv *env = mp_jni_get_env(vo->log);
      if (env) {
          p->osd_window = ANativeWindow_fromSurface(env,
@@ -180,7 +209,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      }
      if (!p->osd_window) {
          MP_ERR(vo, "Failed to wrap the OSD surface; "
-@@ -2853,14 +2881,16 @@
+@@ -2853,14 +2910,28 @@
      init_vsync_sampler(vo);
      osd_init(vo);
  
@@ -197,10 +226,22 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 -#define TIMED_RELEASE_MAX_AHEAD_NS MP_TIME_MS_TO_NS(500)
 +// Allow clock-domain sampling jitter, not the old OSD preparation horizon.
 +#define TIMED_RELEASE_CLOCK_SLOP_NS MP_TIME_MS_TO_NS(2)
++// Must match the cadence-correction bound in mediacodec_timing_predict.
++#define TIMED_RELEASE_PREDICT_BOUND_NS MP_TIME_MS_TO_NS(20)
++
++// Beyond this a deadline is a discontinuity, not a cadence. A correctly
++// admitted frame reaches flip_page one codec lead before its corrected
++// timestamp, and cadence correction plus snapping can place that timestamp
++// ahead of the raw deadline by the prediction bound and most of a period.
++static int64_t mediacodec_release_horizon(int64_t period_ns)
++{
++    return mediacodec_codec_lead(period_ns) + TIMED_RELEASE_PREDICT_BOUND_NS
++         + 2 * (period_ns > 0 ? period_ns : 0) + TIMED_RELEASE_CLOCK_SLOP_NS;
++}
  
  struct release_target {
      int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
-@@ -2894,8 +2924,8 @@
+@@ -2894,8 +2965,8 @@
      return llround(period);
  }
  
@@ -211,7 +252,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  static void update_queue_timing(struct vo *vo, double frame_duration)
  {
      struct priv *p = vo->priv;
-@@ -2908,20 +2938,16 @@
+@@ -2908,20 +2979,16 @@
          p->queue_period_changed = mono_now;
      }
  
@@ -236,17 +277,16 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      }
  }
  
-@@ -2946,7 +2972,8 @@
+@@ -2946,7 +3013,7 @@
  
      result.timestamp = mediacodec_timing_release(
          &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
 -        sample, p->queue_period, TIMED_RELEASE_MAX_AHEAD_NS);
-+        sample, p->queue_period,
-+        mediacodec_codec_lead(p->queue_period) + TIMED_RELEASE_CLOCK_SLOP_NS);
++        sample, p->queue_period, mediacodec_release_horizon(p->queue_period));
      if (result.timestamp && sample && raw_target > mono_now)
          result.vsync = result.timestamp + p->queue_period * 8 / 10;
      return result;
-@@ -2978,52 +3005,102 @@
+@@ -2978,52 +3045,136 @@
          vo->want_redraw = true;
  }
  
@@ -275,6 +315,41 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +        mp_mutex_unlock(&p->osd_lock);
 +    }
 +    return seq;
++}
++
++// When this frame may be handed to the codec. The buffer is presented at the
++// vsync get_release_target picks, not at its raw deadline: cadence correction
++// and snapping place that vsync up to the prediction bound plus most of a
++// period away, so admitting against the raw pts hands MediaCodec a timestamp
++// already inside its two-period window and the picture slips a vsync while
++// the OSD plane stays pinned to the intended one. Evaluate the same decision
++// here without committing it, and count the lead back from the timestamp the
++// codec will actually receive.
++static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (frame->pts <= 0 || frame->display_synced)
++        return 0;
++
++    int64_t lead = mediacodec_codec_lead(p->queue_period);
++    int64_t raw_deadline = frame->pts - lead;
++    int64_t mono_now = monotonic_now_ns();
++    if (mono_now <= 0)
++        return raw_deadline;
++
++    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
++    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
++        sample = 0;
++
++    int64_t timestamp = mediacodec_timing_preview(
++        &p->timing, mp_time_to_monotonic_ns(frame->pts), frame->frame_id,
++        frame->duration, sample, p->queue_period);
++    // The lead is measured against the timestamp, never against the raw
++    // deadline: the 80% pull-back alone puts the timestamp most of a period
++    // ahead of it, and clamping there is what leaves the codec short. The
++    // hold is bounded by construction, at exactly one lead.
++    int64_t deadline = monotonic_to_mp_time_ns(timestamp) - lead;
++    return deadline > 0 ? deadline : raw_deadline;
 +}
 +
 +static int64_t prepare_frame(struct vo *vo, struct vo_frame *frame)
@@ -306,8 +381,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +        p->prepared_frame_id = frame->frame_id;
 +        p->prepared_epoch = p->osd.epoch;
 +    }
-+    return frame->pts > 0 && !frame->display_synced
-+         ? frame->pts - mediacodec_codec_lead(p->queue_period) : 0;
++    return submit_deadline(vo, frame);
 +}
 +
  static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -386,7 +460,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      return VO_TRUE;
  }
  
-@@ -3048,12 +3125,18 @@
+@@ -3048,12 +3199,18 @@
          return;
      }
  
@@ -406,7 +480,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      mp_image_unrefp(&p->cur_image);
      p->cur_pts = 0;
      p->cur_frame_id = 0;
-@@ -3096,6 +3179,11 @@
+@@ -3096,6 +3253,11 @@
      p->cur_pts = 0;
      p->cur_frame_id = 0;
      p->cur_duration = 0;
@@ -418,7 +492,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      mediacodec_timing_reset(&p->timing);
      osd_cadence_reset(&p->cadence);
      p->osd_pts = MP_NOPTS_VALUE;
-@@ -3177,6 +3265,7 @@
+@@ -3177,6 +3339,7 @@
      .name = "mediacodec",
      .preinit = preinit,
      .query_format = query_format,
