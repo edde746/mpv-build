@@ -3,3 +3,4 @@
 0001-mediacodec-dolby-vision.patch
 0003-mediacodec-av1-refuse-non-main-profiles.patch
 0004-mediacodec-size-input-buffers-for-access-units.patch
+0006-mediacodec-select-decoder-despite-profile-mismatch.patch

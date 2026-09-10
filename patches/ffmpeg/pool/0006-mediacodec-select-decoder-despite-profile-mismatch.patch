@@ -1,0 +1,56 @@
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index d662a26..005fa0c 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -475,6 +475,7 @@ char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int e
+     int codec_count;
+     int found_codec = 0;
+     char *name = NULL;
++    char *fallback_name = NULL;
+     char *supported_type = NULL;
+ 
+     JNIEnv *env = NULL;
+@@ -624,6 +625,16 @@ char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int e
+                 }
+             }
+ 
++            /* This codec decodes the mime type but advertises no profileLevels
++             * entry equal to the requested profile. Remember it as a last
++             * resort: a superset constant in place of the base profile is
++             * common enough that refusing hardware decoding on this evidence
++             * alone is wrong. An exact match found later still wins, and the
++             * Dolby Vision override asked for strictness and gets it. */
++            if (!found_codec && !exact_profile && !fallback_name) {
++                fallback_name = av_strdup(name);
++            }
++
+ done_with_type:
+             (*env)->DeleteLocalRef(env, profile_levels);
+             profile_levels = NULL;
+@@ -671,8 +682,26 @@ done:
+ 
+     if (!found_codec) {
+         av_freep(&name);
++
++        /* Nothing matched the profile exactly. Hand back a decoder that at
++         * least claims the mime type and let MediaCodec.configure()/start()
++         * be the authority, instead of telling the caller the device cannot
++         * decode the stream at all. Vendors routinely advertise only a
++         * superset constant -- an HEVC Main 10 stream against a decoder
++         * listing HEVCProfileMain10HDR10 (0x1000) but not HEVCProfileMain10
++         * (0x02) is the common case -- and this equality check is then the
++         * only thing between that stream and hardware decoding. */
++        if (fallback_name) {
++            av_log(log_ctx, AV_LOG_WARNING,
++                   "No %s decoder advertises profile 0x%x; trying %s anyway\n",
++                   mime, profile, fallback_name);
++            name = fallback_name;
++            fallback_name = NULL;
++        }
+     }
+ 
++    av_freep(&fallback_name);
++
+     return name;
+ }
+ 
