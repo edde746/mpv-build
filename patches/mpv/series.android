@@ -16,3 +16,5 @@
 0102-f-output-chain-wake-after-reset-harder.patch
 0010-player-pending-vid-property.patch
 0103-ao-audiotrack-output-stall-watchdog.patch
+0105-vo-mediacodec-separate-preparation-and-submission.patch
+0104-vo-mediacodec-live-osd-rebind.patch

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Compile the production AudioTrack clock and buffer-publication path. Pass an
+# Compile the production AudioTrack clock, write, and reset paths. Pass an
 # already-patched mpv tree for offline use; otherwise fetch and patch the pinned
-# source in a temporary directory. No Android device or JNI runtime is needed.
+# source in a temporary directory. JNI is injected; no Android device is needed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -55,8 +55,24 @@ thread = extract(r'^static MP_THREAD_VOID ao_thread\([^;]*?\)\n\{.*?^\}')
 start = thread.index('            int read_samples =')
 end = thread.index('\n', thread.index('ao_read_data(', start))
 (work / 'audiotrack_read.inc').write_text(thread[start:end] + '\n(void)samples;\n')
+
+regions = [extract(r'^enum \{\n    RAW_SYNC_PA.*?^\};'),
+           extract(r'^struct priv \{.*?^\};')]
+regions += re.findall(r'^#define (?:IEC61937_|STALL_)[^\n]+', source, re.M)
+for name in ('AudioTrack_resetPlayheadSmoothing', 'AudioTrack_resetClock',
+             'AudioTrack_Recreate', 'AudioTrack_smoothPlayhead',
+             'AudioTrack_getPlaybackHeadPosition', 'AudioTrack_getLatency',
+             'AudioTrack_unwrapIEC61937', 'AudioTrack_write',
+             'AudioTrack_beginRecovery', 'AudioTrack_recreateOrFail',
+             'ao_thread', 'monitor_thread', 'stop', 'start'):
+    regions.append(extract(r'^static [^\n]*\b' + name + r'\([^;]*?\)\n\{.*?^\}'))
+(work / 'audiotrack_write.inc').write_text('\n\n'.join(regions) + '\n')
 PY
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_audiotrack_timing.c" -lm
 "$workdir/test"
+
+cc -O2 -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
+    -o "$workdir/test_write" "$root/scripts/test_audiotrack_write.c" -lm
+"$workdir/test_write"

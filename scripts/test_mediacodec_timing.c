@@ -1,6 +1,6 @@
-// Behavioral regressions for the exact freestanding MediaCodec timing core
-// extracted from patch 0001 by test_mediacodec_timing.sh. The timestamps model
-// several days of monotonic uptime; no Android or mpv scheduler is mocked here.
+// Production MediaCodec cadence, VO admission and draw/flip regressions.
+// The shell harness extracts the authoritative patch's implementations.
+// Android/codec/OSD side effects use a deterministic host fixture.
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
@@ -343,6 +343,403 @@ static void test_release_discontinuities(void)
              raw - 2 * MS, "stale vsync sample releases at the cadence target");
 }
 
+// Platform fixture for the extracted production admission/draw/flip path.
+#define MP_TIME_MS_TO_NS(v) ((v) * MS)
+#define MP_TIME_S_TO_NS(v) ((v) * INT64_C(1000000000))
+#define MP_NOPTS_VALUE (-1e20)
+#define VO_TRUE true
+#define OSD_RELEASE_HISTORY 8
+#define OSD_STATS_INTERVAL_FRAMES 120
+#define MP_VERBOSE(...) ((void)0)
+#define MP_WARN(...) ((void)0)
+
+#include "mediacodec_timing_cadence.inc"
+
+typedef struct {
+    int releases;
+    int64_t timestamp;
+} AVMediaCodecBuffer;
+
+struct mp_image {
+    double pts;
+    void *planes[4];
+    int refs;
+};
+
+struct vo_frame {
+    bool redraw, repeat, still, display_synced;
+    int64_t pts;
+    double duration;
+    uint64_t frame_id;
+    struct mp_image *current;
+};
+
+struct osd_request {
+    double pts, delta;
+    uint64_t seq, epoch;
+};
+
+struct osd_release {
+    uint64_t seq;
+    int64_t timestamp, vsync, period;
+};
+
+struct osd_shared {
+    uint64_t epoch, release_seq;
+    unsigned frames;
+    struct osd_release releases[OSD_RELEASE_HISTORY];
+    int release_next, results;
+};
+
+struct priv {
+    struct mp_image *cur_image;
+    int64_t cur_pts;
+    uint64_t cur_frame_id, cur_seq, submitted_frame_id;
+    uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
+    double cur_duration, osd_pts;
+    bool cur_synthetic, osd_threads_created, osd_missing_logged;
+    bool vsync_thread_created;
+    int vsync_lock, osd_lock, osd_wakeup;
+    int64_t vsync_sample, queue_period, queue_period_changed, queue_offset;
+    struct mediacodec_timing timing;
+    struct osd_cadence cadence;
+    struct osd_shared osd;
+    uint64_t frame_seq;
+    unsigned stats_frames;
+};
+
+struct vo;
+struct vo_driver {
+    int64_t (*prepare_frame)(struct vo *, struct vo_frame *);
+};
+
+struct vo_internal {
+    struct vo_frame *frame_queued;
+    bool paused, send_reset;
+    int lock;
+    int64_t wakeup_pts;
+};
+
+struct vo {
+    struct priv *priv;
+    struct vo_internal *in;
+    const struct vo_driver *driver;
+    double period;
+    int64_t admission_offset;
+};
+
+static int64_t clock_ns;
+static struct osd_request requested;
+static struct osd_release published;
+static unsigned requests;
+
+static int64_t monotonic_now_ns(void) { return clock_ns; }
+static int64_t mp_time_ns(void) { return clock_ns; }
+static int64_t mp_time_to_monotonic_ns(int64_t pts) { return pts; }
+static void mp_mutex_lock(int *lock) { (*lock)++; }
+static void mp_mutex_unlock(int *lock) { (*lock)--; }
+static void mp_cond_broadcast(int *cond) { (void)cond; }
+static double vo_get_vsync_interval(struct vo *vo) { return vo->period; }
+static void vo_set_queue_params(struct vo *vo, int64_t offset, int count)
+{
+    (void)count;
+    vo->admission_offset = offset;
+}
+
+static struct mp_image *mp_image_new_ref(struct mp_image *image)
+{
+    image->refs++;
+    return image;
+}
+
+static void mp_image_unrefp(struct mp_image **image)
+{
+    if (*image)
+        (*image)->refs--;
+    *image = NULL;
+}
+
+static struct vo_frame *vo_frame_ref(struct vo_frame *frame)
+{
+    struct vo_frame *copy = malloc(sizeof(*copy));
+    if (!copy)
+        abort();
+    *copy = *frame;
+    if (copy->current)
+        mp_image_new_ref(copy->current);
+    return copy;
+}
+
+static void talloc_free(struct vo_frame *frame)
+{
+    mp_image_unrefp(&frame->current);
+    free(frame);
+}
+
+static int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer,
+                                               int64_t timestamp)
+{
+    buffer->releases++;
+    buffer->timestamp = timestamp;
+    return 0;
+}
+
+static int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
+{
+    CHECK_EQ(render, 1, "buffer is rendered, not discarded");
+    return av_mediacodec_render_buffer_at_time(buffer, 0);
+}
+
+static void osd_file_request(struct priv *p, struct osd_request request)
+{
+    (void)p;
+    requested = request;
+    requests++;
+}
+
+static void osd_result_publish_release(int *results, struct osd_release release)
+{
+    (void)results;
+    published = release;
+}
+
+static void osd_invalidate_locked(struct priv *p) { p->osd.epoch++; }
+static void osd_log_stats(struct vo *vo, const char *why)
+{
+    (void)vo;
+    (void)why;
+}
+
+#include "mediacodec_timing_driver.inc"
+#include "mediacodec_timing_admission.inc"
+
+static const struct vo_driver driver = {.prepare_frame = prepare_frame};
+
+// Run the actual core admission decision and production draw/flip. A false
+// result returns to the VO event loop without releasing a codec buffer.
+static bool present_queued(struct vo *vo)
+{
+    mp_mutex_lock(&vo->in->lock);
+    bool ready = prepare_queued_frame(vo);
+    mp_mutex_unlock(&vo->in->lock);
+    CHECK_EQ(vo->in->lock, 0, "admission returns with balanced locking");
+    if (!ready)
+        return false;
+    struct vo_frame *frame = vo->in->frame_queued;
+    vo->in->frame_queued = NULL;
+    draw_frame(vo, frame);
+    flip_page(vo);
+    return true;
+}
+
+static void test_preparation_does_not_submit_early(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {0};
+    struct mp_image image = {.pts = 12.5, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+                              .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS; // old 25 fps/25 Hz queue budget
+    CHECK_EQ(present_queued(&vo), false, "120ms preparation cannot submit");
+    CHECK_EQ(buffer.releases, 0, "no immediate release at the old budget");
+    CHECK_EQ(vo.admission_offset, 120 * MS, "retain the full OSD horizon");
+    CHECK_EQ(requested.pts * 1000, 12500, "OSD is prepared before admission");
+    CHECK_EQ(in.wakeup_pts, frame.pts - 50 * MS, "50ms codec admission");
+    unsigned prepared = requests;
+    in.paused = true;
+    CHECK_EQ(present_queued(&vo), false, "pause wakeup cannot release too early");
+    CHECK_EQ(buffer.releases, 0, "paused queued video still respects codec lead");
+    in.paused = false;
+    clock_ns = in.wakeup_pts - 1;
+    CHECK_EQ(present_queued(&vo), false, "one ns before admission stays queued");
+    CHECK_EQ(requests, prepared, "unrelated wakeups do not restart OSD work");
+    clock_ns++;
+    p.vsync_sample = clock_ns - 30 * MS;
+    CHECK_EQ(present_queued(&vo), true, "admit at the codec boundary");
+    CHECK_EQ(buffer.releases, 1, "submit once");
+    CHECK_EQ(buffer.timestamp, frame.pts - 32 * MS, "preserve minus 0.8P snap");
+    CHECK_EQ(published.seq, requested.seq, "OSD gets its matching video release");
+    CHECK_EQ(image.refs, 1, "balanced image ownership");
+}
+
+static void test_driver_refresh_and_cadence(void)
+{
+    const struct { double fps, hz; } rates[] = {
+        {23.976, 23.976}, {24, 24}, {25, 25}, {50, 50}, {60, 60},
+        {90, 90}, {120, 120}, {24, 60}, {60, 90}, {25, 120}, {48, 60},
+    };
+    for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
+        int64_t period = llround(1e9 / rates[r].hz);
+        int64_t duration = llround(1e9 / rates[r].fps);
+        struct priv p = {.vsync_thread_created = true};
+        struct vo_internal in = {0};
+        struct vo vo = {&p, &in, &driver, period, 0};
+        struct mediacodec_timing reference = {0};
+        int64_t previous_vsync = 0;
+        for (int i = 0; i < 30; i++) {
+            AVMediaCodecBuffer buffer = {0};
+            struct mp_image image = {.pts = i / rates[r].fps,
+                                     .planes[3] = &buffer, .refs = 1};
+            struct vo_frame frame = {.current = &image, .frame_id = 100 + i,
+                .pts = EPOCH + 1000 * period + i * duration, .duration = duration};
+            in.frame_queued = &frame;
+            if (!i)
+                clock_ns = frame.pts - 500 * MS;
+            CHECK_EQ(present_queued(&vo), false, "early matched/mixed frame waits");
+            clock_ns = in.wakeup_pts;
+            p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period) * period;
+            CHECK_EQ(present_queued(&vo), true, "matched/mixed frame admitted");
+            CHECK_EQ(buffer.releases, 1, "matched/mixed submits once");
+            if (!buffer.timestamp) {
+                fprintf(stderr, "FAIL: %.3f fps / %.3f Hz rendered untimed\n",
+                        rates[r].fps, rates[r].hz);
+                exit(1);
+            }
+            int64_t expected = mediacodec_timing_release(&reference, frame.pts,
+                clock_ns, frame.frame_id, duration, p.vsync_sample, period, MAX_AHEAD);
+            CHECK_EQ(buffer.timestamp, expected, "admission preserves cadence/snap");
+            int64_t shown = presented_vsync(buffer.timestamp, clock_ns, EPOCH, period);
+            if (i && rates[r].fps <= rates[r].hz) {
+                int64_t gap = (shown - previous_vsync) / period;
+                if (gap < (int64_t)floor(rates[r].hz / rates[r].fps) ||
+                    gap > (int64_t)ceil(rates[r].hz / rates[r].fps))
+                    abort();
+            }
+            previous_vsync = shown;
+        }
+    }
+}
+
+static void test_refresh_transition_and_late_frame(void)
+{
+    struct priv p = {.vsync_thread_created = true, .osd_threads_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {0};
+    struct mp_image image = {.pts = 1, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+        .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "prepare before refresh transition");
+    int64_t old_flip = in.wakeup_pts;
+    unsigned old_requests = requests;
+    vo.period = 1e9 / 120;
+    clock_ns = old_flip;
+    CHECK_EQ(present_queued(&vo), false, "old 25Hz deadline cannot submit at 120Hz");
+    CHECK_EQ(buffer.releases, 0, "refresh tightening never releases untimed");
+    CHECK_EQ(requests, old_requests, "refresh keeps prepared OSD");
+    CHECK_EQ(in.wakeup_pts, frame.pts - 2 * llround(vo.period),
+             "refresh transition rearms the interruptible timer");
+    // An OSD invalidation while the video waits must reprepare its pose.
+    p.osd.epoch++;
+    CHECK_EQ(present_queued(&vo), false, "OSD invalidation does not submit video");
+    CHECK_EQ(requests, old_requests + 1, "invalidated preparation is replaced");
+    clock_ns = in.wakeup_pts;
+    p.vsync_sample = clock_ns;
+    CHECK_EQ(present_queued(&vo), true, "transition submits at new lead");
+    CHECK_EQ(buffer.timestamp != 0, true, "transition remains timed");
+
+    buffer = (AVMediaCodecBuffer){0};
+    frame.frame_id++;
+    frame.pts += 40 * MS;
+    image.pts += 0.04;
+    in.frame_queued = &frame;
+    clock_ns = frame.pts + MS;
+    CHECK_EQ(present_queued(&vo), true, "late execution submits without waiting");
+    CHECK_EQ(buffer.timestamp, 0, "late deadline renders untimed");
+    CHECK_EQ(p.timing.frame_id, frame.frame_id, "late frame advances cadence");
+
+    buffer = (AVMediaCodecBuffer){0};
+    frame.frame_id++;
+    frame.pts += 40 * MS;
+    in.frame_queued = &frame;
+    vo.period = NAN;
+    clock_ns = frame.pts - 100 * MS;
+    CHECK_EQ(present_queued(&vo), false, "unknown period still waits");
+    CHECK_EQ(in.wakeup_pts, frame.pts - 50 * MS, "unknown period 50ms fallback");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "unknown period admits at fallback");
+    CHECK_EQ(buffer.timestamp, frame.pts, "unknown period keeps raw timestamp");
+}
+
+static void test_drop_pause_redraw_resume(void)
+{
+    const int64_t period = 40 * MS, base = EPOCH + 1000 * MS;
+    struct priv p = {.vsync_thread_created = true, .osd_threads_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, period, 0};
+    AVMediaCodecBuffer a = {0}, b = {0}, c = {0};
+    struct mp_image images[] = {
+        {.pts = 20, .planes[3] = &a, .refs = 1},
+        {.pts = 20.04, .planes[3] = &b, .refs = 1},
+        {.pts = 20.08, .planes[3] = &c, .refs = 1},
+    };
+    struct vo_frame frame = {.current = &images[0], .frame_id = 10,
+        .pts = base + period / 2 - MS, .duration = period};
+    for (uint64_t i = 1; i < 10; i++)
+        osd_cadence_observe(&p.cadence, i, 20 - (10 - i) * 0.04);
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "prepare A");
+    clock_ns = in.wakeup_pts;
+    p.vsync_sample = base - 2 * period;
+    CHECK_EQ(present_queued(&vo), true, "present A");
+
+    frame = (struct vo_frame){.current = &images[1], .frame_id = 11,
+        .pts = base + period + period / 2 + MS, .duration = period};
+    in.frame_queued = &frame;
+    CHECK_EQ(present_queued(&vo), false, "prepare B without submitting it");
+    // Exercise the production cancellation notification used by the core drop
+    // branch. There must be no codec release until the later full redraw.
+    in.frame_queued = NULL;
+    prepare_frame(&vo, NULL);
+    CHECK_EQ(b.releases, 0, "dropping preparation does not render the buffer");
+    double media_delta = osd_cadence_delta(&p.cadence);
+    int64_t preparation_lead = p.queue_offset;
+
+    // Core dropped B without draw/flip, then do_redraw gives its exact sentinel
+    // shape: full redraw has redraw=false, repeat=false and still=true.
+    frame = (struct vo_frame){.current = &images[1], .frame_id = 11,
+                              .still = true, .pts = 0, .duration = -1};
+    draw_frame(&vo, &frame);
+    flip_page(&vo);
+    CHECK_EQ(b.releases, 1, "previously dropped still buffer becomes visible");
+    CHECK_EQ(b.timestamp, 0, "synthetic still presents immediately");
+    CHECK_EQ(requested.pts * 1000, 20040, "still subtitle pose uses image pts");
+    CHECK_EQ(published.seq, requested.seq, "still pose matches submitted buffer");
+    CHECK_EQ(llround(osd_cadence_delta(&p.cadence) * 1e9),
+             llround(media_delta * 1e9),
+             "synthetic still preserves OSD pre-render cadence");
+    CHECK_EQ(p.queue_offset, preparation_lead, "synthetic duration cannot shrink queue");
+    draw_frame(&vo, &frame);
+    flip_page(&vo);
+    CHECK_EQ(b.releases, 1, "repeated full redraw does not resubmit still buffer");
+    frame.redraw = true;
+    draw_frame(&vo, &frame);
+    flip_page(&vo);
+    CHECK_EQ(b.releases, 1, "ordinary OSD redraw does not resubmit codec buffer");
+
+    frame = (struct vo_frame){.current = &images[2], .frame_id = 12,
+        .pts = base + 2 * period + period / 2 + MS, .duration = period};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "resume prepares C");
+    clock_ns = in.wakeup_pts;
+    p.vsync_sample = base;
+    CHECK_EQ(present_queued(&vo), true, "resume presents C");
+    CHECK_EQ(c.timestamp, base + 2 * period - period * 8 / 10,
+             "resume keeps pre-drop cadence and midpoint preference");
+    for (size_t i = 0; i < 3; i++)
+        CHECK_EQ(images[i].refs, 1, "redraw/resume balances image ownership");
+    reset_video(&vo);
+    CHECK_EQ(p.timing.frame_id, 0, "real seek/reconfig still resets timing");
+    CHECK_EQ(p.cadence.have_last, false, "real seek/reconfig resets OSD cadence");
+}
+
 int main(void)
 {
     test_raw_deadline_jitter();
@@ -356,7 +753,11 @@ int main(void)
     test_release_survives_late_submission();
     test_late_frames_keep_cadence();
     test_release_discontinuities();
-    puts("PASS: MediaCodec timing cadence, hysteresis, drift, reset boundaries "
-         "and late release");
+    test_preparation_does_not_submit_early();
+    test_driver_refresh_and_cadence();
+    test_refresh_transition_and_late_frame();
+    test_drop_pause_redraw_resume();
+    puts("PASS: MediaCodec cadence, production admission/draw/flip, bounded codec "
+         "lead, refresh transitions, and dropped still redraw/resume");
     return 0;
 }

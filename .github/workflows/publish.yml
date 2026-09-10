@@ -76,6 +76,9 @@ jobs:
       - name: Test MediaCodec OSD scheduler
         run: bash ./scripts/test_mediacodec_osd.sh
 
+      - name: Test MediaCodec OSD surface retirement
+        run: bash ./scripts/test_mediacodec_rebind.sh
+
       - name: Test MediaCodec Dolby Vision packet filter
         run: bash ./scripts/test_mediacodec_dv_filter.sh
 

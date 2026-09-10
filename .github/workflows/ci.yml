@@ -106,6 +106,8 @@ jobs:
                   [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest)],
                   check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
+                subprocess.run(['bash', 'scripts/test_mediacodec_timing.sh', str(dest)], check=True)
+                subprocess.run(['bash', 'scripts/test_mediacodec_rebind.sh', str(dest)], check=True)
               if component == 'ffmpeg' and group == 'android':
                 subprocess.run(
                   [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest)],

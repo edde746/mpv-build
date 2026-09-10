@@ -1,5 +1,4 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index f483ccc..122d8dc 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,6 +21,9 @@
@@ -12,7 +11,7 @@ index f483ccc..122d8dc 100644
  #include "ao.h"
  #include "internal.h"
  #include "common/msg.h"
-@@ -44,12 +47,44 @@ struct priv {
+@@ -44,11 +47,48 @@
      int64_t timestamp_fetched;
      bool timestamp_set;
      int timestamp_stable;
@@ -22,7 +21,12 @@ index f483ccc..122d8dc 100644
      uint32_t playhead_pos;
      uint32_t playhead_offset;
      bool reset_pending;
- 
++
++    // Accounting/parser state belongs to this generation, under lock. Only
++    // the worker touches the buffers; reset never clears or frees their data.
++    uint64_t write_generation;
++    bool write_inflight;
++
 +    // Raw passthrough: IEC 61937 bursts from ad_spdif unwrapped into a track
 +    // opened with the codec's own encoding (ENCODING_AC3/E_AC3/DTS).
 +    bool raw_passthrough;
@@ -53,11 +57,10 @@ index f483ccc..122d8dc 100644
 +    int64_t smooth_head;      // smooth_last_head, unwrapped
 +    int64_t smooth_reported;  // last returned estimate, unwrapped
 +    int64_t smooth_reported_ns;
-+
+ 
      void *chunk;
      int chunksize;
-     jbyteArray bytearray;
-@@ -58,6 +93,8 @@ struct priv {
+@@ -58,6 +98,8 @@
      jobject bbuf;
  
      bool cfg_pcm_float;
@@ -66,7 +69,7 @@ index f483ccc..122d8dc 100644
      int cfg_session_id;
  
      bool thread_terminate;
-@@ -99,6 +136,8 @@ static struct JNIAudioTrack {
+@@ -99,6 +141,8 @@
      jmethodID getTimestamp;
      jmethodID getLatency;
      jmethodID getMinBufferSize;
@@ -75,7 +78,7 @@ index f483ccc..122d8dc 100644
      jmethodID getNativeOutputSampleRate;
      jint STATE_INITIALIZED;
      jint PLAYSTATE_STOPPED;
-@@ -132,7 +171,9 @@ static const struct MPJniField AudioTrack_mapping[] = {
+@@ -132,7 +176,9 @@
      {"getPlaybackHeadPosition", "()I", MP_JNI_METHOD, OFFSET(getPlaybackHeadPosition), 1},
      {"getLatency", "()I", MP_JNI_METHOD, OFFSET(getLatency), 1},
      {"getMinBufferSize", "(III)I", MP_JNI_STATIC_METHOD, OFFSET(getMinBufferSize), 1},
@@ -85,7 +88,7 @@ index f483ccc..122d8dc 100644
      {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
      {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
      {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
-@@ -187,6 +228,9 @@ static struct JNIAudioFormat {
+@@ -187,6 +233,9 @@
      jint ENCODING_PCM_16BIT;
      jint ENCODING_PCM_FLOAT;
      jint ENCODING_IEC61937;
@@ -95,7 +98,7 @@ index f483ccc..122d8dc 100644
      jint CHANNEL_OUT_MONO;
      jint CHANNEL_OUT_STEREO;
      jint CHANNEL_OUT_FRONT_CENTER;
-@@ -202,6 +246,9 @@ static const struct MPJniField AudioFormat_mapping[] = {
+@@ -202,6 +251,9 @@
      {"ENCODING_PCM_16BIT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_16BIT), 1},
      {"ENCODING_PCM_FLOAT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_PCM_FLOAT), 1},
      {"ENCODING_IEC61937", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_IEC61937), 0},
@@ -105,7 +108,7 @@ index f483ccc..122d8dc 100644
      {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
      {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
      {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
-@@ -263,6 +310,18 @@ static const struct MPJniField AudioTimestamp_mapping[] = {
+@@ -263,6 +315,18 @@
  };
  #undef OFFSET
  
@@ -124,7 +127,7 @@ index f483ccc..122d8dc 100644
  #define ENTRY(name) { &name, name ## _mapping }
  static const struct {
      void *fields;
-@@ -276,6 +335,7 @@ static const struct {
+@@ -276,6 +340,7 @@
      ENTRY(AudioFormatBuilder),
      ENTRY(AudioManager),
      ENTRY(AudioTimestamp),
@@ -132,7 +135,7 @@ index f483ccc..122d8dc 100644
  };
  #undef ENTRY
  
-@@ -352,7 +412,8 @@ static int AudioTrack_New(struct ao *ao)
+@@ -352,7 +417,8 @@
          return -1;
      }
  
@@ -142,7 +145,11 @@ index f483ccc..122d8dc 100644
          int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
          if (bufferSize > 0) {
              MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
-@@ -376,10 +437,82 @@ static int AudioTrack_Recreate(struct ao *ao)
+@@ -373,13 +439,86 @@
+     struct priv *p = ao->priv;
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+ 
++    p->write_generation++;
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
      MP_JNI_EXCEPTION_LOG(ao);
      MP_JNI_GLOBAL_FREEP(&p->audiotrack);
@@ -226,7 +233,7 @@ index f483ccc..122d8dc 100644
  {
      struct priv *p = ao->priv;
      if (!p->audiotrack)
-@@ -387,27 +520,34 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -387,27 +526,34 @@
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      uint32_t pos = 0;
      int64_t now = mp_raw_time_ns();
@@ -270,7 +277,7 @@ index f483ccc..122d8dc 100644
              }
          }
      }
-@@ -424,15 +564,19 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -424,15 +570,19 @@
          if (fpos != 0 && time != 0 && state == AudioTrack.PLAYSTATE_PLAYING) {
              double diff = (double)(now - time) / 1e9;
              pos += diff * ao->samplerate;
@@ -291,7 +298,7 @@ index f483ccc..122d8dc 100644
          if (p->reset_pending) {
              // after a flush(), playbackHeadPosition will not reset to 0 right away.
              // sometimes, it will never reset at all.
-@@ -449,6 +593,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -449,6 +599,7 @@
              MP_VERBOSE(ao, "IEC/playbackHeadPosition %d -> %d (flush)\n", p->playhead_pos, pos);
              p->playhead_offset = 0;
              p->playhead_pos = 0;
@@ -299,7 +306,7 @@ index f483ccc..122d8dc 100644
          }
  
          // sometimes on a new AudioTrack instance, playbackHeadPosition will reset
-@@ -458,25 +603,31 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao)
+@@ -458,25 +609,31 @@
              p->playhead_offset = 0;
              p->playhead_pos = 0;
              p->written_frames = 0;
@@ -309,11 +316,13 @@ index f483ccc..122d8dc 100644
  
      p->playhead_pos = pos;
 -    return p->playhead_pos - p->playhead_offset;
+-}
+-
+-static double AudioTrack_getLatency(struct ao *ao)
 +    // Raw tracks count codec frames; scale back to the IEC carrier rate.
 +    return (p->playhead_pos - p->playhead_offset) * (uint32_t)p->raw_rate_mult;
- }
- 
--static double AudioTrack_getLatency(struct ao *ao)
++}
++
 +// Pair the delay with the instant its selected playhead represents, in mpv time.
 +static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
  {
@@ -336,7 +345,7 @@ index f483ccc..122d8dc 100644
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -486,6 +637,193 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -486,6 +643,195 @@
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
@@ -459,7 +468,7 @@ index f483ccc..122d8dc 100644
 +            uint8_t *h = p->raw_dts_header;
 +            h[p->raw_dts_header_len++] = hi;
 +            h[p->raw_dts_header_len++] = lo;
-+            if (p->raw_dts_header_len < sizeof(p->raw_dts_header))
++            if (p->raw_dts_header_len < (int)sizeof(p->raw_dts_header))
 +                continue;
 +
 +            int blocks = 0;
@@ -527,14 +536,23 @@ index f483ccc..122d8dc 100644
 +    return out;
 +}
 +
++// Enter and return with p->lock held. Preparation and completion mutate the
++// parser/accounting; only the blocking JNI write runs outside that lock.
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -495,7 +833,23 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -493,38 +839,82 @@
+         return -1;
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
      void *buf = p->chunk;
- 
-     jint ret;
+-
+-    jint ret;
 -    if (p->format == AudioFormat.ENCODING_IEC61937) {
+-        (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
++    jobject buffer;
++    jmethodID method;
++    int count = len, sample_size = 1;
++
 +    if (p->raw_passthrough) {
 +        if (!p->raw_pending) {
 +            p->raw_pending = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
@@ -546,16 +564,91 @@ index f483ccc..122d8dc 100644
 +            MP_JNI_LOCAL_FREEP(&bbuf);
 +        }
 +        // A short write leaves ByteBuffer.position on the unwritten tail.
-+        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, p->raw_pending, AudioTrack.WRITE_BLOCKING);
-+        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-+        if (ret < 0) return ret;
++        buffer = p->bbuf;
++        method = AudioTrack.writeBufferV21;
++        count = p->raw_pending;
++    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
++        sample_size = 2;
++        count = len / sample_size;
++        (*env)->SetShortArrayRegion(env, p->shortarray, 0, count, buf);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        if (ret > 0) ret *= 2;
+-
++        buffer = p->shortarray;
++        method = AudioTrack.writeShortV23;
+     } else if (AudioTrack.writeBufferV21) {
+-        // reset positions for reading
+         jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+         MP_JNI_LOCAL_FREEP(&bbuf);
+-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeBufferV21, p->bbuf, len, AudioTrack.WRITE_BLOCKING);
++        buffer = p->bbuf;
++        method = AudioTrack.writeBufferV21;
++    } else if (p->format == AudioFormat.ENCODING_PCM_FLOAT) {
++        sample_size = sizeof(float);
++        count = len / sample_size;
++        (*env)->SetFloatArrayRegion(env, p->floatarray, 0, count, buf);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-
+-    } else if (p->format == AudioFormat.ENCODING_PCM_FLOAT) {
+-        (*env)->SetFloatArrayRegion(env, p->floatarray, 0, len / sizeof(float), buf);
++        buffer = p->floatarray;
++        method = AudioTrack.writeFloat;
++    } else {
++        (*env)->SetByteArrayRegion(env, p->bytearray, 0, count, buf);
+         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeFloat, p->floatarray, 0, len / sizeof(float), AudioTrack.WRITE_BLOCKING);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        if (ret > 0) ret *= sizeof(float);
+-
++        buffer = p->bytearray;
++        method = AudioTrack.write;
++    }
++
++    // Retain the track before dropping the accounting lock. Buffer globals
++    // and their backing memory live until uninit joins this single writer;
++    // stop/recreate only reset metadata, never reuse the in-flight storage.
++    jobject track = (*env)->NewLocalRef(env, p->audiotrack);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !track)
++        return -1;
++    uint64_t generation = p->write_generation;
++    p->write_inflight = true;
++    mp_mutex_unlock(&p->lock);
++    jint ret;
++    if (method == AudioTrack.writeBufferV21) {
++        ret = MP_JNI_CALL_INT(track, method, buffer, count, AudioTrack.WRITE_BLOCKING);
++    } else if (method == AudioTrack.write) {
++        ret = MP_JNI_CALL_INT(track, method, buffer, 0, count);
+     } else {
+-        (*env)->SetByteArrayRegion(env, p->bytearray, 0, len, buf);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.write, p->bytearray, 0, len);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-    }
+-
+-    return ret;
++        ret = MP_JNI_CALL_INT(track, method, buffer, 0, count, AudioTrack.WRITE_BLOCKING);
++    }
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        ret = -1;
++    MP_JNI_LOCAL_FREEP(&track);
++    mp_mutex_lock(&p->lock);
++    p->write_inflight = false;
++    if (generation != p->write_generation)
++        return 0; // caller also discards stale errors/progress/frame credit
++    if (ret < 0)
++        return ret;
++    if (p->raw_passthrough) {
 +        p->raw_pending -= ret;
 +        return p->raw_pending ? 0 : p->raw_input_len;
-+    } else if (p->format == AudioFormat.ENCODING_IEC61937) {
-         (*env)->SetShortArrayRegion(env, p->shortarray, 0, len / 2, buf);
-         if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
-         ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeShortV23, p->shortarray, 0, len / 2, AudioTrack.WRITE_BLOCKING);
-@@ -566,6 +920,55 @@ error:
++    }
++    return ret * sample_size;
+ }
+ 
+ static void uninit_jni(struct ao *ao)
+@@ -566,6 +956,55 @@
      return -1;
  }
  
@@ -611,7 +704,7 @@ index f483ccc..122d8dc 100644
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -574,6 +977,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -574,6 +1013,7 @@
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
      while (!p->thread_terminate) {
@@ -619,7 +712,7 @@ index f483ccc..122d8dc 100644
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
              state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
-@@ -581,9 +985,13 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -581,10 +1021,17 @@
          if (state == AudioTrack.PLAYSTATE_PLAYING) {
              int read_samples = p->chunksize / ao->sstride;
              int64_t ts = mp_time_ns();
@@ -632,10 +725,14 @@ index f483ccc..122d8dc 100644
 +            ts += MP_TIME_S_TO_NS(delay);
 +            int samples = p->raw_pending ? 0 :
 +                ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
++            uint64_t generation = p->write_generation;
              int ret = AudioTrack_write(ao, samples * ao->sstride);
++            if (generation != p->write_generation)
++                continue;
              if (ret >= 0) {
                  p->written_frames += ret / ao->sstride;
-@@ -657,9 +1065,32 @@ static int init(struct ao *ao)
+             } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
+@@ -657,9 +1104,32 @@
      if (init_jni(ao) < 0)
          return -1;
  
@@ -671,7 +768,7 @@ index f483ccc..122d8dc 100644
              MP_ERR(ao, "spdif passthrough not supported by API\n");
              return -1;
          }
-@@ -673,7 +1104,8 @@ static int init(struct ao *ao)
+@@ -673,7 +1143,8 @@
          p->format = AudioFormat.ENCODING_PCM_16BIT;
      }
  
@@ -681,7 +778,7 @@ index f483ccc..122d8dc 100644
          jint samplerate = MP_JNI_CALL_STATIC_INT(
              AudioTrack.clazz,
              AudioTrack.getNativeOutputSampleRate,
-@@ -685,6 +1117,10 @@ static int init(struct ao *ao)
+@@ -685,6 +1156,10 @@
          }
      }
      p->samplerate = ao->samplerate;
@@ -692,7 +789,7 @@ index f483ccc..122d8dc 100644
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -710,8 +1146,16 @@ static int init(struct ao *ao)
+@@ -710,8 +1185,16 @@
          AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
      };
      static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
@@ -711,7 +808,7 @@ index f483ccc..122d8dc 100644
      } else {
          struct mp_chmap_sel sel = {0};
          for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
-@@ -731,20 +1175,47 @@ static int init(struct ao *ao)
+@@ -731,20 +1214,47 @@
          p->channel_config,
          p->format
      );
@@ -767,7 +864,7 @@ index f483ccc..122d8dc 100644
      mp_assert(p->size % bps == 0);
      ao->device_buffer = p->size / bps;
  
-@@ -760,7 +1231,14 @@ static int init(struct ao *ao)
+@@ -760,7 +1270,14 @@
      MP_JNI_LOCAL_FREEP(&timestamp);
  
      // decide and create buffer of right type
@@ -783,12 +880,13 @@ index f483ccc..122d8dc 100644
          jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
          p->shortarray = (*env)->NewGlobalRef(env, shortarray);
          MP_JNI_LOCAL_FREEP(&shortarray);
-@@ -812,11 +1290,21 @@ static void stop(struct ao *ao)
+@@ -812,11 +1329,22 @@
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
      MP_JNI_EXCEPTION_LOG(ao);
  
-+    // pause() interrupts the worker's blocking write; the reset waits for it.
++    // Interrupt first, then reset without waiting for a late write to return.
 +    mp_mutex_lock(&p->lock);
++    p->write_generation++;
      p->playhead_offset = 0;
      p->reset_pending = true;
      p->written_frames = 0;
@@ -805,7 +903,7 @@ index f483ccc..122d8dc 100644
  }
  
  static void start(struct ao *ao)
-@@ -846,9 +1334,13 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -846,9 +1374,13 @@
      .priv_size = sizeof(struct priv),
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,

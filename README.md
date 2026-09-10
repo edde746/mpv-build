@@ -144,9 +144,11 @@ build before packaging; changing patch files does not update installed binaries.
 
 Run the host-side MediaCodec timing regression with
 `bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
-It extracts the production timing core from its patch and covers cadence
-prediction, refresh hysteresis, clock drift, reset boundaries, and the release
-timestamp handed to MediaCodec when the VO thread runs late, without a device.
+It applies the full Android series to pinned mpv and extracts the production
+timing and prepare/draw/flip paths. Coverage includes cadence prediction,
+refresh hysteresis, clock drift, bounded nonzero codec submission lead, and
+dropped-frame still redraws without resetting cadence. Pass an already-patched
+source directory as the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core and request dispatcher of the
@@ -158,6 +160,18 @@ pre-render, or a repaint after seeking.
 Completed animation poses use an immutable bounded FIFO rather than replacing
 each other while the presenter waits. Queue regressions cover ordered handoff,
 full-capacity admission, wraparound, release ownership, and epoch cancellation.
+
+Run the OSD surface-retirement regression with
+`bash scripts/test_mediacodec_rebind.sh`. It applies the full Android series
+and exercises live OSD replacement without rebuilding the video decoder:
+retirement waits for the old producer, releases its window exactly once, and
+starts the replacement without stale requests or timing state. An
+already-patched source directory may be passed for offline runs.
+
+Live OSD replacement requires the matching Plezy JNI surface-generation
+handoff. Update the application and Android libmpv artifacts together; a
+timeout quarantines a live producer rather than releasing resources it may
+still use.
 
 Run the libass change-detection regression with
 `bash scripts/test_libass_change_detection.sh`. It fetches the pinned upstream
@@ -200,8 +214,9 @@ Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer
 deadline code with deterministic JNI delays. Coverage includes passthrough,
-PCM timestamp/fallback paths, startup, and E-AC3 counter wrap. Pass an
-already-patched source directory as the first argument to run offline.
+PCM timestamp/fallback paths, startup, E-AC3 counter wrap, partial writes
+across stop/reset/recreation, and stale write completions without clock credit.
+Pass an already-patched source directory as the first argument to run offline.
 
 ## Make demo app using the local build version
 

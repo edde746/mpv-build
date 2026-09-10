@@ -1,0 +1,124 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -77,6 +77,7 @@
+ #include "misc/jni.h"
+ #include "options/m_config_core.h"
+ #include "options/m_option.h"
++#include "options/options.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+ #include "sub/draw_bmp.h"
+@@ -701,11 +702,14 @@
+ struct mediacodec_opts {
+     char *video_rect;
+     int osd_vsync_delay;
++    int64_t osd_surface;
+ };
+ 
+ #define OPT_BASE_STRUCT struct mediacodec_opts
+ static const struct m_sub_options mediacodec_conf = {
+     .opts = (const struct m_option[]){
++        {"vo-mediacodec-osd-surface", OPT_INT64(osd_surface),
++            .flags = UPDATE_VIDEO},
+         {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
+         {"vo-mediacodec-osd-vsync-delay", OPT_INT(osd_vsync_delay),
+             M_RANGE(0, 3)},
+@@ -2797,9 +2801,18 @@
+         return;
+     }
+ 
+-    p->osd.results = (struct osd_result_queue){0};
+-    p->osd.present_slot = -1;
+-    p->osd.present_source = NULL;
++    // A rebind starts fresh workers, not a new video decoder. Preserve only
++    // the presentation policy; no old request, slot or termination flag lives on.
++    p->osd = (struct osd_shared){
++        .epoch = p->osd.epoch + 1,
++        .geometry = p->osd.geometry,
++        .vsync_delay = p->osd.vsync_delay,
++        .paused = p->osd.paused,
++        .present_slot = -1,
++    };
++    p->prepared_frame_id = p->prepared_seq = p->prepared_epoch = 0;
++    p->stats_frames = 0;
++    p->osd_missing_logged = false;
+     mp_mutex_init(&p->osd_lock);
+     mp_cond_init(&p->osd_wakeup);
+     if (mp_thread_create(&p->osd_render_thread, osd_render_thread, vo)) {
+@@ -2836,6 +2849,9 @@
+         p->osd.epoch++;
+         mp_cond_broadcast(&p->osd_wakeup);
+         mp_mutex_unlock(&p->osd_lock);
++        // Never free or reuse a producer still executing a vendor EGL call.
++        // The embedder's independent deadline quarantines this native session
++        // while these joins retain its window, slots and VO ownership.
+         mp_thread_join(p->osd_render_thread);
+         mp_thread_join(p->osd_present_thread);
+         osd_log_stats(vo, "final");
+@@ -2843,8 +2859,10 @@
+         mp_mutex_destroy(&p->osd_lock);
+         p->osd_threads_created = false;
+     }
+-    for (int n = 0; n < OSD_SLOTS; n++)
++    for (int n = 0; n < OSD_SLOTS; n++) {
+         talloc_free(p->osd_slots[n].sbs);
++        p->osd_slots[n] = (struct osd_slot){0};
++    }
+     if (p->osd_window)
+         ANativeWindow_release(p->osd_window);
+     p->osd_window = NULL;
+@@ -2861,6 +2879,7 @@
+     p->osd_pts = MP_NOPTS_VALUE;
+     p->opts_cache = m_config_cache_alloc(p, vo->global, &mediacodec_conf);
+     struct mediacodec_opts *opts = p->opts_cache->opts;
++    p->osd_surface = opts->osd_surface;
+     if (!mediacodec_geometry_parse(opts->video_rect, &p->osd.geometry))
+         MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
+     p->osd.vsync_delay = opts->osd_vsync_delay;
+@@ -2989,6 +3008,17 @@
+     bool geometry_ok = mediacodec_geometry_parse(opts->video_rect, &geometry);
+     if (!geometry_ok)
+         MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; keeping previous geometry.\n");
++    if (opts->osd_surface != p->osd_surface) {
++        // UPDATE_VIDEO dispatches synchronously onto this VO thread. Returning
++        // acknowledges retirement of the previous producer to the JNI owner.
++        osd_uninit(vo);
++        p->osd_surface = opts->osd_surface;
++        if (geometry_ok)
++            p->osd.geometry = geometry;
++        p->osd.vsync_delay = opts->osd_vsync_delay;
++        osd_init(vo);
++        vo->want_redraw = true;
++    }
+     if (!p->osd_threads_created)
+         return;
+     mp_mutex_lock(&p->osd_lock);
+@@ -3211,6 +3241,7 @@
+ {
+     switch (request) {
+     case VOCTRL_CHECK_EVENTS:
++    case VOCTRL_UPDATE_RENDER_OPTS:
+         update_opts(vo);
+         return VO_TRUE;
+     case VOCTRL_RESET:
+@@ -3258,8 +3289,6 @@
+     av_buffer_unref(&p->hwctx.av_device_ref);
+ }
+ 
+-#define OPT_BASE_STRUCT struct priv
+-
+ const struct vo_driver video_out_mediacodec = {
+     .description = "Android (Timed MediaCodec Surface with OSD plane)",
+     .name = "mediacodec",
+@@ -3272,10 +3301,5 @@
+     .reconfig = reconfig,
+     .uninit = uninit,
+     .priv_size = sizeof(struct priv),
+-    .options = (const struct m_option[]){
+-        {"osd-surface", OPT_INT64(osd_surface)},
+-        {0}
+-    },
+-    .options_prefix = "vo-mediacodec",
+     .global_opts = &mediacodec_conf,
+ };

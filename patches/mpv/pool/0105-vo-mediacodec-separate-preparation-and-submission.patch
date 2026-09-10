@@ -1,0 +1,485 @@
+diff --git a/video/out/vo.c b/video/out/vo.c
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -915,6 +915,26 @@
+     mp_mutex_unlock(&in->lock);
+ }
+ 
++// Called locked. Preparation may start early without blocking the event loop
++// or committing the queued frame to draw/flip. Recheck after each wakeup.
++static bool prepare_queued_frame(struct vo *vo)
++{
++    struct vo_internal *in = vo->in;
++    if (!in->frame_queued || !vo->driver->prepare_frame)
++        return true;
++    struct vo_frame *frame = vo_frame_ref(in->frame_queued);
++    mp_mutex_unlock(&in->lock);
++    int64_t ready = vo->driver->prepare_frame(vo, frame);
++    mp_mutex_lock(&in->lock);
++    talloc_free(frame);
++    // Seek/reset may discard the queued frame while preparation is unlocked.
++    if (in->frame_queued && ready > mp_time_ns()) {
++        in->wakeup_pts = ready;
++        return false;
++    }
++    return true;
++}
++
+ static bool render_frame(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+@@ -924,6 +944,9 @@
+     update_display_fps(vo);
+ 
+     mp_mutex_lock(&in->lock);
++
++    if (!prepare_queued_frame(vo))
++        goto done;
+ 
+     if (in->frame_queued) {
+         talloc_free(in->current_frame);
+@@ -950,7 +973,8 @@
+     int64_t end_time = pts + duration;
+ 
+     // Time at which we should flip_page on the VO.
+-    int64_t target = frame->display_synced ? 0 : pts - in->flip_queue_offset;
++    int64_t target = frame->display_synced || vo->driver->prepare_frame
++                   ? 0 : pts - in->flip_queue_offset;
+ 
+     // "normal" strict drop threshold.
+     in->dropped_frame = duration >= 0 && end_time < now;
+@@ -992,6 +1016,11 @@
+ 
+     if (in->dropped_frame) {
+         in->drop_count += 1;
++        if (vo->driver->prepare_frame) {
++            mp_mutex_unlock(&in->lock);
++            vo->driver->prepare_frame(vo, NULL);
++            mp_mutex_lock(&in->lock);
++        }
+         wakeup_core(vo);
+     } else {
+         in->rendering = true;
+diff --git a/video/out/vo.h b/video/out/vo.h
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -394,6 +394,16 @@
+     struct mp_image *(*get_image_ts)(struct vo *vo, int imgfmt, int w, int h,
+                                      int stride_align, int flags);
+ 
++    /*
++     * Optional asynchronous preparation before draw_frame. Return the earliest
++     * mp_time_ns() at which to draw/flip, or 0 for no delay. While waiting, the
++     * core retains the queued frame and services events normally. Called again
++     * after wakeups; implementations must not repeat preparation for the same
++     * frame. Redraws bypass this callback. A NULL frame cancels preparation
++     * when the core drops it; seek/reconfig cancellation uses VOCTRL_RESET.
++     */
++    int64_t (*prepare_frame)(struct vo *vo, struct vo_frame *frame);
++
+     /* Render the given frame. Note that this is also called when repeating
+      * or redrawing frames.
+      *
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -19,9 +19,9 @@
+  * Timed MediaCodec Surface output with a sibling OSD plane.
+  *
+  * Decoded buffers go straight to the --wid Surface (no GPU pass, decoder
+- * dataspace intact) and are released with a presentation timestamp about
+- * two vsyncs ahead, snapped to the Choreographer vsync grid when a fresh
+- * sample exists. The embedder owns all geometry; software frames are
++ * dataspace intact) and are submitted no more than two vsyncs or 50 ms ahead,
++ * snapped to the Choreographer vsync grid when a fresh sample exists. The
++ * embedder owns all geometry; software frames are
+  * refused so the Surface never becomes a CPU producer.
+  *
+  * OSD/subtitles go to the transparent --vo-mediacodec-osd-surface Surface,
+@@ -29,8 +29,8 @@
+  * that never holds the video back:
+  *
+  *  - The render stage (thread "vo/osd-render") rasterizes the OSD for a
+- *    media pts into a CPU slot. It is asked to as soon as draw_frame knows
+- *    the frame, up to --video-timing-offset plus the queue lead before the
++ *    media pts. prepare_frame requests it as soon as the frame is admitted,
++ *    up to --video-timing-offset plus the preparation lead before the
+  *    frame is due, and between requests it pre-renders the next frame's pts
+  *    from the observed cadence so a regular request is served without
+  *    calling libass at all. Pre-rendering never runs past the subtitle
+@@ -217,6 +217,31 @@
+     return snapped - period_ns * 8 / 10;
+ }
+ 
++// OSD work needs the current/next render plus composition time, independently
++// of how long a decoder-owned output buffer is held by SurfaceView.
++static int64_t mediacodec_codec_lead(int64_t period_ns)
++{
++    return period_ns > 0 && period_ns < 25000000
++         ? 2 * period_ns : 50000000;
++}
++
++static int64_t mediacodec_prepare_lead(int64_t period_ns, double duration_ns)
++{
++    int64_t lead = period_ns * 2 > 50000000 ? period_ns * 2 : 50000000;
++    if (period_ns > 0 && isfinite(duration_ns) && duration_ns > 0) {
++        int64_t render = llround(fmin(2 * duration_ns + period_ns, 500000000));
++        if (render > lead)
++            lead = render;
++    }
++    return lead;
++}
++
++static bool mediacodec_synthetic_still(bool still, int64_t pts,
++                                      double duration)
++{
++    return still && pts == 0 && duration < 0;
++}
++
+ // --- end mediacodec timing core
+ 
+ typedef AChoreographer *(*mp_get_choreographer_fn)(void);
+@@ -325,9 +350,9 @@
+ #define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
+ #define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
+ 
+-// Media-pts cadence of the frames the VO flips, as the ExoPlayer overlay
+-// estimates it: median of the last eight consecutive deltas, trusted after
+-// four. A frame_id gap (frames the VO dropped), a non-positive delta (seek,
++// Media-pts cadence of the frames admitted for preparation: median of the
++// last eight consecutive deltas, trusted after four. A frame_id gap, a
++// non-positive delta (seek,
+ // backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
+ struct osd_cadence {
+     double deltas[OSD_CADENCE_SAMPLES];
+@@ -771,6 +796,9 @@
+     uint64_t cur_frame_id;
+     double cur_duration;
+     uint64_t cur_seq;    // sequence of the frame draw_frame received
++    bool cur_synthetic;
++    uint64_t submitted_frame_id;
++    uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
+     double osd_pts;      // render pts of the last real frame
+ 
+     struct mp_hwdec_ctx hwctx;
+@@ -977,7 +1005,7 @@
+ 
+     AVHWDeviceContext *ctx = (void *)device_ref->data;
+     AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
+-    hwctx->surface = (void *)(intptr_t)(vo->opts->WinID);
++    hwctx->surface = (void *)(uintptr_t)vo->opts->WinID;
+ 
+     if (av_hwdevice_ctx_init(device_ref) < 0)
+         av_buffer_unref(&device_ref);
+@@ -2761,7 +2789,7 @@
+     JNIEnv *env = mp_jni_get_env(vo->log);
+     if (env) {
+         p->osd_window = ANativeWindow_fromSurface(env,
+-                (jobject)(intptr_t)p->osd_surface);
++                (jobject)(uintptr_t)p->osd_surface);
+     }
+     if (!p->osd_window) {
+         MP_ERR(vo, "Failed to wrap the OSD surface; "
+@@ -2853,14 +2881,16 @@
+     init_vsync_sampler(vo);
+     osd_init(vo);
+ 
+-    // vo.c would otherwise wait until frame->pts before calling flip_page.
+-    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(50), 1);
++    // Initial preparation horizon, independent of the codec submission lead.
++    p->queue_offset = MP_TIME_MS_TO_NS(50);
++    vo_set_queue_params(vo, p->queue_offset, 1);
+ 
+     return 0;
+ }
+ 
+ #define VSYNC_SAMPLE_MAX_AGE_NS MP_TIME_S_TO_NS(1)
+-#define TIMED_RELEASE_MAX_AHEAD_NS MP_TIME_MS_TO_NS(500)
++// Allow clock-domain sampling jitter, not the old OSD preparation horizon.
++#define TIMED_RELEASE_CLOCK_SLOP_NS MP_TIME_MS_TO_NS(2)
+ 
+ struct release_target {
+     int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
+@@ -2894,8 +2924,8 @@
+     return llround(period);
+ }
+ 
+-// Keep the initial 50 ms budget and two vsyncs for SurfaceView submission.
+-// Cover the current render, next-frame preparation, and a composition vsync.
++// Keep the early OSD preparation horizon. prepare_frame separately tells the
++// core when this queued frame may be submitted to the codec.
+ static void update_queue_timing(struct vo *vo, double frame_duration)
+ {
+     struct priv *p = vo->priv;
+@@ -2908,20 +2938,16 @@
+         p->queue_period_changed = mono_now;
+     }
+ 
+-    int64_t offset = MPMAX(2 * period, MP_TIME_MS_TO_NS(50));
+-    if (period > 0 && isfinite(frame_duration) && frame_duration > 0) {
+-        int64_t render_budget = llround(fmin(2 * frame_duration + period,
+-                                             TIMED_RELEASE_MAX_AHEAD_NS));
+-        offset = MPMAX(offset, render_budget);
+-    }
++    int64_t offset = mediacodec_prepare_lead(period, frame_duration);
+     if (offset == p->queue_offset)
+         return;
+ 
+     p->queue_offset = offset;
+     vo_set_queue_params(vo, offset, 1);
+     if (period) {
+-        MP_VERBOSE(vo, "Timed release: %.3f Hz, queue %.1f ms ahead.\n",
+-                   1e9 / period, offset / 1e6);
++        MP_VERBOSE(vo, "Timed release: %.3f Hz, prepare %.1f ms, codec %.1f ms ahead.\n",
++                   1e9 / period, offset / 1e6,
++                   mediacodec_codec_lead(period) / 1e6);
+     }
+ }
+ 
+@@ -2946,7 +2972,8 @@
+ 
+     result.timestamp = mediacodec_timing_release(
+         &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
+-        sample, p->queue_period, TIMED_RELEASE_MAX_AHEAD_NS);
++        sample, p->queue_period,
++        mediacodec_codec_lead(p->queue_period) + TIMED_RELEASE_CLOCK_SLOP_NS);
+     if (result.timestamp && sample && raw_target > mono_now)
+         result.vsync = result.timestamp + p->queue_period * 8 / 10;
+     return result;
+@@ -2978,52 +3005,102 @@
+         vo->want_redraw = true;
+ }
+ 
++// Preparation does not own or submit the decoder image. The core can discard
++// a queued frame on seek/drop while this bounded OSD request is in flight.
++static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool synthetic)
++{
++    struct priv *p = vo->priv;
++    uint64_t seq = ++p->frame_seq;
++    double pts = frame->current->pts;
++    if (!synthetic && p->cadence.last_frame_id != frame->frame_id) {
++        if (pts == MP_NOPTS_VALUE)
++            osd_cadence_reset(&p->cadence);
++        else
++            osd_cadence_observe(&p->cadence, frame->frame_id, pts);
++    }
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd_lock);
++        osd_file_request(p, (struct osd_request){
++            .pts = pts,
++            .delta = synthetic ? 0 : osd_cadence_delta(&p->cadence),
++            .seq = seq,
++            .epoch = p->osd.epoch,
++        });
++        p->osd.frames++;
++        mp_mutex_unlock(&p->osd_lock);
++    }
++    return seq;
++}
++
++static int64_t prepare_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!frame) {
++        // A dropped prepared pose will never get a release timestamp. Retire
++        // it, including raster work in flight, rather than wedging the FIFO.
++        p->prepared_frame_id = p->prepared_seq = p->prepared_epoch = 0;
++        if (p->osd_threads_created) {
++            mp_mutex_lock(&p->osd_lock);
++            osd_invalidate_locked(p);
++            mp_mutex_unlock(&p->osd_lock);
++        }
++        return 0;
++    }
++    if (frame->redraw || frame->repeat || !frame->current ||
++        mediacodec_synthetic_still(frame->still, frame->pts, frame->duration))
++        return 0;
++
++    // Called on each event-loop wake, including after refresh-rate changes.
++    // Never rely on the offset the core observed before this frame was drawn.
++    update_queue_timing(vo, frame->duration);
++    // Only this VO thread changes epoch; OSD workers only read it under lock.
++    if (!p->prepared_seq || p->prepared_frame_id != frame->frame_id ||
++        p->prepared_epoch != p->osd.epoch)
++    {
++        p->prepared_seq = prepare_osd(vo, frame, false);
++        p->prepared_frame_id = frame->frame_id;
++        p->prepared_epoch = p->osd.epoch;
++    }
++    return frame->pts > 0 && !frame->display_synced
++         ? frame->pts - mediacodec_codec_lead(p->queue_period) : 0;
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+-
+     if (frame->redraw || frame->repeat)
+         return VO_TRUE;
+ 
+-    update_queue_timing(vo, frame->duration);
++    bool synthetic = mediacodec_synthetic_still(
++        frame->still, frame->pts, frame->duration);
+     mp_image_unrefp(&p->cur_image);
+-    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
++    if (!frame->current) {
++        if (!synthetic) {
++            mediacodec_timing_reset(&p->timing);
++            osd_cadence_reset(&p->cadence);
++            p->osd_pts = MP_NOPTS_VALUE;
++        }
++        return VO_TRUE;
++    }
++
++    p->osd_pts = frame->current->pts;
++    if (frame->frame_id && frame->frame_id == p->submitted_frame_id)
++        return VO_TRUE;
++
++    p->cur_image = mp_image_new_ref(frame->current);
+     p->cur_pts = frame->pts;
+-    p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
+-    p->cur_duration = p->cur_image ? frame->duration : 0;
+-    if (!p->cur_image) {
+-        mediacodec_timing_reset(&p->timing);
+-        osd_cadence_reset(&p->cadence);
+-        p->osd_pts = MP_NOPTS_VALUE;
+-        return VO_TRUE;
+-    }
+-
+-    p->cur_seq = ++p->frame_seq;
+-    double pts = p->cur_image->pts;
+-    if (pts == MP_NOPTS_VALUE) {
+-        osd_cadence_reset(&p->cadence);
++    p->cur_frame_id = frame->frame_id;
++    p->cur_duration = frame->duration;
++    p->cur_synthetic = synthetic;
++    if (!synthetic && p->prepared_seq &&
++        p->prepared_frame_id == frame->frame_id)
++    {
++        p->cur_seq = p->prepared_seq;
+     } else {
+-        osd_cadence_observe(&p->cadence, frame->frame_id, pts);
+-    }
+-
+-    if (!p->osd_threads_created) {
+-        p->osd_pts = pts;
+-        return VO_TRUE;
+-    }
+-
+-    // Ask for this frame's OSD now, up to --video-timing-offset plus the
+-    // queue lead before it is due; flip_page publishes where it will land.
+-    mp_mutex_lock(&p->osd_lock);
+-    p->osd_pts = pts;
+-    osd_file_request(p, (struct osd_request){
+-        .pts = pts,
+-        .delta = osd_cadence_delta(&p->cadence),
+-        .seq = p->cur_seq,
+-        .epoch = p->osd.epoch,
+-    });
+-    p->osd.frames++;
+-    mp_mutex_unlock(&p->osd_lock);
+-
++        if (!synthetic)
++            update_queue_timing(vo, frame->duration);
++        p->cur_seq = prepare_osd(vo, frame, synthetic);
++    }
+     return VO_TRUE;
+ }
+ 
+@@ -3048,12 +3125,18 @@
+         return;
+     }
+ 
+-    struct release_target target = get_release_target(vo, p->cur_pts);
++    // do_redraw's full redraw after a drop has pts=0/duration=-1 but can own
++    // an unsubmitted picture. Show it once without relearning either cadence.
++    struct release_target target = p->cur_synthetic
++                                 ? (struct release_target){0}
++                                 : get_release_target(vo, p->cur_pts);
+ 
+     AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
+     int ret = target.timestamp
+             ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
+             : av_mediacodec_release_buffer(buffer, 1);
++    if (ret >= 0)
++        p->submitted_frame_id = p->cur_frame_id;
+     mp_image_unrefp(&p->cur_image);
+     p->cur_pts = 0;
+     p->cur_frame_id = 0;
+@@ -3096,6 +3179,11 @@
+     p->cur_pts = 0;
+     p->cur_frame_id = 0;
+     p->cur_duration = 0;
++    p->cur_synthetic = false;
++    p->submitted_frame_id = 0;
++    p->prepared_frame_id = 0;
++    p->prepared_seq = 0;
++    p->prepared_epoch = 0;
+     mediacodec_timing_reset(&p->timing);
+     osd_cadence_reset(&p->cadence);
+     p->osd_pts = MP_NOPTS_VALUE;
+@@ -3177,6 +3265,7 @@
+     .name = "mediacodec",
+     .preinit = preinit,
+     .query_format = query_format,
++    .prepare_frame = prepare_frame,
+     .control = control,
+     .draw_frame = draw_frame,
+     .flip_page = flip_page,
+diff --git a/video/out/android_common.c b/video/out/android_common.c
+--- a/video/out/android_common.c
++++ b/video/out/android_common.c
+@@ -48,7 +48,7 @@
+         MP_FATAL(ctx, "Missing surface pointer\n");
+         goto fail;
+     }
+-    jobject surface = (jobject)(intptr_t)vo->opts->WinID;
++    jobject surface = (jobject)(uintptr_t)vo->opts->WinID;
+     ctx->native_window = ANativeWindow_fromSurface(env, surface);
+     if (!ctx->native_window) {
+         MP_FATAL(ctx, "Failed to create ANativeWindow\n");
+diff --git a/video/out/vo_mediacodec_embed.c b/video/out/vo_mediacodec_embed.c
+--- a/video/out/vo_mediacodec_embed.c
++++ b/video/out/vo_mediacodec_embed.c
+@@ -31,14 +31,16 @@
+ 
+ static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
+ {
++    if (vo->opts->WinID == 0 || vo->opts->WinID == -1)
++        return NULL;
++
+     AVBufferRef *device_ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
+     if (!device_ref)
+         return NULL;
+ 
+     AVHWDeviceContext *ctx = (void *)device_ref->data;
+     AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
+-    mp_assert(vo->opts->WinID != 0 && vo->opts->WinID != -1);
+-    hwctx->surface = (void *)(intptr_t)(vo->opts->WinID);
++    hwctx->surface = (void *)(uintptr_t)vo->opts->WinID;
+ 
+     if (av_hwdevice_ctx_init(device_ref) < 0)
+         av_buffer_unref(&device_ref);
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -727,8 +727,8 @@
+     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``
+     with per-frame presentation timestamps, and renders subtitles/OSD into a
+     second, transparent ``android.view.Surface``. Requires
+-    ``--wid=(intptr_t)(*android.view.Surface)`` and, for OSD/subtitles,
+-    ``--vo-mediacodec-osd-surface=(intptr_t)(*android.view.Surface)``.
++    ``--wid=(uintptr_t)(*android.view.Surface)`` and, for OSD/subtitles,
++    ``--vo-mediacodec-osd-surface=(uintptr_t)(*android.view.Surface)``.
+     Hardware sessions require ``--hwdec=mediacodec`` (not ``-copy``); software
+     frames are rejected, since copying them in would connect the Surface as a
+     CPU producer and prevent a GL VO from binding it later.
+@@ -797,7 +797,7 @@
+ ``mediacodec_embed`` (Android)
+     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
+     Requires ``--hwdec=mediacodec`` for hardware decoding, along with
+-    ``--vo=mediacodec_embed`` and ``--wid=(intptr_t)(*android.view.Surface)``.
++    ``--vo=mediacodec_embed`` and ``--wid=(uintptr_t)(*android.view.Surface)``.
+ 
+     Since this video output driver uses native decoding and rendering routines,
+     many of mpv's features (subtitle rendering, OSD/OSC, video filters, etc)
