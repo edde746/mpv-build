@@ -428,3 +428,22 @@ index a0c958e..c023836 100644
      }
  }
  
+diff --git a/libass/ass_utils.h b/libass/ass_utils.h
+--- a/libass/ass_utils.h
++++ b/libass/ass_utils.h
+@@ -193,6 +193,15 @@ static inline long ass_lrint(double x)
+     // Unlike GCC and Clang, Visual C++ can't inline lrint() without -fp:fast, so
+     // we provide our own implementation
+     return _mm_cvtsd_si32(_mm_set_sd(x));
++#elif defined(__arm__) && defined(__GNUC__) && defined(__ARM_FP) && (__ARM_FP & 8)
++    // Clang leaves lrint as a libm call on ARMv7, including Bionic's costly
++    // floating-point environment save/restore. VCVTR honors the current
++    // rounding mode; keep libm's overflow/NaN result and exception behavior.
++    if (!(x >= LONG_MIN && x <= LONG_MAX))
++        return lrint(x);
++    long result;
++    __asm__ volatile ("vcvtr.s32.f64 %0, %P1" : "=t" (result) : "w" (x));
++    return result;
+ #else
+     return lrint(x);
+ #endif

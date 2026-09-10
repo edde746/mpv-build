@@ -1,8 +1,8 @@
 diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index 814e1e4..de1a962 100644
+index 814e1e4..e1bf520 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
-@@ -723,6 +723,65 @@ Available video output drivers are:
+@@ -723,6 +723,63 @@ Available video output drivers are:
          :yes:   Attempt to enable VRR, whether the capability is reported or not.
          :auto:  Attempt to enable VRR if support is reported.
  
@@ -23,31 +23,29 @@ index 814e1e4..de1a962 100644
 +    system compositor, the decoder's dataspace (HDR) is preserved and no GPU
 +    pass runs on the video, but video filters and screenshots are unavailable.
 +
++    The render-request mailbox is latest-wins: requests not yet serviced may
++    be replaced under load. Completed frames instead enter a four-result FIFO;
++    newer requests cannot replace queued frames or a result held by the
++    presenter. Each retains its snapshot and matching video-release timing
++    until presentation or invalidation. Only the raster worker waits for queue
++    capacity; video release does not wait. Seven CPU slots bound ownership of
++    active, queued and speculative snapshots.
++
 +    Subtitles/OSD are rasterized on their own thread as soon as a frame is
 +    known to the VO, pre-rendered for the next frame from the observed frame
 +    cadence while the current one waits for its deadline, and, while the OSD
 +    is static, for the first frame of the next subtitle event ahead of its
-+    start (never past what the subtitle decoders have read), so a heavy sign
-+    is ready when its shot begins. Render times are modelled from the
-+    subtitle events a frame shows (a fixed part, a rate for events libass
-+    has not rasterized yet, a rate for those it has); a frame whose render
-+    cannot finish inside its own interval is not rendered as asked: the
-+    frame that will be current when the render finishes is rendered
-+    instead, and when a subtitle event that stays on screen begins before
-+    then, that event's first frame is rendered and held for its start. An
-+    animated intro too heavy for the device is therefore skipped, and the
-+    sign it leads to lands on its cut instead of a render later; the first
-+    frame of such an intro is not pre-rendered either, since it would
-+    freeze over the moving picture. A render that repeats the pixels
-+    already on screen is folded into them and costs no swap. Rasterized
-+    frames are uploaded and composed on the GPU while the present thread is
-+    idle, and presented through a GLES2 surface over the OSD Surface with
-+    the same presentation timestamp the video buffer got, so both latch on
-+    one vsync. The video is never held back for the OSD: under load
-+    subtitle updates are skipped or shown late instead. A ``osd-sync`` line
-+    in the verbose log every 120 frames and at exit reports render times,
-+    pre-render hits, frames rendered ahead of, held for or skipped in favour
-+    of a later frame (``ahead=``), the cost model's rates (``costMs=``), how
++    start (never past what the subtitle decoders have read). Event pre-renders
++    warm the renderer and GPU caches but are not presented directly: each
++    request uses a timestamp-matched render, reusing the prepared atlas when
++    the pixels match. A render that repeats the pixels already on screen is
++    folded into them and costs no swap. Rasterized frames are
++    uploaded and composed on the GPU while the present thread is idle, and
++    presented through a GLES2 surface over the OSD Surface with the same
++    presentation timestamp the video buffer got, so both latch on one vsync.
++    The video is never held back for the OSD: under load subtitle updates
++    are skipped or shown late instead. A ``osd-sync`` line in the verbose log
++    every 120 frames and at exit reports render times, pre-render hits, how
 +    many frames were uploaded and composed ahead of their draw, late swaps
 +    and, where the compositor supports ``EGL_ANDROID_get_frame_timestamps``,
 +    where swaps actually landed.
@@ -102,10 +100,9 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..d879f5f
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,3437 @@
+@@ -0,0 +1,3192 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -152,12 +149,12 @@ index 0000000..d879f5f
 + *    timestamp, and EGL_ANDROID_get_frame_timestamps reports where they
 + *    actually landed.
 + *
-+ * Both hand-offs are latest-wins mailboxes: under load the render stage
-+ * services the newest frame and the intermediate ones are skipped, a
-+ * pinned result is presented late rather than dropped, and the dirty region
-+ * of anything skipped is folded into the next result so the texture never
-+ * misses an update. The scheduler core is freestanding and covered by the
-+ * host regression in scripts/test_mediacodec_osd.sh.
++ * Unserved requests are latest-wins under load, but completed frames enter a
++ * bounded FIFO and cannot replace one another while the presenter waits.
++ * Only the render stage waits for queue capacity; video keeps advancing.
++ * A pinned result is presented late rather than dropped. Dirty regions from
++ * skipped requests are folded into the next result. The freestanding
++ * scheduler core is covered by scripts/test_mediacodec_osd.sh.
 + */
 +
 +#include <dlfcn.h>
@@ -188,7 +185,6 @@ index 0000000..d879f5f
 +#include "osdep/threads.h"
 +#include "osdep/timer.h"
 +#include "sub/draw_bmp.h"
-+#include "sub/dec_sub.h"
 +#include "sub/osd.h"
 +#include "video/hwdec.h"
 +#include "video/mp_image.h"
@@ -560,191 +556,52 @@ index 0000000..d879f5f
 +    s->slot = slot;
 +}
 +
-+// What a frame's render costs, from what renders have cost. libass caches
-+// what it rasterized, so an event costs on its first render (cold) what it
-+// never costs again (warm): the same 500-event sign is 100 ms at its cut
-+// and a few ms after. A frame is therefore charged a fixed part, a cold rate
-+// for the events it shows that the last rendered frame did not, and a warm
-+// rate for the rest. Each rate is the recent cost per event of renders of
-+// its kind, weighted by size: a 1735-event sign that took 230 ms outweighs
-+// a 100-event one that libass served from its glyph cache in 5 ms, and one
-+// heavy sign does not set the rate for the whole file. A 1-event render
-+// measures only the fixed part.
-+#define OSD_COST_LIGHT_EVENTS 2
-+#define OSD_COST_HEAVY_EVENTS 16
-+#define OSD_COST_DEFAULT_FIXED 0.02
-+#define OSD_COST_DEFAULT_COLD 0.0005
-+#define OSD_COST_DEFAULT_WARM 0.0001
-+#define OSD_COST_DECAY 0.2
-+#define OSD_COST_MAX 1.5
-+
-+struct osd_cost {
-+    double fixed_s;  // renders of at most OSD_COST_LIGHT_EVENTS events
-+    double cold_s, cold_events; // decayed sums: seconds and events, cold renders
-+    double warm_s, warm_events; // the same for warm renders
-+    bool have_fixed;
-+};
-+
-+// The subtitle events of one frame, as far as the cost model and the
-+// skip-ahead need them (struct sub_event_load, relative to the last
-+// rendered frame).
-+struct osd_frame_load {
-+    int active;       // events visible in the frame
-+    int cold;         // of those, not visible in the last rendered frame
-+    double boundary;  // last event start or end at or before the frame
-+    double next_boundary, visible_end; // first boundary after; latest end
-+    int next_starting; // events starting at next_boundary
-+};
-+
-+static double osd_cost_rate(const struct osd_cost *c, bool cold)
-+{
-+    if (cold)
-+        return c->cold_events > 0 ? c->cold_s / c->cold_events : OSD_COST_DEFAULT_COLD;
-+    return c->warm_events > 0 ? c->warm_s / c->warm_events : OSD_COST_DEFAULT_WARM;
-+}
-+
-+static void osd_cost_accumulate(double *seconds, double *events, double s, int n)
-+{
-+    *seconds = (1 - OSD_COST_DECAY) * *seconds + OSD_COST_DECAY * s;
-+    *events = (1 - OSD_COST_DECAY) * *events + OSD_COST_DECAY * n;
-+}
-+
-+// Expected duration of rendering the frame. `margin` scales the per-event
-+// parts: 1 for the likely value, more when finishing late has a cost.
-+static double osd_cost_estimate(const struct osd_cost *c,
-+                                const struct osd_frame_load *l, double margin)
-+{
-+    double fixed = c->have_fixed ? c->fixed_s : OSD_COST_DEFAULT_FIXED;
-+    int cold = MPCLAMP(l->cold, 0, l->active);
-+    int warm = MPMAX(l->active, 0) - cold;
-+    double estimate = fixed + margin * (osd_cost_rate(c, true) * cold +
-+                                        osd_cost_rate(c, false) * warm);
-+    return MPCLAMP(estimate, 0, OSD_COST_MAX);
-+}
-+
-+static void osd_cost_observe(struct osd_cost *c, const struct osd_frame_load *l,
-+                             double render_s)
-+{
-+    if (!(render_s >= 0))
-+        return;
-+    if (l->active <= OSD_COST_LIGHT_EVENTS) {
-+        c->fixed_s = c->have_fixed ? 0.5 * (c->fixed_s + render_s) : render_s;
-+        c->have_fixed = true;
-+        return;
-+    }
-+    double fixed = c->have_fixed ? c->fixed_s : OSD_COST_DEFAULT_FIXED;
-+    int cold = MPCLAMP(l->cold, 0, l->active);
-+    int warm = l->active - cold;
-+    if (cold >= OSD_COST_HEAVY_EVENTS) {
-+        // Charge the cold events; the warm ones are cheap by comparison.
-+        double s = MPMAX(render_s - fixed - osd_cost_rate(c, false) * warm, 0);
-+        osd_cost_accumulate(&c->cold_s, &c->cold_events, s, cold);
-+    } else if (cold <= OSD_COST_LIGHT_EVENTS && warm >= OSD_COST_HEAVY_EVENTS) {
-+        osd_cost_accumulate(&c->warm_s, &c->warm_events, MPMAX(render_s - fixed, 0), warm);
-+    }
-+}
-+
-+// A request whose render cannot finish inside its own frame interval shows
-+// its result a whole render late, and the frame after the run pays that
-+// latency too: a static sign lands hundreds of ms after its cut because the
-+// thread was still rendering the animated frames before it. Such a request
-+// renders a frame that will still be current when the render finishes
-+// instead, at the target time pts + estimate. When an event boundary lies
-+// before the target, the frame at one of them is rendered and held for that
-+// boundary's request (see osd_prefetch_service, osd_ahead_hold); otherwise
-+// the target frame is posted for the request itself. A held frame that is
-+// at or past the target, or that persists (osd_ahead_hold), is already the
-+// right answer, so nothing is rendered and the thread stays free to serve
-+// it on time; any other held frame is a frame of the same hopeless run and
-+// is replaced.
-+//  held_start: start of the frame in the pre-render slot, MP_NOPTS_VALUE when none
-+enum osd_ahead {
-+    OSD_AHEAD_NONE,   // render pts itself
-+    OSD_AHEAD_SKIP,   // render nothing: a later frame is held already
-+    OSD_AHEAD_TARGET, // render at or before *target instead of pts
-+};
-+
-+static enum osd_ahead osd_ahead_plan(double estimate, double delta, double pts,
-+                                     double held_start, bool held_persists,
-+                                     double horizon, double *target)
-+{
-+    if (!(delta > 0) || !(estimate > delta))
-+        return OSD_AHEAD_NONE;
-+    double t = pts + estimate;
-+    if (held_start != MP_NOPTS_VALUE && held_start > pts &&
-+        (held_start >= t || held_persists))
-+        return OSD_AHEAD_SKIP;
-+    if (!(t <= horizon)) // also rejects NAN
-+        return OSD_AHEAD_NONE;
-+    *target = t;
-+    return OSD_AHEAD_TARGET;
-+}
-+
-+// Whether the frame at boundary b (with load l, costing estimate) is the one
-+// to hold for a hopeless request at pts: it can be ready by b, one frame
-+// late at worst, the decoders can render it, and it persists, so the work is
-+// not thrown away a frame later: something in it stays on screen for a
-+// while, and the next boundary does not bring another heavy render. The
-+// boundaries of an animated intro fail the last test one after the other;
-+// the static sign after them passes. Boundaries are walked up to
-+// osd_ahead_window() past the request: at least a quarter second, so the
-+// sign a short intro leads to is in reach from its first frame.
-+#define OSD_AHEAD_MAX_BOUNDARIES 32
-+#define OSD_AHEAD_MIN_LIFE 0.25
-+#define OSD_AHEAD_MIN_WINDOW 0.25
-+
-+static double osd_ahead_window(double pts, double estimate)
-+{
-+    return pts + MPMAX(2 * estimate, OSD_AHEAD_MIN_WINDOW);
-+}
-+
-+static bool osd_ahead_hold(double pts, double delta, double window, double b,
-+                           double estimate, double horizon,
-+                           const struct osd_frame_load *l)
-+{
-+    if (!(b > pts) || !(b <= window) || !(b <= horizon))
-+        return false;
-+    if (pts + estimate > b + delta)
-+        return false;
-+    if (!(l->visible_end >= b + OSD_AHEAD_MIN_LIFE))
-+        return false;
-+    return l->next_boundary == MP_NOPTS_VALUE || l->next_starting < OSD_COST_HEAVY_EVENTS;
-+}
-+
-+// Pre-rendering the next event, the counterpart of the ExoPlayer overlay's
-+// cache warming: while the OSD is static, the first frame of the next event
-+// is rendered ahead of its start and kept in its own slot, so the request
-+// for that frame is served at once instead of after a cold render that
-+// leaves the previous shot's sign on screen for hundreds of ms. While the
-+// render runs, requests coalesce and a change that falls due meanwhile
-+// waits for it, so it must fit before anything on screen ends.
++// Warm the next event while the OSD is static. Keep its first image for
++// background atlas upload and composition, not as a result for a later PTS.
++// A timestamp-matched render validates the content; osd_dedup_items reuses
++// the prepared atlas when its pixels match. While warming, requests coalesce
++// and a change that falls due meanwhile waits, so it must fit before
++// anything on screen ends.
 +#define OSD_PREFETCH_MIN_LEAD 0.2
 +#define OSD_PREFETCH_MAX_LEAD 15.0
 +#define OSD_PREFETCH_STATIC_RENDERS 3
-+#define OSD_PREFETCH_MARGIN 1.25
 +
 +struct osd_prefetch {
 +    bool valid;            // a slot holds the next event's first frame
 +    double event_start;    // that event's start (video pts)
-+    bool persists;         // chosen by osd_ahead_hold: worth waiting for
 +    uint64_t epoch;
 +    int slot;
-+    double attempted_start; // last event start rendered, hit or not
++    double attempted_start; // last event start warmed
++    double max_event_s;    // slowest render per event starting, seen so far
 +    int unchanged_streak;  // consecutive renders that changed nothing
-+    uint32_t count, hits;
++    uint32_t count;
 +};
 +
-+// Whether to render next_start's first frame now, playing at pts, given
-+// the estimate of that render. Something on screen ending before that start
-+// must not wait for the render, so the estimate has to fit before it, with
-+// margin. The start itself may be overrun: a render that finishes late still
-+// serves the first request that follows, sooner than the cold render it
-+// replaces would have; only a hopeless attempt, one that cannot finish
-+// within twice its lead, is skipped.
++// A worst-case guess of what rendering a frame where `events` events start
++// takes: the slowest per-event rate seen so far, with a floor before any
++// heavy sign has been measured. Typesetting is hundreds of events per
++// shot, a dialogue line is one.
++static double osd_prefetch_estimate(const struct osd_prefetch *p, int events)
++{
++    double per_event = p->max_event_s > 0.001 ? p->max_event_s : 0.001;
++    double estimate = 1.25 * per_event * (events > 1 ? events : 1);
++    if (estimate < 0.05)
++        estimate = 0.05;
++    if (estimate > 1.5)
++        estimate = 1.5;
++    return estimate;
++}
++
++// Whether to render next_start's first frame now, playing at pts. Something
++// on screen ending before that start must not wait for the render, so the
++// render's estimate has to fit before it, with margin. The start itself may
++// be overrun: the following timestamp-matched render still benefits from
++// warm caches. Only an attempt that cannot finish within twice its lead is
++// skipped.
 +//  eligible: playing, the last request was a real frame, nothing pending,
 +//            a slot is free
 +static bool osd_prefetch_plan(const struct osd_prefetch *p, double pts,
-+                              double next_start, double estimate,
++                              double next_start, int next_events,
 +                              double visible_end, double horizon,
 +                              bool eligible)
 +{
@@ -757,6 +614,7 @@ index 0000000..d879f5f
 +        return false;
 +    if (fabs(next_start - p->attempted_start) < 0.002) // same event, another frame
 +        return false;
++    double estimate = osd_prefetch_estimate(p, next_events);
 +    if (visible_end > pts && visible_end < next_start &&
 +        visible_end - pts < estimate + 0.15)
 +        return false;
@@ -764,60 +622,27 @@ index 0000000..d879f5f
 +}
 +
 +static void osd_prefetch_store(struct osd_prefetch *p, double event_start,
-+                               bool persists, uint64_t epoch, int slot)
++                               int events, uint64_t epoch, int slot,
++                               double render_s)
 +{
 +    p->valid = slot >= 0;
 +    p->event_start = event_start;
-+    p->persists = persists;
 +    p->epoch = epoch;
 +    p->slot = slot;
 +    p->attempted_start = event_start;
 +    p->count++;
++    double per_event = render_s / (events > 1 ? events : 1);
++    if (per_event > p->max_event_s)
++        p->max_event_s = per_event;
 +}
 +
-+enum osd_prefetch_result {
-+    OSD_PREFETCH_NONE,    // not this event's first frame; keep waiting
-+    OSD_PREFETCH_HIT,     // post p->slot for this request
-+    OSD_PREFETCH_EXPIRED, // the event's first frame went by (or a seek)
-+};
-+
-+// A request for pts arrived. The pre-render serves the first request at or
-+// past the event's start. It was rendered a hair after the start, so it is
-+// that frame exactly when the request is the event's first frame; when the
-+// render thread was busy and the first frames were coalesced, serving the
-+// request that did arrive still beats a cold render: a static sign shows
-+// its only frame, an animated one jumps once to its live frame right after,
-+// which is still less late than the cold render's blank.
-+#define OSD_PREFETCH_SERVE_FRAMES 12
-+
-+static enum osd_prefetch_result osd_prefetch_service(struct osd_prefetch *p,
-+                                                     double pts, uint64_t epoch,
-+                                                     double delta)
++// Called after servicing a request. Keep the prepared image available to
++// the GPU and pixel deduplication through the first timestamp-matched render
++// at/after its start, then release the staging slot for the next event.
++static void osd_prefetch_retire(struct osd_prefetch *p, double pts, uint64_t epoch)
 +{
-+    if (!p->valid)
-+        return OSD_PREFETCH_NONE;
-+    double frame = delta > 0 ? delta : 0.05;
-+    if (epoch != p->epoch ||
-+        pts >= p->event_start + OSD_PREFETCH_SERVE_FRAMES * frame)
-+    {
++    if (epoch != p->epoch || pts >= p->event_start)
 +        p->valid = false;
-+        return OSD_PREFETCH_EXPIRED;
-+    }
-+    if (pts < p->event_start - 0.002)
-+        return OSD_PREFETCH_NONE;
-+    p->valid = false;
-+    p->hits++;
-+    return OSD_PREFETCH_HIT;
-+}
-+
-+// Whether the kept event pre-render already covers pts: the next-frame
-+// pre-render must not spend the same render again.
-+static bool osd_prefetch_covers(const struct osd_prefetch *p, double pts,
-+                                double delta)
-+{
-+    double frame = delta > 0 ? delta : 0.05;
-+    return p->valid && pts >= p->event_start - 0.002 &&
-+           pts < p->event_start + OSD_PREFETCH_SERVE_FRAMES * frame;
 +}
 +
 +static void osd_prefetch_observe_render(struct osd_prefetch *p, bool changed)
@@ -880,6 +705,77 @@ index 0000000..d879f5f
 +            : lead > OSD_SWAP_LEAD_MAX_NS ? OSD_SWAP_LEAD_MAX_NS : lead;
 +}
 +
++// Release timestamp of a flipped frame, by sequence number.
++struct osd_release {
++    uint64_t seq;
++    int64_t timestamp;  // CLOCK_MONOTONIC handed to MediaCodec, 0 = untimed
++    int64_t vsync;      // the vsync that timestamp targets, 0 = unknown
++    int64_t period;     // display period at release, 0 = unknown
++};
++
++struct osd_result {
++    int slot;        // -1: none
++    uint64_t seq;
++    uint64_t epoch;
++    double pts;      // trace
++    int64_t posted;  // trace: mp_time_ns at post
++    struct osd_release release; // copied before release history can roll over
++};
++
++// Future poses must not replace each other while the presenter waits for an
++// earlier deadline. Bound CPU snapshots; only the renderer waits for capacity.
++#define OSD_RESULT_CAPACITY 4
++struct osd_result_queue {
++    struct osd_result entries[OSD_RESULT_CAPACITY];
++    int first, count;
++};
++
++static struct osd_result *osd_result_head(struct osd_result_queue *q)
++{
++    return q->count ? &q->entries[q->first] : NULL;
++}
++
++static int osd_result_slot(const struct osd_result_queue *q)
++{
++    return q->count ? q->entries[q->first].slot : -1;
++}
++
++static bool osd_result_holds(const struct osd_result_queue *q, int slot)
++{
++    for (int n = 0; n < q->count; n++) {
++        if (q->entries[(q->first + n) % OSD_RESULT_CAPACITY].slot == slot)
++            return true;
++    }
++    return false;
++}
++
++static bool osd_result_push(struct osd_result_queue *q, struct osd_result r)
++{
++    if (q->count == OSD_RESULT_CAPACITY)
++        return false;
++    q->entries[(q->first + q->count++) % OSD_RESULT_CAPACITY] = r;
++    return true;
++}
++
++static struct osd_result osd_result_pop(struct osd_result_queue *q)
++{
++    assert(q->count > 0);
++    struct osd_result r = q->entries[q->first];
++    q->first = (q->first + 1) % OSD_RESULT_CAPACITY;
++    q->count--;
++    return r;
++}
++
++static void osd_result_publish_release(struct osd_result_queue *q,
++                                       struct osd_release release)
++{
++    for (int n = 0; n < q->count; n++) {
++        struct osd_result *r = &q->entries[(q->first + n) % OSD_RESULT_CAPACITY];
++        if (r->seq == release.seq)
++            r->release = release;
++    }
++}
++
 +// --- end mediacodec osd scheduler core
 +
 +struct mediacodec_opts {
@@ -900,7 +796,8 @@ index 0000000..d879f5f
 +};
 +#undef OPT_BASE_STRUCT
 +
-+#define OSD_SLOTS 4
++// Active frame, bounded pending queue, next-frame and event pre-renders.
++#define OSD_SLOTS (OSD_RESULT_CAPACITY + 3)
 +#define OSD_STATS_INTERVAL_FRAMES 120
 +#define OSD_LATE_THRESHOLD_NS MP_TIME_MS_TO_NS(4)
 +#define OSD_RELEASE_HISTORY 16
@@ -919,22 +816,6 @@ index 0000000..d879f5f
 +    uint64_t seq;    // frame sequence, 0 for an unpinned repaint
 +    uint64_t epoch;
 +    bool full;
-+};
-+
-+struct osd_result {
-+    int slot;        // -1: none
-+    uint64_t seq;
-+    uint64_t epoch;
-+    double pts;      // trace
-+    int64_t posted;  // trace: mp_time_ns at post
-+};
-+
-+// Release timestamp of a flipped frame, by sequence number.
-+struct osd_release {
-+    uint64_t seq;
-+    int64_t timestamp;  // CLOCK_MONOTONIC handed to MediaCodec, 0 = untimed
-+    int64_t vsync;      // the vsync that timestamp targets, 0 = unknown
-+    int64_t period;     // display period at release, 0 = unknown
 +};
 +
 +struct osd_present_probe {
@@ -962,7 +843,7 @@ index 0000000..d879f5f
 +    int release_next;
 +    uint64_t release_seq; // newest published
 +    // render -> present
-+    struct osd_result result;
++    struct osd_result_queue results;
 +    int present_slot;     // slot on screen or being presented, -1 none
 +
 +    // Statistics (writer noted per field; the VO thread reads them all).
@@ -971,8 +852,7 @@ index 0000000..d879f5f
 +    uint32_t renders, renders_changed; // render
 +    int64_t render_ns_last, render_ns_max; // render
 +    uint32_t render_hist[5];    // render: <=10, <=25, <=42, <=84, >84 ms
-+    uint32_t superseded;        // render: results replaced before taken
-+    uint32_t stale;             // present: results discarded on epoch change
++    uint32_t stale;             // results cancelled or missing their release
 +    uint32_t swaps, late;       // present
 +    int64_t late_ns_max;        // present
 +    int64_t lead_ns_last, lead_ns_min; // present: release - queued
@@ -988,8 +868,6 @@ index 0000000..d879f5f
 +    uint32_t present_measured, present_invalid, present_dropped;
 +    struct osd_spec spec;       // render (counters read by the VO thread)
 +    struct osd_prefetch prefetch; // render (counters read by the VO thread)
-+    struct osd_cost cost;       // render
-+    uint32_t ahead_predicted, ahead_held, ahead_skipped; // render: hopeless requests
 +};
 +
 +struct priv {
@@ -1227,8 +1105,8 @@ index 0000000..d879f5f
 +
 +// --- OSD render stage --------------------------------------------------------
 +
-+// libass glyph atlases and RGBA image subtitles are what the present stage
-+// composites on the GPU; nothing is flattened on the CPU.
++// Accept glyph masks and premultiplied images. The packer only flattens
++// overlapping masks when their upload would dwarf the composited image.
 +static const bool osd_gl_formats[SUBBITMAP_COUNT] = {
 +    [SUBBITMAP_LIBASS] = true,
 +    [SUBBITMAP_BGRA] = true,
@@ -1239,7 +1117,6 @@ index 0000000..d879f5f
 +    bool force_full;
 +    int64_t posted_change_id; // sub_bitmap_list.change_id of the last result
 +    struct osd_request last;  // last serviced request
-+    double rendered_pts;      // pts of the last render: what libass has cached
 +    uint64_t planned_seq;     // last.seq whose pre-renders were decided
 +    // Per OSD object: the change id libass last reported, and when that
 +    // render repeated an earlier one's pixels, the earlier item (id, atlas
@@ -1248,14 +1125,13 @@ index 0000000..d879f5f
 +    struct sub_bitmaps *dedup_canon[MAX_OSD_PARTS];
 +};
 +
-+// Locked. A slot that is neither on screen, nor the untaken result, nor a
-+// kept pre-render. Four slots: one is always free for an on-demand render
-+// once the next-frame pre-render is consumed.
++// Locked. Queued and active snapshots stay immutable. Consuming the
++// next-frame pre-render leaves a working slot even with event prefetch held.
 +static int osd_free_slot(struct priv *p)
 +{
 +    struct osd_shared *s = &p->osd;
 +    for (int n = 0; n < OSD_SLOTS; n++) {
-+        if (n == s->result.slot || n == s->present_slot)
++        if (osd_result_holds(&s->results, n) || n == s->present_slot)
 +            continue;
 +        if (s->spec.valid && n == s->spec.slot)
 +            continue;
@@ -1380,35 +1256,11 @@ index 0000000..d879f5f
 +    }
 +}
 +
-+// The frame's subtitle events, for the cost model and the skip-ahead,
-+// relative to the frame at ref (normally the last render). Takes the OSD and
-+// decoder locks: never under osd_lock.
-+static struct osd_frame_load osd_query_load_from(struct vo *vo, double ref, double pts)
-+{
-+    struct sub_event_load l;
-+    osd_get_sub_load(vo->osd, pts, ref, &l);
-+    return (struct osd_frame_load){
-+        .active = l.active,
-+        .cold = l.cold,
-+        .boundary = l.boundary,
-+        .next_boundary = l.next_boundary,
-+        .next_starting = l.next_starting,
-+        .visible_end = l.visible_end,
-+    };
-+}
-+
-+static struct osd_frame_load osd_query_load(struct vo *vo, const struct osd_render_state *rs,
-+                                            double pts)
-+{
-+    return osd_query_load_from(vo, rs->rendered_pts, pts);
-+}
-+
 +// Render the OSD for pts into slot. Returns whether the slot holds a frame
-+// that differs from the last one posted (or a forced repaint). `load` is
-+// the frame's subtitle events, for the cost model; NULL when unknown.
++// that differs from the last one posted (or a forced repaint).
 +static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
-+                            double pts, const struct osd_frame_load *load,
-+                            struct mediacodec_geometry geometry, int slot)
++                            double pts, struct mediacodec_geometry geometry,
++                            int slot)
 +{
 +    struct priv *p = vo->priv;
 +
@@ -1428,7 +1280,6 @@ index 0000000..d879f5f
 +    struct sub_bitmap_list *sbs =
 +        osd_render(vo->osd, res, pts, 0, osd_gl_formats);
 +    int64_t render_ns = mp_time_ns() - t0;
-+    rs->rendered_pts = pts;
 +    if (!sbs)
 +        return false;
 +    osd_dedup_items(p, rs, sbs);
@@ -1442,8 +1293,6 @@ index 0000000..d879f5f
 +    mp_mutex_lock(&p->osd_lock);
 +    osd_record_render(p, render_ns, changed);
 +    osd_prefetch_observe_render(&p->osd.prefetch, changed);
-+    if (load)
-+        osd_cost_observe(&p->osd.cost, load, render_ns / 1e9);
 +    mp_mutex_unlock(&p->osd_lock);
 +
 +    if (!changed) {
@@ -1459,25 +1308,36 @@ index 0000000..d879f5f
 +    return true;
 +}
 +
-+// Locked. Hand a slot to the present stage; a result it has not taken yet is
-+// replaced, which is safe because every result is a complete frame.
++static struct osd_release osd_find_release(struct priv *p, uint64_t seq);
++
++// Locked. Preserve every accepted future pose until presentation or invalidation.
 +static void osd_post_result(struct priv *p, struct osd_render_state *rs,
 +                            int slot, const struct osd_request *req)
 +{
 +    struct osd_shared *s = &p->osd;
-+    if (s->result.slot >= 0)
-+        s->superseded++;
-+    s->result = (struct osd_result){.slot = slot, .seq = req->seq, .epoch = req->epoch,
-+                                    .pts = req->pts, .posted = mp_time_ns()};
++    struct osd_release release = osd_find_release(p, req->seq);
++    if (s->terminate || s->present_failed || req->epoch != s->epoch ||
++        (req->seq && req->seq <= s->release_seq && release.seq != req->seq))
++    {
++        s->stale++;
++        rs->force_full = true;
++        return;
++    }
++    struct osd_result r = {
++        .slot = slot, .seq = req->seq, .epoch = req->epoch,
++        .pts = req->pts, .posted = mp_time_ns(), .release = release,
++    };
++    // Admission reserves capacity before rendering; only this thread produces.
++    bool queued = osd_result_push(&s->results, r);
++    assert(queued);
++    if (!queued) {
++        rs->force_full = true;
++        return;
++    }
 +    rs->posted_change_id = p->osd_slots[slot].sbs->change_id;
 +    rs->force_full = false;
 +    mp_cond_broadcast(&p->osd_wakeup);
 +}
-+
-+static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
-+                               double event_start, const struct osd_frame_load *load,
-+                               bool persists, uint64_t epoch,
-+                               struct mediacodec_geometry geometry, int slot);
 +
 +static void osd_service_request(struct vo *vo, struct osd_render_state *rs,
 +                                struct osd_request req,
@@ -1488,31 +1348,16 @@ index 0000000..d879f5f
 +
 +    rs->force_full |= req.full;
 +
-+    bool have_load = req.pts != MP_NOPTS_VALUE && req.delta > 0;
-+    struct osd_frame_load load = {0};
-+    if (have_load)
-+        load = osd_query_load(vo, rs, req.pts);
-+
 +    mp_mutex_lock(&p->osd_lock);
-+    // The next event's first frame outranks the next-frame pre-render: it
-+    // is the one a cold render would show late.
-+    int event_slot = s->prefetch.valid ? s->prefetch.slot : -1;
-+    double event_start = s->prefetch.event_start;
-+    enum osd_prefetch_result event = osd_prefetch_service(&s->prefetch, req.pts,
-+                                                          req.epoch, req.delta);
-+    if (event_slot >= 0 && event != OSD_PREFETCH_NONE) {
-+        MP_VERBOSE(vo, "OSD: event pre-render at %.3f met request %.3f: %s\n",
-+                   event_start, req.pts,
-+                   event == OSD_PREFETCH_HIT ? "hit" : "expired");
-+    }
-+    double estimate = have_load ? osd_cost_estimate(&s->cost, &load, 1.0) : 0;
-+    rs->last = req;
-+    if (event == OSD_PREFETCH_HIT && !rs->force_full) {
-+        s->spec.valid = false;
-+        osd_post_result(p, rs, event_slot, &req);
++    if (req.epoch != s->epoch) {
++        rs->force_full = true;
 +        mp_mutex_unlock(&p->osd_lock);
 +        return;
 +    }
++    // A warmed event image is only a cache candidate. It can be animated,
++    // expired, or missing a cue that started since it was rendered.
++    if (rs->force_full || req.epoch != s->prefetch.epoch)
++        s->prefetch.valid = false;
 +    int spec_slot = s->spec.valid ? s->spec.slot : -1;
 +    enum osd_spec_result hit = osd_spec_service(&s->spec, req.pts, req.epoch,
 +                                                rs->force_full, req.delta);
@@ -1520,102 +1365,28 @@ index 0000000..d879f5f
 +    if (hit == OSD_SPEC_HIT) {
 +        if (spec_slot >= 0)
 +            osd_post_result(p, rs, spec_slot, &req);
++        osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
 +        mp_mutex_unlock(&p->osd_lock);
++        rs->last = req;
 +        return;
 +    }
-+    // A hopeless request: see osd_ahead_plan.
-+    double target = MP_NOPTS_VALUE;
-+    double horizon = INFINITY;
-+    enum osd_ahead ahead = OSD_AHEAD_NONE;
-+    if (!rs->force_full && !s->paused && estimate > req.delta) {
-+        double held_start = s->prefetch.valid ? s->prefetch.event_start : MP_NOPTS_VALUE;
-+        bool held_persists = s->prefetch.valid && s->prefetch.persists;
-+        // The horizon takes the decoder locks; only needed here.
-+        mp_mutex_unlock(&p->osd_lock);
-+        horizon = osd_get_sub_render_horizon(vo->osd);
-+        mp_mutex_lock(&p->osd_lock);
-+        ahead = osd_ahead_plan(estimate, req.delta, req.pts, held_start,
-+                               held_persists, horizon, &target);
-+        if (ahead == OSD_AHEAD_SKIP)
-+            s->ahead_skipped++;
-+        if (ahead == OSD_AHEAD_TARGET && s->prefetch.valid)
-+            s->prefetch.valid = false; // a frame of this run; stale once served
-+    }
-+    if (ahead == OSD_AHEAD_SKIP || s->epoch != req.epoch) {
-+        mp_mutex_unlock(&p->osd_lock);
-+        return;
-+    }
-+    // Four slots: the frame on screen, the posted result, and the two
-+    // pre-renders. The next-frame pre-render was just consumed above, so
-+    // one is always free here.
++    // Admission reserves queue capacity and consuming speculation frees its
++    // slot; an active frame and event prefetch cannot exhaust the working slots.
 +    int slot = osd_free_slot(p);
 +    mp_mutex_unlock(&p->osd_lock);
-+    if (slot < 0)
++    if (slot < 0) {
++        rs->last = req;
 +        return;
-+
-+    double render_pts = req.pts;
-+    if (ahead == OSD_AHEAD_TARGET) {
-+        // Walk the boundaries up to the target for a frame worth holding
-+        // (osd_ahead_hold); failing that, the frame current at the target:
-+        // held when it starts after the request, posted for the request
-+        // when it is the same run all the way.
-+        double hold = MP_NOPTS_VALUE;
-+        bool persists = false;
-+        struct osd_frame_load hold_load = {0};
-+        double window = osd_ahead_window(req.pts, estimate);
-+        double b = load.next_boundary;
-+        for (int n = 0; n < OSD_AHEAD_MAX_BOUNDARIES && b != MP_NOPTS_VALUE &&
-+                        b <= window; n++)
-+        {
-+            struct osd_frame_load l = osd_query_load(vo, rs, b + 0.001);
-+            mp_mutex_lock(&p->osd_lock);
-+            double est = osd_cost_estimate(&s->cost, &l, 1.0);
-+            mp_mutex_unlock(&p->osd_lock);
-+            if (osd_ahead_hold(req.pts, req.delta, window, b, est, horizon, &l)) {
-+                hold = b;
-+                hold_load = l;
-+                persists = true;
-+                break;
-+            }
-+            if (!(l.next_boundary > b))
-+                break;
-+            b = l.next_boundary;
-+        }
-+        struct osd_frame_load target_load = osd_query_load(vo, rs, target);
-+        if (hold == MP_NOPTS_VALUE && target_load.boundary != MP_NOPTS_VALUE &&
-+            target_load.boundary > req.pts + 0.0005)
-+        {
-+            hold = target_load.boundary;
-+            hold_load = osd_query_load(vo, rs, hold + 0.001);
-+        }
-+        if (hold != MP_NOPTS_VALUE) {
-+            mp_mutex_lock(&p->osd_lock);
-+            s->ahead_held++;
-+            mp_mutex_unlock(&p->osd_lock);
-+            MP_VERBOSE(vo, "OSD: request %.3f needs %.0f ms; holding the frame at %.3f instead%s\n",
-+                       req.pts, estimate * 1e3, hold, persists ? " (persists)" : "");
-+            osd_prefetch_event(vo, rs, hold, &hold_load, persists, req.epoch,
-+                               geometry, slot);
-+            return;
-+        }
-+        // The same events all the way: render the phase that will be
-+        // current when this finishes, and post it as this request's frame.
-+        mp_mutex_lock(&p->osd_lock);
-+        s->ahead_predicted++;
-+        mp_mutex_unlock(&p->osd_lock);
-+        MP_VERBOSE(vo, "OSD: request %.3f needs %.0f ms; rendering %.3f for it\n",
-+                   req.pts, estimate * 1e3, target);
-+        render_pts = target;
-+        load = target_load;
 +    }
 +
-+    bool posted = osd_render_pass(vo, rs, render_pts, have_load ? &load : NULL,
-+                                  geometry, slot);
++    bool posted = osd_render_pass(vo, rs, req.pts, geometry, slot);
 +
 +    mp_mutex_lock(&p->osd_lock);
 +    if (posted)
 +        osd_post_result(p, rs, slot, &req);
++    osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
 +    mp_mutex_unlock(&p->osd_lock);
++    rs->last = req;
 +}
 +
 +static void osd_speculate(struct vo *vo, struct osd_render_state *rs,
@@ -1624,7 +1395,7 @@ index 0000000..d879f5f
 +{
 +    struct priv *p = vo->priv;
 +
-+    bool rendered = osd_render_pass(vo, rs, pts, NULL, geometry, slot);
++    bool rendered = osd_render_pass(vo, rs, pts, geometry, slot);
 +
 +    mp_mutex_lock(&p->osd_lock);
 +    if (p->osd.epoch == epoch)
@@ -1632,15 +1403,10 @@ index 0000000..d879f5f
 +    mp_mutex_unlock(&p->osd_lock);
 +}
 +
-+// Render the first frame of the event starting at event_start into slot and
-+// keep it until that frame is requested (see osd_prefetch_service). `events`
-+// is the number of events active in that frame, for the cost model. A held
-+// frame from a hopeless request (osd_ahead_plan) replaces an earlier
-+// pre-render: it is the later boundary, and the earlier one is the run the
-+// request came from.
++// Warm the event's first frame and retain it for GPU preparation and pixel
++// deduplication. Only a timestamp-matched render can authorize presentation.
 +static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
-+                               double event_start, const struct osd_frame_load *load,
-+                               bool persists, uint64_t epoch,
++                               double event_start, int events, uint64_t epoch,
 +                               struct mediacodec_geometry geometry, int slot)
 +{
 +    struct priv *p = vo->priv;
@@ -1652,7 +1418,6 @@ index 0000000..d879f5f
 +    struct sub_bitmap_list *sbs =
 +        osd_render(vo->osd, res, event_start + 0.001, 0, osd_gl_formats);
 +    double render_s = (mp_time_ns() - t0) / 1e9;
-+    rs->rendered_pts = event_start + 0.001;
 +    if (sbs)
 +        osd_dedup_items(p, rs, sbs);
 +    mp_mutex_lock(&p->osd_lock);
@@ -1664,14 +1429,13 @@ index 0000000..d879f5f
 +        dst->canvas_w = w;
 +        dst->canvas_h = h;
 +    }
-+    osd_prefetch_store(&p->osd.prefetch, event_start, persists, epoch, keep ? slot : -1);
-+    osd_cost_observe(&p->osd.cost, load, render_s);
++    osd_prefetch_store(&p->osd.prefetch, event_start, events, epoch,
++                       keep ? slot : -1, render_s);
 +    mp_mutex_unlock(&p->osd_lock);
 +    if (!keep)
 +        talloc_free(sbs);
-+    MP_VERBOSE(vo, "OSD: pre-rendered the event at %.3f (%d events, %d cold, %.0f ms, %.2fs ahead)\n",
-+               event_start, load->active, load->cold, render_s * 1e3,
-+               event_start - rs->last.pts);
++    MP_VERBOSE(vo, "OSD: pre-rendered the event at %.3f (%d events, %.0f ms, %.2fs ahead)\n",
++               event_start, events, render_s * 1e3, event_start - rs->last.pts);
 +}
 +
 +static MP_THREAD_VOID osd_render_thread(void *arg)
@@ -1680,14 +1444,20 @@ index 0000000..d879f5f
 +    struct priv *p = vo->priv;
 +    struct osd_shared *s = &p->osd;
 +    mp_thread_set_name("vo/osd-render");
++    // Raster work has the same frame deadline as presentation.
++    setpriority(PRIO_PROCESS, 0, -4);
 +
-+    struct osd_render_state rs = {.force_full = true, .rendered_pts = MP_NOPTS_VALUE};
++    struct osd_render_state rs = {.force_full = true};
 +
 +    mp_mutex_lock(&p->osd_lock);
 +    while (!s->terminate) {
 +        if (s->present_failed) {
 +            // Nothing will consume results; do not burn CPU on libass.
 +            s->requested = false;
++            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            continue;
++        }
++        if (s->results.count == OSD_RESULT_CAPACITY) {
 +            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
 +            continue;
 +        }
@@ -1709,31 +1479,23 @@ index 0000000..d879f5f
 +        }
 +        rs.planned_seq = rs.last.seq;
 +        int spec_slot = osd_free_slot(p);
-+        double delta = rs.last.delta;
 +        bool eligible = !s->paused && rs.last.seq && rs.last.epoch == s->epoch &&
 +                        spec_slot >= 0 && !s->spec.valid;
++        double delta = rs.last.delta;
 +        double last_pts = rs.last.pts;
 +        uint64_t epoch = s->epoch;
 +        struct mediacodec_geometry geometry = s->geometry;
 +        double horizon = NAN;
 +        if (eligible && delta > 0) {
-+            // osd_get_sub_render_horizon and osd_query_load take the OSD and
-+            // decoder locks; never under osd_lock.
++            // osd_get_sub_render_horizon takes the OSD and decoder locks;
++            // never under osd_lock.
 +            mp_mutex_unlock(&p->osd_lock);
 +            horizon = osd_get_sub_render_horizon(vo->osd);
-+            struct osd_frame_load next = osd_query_load(vo, &rs, last_pts + delta);
 +            mp_mutex_lock(&p->osd_lock);
-+            // No next-frame pre-render of a frame that cannot be rendered
-+            // inside its interval: it would only block the thread for a
-+            // frame that is stale by the time it is done, and the request
-+            // for it is what osd_ahead_plan handles.
-+            eligible = !s->requested && !s->terminate && s->epoch == epoch &&
-+                       osd_cost_estimate(&s->cost, &next, 1.0) <= delta;
++            eligible = !s->requested && !s->terminate && s->epoch == epoch;
 +        }
 +        double pts;
-+        if (osd_spec_plan(&s->spec, last_pts, delta, horizon, eligible, &pts) &&
-+            !osd_prefetch_covers(&s->prefetch, pts, delta))
-+        {
++        if (osd_spec_plan(&s->spec, last_pts, delta, horizon, eligible, &pts)) {
 +            mp_mutex_unlock(&p->osd_lock);
 +            osd_speculate(vo, &rs, pts, epoch, geometry, spec_slot);
 +            mp_mutex_lock(&p->osd_lock);
@@ -1753,40 +1515,17 @@ index 0000000..d879f5f
 +        int next_events;
 +        osd_get_sub_schedule(vo->osd, last_pts, last_pts + OSD_PREFETCH_MIN_LEAD,
 +                             &next_start, &next_events, &visible_end);
-+        struct osd_frame_load next_load = {0};
-+        if (next_start != MP_NOPTS_VALUE)
-+            next_load = osd_query_load(vo, &rs, next_start + 0.001);
 +        if (isnan(horizon))
 +            horizon = osd_get_sub_render_horizon(vo->osd);
 +        mp_mutex_lock(&p->osd_lock);
-+        double estimate = osd_cost_estimate(&s->cost, &next_load, OSD_PREFETCH_MARGIN);
 +        bool plan = osd_prefetch_plan(&s->prefetch, last_pts, next_start,
-+                                      estimate, visible_end, horizon,
++                                      next_events, visible_end, horizon,
 +                                      !s->requested && !s->terminate &&
 +                                      s->epoch == epoch);
 +        mp_mutex_unlock(&p->osd_lock);
 +        if (plan) {
-+            // Worth waiting for when it stays a while and the boundary
-+            // after it is light (the osd_ahead_hold tests).
-+            bool persists = next_load.visible_end >= next_start + OSD_AHEAD_MIN_LIFE &&
-+                            (next_load.next_boundary == MP_NOPTS_VALUE ||
-+                             next_load.next_starting < OSD_COST_HEAVY_EVENTS);
-+            // A first frame is only worth showing on time when it stays:
-+            // an animated intro whose boundaries each bring hundreds of new
-+            // events would otherwise freeze on its first frame over a
-+            // moving picture, oversized, until the sign it leads to. Blank
-+            // until that sign is the lesser evil; osd_ahead_plan brings the
-+            // sign in on time.
-+            if (persists) {
-+                osd_prefetch_event(vo, &rs, next_start, &next_load, true, epoch,
-+                                   geometry, event_slot);
-+            } else {
-+                mp_mutex_lock(&p->osd_lock);
-+                s->prefetch.attempted_start = next_start; // decided: not this one
-+                mp_mutex_unlock(&p->osd_lock);
-+                MP_VERBOSE(vo, "OSD: not pre-rendering the event at %.3f: it does not stay\n",
-+                           next_start);
-+            }
++            osd_prefetch_event(vo, &rs, next_start, next_events, epoch, geometry,
++                               event_slot);
 +        }
 +        mp_mutex_lock(&p->osd_lock);
 +    }
@@ -2233,12 +1972,12 @@ index 0000000..d879f5f
 +}
 +
 +// Locked. Pin what the present stage draws now and next: the present slot
-+// and the posted result; their atlases are never evicted or trimmed.
++// and the queue head; deeper frames retain CPU snapshots, not GPU residency.
 +static void osd_tex_pin_live(struct priv *p, struct osd_gl *g)
 +{
 +    struct osd_shared *s = &p->osd;
 +    g->num_pinned = 0;
-+    int slots[2] = {s->present_slot, s->result.slot};
++    int slots[2] = {s->present_slot, osd_result_slot(&s->results)};
 +    for (int n = 0; n < 2; n++) {
 +        if (slots[n] < 0)
 +            continue;
@@ -2393,7 +2132,7 @@ index 0000000..d879f5f
 +    struct osd_shared *s = &p->osd;
 +    osd_tex_pin_live(p, g);
 +    int slots[3] = {
-+        s->result.slot,
++        osd_result_slot(&s->results),
 +        s->spec.valid ? s->spec.slot : -1,
 +        s->prefetch.valid ? s->prefetch.slot : -1,
 +    };
@@ -2536,12 +2275,12 @@ index 0000000..d879f5f
 +        g->composing = NULL;
 +}
 +
-+// Locked. The frames on screen and posted are never evicted.
++// Locked. The active frame and queue head are never evicted.
 +static void osd_comp_pin_live(struct priv *p, struct osd_gl *g)
 +{
 +    struct osd_shared *s = &p->osd;
 +    g->num_pinned_comps = 0;
-+    int slots[2] = {s->present_slot, s->result.slot};
++    int slots[2] = {s->present_slot, osd_result_slot(&s->results)};
 +    for (int n = 0; n < 2; n++) {
 +        if (slots[n] < 0)
 +            continue;
@@ -2712,7 +2451,7 @@ index 0000000..d879f5f
 +    struct osd_shared *s = &p->osd;
 +    osd_comp_pin_live(p, g);
 +    int slots[3] = {
-+        s->result.slot,
++        osd_result_slot(&s->results),
 +        s->spec.valid ? s->spec.slot : -1,
 +        s->prefetch.valid ? s->prefetch.slot : -1,
 +    };
@@ -2775,7 +2514,7 @@ index 0000000..d879f5f
 +        mp_mutex_lock(&p->osd_lock);
 +        if (busy)
 +            return true;
-+        if (!until && p->osd.result.slot >= 0)
++        if (!until && p->osd.results.count)
 +            return false; // a result outranks warming
 +    }
 +    return false;
@@ -2882,15 +2621,14 @@ index 0000000..d879f5f
 +    return !s->terminate && s->epoch == epoch;
 +}
 +
-+// Locked. The release for seq, or an untimed one when it was never published
-+// or has already rolled out of the history.
++// Locked. A zero sequence means the release is not retained in the history.
 +static struct osd_release osd_find_release(struct priv *p, uint64_t seq)
 +{
 +    for (int n = 0; n < OSD_RELEASE_HISTORY; n++) {
 +        if (p->osd.releases[n].seq == seq)
 +            return p->osd.releases[n];
 +    }
-+    return (struct osd_release){.seq = seq};
++    return (struct osd_release){0};
 +}
 +
 +static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
@@ -2994,9 +2732,9 @@ index 0000000..d879f5f
 +        mp_cond_broadcast(&p->osd_wakeup);
 +    }
 +    while (ok && !s->terminate) {
-+        if (s->result.slot < 0) {
++        if (!s->results.count) {
 +            bool gpu_busy = osd_upload_ahead(vo, &g, 0);
-+            if (s->result.slot < 0 && !s->terminate) {
++            if (!s->results.count && !s->terminate) {
 +                if (gpu_busy) {
 +                    mp_cond_timedwait_until(&p->osd_wakeup, &p->osd_lock,
 +                                            mp_time_ns() + OSD_GPU_POLL_NS);
@@ -3006,17 +2744,18 @@ index 0000000..d879f5f
 +            }
 +            continue;
 +        }
-+        struct osd_result r = s->result;
-+        s->result.slot = -1;
-+        s->present_slot = r.slot;
-+
-+        // A real frame's release timestamp is published by flip_page, which
-+        // may still be waiting for its queue slot.
-+        while (r.seq > s->release_seq && !s->terminate && s->epoch == r.epoch)
++        struct osd_result *head = osd_result_head(&s->results);
++        // Keep unpublished results addressable by flip_page. Once dequeued,
++        // the exact release travels with the pose, independent of the history.
++        if (head->seq && head->release.seq != head->seq) {
 +            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-+        bool current = !s->terminate && s->epoch == r.epoch;
-+        struct osd_release release = current && r.seq
-+            ? osd_find_release(p, r.seq) : (struct osd_release){0};
++            continue;
++        }
++        struct osd_result r = osd_result_pop(&s->results);
++        s->present_slot = r.slot;
++        mp_cond_broadcast(&p->osd_wakeup);
++        bool current = s->epoch == r.epoch;
++        struct osd_release release = r.release;
 +        // Some codec paths put the picture on screen a vsync after a GL
 +        // layer given the same timestamp; the embedder measured how many.
 +        if (release.timestamp && release.period > 0 && s->vsync_delay) {
@@ -3053,11 +2792,21 @@ index 0000000..d879f5f
 +        s->coalesced++;
 +        // A pending full repaint must not be lost to a later partial one, and
 +        // a repaint of the frame that is still pending keeps its deadline.
-+        req.full |= s->request.full;
-+        if (!req.seq && s->request.seq && req.pts == s->request.pts) {
++        if (!req.seq && !req.full && s->request.seq && req.pts == s->request.pts &&
++            req.epoch == s->request.epoch)
++        {
 +            req.seq = s->request.seq;
 +            req.delta = s->request.delta;
 +        }
++        req.full |= s->request.full;
++    }
++    if (!req.seq) {
++        // An immediate repaint replaces the timeline, not merely its tail.
++        req.epoch = ++s->epoch;
++        req.full = true;
++        s->stale += s->results.count;
++        s->results.first = s->results.count = 0;
++        s->spec.valid = s->prefetch.valid = false;
 +    }
 +    s->request = req;
 +    s->requested = true;
@@ -3068,7 +2817,6 @@ index 0000000..d879f5f
 +static void osd_invalidate_locked(struct priv *p)
 +{
 +    struct osd_shared *s = &p->osd;
-+    s->epoch++;
 +    osd_file_request(p, (struct osd_request){
 +        .pts = p->osd_pts, .epoch = s->epoch, .full = true,
 +    });
@@ -3083,8 +2831,8 @@ index 0000000..d879f5f
 +    struct osd_shared s = p->osd;
 +    mp_mutex_unlock(&p->osd_lock);
 +    MP_VERBOSE(vo, "osd-sync %s frames=%u render=%u/%u renderMs=%d/%d "
-+               "renderHist=%u,%u,%u,%u,%u spec=%u/%u/%u horizonSkips=%u prefetch=%u/%u "
-+               "ahead=%u/%u/%u costMs=%d+%.2f/%.2f coalesced=%u superseded=%u stale=%u swaps=%u late=%u "
++               "renderHist=%u,%u,%u,%u,%u spec=%u/%u/%u horizonSkips=%u prefetch=%u "
++               "coalesced=%u stale=%u swaps=%u late=%u "
 +               "maxLateMs=%d leadMs=%d minLeadMs=%s swapLeadMs=%d "
 +               "swapMs=%d/%d uploadMs=%d/%d uploads=%u/%u composed=%u/%u present=%s presentErrMs=%s worstPresentMs=%s "
 +               "presentHist=%u,%u,%u,%u,%u presentMeasured=%u "
@@ -3094,11 +2842,7 @@ index 0000000..d879f5f
 +               s.render_hist[0], s.render_hist[1], s.render_hist[2],
 +               s.render_hist[3], s.render_hist[4],
 +               s.spec.hits, s.spec.misses, s.spec.skips, s.spec.horizon_skips,
-+               s.prefetch.hits, s.prefetch.count,
-+               s.ahead_predicted, s.ahead_held, s.ahead_skipped,
-+               (int)((s.cost.have_fixed ? s.cost.fixed_s : OSD_COST_DEFAULT_FIXED) * 1e3),
-+               osd_cost_rate(&s.cost, true) * 1e3, osd_cost_rate(&s.cost, false) * 1e3,
-+               s.coalesced, s.superseded, s.stale, s.swaps, s.late,
++               s.prefetch.count, s.coalesced, s.stale, s.swaps, s.late,
 +               (int)(s.late_ns_max / 1000000), (int)(s.lead_ns_last / 1000000),
 +               s.have_lead_min ? mp_tprintf(16, "%d", (int)(s.lead_ns_min / 1000000)) : "n/a",
 +               (int)(s.swap_lead_ns / 1000000),
@@ -3130,7 +2874,7 @@ index 0000000..d879f5f
 +        return;
 +    }
 +
-+    p->osd.result.slot = -1;
++    p->osd.results = (struct osd_result_queue){0};
 +    p->osd.present_slot = -1;
 +    p->osd.present_source = NULL;
 +    mp_mutex_init(&p->osd_lock);
@@ -3255,9 +2999,9 @@ index 0000000..d879f5f
 +    return llround(period);
 +}
 +
-+// Release about two vsyncs early (MediaCodec's SurfaceView guidance); 50 ms
-+// when the display period is unknown.
-+static void update_queue_timing(struct vo *vo)
++// Keep the initial 50 ms budget and two vsyncs for SurfaceView submission.
++// Cover the current render, next-frame preparation, and a composition vsync.
++static void update_queue_timing(struct vo *vo, double frame_duration)
 +{
 +    struct priv *p = vo->priv;
 +    int64_t mono_now = monotonic_now_ns();
@@ -3269,7 +3013,12 @@ index 0000000..d879f5f
 +        p->queue_period_changed = mono_now;
 +    }
 +
-+    int64_t offset = period > 0 ? 2 * period : MP_TIME_MS_TO_NS(50);
++    int64_t offset = MPMAX(2 * period, MP_TIME_MS_TO_NS(50));
++    if (period > 0 && isfinite(frame_duration) && frame_duration > 0) {
++        int64_t render_budget = llround(fmin(2 * frame_duration + period,
++                                             TIMED_RELEASE_MAX_AHEAD_NS));
++        offset = MPMAX(offset, render_budget);
++    }
 +    if (offset == p->queue_offset)
 +        return;
 +
@@ -3341,7 +3090,7 @@ index 0000000..d879f5f
 +    if (frame->redraw || frame->repeat)
 +        return VO_TRUE;
 +
-+    update_queue_timing(vo);
++    update_queue_timing(vo, frame->duration);
 +    mp_image_unrefp(&p->cur_image);
 +    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
 +    p->cur_pts = frame->pts;
@@ -3428,6 +3177,7 @@ index 0000000..d879f5f
 +        .seq = p->cur_seq, .timestamp = target.timestamp, .vsync = target.vsync,
 +        .period = p->queue_period,
 +    };
++    osd_result_publish_release(&s->results, s->releases[s->release_next]);
 +    s->release_next = (s->release_next + 1) % OSD_RELEASE_HISTORY;
 +    s->release_seq = p->cur_seq;
 +    mp_cond_broadcast(&p->osd_wakeup);
@@ -3467,6 +3217,8 @@ index 0000000..d879f5f
 +    if (!p->osd_threads_created)
 +        return;
 +    mp_mutex_lock(&p->osd_lock);
++    if (paused && !p->osd.paused)
++        osd_invalidate_locked(p);
 +    p->osd.paused = paused;
 +    mp_cond_broadcast(&p->osd_wakeup);
 +    mp_mutex_unlock(&p->osd_lock);

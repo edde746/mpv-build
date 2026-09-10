@@ -149,22 +149,38 @@ prediction, refresh hysteresis, clock drift, reset boundaries, and the release
 timestamp handed to MediaCodec when the VO thread runs late, without a device.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
-It extracts the freestanding scheduler core of the same patch and covers the
-frame-cadence estimator that predicts the next pts, the single-use next-frame
-pre-render and its match tolerance, the subtitle read-horizon cap, the render
-cost model (fixed, cold and warm parts, size-weighted), the skip-ahead for a
-frame that cannot be rendered inside its interval and the criteria for the
-frame held in its place, the event pre-render planner (the visible-end guard
-and the serve window), and the swap lead.
+It extracts the freestanding scheduler core and request dispatcher of the
+same patch. Coverage includes frame-cadence prediction, next-frame pre-render
+matching, the subtitle read horizon, event warming and staging lifetime, and
+swap lead. Request scenarios ensure that a warmed image cannot replace an
+expired cue's blank frame, a newer or overlapping cue, a timestamp-matched
+pre-render, or a repaint after seeking.
+Completed animation poses use an immutable bounded FIFO rather than replacing
+each other while the presenter waits. Queue regressions cover ordered handoff,
+full-capacity admission, wraparound, release ownership, and epoch cancellation.
 
 Run the libass change-detection regression with
 `bash scripts/test_libass_change_detection.sh`. It fetches the pinned upstream
 libass, applies `patches/libass/series.common` (the threaded renderer, layout
 cache and fast blur that used to be the edde746/libass fork), builds it for the
 host (freetype, fribidi, harfbuzz and libunibreak via pkg-config) and checks
-that a static frame rendered twice is reported unchanged the second time, which
-mpv's subtitle packer relies on to skip re-packing the frame. Pass an
-already-patched source directory as the first argument to run offline.
+that a static frame is reported unchanged on repeat and after handing off a
+prefetched renderer while another renderer has advanced the same track.
+Two-way handoffs also release only event-layout snapshots while both renderers
+remain alive and reusable. Retained frame pixels survive cache release and
+renderer reuse; overlapping-event renders settle unchanged on a same-timestamp
+repeat, and clearing the old owner's cache again leaves the new owner's frame
+unchanged. Cue expiry clears both renderers without preserving stale pixels.
+mpv's subtitle packer relies on that unchanged result to reuse its prepared
+atlas. Pass an already-patched source directory as the first argument to run
+offline.
+
+`scripts/test_libass_rounding.c` checks the ARMv7 VFP rounding fast path against
+the device's `lrint`: ties, signed limits, non-finite values, subnormals, all four
+rounding modes, and preserved exception state. Cross-compile it with the Android
+ARMv7 compiler, `-O2 -I<patched-libass>/libass -lm`, then run the executable on
+an ARMv7-capable Android device. It deliberately rejects a host-only build,
+which would exercise the unchanged fallback instead of the VFP instructions.
 
 Run the Dolby Vision packet-filter regression with
 `bash scripts/test_mediacodec_dv_filter.sh`. It extracts the production

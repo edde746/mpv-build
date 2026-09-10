@@ -1,0 +1,257 @@
+diff --git a/sub/ass_mp.c b/sub/ass_mp.c
+--- a/sub/ass_mp.c
++++ b/sub/ass_mp.c
+@@ -167,6 +167,8 @@
+     const unsigned int g = (color >> 16) & 0xff;
+     const unsigned int b = (color >>  8) & 0xff;
+     const unsigned int a = 0xff - (color & 0xff);
++    if (!a)
++        return;
+ 
+     dst += dst_y * dst_stride + dst_x * 4;
+ 
+@@ -174,6 +176,12 @@
+         uint32_t *dstrow = (uint32_t *) dst;
+         for (int x = 0; x < src_w; x++) {
+             const unsigned int v = src[x];
++            if (!v)
++                continue;
++            if (a == 255 && v == 255) {
++                dstrow[x] = 0xff000000u | (r << 16) | (g << 8) | b;
++                continue;
++            }
+             int rr = (r * a * v);
+             int gg = (g * a * v);
+             int bb = (b * a * v);
+@@ -337,6 +345,7 @@
+         .format = SUBBITMAP_BGRA,
+         .parts = p->rgba_imgs,
+         .num_parts = num_bb,
++        .video_color_space = res->video_color_space,
+     };
+ 
+     for (int n = 0; n < imgs.num_parts; n++) {
+@@ -387,17 +396,15 @@
+ // Pack the contents of image_lists[0] to image_lists[num_image_lists-1] into
+ // a single image, and make *out point to it. *out is completely overwritten.
+ // If libass reported any change, image_lists_changed must be set (it then
+-// repacks all images). preferred_osd_format can be set to a desired
+-// sub_bitmap_format. Currently, only SUBBITMAP_LIBASS is supported.
++// repacks all images). preferred_osd_format is a bitmask of supported
++// (1 << SUBBITMAP_*) formats. Prefer masks unless heavy overlap makes their
++// upload substantially larger than a composited image.
+ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+                         int num_image_lists, bool image_lists_changed, bool video_color_space,
+                         int preferred_osd_format, struct sub_bitmaps *out)
+ {
+-    int format = preferred_osd_format == SUBBITMAP_BGRA ? SUBBITMAP_BGRA
+-                                                        : SUBBITMAP_LIBASS;
+-
+     if (p->cached_subs_valid && !image_lists_changed &&
+-        p->cached_subs.format == format)
++        (preferred_osd_format & (1 << p->cached_subs.format)))
+     {
+         *out = p->cached_subs;
+         return;
+@@ -407,7 +414,7 @@
+     p->cached_subs_valid = false;
+ 
+     struct sub_bitmaps res = {
+-        .change_id = image_lists_changed,
++        .change_id = 1,
+         .format = SUBBITMAP_LIBASS,
+         .parts = p->cached_parts,
+         .video_color_space = video_color_space,
+@@ -431,6 +438,24 @@
+         }
+     }
+ 
++    int format = SUBBITMAP_LIBASS;
++    if (!(preferred_osd_format & (1 << SUBBITMAP_LIBASS))) {
++        format = SUBBITMAP_BGRA;
++    } else if (res.num_parts > 16 && (preferred_osd_format & (1 << SUBBITMAP_BGRA))) {
++        // At most 16 masks cannot exceed four times a four-channel union.
++        struct mp_rect bb_list[MP_SUB_BB_LIST_MAX];
++        int num_bb = mp_get_sub_bb_list(&res, bb_list, MP_SUB_BB_LIST_MAX);
++        int64_t mask_bytes = 0, rgba_bytes = 0;
++        for (int n = 0; n < res.num_parts; n++)
++            mask_bytes += (int64_t)res.parts[n].w * res.parts[n].h;
++        for (int n = 0; n < num_bb; n++)
++            rgba_bytes += (int64_t)mp_rect_w(bb_list[n]) * mp_rect_h(bb_list[n]) * 4;
++        // Leave ordinary dialogue and animation on the cheap mask path.
++        // Require a large saving to pay for CPU source-over composition.
++        if (mask_bytes > rgba_bytes * 4)
++            format = SUBBITMAP_BGRA;
++    }
++
+     bool r = false;
+     if (format == SUBBITMAP_BGRA) {
+         r = pack_rgba(p, &res);
+diff --git a/sub/ass_mp.h b/sub/ass_mp.h
+--- a/sub/ass_mp.h
++++ b/sub/ass_mp.h
+@@ -56,6 +56,7 @@
+ struct sub_bitmaps;
+ struct mp_ass_packer;
+ struct mp_ass_packer *mp_ass_packer_alloc(void *ta_parent);
++// preferred_osd_format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+                         int num_image_lists, bool changed, bool video_color_space,
+                         int preferred_osd_format, struct sub_bitmaps *out);
+diff --git a/sub/osd.c b/sub/osd.c
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -413,7 +413,10 @@
+             osd->sub_render_busy = true;
+             mp_mutex_unlock(&osd->lock);
+ 
+-            res = sub_get_bitmaps(sub, vo_res, format, video_pts, prefetch);
++            int formats = 1 << format;
++            if (format == SUBBITMAP_LIBASS && sub_formats[SUBBITMAP_BGRA])
++                formats |= 1 << SUBBITMAP_BGRA;
++            res = sub_get_bitmaps(sub, vo_res, formats, video_pts, prefetch);
+ 
+             mp_mutex_lock(&osd->lock);
+             osd->sub_render_busy = false;
+diff --git a/sub/osd_libass.c b/sub/osd_libass.c
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -714,7 +714,7 @@
+ done:;
+     struct sub_bitmaps out_imgs = {0};
+     mp_ass_packer_pack(obj->ass_packer, obj->ass_imgs, obj->num_externals + 1,
+-                       obj->changed, false, format, &out_imgs);
++                       obj->changed, false, 1 << format, &out_imgs);
+ 
+     obj->changed = false;
+ 
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -108,7 +108,7 @@
+     .change_flags = UPDATE_SUB_FILT,
+ };
+ 
+-static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
++static bool mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
+ static void fill_plaintext(struct sd *sd, double pts);
+ 
+ static const struct sd_filter_functions *const filters[] = {
+@@ -848,6 +848,10 @@
+ 
+     int changed;
+     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
++    // VSFilter compatibility adjusts individual mask colors after packing.
++    // Keep those masks rather than flattening colors before that adjustment.
++    if (!converted && (format & (1 << SUBBITMAP_LIBASS)) && mangle_colors(sd, NULL))
++        format &= ~(1 << SUBBITMAP_BGRA);
+     mp_ass_packer_pack(r->packer, &imgs, 1, changed, !converted, format, res);
+ 
+ done:
+@@ -1182,14 +1186,14 @@
+ };
+ 
+ // Disgusting hack for (xy-)vsfilter color compatibility.
+-static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
++static bool mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
+ {
+     struct mp_subtitle_opts *opts = sd->opts;
+     struct sd_ass_priv *ctx = sd->priv;
+     enum pl_color_system csp = 0;
+     enum pl_color_levels levels = 0;
+     if (opts->ass_vsfilter_color_compat == 0) // "no"
+-        return;
++        return false;
+     bool force_601 = opts->ass_vsfilter_color_compat == 3;
+     ASS_Track *track = ctx->ass_track;
+     static const int ass_csp[] = {
+@@ -1213,7 +1217,7 @@
+         trackcsp = YCBCR_BT601_TV;
+     // NONE is a bit random, but the intention is: don't modify colors.
+     if (trackcsp == YCBCR_NONE)
+-        return;
++        return false;
+     if (trackcsp < MP_ARRAY_SIZE(ass_csp))
+         csp = ass_csp[trackcsp];
+     if (trackcsp <  MP_ARRAY_SIZE(ass_levels))
+@@ -1224,7 +1228,7 @@
+     }
+     // Unknown colorspace (either YCBCR_UNKNOWN, or a valid value unknown to us)
+     if (!csp || !levels)
+-        return;
++        return false;
+ 
+     struct mp_image_params params = ctx->video_params;
+ 
+@@ -1237,7 +1241,7 @@
+ 
+     if ((csp == params.repr.sys && levels == params.repr.levels) ||
+             params.repr.sys == PL_COLOR_SYSTEM_RGB) // Even VSFilter doesn't mangle on RGB video
+-        return;
++        return false;
+ 
+     bool basic_conv = params.repr.sys == PL_COLOR_SYSTEM_BT_709 &&
+                       params.repr.levels == PL_COLOR_LEVELS_LIMITED &&
+@@ -1246,7 +1250,10 @@
+ 
+     // With "basic", only do as much as needed for basic compatibility.
+     if (opts->ass_vsfilter_color_compat == 1 && !basic_conv)
+-        return;
++        return false;
++
++    if (!parts)
++        return true;
+ 
+     if (params.repr.sys != ctx->last_params.repr.sys ||
+         params.repr.levels != ctx->last_params.repr.levels)
+@@ -1288,6 +1295,7 @@
+         mp_map_fixp_color(&vs2rgb, 8, yuv, 8, rgb);
+         sb->libass.color = MP_ASS_RGBA(rgb[0], rgb[1], rgb[2], a);
+     }
++    return true;
+ }
+ 
+ int sd_ass_fmt_offset(const char *evt_fmt)
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -48,6 +48,7 @@
+ void sub_redecode_cached_packets(struct dec_sub *sub);
+ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+                       bool *packets_read, bool *sub_updated);
++// format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+                                     int format, double pts, bool prefetch);
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+diff --git a/sub/sd.h b/sub/sd.h
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -47,6 +47,7 @@
+     bool (*accepts_packet)(struct sd *sd, double pts); // implicit default if NULL: true
+     int (*control)(struct sd *sd, enum sd_ctrl cmd, void *arg);
+ 
++    // format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
+                                        int format, double pts, bool prefetch);
+     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -763,8 +763,15 @@
+     pending renderer. This prefetch path is used by this Android VO; it does
+     not enable persistent libass layout caching.
+     A render that repeats the pixels already on screen is
+-    folded into them and costs no swap. Rasterized frames are
+-    uploaded and composed on the GPU while the present thread is idle, and
++    folded into them and costs no swap. Glyph masks normally remain separate
++    and are composed on the GPU. Heavy overlap is flattened before upload
++    only when the masks occupy more than four times the composited RGBA
++    area in bytes; tracks requiring per-mask VSFilter color correction keep
++    their masks. Transparent pixels are skipped and opaque pixels copied
++    directly during CPU composition. Both workers use display priority.
++    Queue lookahead keeps a 50 ms/two-display-period floor and budgets two
++    source-frame intervals plus a composition display period, capped at 500 ms.
++    Rasterized frames are uploaded while the present thread is idle, and
+     presented through a GLES2 surface over the OSD Surface with the same
+     presentation timestamp the video buffer got, so both latch on one vsync.
+     The video is never held back for the OSD: under load subtitle updates

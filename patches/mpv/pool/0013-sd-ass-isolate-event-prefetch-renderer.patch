@@ -1,0 +1,434 @@
+sd_ass: preserve the complete event-prefetch render state
+
+The Android mediacodec VO requests isolated event-prefetch state. Keep at most
+two reusable ASS renderers with their packers so intervening current-frame
+renders cannot evict the prepared renderer and atlas. At exact-time promotion,
+release only the old renderer's event-layout snapshots through
+ass_renderer_clear_layout_cache; retain both renderers' raster/font caches and
+worker pools. Render the requested timestamp, including repeated timestamps;
+unchanged content reuses the prepared atlas, never an image accepted by age.
+
+Epoch/full-repaint presentation checks remain in the VO. Reset, option changes
+and output deselection discard the pending renderer. Other subtitle decoders
+accept the render hint without changing behavior. This path does not enable
+persistent libass layout caching.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index e1bf520..e1d8eb6 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -752,10 +752,17 @@ Available video output drivers are:
+     known to the VO, pre-rendered for the next frame from the observed frame
+     cadence while the current one waits for its deadline, and, while the OSD
+     is static, for the first frame of the next subtitle event ahead of its
+-    start (never past what the subtitle decoders have read). Event pre-renders
+-    warm the renderer and GPU caches but are not presented directly: each
+-    request uses a timestamp-matched render, reusing the prepared atlas when
+-    the pixels match. A render that repeats the pixels already on screen is
++    start (never past what the subtitle decoders have read). ASS event
++    pre-renders retain a separate renderer and packed atlas, so intervening
++    current-frame renders cannot evict their prepared state. At handoff only
++    the old renderer's event-layout snapshots are released; both renderers,
++    their raster/font caches and worker pools remain reusable. The exact
++    requested timestamp is rendered, including repeated requests at the same
++    timestamp: an unchanged result reuses the prepared atlas, not an image
++    accepted by age. Reset, option changes and output deselection discard the
++    pending renderer. This prefetch path is used by this Android VO; it does
++    not enable persistent libass layout caching.
++    A render that repeats the pixels already on screen is
+     folded into them and costs no swap. Rasterized frames are
+     uploaded and composed on the GPU while the present thread is idle, and
+     presented through a GLES2 surface over the OSD Surface with the same
+diff --git a/sub/dec_sub.c b/sub/dec_sub.c
+index 3b094a6..363cd00 100644
+--- a/sub/dec_sub.c
++++ b/sub/dec_sub.c
+@@ -505,7 +505,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub)
+ // render returns. sd is exclusively the renderer's meanwhile; see
+ // wait_render_done / apply_pending for how everything else keeps out.
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+-                                    int format, double pts)
++                                    int format, double pts, bool prefetch)
+ {
+     mp_mutex_lock(&sub->lock);
+     wait_render_done(sub);
+@@ -524,7 +524,7 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+         sub->rendering = true;
+         mp_mutex_unlock(&sub->lock);
+ 
+-        res = sd->driver->get_bitmaps(sd, dim, format, pts);
++        res = sd->driver->get_bitmaps(sd, dim, format, pts, prefetch);
+ 
+         mp_mutex_lock(&sub->lock);
+         sub->rendering = false;
+diff --git a/sub/dec_sub.h b/sub/dec_sub.h
+index cb18ae2..0e43f20 100644
+--- a/sub/dec_sub.h
++++ b/sub/dec_sub.h
+@@ -49,7 +49,7 @@ void sub_redecode_cached_packets(struct dec_sub *sub);
+ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
+                       bool *packets_read, bool *sub_updated);
+ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
+-                                    int format, double pts);
++                                    int format, double pts, bool prefetch);
+ char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
+ char *sub_ass_get_extradata(struct dec_sub *sub);
+ struct sd_times sub_get_times(struct dec_sub *sub, double pts);
+diff --git a/sub/osd.c b/sub/osd.c
+index dec9b8b..6b1ae86 100644
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -386,7 +386,8 @@ void osd_resize(struct osd_state *osd, struct mp_osd_res res)
+ static struct sub_bitmaps *render_object(struct osd_state *osd,
+                                          struct osd_object *obj,
+                                          struct mp_osd_res osdres, double video_pts,
+-                                         const bool sub_formats[SUBBITMAP_COUNT])
++                                         const bool sub_formats[SUBBITMAP_COUNT],
++                                         bool prefetch)
+ {
+     int format = SUBBITMAP_LIBASS;
+     if (!sub_formats[format] || osd->opts->force_rgba_osd)
+@@ -412,7 +413,7 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
+             osd->sub_render_busy = true;
+             mp_mutex_unlock(&osd->lock);
+ 
+-            res = sub_get_bitmaps(sub, vo_res, format, video_pts);
++            res = sub_get_bitmaps(sub, vo_res, format, video_pts, prefetch);
+ 
+             mp_mutex_lock(&osd->lock);
+             osd->sub_render_busy = false;
+@@ -482,7 +483,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
+         stats_time_start(osd->stats, stat_type_render);
+ 
+         struct sub_bitmaps *imgs =
+-            render_object(osd, obj, res, video_pts, formats);
++            render_object(osd, obj, res, video_pts, formats,
++                          draw_flags & OSD_DRAW_PREFETCH);
+ 
+         stats_time_end(osd->stats, stat_type_render);
+ 
+diff --git a/sub/osd.h b/sub/osd.h
+index 327f6a3..30feacd 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -210,6 +210,7 @@ enum mp_osd_draw_flags {
+     OSD_DRAW_SUB_FILTER = (1 << 0),
+     OSD_DRAW_SUB_ONLY   = (1 << 1),
+     OSD_DRAW_OSD_ONLY   = (1 << 2),
++    OSD_DRAW_PREFETCH   = (1 << 3),
+ };
+ 
+ void osd_draw(struct osd_state *osd, struct mp_osd_res res,
+diff --git a/sub/sd.h b/sub/sd.h
+index 8db7c41..5541b4f 100644
+--- a/sub/sd.h
++++ b/sub/sd.h
+@@ -48,7 +48,7 @@ struct sd_functions {
+     int (*control)(struct sd *sd, enum sd_ctrl cmd, void *arg);
+ 
+     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
+-                                       int format, double pts);
++                                       int format, double pts, bool prefetch);
+     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
+     struct sd_times (*get_times)(struct sd *sd, double pts);
+ };
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 555b5af..dc438fc 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -40,23 +40,35 @@
+ #include "ass_mp.h"
+ #include "sd.h"
+ 
++// The one future event render keeps its libass change-detection state and
++// packed atlas together, separate from intervening current-frame renders.
++// Promotion still renders the requested timestamp; it never presents a cached
++// image by age. Promotion releases only event-layout ownership, retaining both
++// renderers' raster/font caches and workers. Reset discards the pending context.
++struct ass_render_state {
++    ASS_Renderer *renderer;
++    struct mp_ass_packer *packer;
++    struct mp_osd_res osd;
++    bool configured;
++};
++
+ struct sd_ass_priv {
+     struct ass_library *ass_library;
+-    struct ass_renderer *ass_renderer;
++    struct ass_render_state *renderers[2];
++    int active_renderer;
++    int last_renderer;
++    bool prefetched;
++    double prefetch_pts;
+     struct ass_track *ass_track;
+     struct ass_track *shadow_track; // for --sub-ass=no rendering
+-    bool ass_configured;
+     bool is_converted;
+     struct lavc_conv *converter;
+     struct sd_filter **filters;
+     int num_filters;
+     bool clear_once;
+-    struct mp_ass_packer *packer;
+-    struct sub_bitmap_copy_cache *copy_cache;
+     bstr last_text;
+     struct mp_image_params video_params;
+     struct mp_image_params last_params;
+-    struct mp_osd_res osd;
+     struct seen_packet *seen_packets;
+     int num_seen_packets;
+     int *packets_animated;
+@@ -229,28 +241,60 @@ static void filters_init(struct sd *sd)
+     }
+ }
+ 
++static void destroy_renderer(void *ptr)
++{
++    struct ass_render_state *r = ptr;
++    if (r->renderer)
++        ass_renderer_done(r->renderer);
++}
++
++static struct ass_render_state *get_renderer(struct sd *sd, int index)
++{
++    struct sd_ass_priv *ctx = sd->priv;
++    if (ctx->renderers[index])
++        return ctx->renderers[index];
++    struct ass_render_state *r = talloc_zero(ctx, struct ass_render_state);
++    talloc_set_destructor(r, destroy_renderer);
++    r->renderer = ass_renderer_init(ctx->ass_library);
++    if (!r->renderer) {
++        talloc_free(r);
++        return NULL;
++    }
++    unsigned threads = ass_set_threads(r->renderer, 0);
++    if (threads)
++        MP_VERBOSE(sd, "libass rendering threads: %u\n", threads);
++    else
++        MP_WARN(sd, "libass built without threading support\n");
++    mp_ass_configure_fonts(r->renderer, sd->opts->sub_style, sd->global, sd->log);
++    ass_set_cache_limits(r->renderer, sd->opts->sub_glyph_limit,
++                         sd->opts->sub_bitmap_max_size);
++    r->packer = mp_ass_packer_alloc(r);
++    ctx->renderers[index] = r;
++    return r;
++}
++
++static void discard_prefetch(struct sd_ass_priv *ctx)
++{
++    int index = ctx->active_renderer ^ 1;
++    talloc_free(ctx->renderers[index]);
++    ctx->renderers[index] = NULL;
++    ctx->prefetched = false;
++    if (ctx->last_renderer == index)
++        ctx->last_renderer = -1;
++}
++
+ static void enable_output(struct sd *sd, bool enable)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
+-    if (enable == !!ctx->ass_renderer)
+-        return;
+-    if (ctx->ass_renderer) {
+-        ass_renderer_done(ctx->ass_renderer);
+-        ctx->ass_renderer = NULL;
++    if (enable) {
++        get_renderer(sd, ctx->active_renderer);
+     } else {
+-        ctx->ass_renderer = ass_renderer_init(ctx->ass_library);
+-
+-        // Same renderer setup as Plezy's ExoPlayer libass path (AssKt.c):
+-        // the pool size is autodetected from the core count. mpv's message
+-        // callback is thread-safe, which ass_set_threads requires.
+-        unsigned threads = ass_set_threads(ctx->ass_renderer, 0);
+-        if (threads)
+-            MP_VERBOSE(sd, "libass rendering threads: %u\n", threads);
+-        else
+-            MP_WARN(sd, "libass built without threading support\n");
+-
+-        mp_ass_configure_fonts(ctx->ass_renderer, sd->opts->sub_style,
+-                               sd->global, sd->log);
++        for (int n = 0; n < 2; n++) {
++            talloc_free(ctx->renderers[n]);
++            ctx->renderers[n] = NULL;
++        }
++        ctx->prefetched = false;
++        ctx->last_renderer = -1;
+     }
+ }
+ 
+@@ -300,7 +344,6 @@ static void assobjects_init(struct sd *sd)
+ #endif
+ 
+     enable_output(sd, true);
+-    ass_set_cache_limits(ctx->ass_renderer, sd->opts->sub_glyph_limit, sd->opts->sub_bitmap_max_size);
+ }
+ 
+ static void assobjects_destroy(struct sd *sd)
+@@ -317,6 +360,7 @@ static int init(struct sd *sd)
+ {
+     struct sd_ass_priv *ctx = talloc_zero(sd, struct sd_ass_priv);
+     sd->priv = ctx;
++    ctx->last_renderer = -1;
+ 
+     // Note: accept "null" as alias for "ass", so EDL delay_open subtitle
+     //       streams work.
+@@ -332,7 +376,6 @@ static int init(struct sd *sd)
+     assobjects_init(sd);
+     filters_init(sd);
+ 
+-    ctx->packer = mp_ass_packer_alloc(ctx);
+ 
+     // Subtitles does not have any profile value, so put the converted type as a profile.
+     const char *_Atomic *desc = ctx->converter ? &sd->codec->codec_profile : &sd->codec->codec_desc;
+@@ -533,13 +576,11 @@ static float get_libass_scale_height(struct mp_osd_res *dim, bool use_margins)
+         return MPMIN(dim->h, dim->w / vidw * vidh);
+ }
+ 
+-static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
+-                          bool converted, ASS_Track *track)
++static void configure_ass(struct sd *sd, ASS_Renderer *priv,
++                          struct mp_osd_res *dim, bool converted, ASS_Track *track)
+ {
+     struct mp_subtitle_opts *opts = sd->opts;
+     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
+-    struct sd_ass_priv *ctx = sd->priv;
+-    ASS_Renderer *priv = ctx->ass_renderer;
+ 
+     ass_set_frame_size(priv, dim->w, dim->h);
+     ass_set_margins(priv, dim->mt, dim->mb, dim->ml, dim->mr);
+@@ -736,7 +777,7 @@ static long long find_timestamp(struct sd *sd, double pts)
+ #undef END
+ 
+ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+-                                       int format, double pts)
++                                       int format, double pts, bool prefetch)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
+     struct mp_subtitle_opts *opts = sd->opts;
+@@ -745,12 +786,28 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+         shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_STRIP;
+     bool converted = (ctx->is_converted && !lavc_conv_is_styled(ctx->converter)) || no_ass;
+     ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
+-    ASS_Renderer *renderer = ctx->ass_renderer;
++    if (!ctx->renderers[ctx->active_renderer])
++        return NULL;
++    int index = ctx->active_renderer;
++    if (prefetch) {
++        index ^= 1;
++    } else if (ctx->prefetched && pts != MP_NOPTS_VALUE && pts >= ctx->prefetch_pts) {
++        // Release event-layout ownership, not the reusable raster/font caches
++        // or worker pool. Destroying the old renderer stalls the exact render.
++        ass_renderer_clear_layout_cache(ctx->renderers[index]->renderer);
++        ctx->active_renderer ^= 1;
++        ctx->prefetched = false;
++        index = ctx->active_renderer;
++    }
++    struct ass_render_state *r = get_renderer(sd, index);
++    if (!r)
++        return NULL;
++    ASS_Renderer *renderer = r->renderer;
+     struct sub_bitmaps *res = &(struct sub_bitmaps){0};
+ 
+     // Always update the osd_res
+-    struct mp_osd_res old_osd = ctx->osd;
+-    ctx->osd = dim;
++    struct mp_osd_res old_osd = r->osd;
++    r->osd = dim;
+ 
+     if (pts == MP_NOPTS_VALUE || !renderer)
+         goto done;
+@@ -772,9 +829,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+         if (isnormal(par))
+             scale *= par;
+     }
+-    if (!ctx->ass_configured || !osd_res_equals(old_osd, ctx->osd)) {
+-        configure_ass(sd, &dim, converted, track);
+-        ctx->ass_configured = true;
++    if (!r->configured || !osd_res_equals(old_osd, r->osd)) {
++        configure_ass(sd, renderer, &dim, converted, track);
++        r->configured = true;
+     }
+     ass_set_pixel_aspect(renderer, scale);
+     if (!converted && (!shared_opts->ass_style_override[sd->order] ||
+@@ -791,14 +848,23 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+ 
+     int changed;
+     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
+-    mp_ass_packer_pack(ctx->packer, &imgs, 1, changed, !converted, format, res);
++    mp_ass_packer_pack(r->packer, &imgs, 1, changed, !converted, format, res);
+ 
+ done:
+     // mangle_colors() modifies the color field, so copy the thing _before_.
+-    res = sub_bitmaps_copy(&ctx->copy_cache, res);
++    res = sub_bitmaps_copy(NULL, res);
+ 
+     if (!converted && res)
+         mangle_colors(sd, res);
++    // The OSD change counter spans both contexts, not just the images last
++    // produced by this libass renderer.
++    if (res && ctx->last_renderer != index)
++        res->change_id++;
++    ctx->last_renderer = index;
++    if (prefetch) {
++        ctx->prefetched = true;
++        ctx->prefetch_pts = pts;
++    }
+ 
+     return res;
+ }
+@@ -1007,6 +1073,8 @@ static void fill_plaintext(struct sd *sd, double pts)
+ static void reset(struct sd *sd)
+ {
+     struct sd_ass_priv *ctx = sd->priv;
++    discard_prefetch(ctx);
++    ctx->last_renderer = -1;
+     if (sd->opts->sub_clear_on_seek || ctx->clear_once) {
+         ass_flush_events(ctx->ass_track);
+         ctx->num_seen_packets = 0;
+@@ -1025,7 +1093,6 @@ static void uninit(struct sd *sd)
+     if (ctx->converter)
+         lavc_conv_uninit(ctx->converter);
+     assobjects_destroy(sd);
+-    talloc_free(ctx->copy_cache);
+ }
+ 
+ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+@@ -1088,7 +1155,11 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
+             assobjects_destroy(sd);
+             assobjects_init(sd);
+         }
+-        ctx->ass_configured = false; // ass always needs to be reconfigured
++        discard_prefetch(ctx);
++        for (int n = 0; n < 2; n++) {
++            if (ctx->renderers[n])
++                ctx->renderers[n]->configured = false;
++        }
+         return CONTROL_OK;
+     }
+     default:
+diff --git a/sub/sd_lavc.c b/sub/sd_lavc.c
+index 5cbc6d0..fc2506b 100644
+--- a/sub/sd_lavc.c
++++ b/sub/sd_lavc.c
+@@ -438,7 +438,7 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
+ }
+ 
+ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
+-                                       int format, double pts)
++                                       int format, double pts, bool prefetch)
+ {
+     struct sd_lavc_priv *priv = sd->priv;
+     struct mp_subtitle_opts *opts = sd->opts;
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 69189c9..0c8c65d 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -1311,7 +1311,7 @@ static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
+     struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
+     int64_t t0 = mp_time_ns();
+     struct sub_bitmap_list *sbs =
+-        osd_render(vo->osd, res, event_start + 0.001, 0, osd_gl_formats);
++        osd_render(vo->osd, res, event_start + 0.001, OSD_DRAW_PREFETCH, osd_gl_formats);
+     double render_s = (mp_time_ns() - t0) / 1e9;
+     if (sbs)
+         osd_dedup_items(p, rs, sbs);

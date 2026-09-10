@@ -10,6 +10,8 @@
 0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
 0011-sub-render-horizon-for-vo-prefetch.patch
 0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared.patch
+0013-sd-ass-isolate-event-prefetch-renderer.patch
+0014-ass-mp-compact-high-overdraw-atlases.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
 0102-f-output-chain-wake-after-reset-harder.patch
 0010-player-pending-vid-property.patch
