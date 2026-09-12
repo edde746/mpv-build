@@ -85,6 +85,9 @@ jobs:
       - name: Test MediaCodec input sizing and submission
         run: bash ./scripts/test_mediacodec_input.sh
 
+      - name: Test MediaCodec output crop transitions
+        run: bash ./scripts/test_mediacodec_crop.sh
+
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 

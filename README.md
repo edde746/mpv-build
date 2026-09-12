@@ -213,6 +213,12 @@ unit that does not fit its input buffer is dropped whole and the decoder
 flushed, never split across buffers. Pass an already-patched source directory
 as the first argument to run offline.
 
+Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
+It exercises the production FFmpeg format parser: MediaTek's configured
+placeholder crop is ignored, but decoded output crops remove buffer padding
+and follow resolution changes. Java crop keys and legacy fallback dimensions
+retain their precedence. Pass an already-patched source directory to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer
