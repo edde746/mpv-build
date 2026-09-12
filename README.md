@@ -219,6 +219,13 @@ placeholder crop is ignored, but decoded output crops remove buffer padding
 and follow resolution changes. Java crop keys and legacy fallback dimensions
 retain their precedence. Pass an already-patched source directory to run offline.
 
+Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
+It compiles the production fill against a recording GL stub: the fill covers
+exactly the render's margins in surface pixels, rounds a scaled plane outward,
+paints nothing for cover/zoom or a full-frame picture, and leaves the scissor
+and clear color as the subtitle draw expects. Pass an already-patched source
+directory to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer

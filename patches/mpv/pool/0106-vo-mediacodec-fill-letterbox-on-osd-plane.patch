@@ -1,0 +1,110 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -757,10 +757,13 @@
+ #define OSD_PRESENT_PROBES 16
+ 
+ // One rendered OSD frame: the sub bitmap list for a canvas_w x canvas_h
+-// canvas, composited by the present stage on the GPU.
++// canvas, composited by the present stage on the GPU. The margins are the
++// letterbox of that render (mp_osd_res ml/mt/mr/mb), which the present stage
++// fills opaque black; see osd_gl_fill_letterbox.
+ struct osd_slot {
+     struct sub_bitmap_list *sbs;
+     int canvas_w, canvas_h;
++    int ml, mt, mr, mb;
+ };
+ 
+ struct osd_request {
+@@ -1261,6 +1264,10 @@
+     dst->sbs = sbs;
+     dst->canvas_w = w;
+     dst->canvas_h = h;
++    dst->ml = res.ml;
++    dst->mt = res.mt;
++    dst->mr = res.mr;
++    dst->mb = res.mb;
+     return true;
+ }
+ 
+@@ -1384,6 +1391,10 @@
+         dst->sbs = sbs;
+         dst->canvas_w = w;
+         dst->canvas_h = h;
++        dst->ml = res.ml;
++        dst->mt = res.mt;
++        dst->mr = res.mr;
++        dst->mb = res.mb;
+     }
+     osd_prefetch_store(&p->osd.prefetch, event_start, events, epoch,
+                        keep ? slot : -1, render_s);
+@@ -2476,6 +2487,61 @@
+     return false;
+ }
+ 
++// A bar of margin canvas pixels in surface pixels, rounded outward: a scaled
++// plane must never leave a sliver of background, and a pixel of black over
++// the picture edge is invisible. Negative margins (cover, zoom) have no bar.
++static int osd_gl_bar(int margin, int surface, int canvas)
++{
++    if (margin <= 0 || surface <= 0 || canvas <= 0)
++        return 0;
++    int64_t bar = ((int64_t)margin * surface + canvas - 1) / canvas;
++    return bar < surface ? (int)bar : surface;
++}
++
++// The OSD plane sits below the app window but spans the whole player, so
++// Android punches the entire container out of the window canvas and the
++// window's black background never reaches the letterbox. Whatever this plane
++// leaves transparent outside the picture scans out as the compositor's own
++// background, which the MediaTek TV pipeline (Google TV Streamer, Fire TV
++// 4K Max) renders above black while the display is in HDR/Dolby Vision
++// mode: gray bars on an OLED. Fill the margins opaque black on this plane.
++// That adds no layer, so the HWC keeps the picture on the video plane - an
++// extra layer, even a non-overlapping solid color, demotes it to GPU
++// composition and drops the HDR output - and subtitles placed in the margins
++// draw over the fill in the same buffer.
++static void osd_gl_fill_letterbox(struct osd_gl *g, const struct osd_slot *slot,
++                                  int sw, int sh)
++{
++    int top = osd_gl_bar(slot->mt, sh, slot->canvas_h);
++    int bottom = osd_gl_bar(slot->mb, sh, slot->canvas_h);
++    int left = osd_gl_bar(slot->ml, sw, slot->canvas_w);
++    int right = osd_gl_bar(slot->mr, sw, slot->canvas_w);
++    if (!top && !bottom && !left && !right)
++        return;
++    struct GL *gl = g->gl;
++    gl->ClearColor(0, 0, 0, 1);
++    gl->Enable(GL_SCISSOR_TEST);
++    // Scissor origin is the bottom-left of the surface.
++    if (top) {
++        gl->Scissor(0, sh - top, sw, top);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (bottom) {
++        gl->Scissor(0, 0, sw, bottom);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (left) {
++        gl->Scissor(0, 0, left, sh);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (right) {
++        gl->Scissor(sw - right, 0, right, sh);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    gl->Disable(GL_SCISSOR_TEST);
++    gl->ClearColor(0, 0, 0, 0);
++}
++
+ static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *slot)
+ {
+     struct priv *p = vo->priv;
+@@ -2487,6 +2553,7 @@
+     g->surface_h = sh;
+     gl->Viewport(0, 0, sw, sh);
+     gl->Clear(GL_COLOR_BUFFER_BIT);
++    osd_gl_fill_letterbox(g, slot, sw, sh);
+ 
+     struct sub_bitmap_list *sbs = slot->sbs;
+     // Canvas pixels -> NDC; the list's w/h is the canvas the parts address.

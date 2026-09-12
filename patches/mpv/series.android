@@ -18,3 +18,4 @@
 0103-ao-audiotrack-output-stall-watchdog.patch
 0105-vo-mediacodec-separate-preparation-and-submission.patch
 0104-vo-mediacodec-live-osd-rebind.patch
+0106-vo-mediacodec-fill-letterbox-on-osd-plane.patch

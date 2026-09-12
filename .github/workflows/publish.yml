@@ -79,6 +79,9 @@ jobs:
       - name: Test MediaCodec OSD surface retirement
         run: bash ./scripts/test_mediacodec_rebind.sh
 
+      - name: Test MediaCodec OSD-plane letterbox fill
+        run: bash ./scripts/test_mediacodec_letterbox.sh
+
       - name: Test MediaCodec Dolby Vision packet filter
         run: bash ./scripts/test_mediacodec_dv_filter.sh
 
