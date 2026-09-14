@@ -1,0 +1,38 @@
+Subject: [PATCH] avfilter/audio: reinit the link frame pool whenever the request size differs
+
+ff_default_get_audio_buffer() kept a link's frame pool as long as it was
+at least as large as the request, so one large request permanently
+oversized the pool for every later frame on that link. loudnorm in dynamic
+mode triggers exactly that: its first ff_inlink_consume_samples() asks for
+3 s at 192 kHz, take_samples() allocates the concatenation buffer from the
+inlink pool, and from then on every frame the auto-inserted aresample
+pushes onto that link (160 samples for a TrueHD access unit) occupies a
+3 s x channels x 8 B buffer -- 35 MiB at 7.1. loudnorm releases nothing
+until 100 ms are queued, which takes 120 of those frames: 4 GiB of
+mappings on a TV box, then ENOMEM and "Disabling filter loudnorm because
+it has failed".
+
+Backport of the audio pool semantics of upstream ad7956d5bb50
+("avfilter/{audio,video}: switch to ff_frame_pool_*_reinit()", 2026-03):
+a request whose sample count differs from the pool's reinitializes the
+pool, so a buffer is only ever as large as the frame that asked for it.
+Video pools are untouched. Drop this patch once the pinned FFmpeg carries
+that commit.
+
+diff --git a/libavfilter/audio.c b/libavfilter/audio.c
+--- a/libavfilter/audio.c
++++ b/libavfilter/audio.c
+@@ -67,7 +67,12 @@ AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples)
+             return NULL;
+         }
+ 
+-        if (pool_channels != channels || pool_nb_samples < nb_samples ||
++        /* Size the pool to the request exactly. A pool that outlives a larger
++         * request (a consumer's ff_inlink_consume_samples() window landing on
++         * this link) would hand that oversized buffer to every later frame,
++         * however small, and a consumer that waits for many such frames before
++         * releasing any holds the whole set at once. */
++        if (pool_channels != channels || pool_nb_samples != nb_samples ||
+             pool_format != link->format || pool_align != align) {
+ 
+             ff_frame_pool_uninit(&li->frame_pool);

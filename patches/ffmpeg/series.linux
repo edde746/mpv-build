@@ -1,4 +1,5 @@
-# Linux patch series for ffmpeg. Empty today: the linux build ships an
-# unpatched ffmpeg (the 7.1 archive pinned in overrides.linux) and every pool
-# patch so far is apple-only. build.sh applies this series on every run, so a
-# line added here starts applying without touching the driver.
+# Linux patch series for ffmpeg, applied after series.common to the 7.1
+# archive pinned in overrides.linux. Empty today: the linux-only pool is
+# empty and the videotoolbox/mediacodec stacks are apple/android-only.
+# build.sh applies the resolved series on every run, so a line added here
+# starts applying without touching the driver.

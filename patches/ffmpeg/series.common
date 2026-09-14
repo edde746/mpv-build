@@ -1,5 +1,8 @@
-# Patches applied on every platform, before series.<platform>.
-# Empty today: every patch below started life on apple. Promote a patch here
-# once a second platform needs the same pool file, instead of copying it into
-# another per-platform series -- the pool entry stays the single source of
-# truth and the resolved order stays series.common first.
+# Patches applied on every platform, before series.<platform>. Every entry
+# must apply to both pinned trees: the n8.0.1 git checkout (apple, android,
+# windows) and the 7.1 archive linux builds from (versions.json
+# overrides.linux). Promote a per-platform patch here once a second platform
+# needs the same pool file, instead of copying it into another series -- the
+# pool entry stays the single source of truth and the resolved order stays
+# series.common first.
+0020-avfilter-audio-frame-pool-exact-size.patch
