@@ -1,0 +1,136 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -274,6 +274,39 @@ static bool mediacodec_synthetic_still(bool still, int64_t pts,
+ 
+ // --- end mediacodec timing core
+ 
++// --- mediacodec stats core
++
++// Verbose statistics log sparsely. One line every OSD_STATS_INTERVAL_FRAMES
++// flips was the largest single contributor to an uploaded log (58% of an
++// hour of 24p), and the log relay trims uploads from the front at 1 MiB, so
++// a two-hour session lost its startup section. A tick logs when a failure
++// counter moved since the previous tick, on the first tick, and otherwise as
++// a heartbeat every STATS_HEARTBEAT_TICKS ticks. Failure counters only grow
++// between resets, so their sum moves exactly when one of them does.
++#define STATS_HEARTBEAT_TICKS 12 // 60 s of 24p at 120-frame ticks
++
++struct stats_cadence {
++    unsigned ticks;
++    unsigned logged_tick;
++    bool logged;
++    uint64_t failures;
++};
++
++// The reason this tick logs, or NULL when it stays silent.
++static const char *stats_due(struct stats_cadence *c, uint64_t failures)
++{
++    c->ticks++;
++    bool event = c->logged && failures != c->failures;
++    c->failures = failures;
++    if (!event && c->logged && c->ticks - c->logged_tick < STATS_HEARTBEAT_TICKS)
++        return NULL;
++    c->logged = true;
++    c->logged_tick = c->ticks;
++    return event ? "event" : "periodic";
++}
++
++// --- end mediacodec stats core
++
+ typedef AChoreographer *(*mp_get_choreographer_fn)(void);
+ typedef void (*mp_post_frame_callback_fn)(
+     AChoreographer *, AChoreographer_frameCallback, void *);
+@@ -852,6 +885,7 @@ struct priv {
+     struct osd_cadence cadence;
+     uint64_t frame_seq;
+     uint32_t stats_frames;
++    struct stats_cadence osd_stats;
+ 
+     // Choreographer vsync sampler
+     void *choreographer_lib;
+@@ -2845,14 +2879,10 @@ static void osd_invalidate_locked(struct priv *p)
+     });
+ }
+ 
+-static void osd_log_stats(struct vo *vo, const char *why)
++static void osd_log_stats_snapshot(struct vo *vo, const char *why,
++                                   const struct osd_shared *snapshot)
+ {
+-    struct priv *p = vo->priv;
+-    if (!p->osd_threads_created)
+-        return;
+-    mp_mutex_lock(&p->osd_lock);
+-    struct osd_shared s = p->osd;
+-    mp_mutex_unlock(&p->osd_lock);
++    const struct osd_shared s = *snapshot;
+     MP_VERBOSE(vo, "osd-sync %s frames=%u render=%u/%u renderMs=%d/%d "
+                "renderHist=%u,%u,%u,%u,%u spec=%u/%u/%u horizonSkips=%u prefetch=%u "
+                "coalesced=%u stale=%u swaps=%u late=%u "
+@@ -2880,6 +2910,46 @@ static void osd_log_stats(struct vo *vo, const char *why)
+                s.present_measured, s.present_invalid, s.present_dropped);
+ }
+ 
++static void osd_log_stats(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_threads_created)
++        return;
++    mp_mutex_lock(&p->osd_lock);
++    struct osd_shared s = p->osd;
++    mp_mutex_unlock(&p->osd_lock);
++    osd_log_stats_snapshot(vo, why, &s);
++}
++
++// What an OSD statistics line exists to catch: a swap that missed its vsync,
++// a result dropped or orphaned, a present the display did not confirm, a
++// pre-render horizon miss, or a confirmed present off its vsync.
++static uint64_t osd_failures(const struct osd_shared *s)
++{
++    return (uint64_t)s->late + s->stale + s->present_invalid +
++           s->present_dropped + s->spec.horizon_skips +
++           s->present_hist[0] + s->present_hist[1] +
++           s->present_hist[3] + s->present_hist[4];
++}
++
++// One tick per OSD_STATS_INTERVAL_FRAMES flips; each line decides its own
++// cadence through stats_due.
++static void stats_tick(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (++p->stats_frames < OSD_STATS_INTERVAL_FRAMES)
++        return;
++    p->stats_frames = 0;
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd_lock);
++        struct osd_shared s = p->osd;
++        mp_mutex_unlock(&p->osd_lock);
++        const char *why = stats_due(&p->osd_stats, osd_failures(&s));
++        if (why)
++            osd_log_stats_snapshot(vo, why, &s);
++    }
++}
++
+ static void osd_init(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -2908,6 +2978,7 @@ static void osd_init(struct vo *vo)
+     };
+     p->prepared_frame_id = p->prepared_seq = p->prepared_epoch = 0;
+     p->stats_frames = 0;
++    p->osd_stats = (struct stats_cadence){0};
+     p->osd_missing_logged = false;
+     mp_mutex_init(&p->osd_lock);
+     mp_cond_init(&p->osd_wakeup);
+@@ -3332,10 +3403,7 @@ static void flip_page(struct vo *vo)
+     mp_cond_broadcast(&p->osd_wakeup);
+     mp_mutex_unlock(&p->osd_lock);
+ 
+-    if (++p->stats_frames >= OSD_STATS_INTERVAL_FRAMES) {
+-        p->stats_frames = 0;
+-        osd_log_stats(vo, "periodic");
+-    }
++    stats_tick(vo);
+ }
+ 
+ static int query_format(struct vo *vo, int format)

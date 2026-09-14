@@ -148,10 +148,12 @@ It applies the full Android series to pinned mpv and extracts the production
 timing and prepare/draw/flip paths. Coverage includes cadence prediction,
 refresh hysteresis, clock drift across the mp_time/CLOCK_MONOTONIC boundary,
 playback-speed changes, seek during preparation, dropped-frame still redraws
-without resetting cadence, and the invariant the codec submission lead exists
+without resetting cadence, the invariant the codec submission lead exists
 for: every frame reaches MediaCodec at least two display periods before the
-presentation timestamp it is given, not before its raw deadline. Pass an
-already-patched source directory as the first argument to run offline.
+presentation timestamp it is given, not before its raw deadline, and the
+sparse statistics cadence (a line when a failure counter moves, on the first
+tick, and as a 60 s heartbeat otherwise). Pass an already-patched source
+directory as the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core and request dispatcher of the

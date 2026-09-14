@@ -49,6 +49,7 @@ struct priv {
     struct osd_slot osd_slots[OSD_SLOTS];
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
     uint32_t stats_frames;
+    struct stats_cadence { unsigned ticks; } osd_stats;
     struct m_config_cache *opts_cache;
 };
 struct vo { struct priv *priv; void *log; bool want_redraw; };

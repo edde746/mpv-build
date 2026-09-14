@@ -45,6 +45,12 @@ if source.count(start) != 1 or source.count(end) != 1:
     raise SystemExit("FAIL: expected exactly one production MediaCodec timing core")
 timing = source[source.index(start):source.index(end) + len(end)]
 (directory / "mediacodec_timing_core.inc").write_text(timing + "\n")
+stats_start = "// --- mediacodec stats core"
+stats_end = "// --- end mediacodec stats core"
+if source.count(stats_start) != 1 or source.count(stats_end) != 1:
+    raise SystemExit("FAIL: expected exactly one production MediaCodec stats core")
+stats = source[source.index(stats_start):source.index(stats_end) + len(stats_end)]
+(directory / "mediacodec_stats_core.inc").write_text(stats + "\n")
 # Compile production preparation, draw and flip, not a parallel scheduling model.
 # Only platform/codec/OSD side effects are replaced by the host harness.
 functions = [

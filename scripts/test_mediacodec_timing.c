@@ -8,8 +8,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "mediacodec_timing_core.inc"
+#include "mediacodec_stats_core.inc"
 
 #define MS INT64_C(1000000)
 #define EPOCH INT64_C(604800000000000)
@@ -343,6 +345,32 @@ static void test_release_discontinuities(void)
              raw - 2 * MS, "stale vsync sample releases at the cadence target");
 }
 
+static void test_stats_log_on_failure_or_heartbeat(void)
+{
+    struct stats_cadence c = {0};
+    const char *why = stats_due(&c, 0);
+    CHECK_EQ(why && !strcmp(why, "periodic"), 1, "the first tick always logs");
+    for (int tick = 2; tick < STATS_HEARTBEAT_TICKS + 1; tick++)
+        CHECK_EQ(stats_due(&c, 0) == NULL, 1, "a clean tick inside the heartbeat stays silent");
+    why = stats_due(&c, 0);
+    CHECK_EQ(why && !strcmp(why, "periodic"), 1, "the heartbeat logs after STATS_HEARTBEAT_TICKS");
+    CHECK_EQ(stats_due(&c, 0) == NULL, 1, "the heartbeat restarts its interval");
+    why = stats_due(&c, 3);
+    CHECK_EQ(why && !strcmp(why, "event"), 1, "a moved failure counter logs at once");
+    CHECK_EQ(stats_due(&c, 3) == NULL, 1, "an unchanged failure sum does not log again");
+    why = stats_due(&c, 4);
+    CHECK_EQ(why && !strcmp(why, "event"), 1, "every further move logs");
+    for (int tick = 0; tick < STATS_HEARTBEAT_TICKS - 1; tick++)
+        CHECK_EQ(stats_due(&c, 4) == NULL, 1, "an event restarts the heartbeat interval");
+    why = stats_due(&c, 4);
+    CHECK_EQ(why && !strcmp(why, "periodic"), 1, "the heartbeat resumes after a quiet interval");
+
+    struct stats_cadence reset = {0};
+    why = stats_due(&reset, 7);
+    CHECK_EQ(why && !strcmp(why, "periodic"), 1,
+             "a rebuilt pipeline's first tick is a baseline, not an event");
+}
+
 // Platform fixture for the extracted production admission/draw/flip path.
 #define MP_TIME_MS_TO_NS(v) ((v) * MS)
 #define MP_TIME_S_TO_NS(v) ((v) * INT64_C(1000000000))
@@ -520,11 +548,7 @@ static void osd_result_publish_release(int *results, struct osd_release release)
 }
 
 static void osd_invalidate_locked(struct priv *p) { p->osd.epoch++; }
-static void osd_log_stats(struct vo *vo, const char *why)
-{
-    (void)vo;
-    (void)why;
-}
+static void stats_tick(struct vo *vo) { (void)vo; }
 
 #include "mediacodec_timing_driver.inc"
 #include "mediacodec_timing_admission.inc"
@@ -950,6 +974,7 @@ int main(void)
     test_speed_change_admission();
     test_seek_during_preparation();
     test_expired_deadline_does_not_idle_the_vo();
+    test_stats_log_on_failure_or_heartbeat();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
          "and dropped still redraw/resume");
