@@ -152,8 +152,11 @@ without resetting cadence, the invariant the codec submission lead exists
 for: every frame reaches MediaCodec at least two display periods before the
 presentation timestamp it is given, not before its raw deadline, and the
 sparse statistics cadence (a line when a failure counter moves, on the first
-tick, and as a 60 s heartbeat otherwise). Pass an already-patched source
-directory as the first argument to run offline.
+tick, and as a 60 s heartbeat otherwise), and the video-plane presentation
+feedback: a release records the vsync it aimed at, the codec's rendered
+report is matched back by presentation time and bucketed by vsync error, and
+a reset forgets intents but keeps the counters. Pass an already-patched
+source directory as the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core and request dispatcher of the
@@ -220,6 +223,17 @@ It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding
 and follow resolution changes. Java crop keys and legacy fallback dimensions
 retain their precedence. Pass an already-patched source directory to run offline.
+
+Run the rendered-frame feedback regression with
+`bash scripts/test_mediacodec_rendered.sh`. It fetches the pinned ffmpeg
+revision, applies the Android series, and exercises the production ring the
+codec's frame-rendered callback fills and `av_mediacodec_drain_rendered`
+empties: delivery order across bounded drains, a full ring dropping and
+counting the newest report, a producer racing a consumer across many wraps,
+and a codec without feedback answering ENOSYS. The VO side - each release's
+intended vsync matched to the codec's report, the vsync histogram and the
+`video-present` line - is covered by `test_mediacodec_timing.sh`. Pass an
+already-patched source directory as the first argument to run offline.
 
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers

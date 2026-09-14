@@ -91,6 +91,9 @@ jobs:
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh
 
+      - name: Test MediaCodec rendered-frame feedback ring
+        run: bash ./scripts/test_mediacodec_rendered.sh
+
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 

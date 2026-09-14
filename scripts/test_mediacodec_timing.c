@@ -371,6 +371,54 @@ static void test_stats_log_on_failure_or_heartbeat(void)
              "a rebuilt pipeline's first tick is a baseline, not an event");
 }
 
+static void test_present_reports_match_intents(void)
+{
+    struct present_stats s = {0};
+    const int64_t period = 16666667;
+    present_record(&s, 1000, EPOCH);
+    present_record(&s, 2000, EPOCH + 3 * period);
+    present_record(&s, 3000, 0);
+    present_observe(&s, 2000, EPOCH + 3 * period + MS, period);
+    CHECK_EQ(s.measured, 1, "a report matches its intent by media time, in any order");
+    CHECK_EQ(s.hist[2], 1, "a present within half a period is on time");
+    CHECK_EQ(s.err_last_ns, MS, "the error is the report against the intended vsync");
+    present_observe(&s, 1000, EPOCH + period + 2 * MS, period);
+    CHECK_EQ(s.hist[3], 1, "one period late lands in the +1 bucket");
+    CHECK_EQ(s.err_worst_ns, period + 2 * MS, "the worst error is kept by magnitude");
+    present_observe(&s, 3000, EPOCH + 9 * period, period);
+    CHECK_EQ(s.untimed, 1, "a report for an untimed release is untimed, not measured");
+    CHECK_EQ(s.measured, 2, "untimed releases never enter the histogram");
+    present_observe(&s, 2000, EPOCH, period);
+    CHECK_EQ(s.unmatched, 1, "a second report for a retired intent is unmatched");
+    present_observe(&s, 4000, EPOCH, period);
+    CHECK_EQ(s.unmatched, 2, "a report nobody intended is unmatched");
+    CHECK_EQ(present_failures(&s), 2, "late and untimed presents are failures, unmatched reports are not");
+
+    struct present_stats b = {0};
+    const int64_t edges[] = {-2 * period, -period, -period / 2 + 1, 0,
+                             period / 2 - 1, period, 2 * period};
+    const int buckets[] = {0, 1, 2, 2, 2, 3, 4};
+    const int counts[] = {1, 1, 1, 2, 3, 1, 1}; // the bucket's count after each edge
+    for (size_t n = 0; n < sizeof(edges) / sizeof(edges[0]); n++) {
+        present_record(&b, n, EPOCH);
+        present_observe(&b, n, EPOCH + edges[n], period);
+        CHECK_EQ(b.hist[buckets[n]], counts[n],
+                 "bucket edges sit at odd half periods like the OSD probes");
+    }
+    present_record(&b, 100, EPOCH);
+    present_observe(&b, 100, EPOCH + period, 0);
+    CHECK_EQ(b.untimed, 1, "an unknown period cannot bucket and reads as untimed");
+
+    struct present_stats o = {0};
+    for (int n = 0; n < PRESENT_INTENTS + 2; n++)
+        present_record(&o, n, EPOCH);
+    CHECK_EQ(o.overrun, 2, "intents that never got a report are counted when overwritten");
+    present_reset(&o);
+    present_observe(&o, PRESENT_INTENTS + 1, EPOCH, period);
+    CHECK_EQ(o.unmatched, 1, "a reset forgets every intent");
+    CHECK_EQ(o.overrun, 2, "a reset keeps the counters");
+}
+
 // Platform fixture for the extracted production admission/draw/flip path.
 #define MP_TIME_MS_TO_NS(v) ((v) * MS)
 #define MP_TIME_S_TO_NS(v) ((v) * INT64_C(1000000000))
@@ -386,7 +434,14 @@ static void test_stats_log_on_failure_or_heartbeat(void)
 typedef struct {
     int releases;
     int64_t timestamp;
+    int64_t pts; // microseconds, what the codec echoes in its reports
 } AVMediaCodecBuffer;
+
+typedef struct AVMediaCodecRendered {
+    int64_t media_time_us;
+    int64_t system_nano;
+} AVMediaCodecRendered;
+#define MP_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 struct mp_image {
     double pts;
@@ -434,6 +489,8 @@ struct priv {
     struct osd_shared osd;
     uint64_t frame_seq;
     unsigned stats_frames;
+    struct present_stats present;
+    const char *present_source;
 };
 
 struct vo;
@@ -526,6 +583,38 @@ static int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
     return av_mediacodec_render_buffer_at_time(buffer, 0);
 }
 
+// Rendered-frame reports the fake codec hands the next drain, in order.
+static AVMediaCodecRendered rendered_script[8];
+static int rendered_scripted, rendered_drains;
+static const char *rendered_source = "ndk";
+
+static int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
+{
+    return buffer->pts;
+}
+
+static const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
+{
+    (void)buffer;
+    return rendered_source;
+}
+
+static int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+                                        AVMediaCodecRendered *out, int max)
+{
+    (void)buffer;
+    rendered_drains++;
+    if (strcmp(rendered_source, "ndk"))
+        return -38; // AVERROR(ENOSYS)
+    int n = rendered_scripted < max ? rendered_scripted : max;
+    for (int i = 0; i < n; i++)
+        out[i] = rendered_script[i];
+    for (int i = n; i < rendered_scripted; i++)
+        rendered_script[i - n] = rendered_script[i];
+    rendered_scripted -= n;
+    return n;
+}
+
 // Armed by the seek regression: the core discards the queued frame while
 // preparation runs with the VO lock released.
 static struct vo_internal *seek_victim;
@@ -609,6 +698,70 @@ static void test_preparation_does_not_submit_early(void)
     CHECK_EQ(monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns, 80 * MS,
              "the codec gets two display periods of notice");
     CHECK_EQ(published.seq, requested.seq, "OSD gets its matching video release");
+    CHECK_EQ(image.refs, 1, "balanced image ownership");
+}
+
+static void test_flip_records_intents_and_drains_reports(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {.pts = 12500000};
+    struct mp_image image = {.pts = 12.5, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+                              .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    p.vsync_sample = frame.pts - 2 * 40 * MS;
+    CHECK_EQ(present_queued(&vo), false, "preparation waits for the codec window");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the frame is released");
+    CHECK_EQ(p.present.ring[0].live, 1, "the release records an intent");
+    CHECK_EQ(p.present.ring[0].media_us, 12500000, "keyed by the codec's presentation time");
+    CHECK_EQ(p.present.ring[0].vsync, published.vsync, "aimed at the vsync the OSD was pinned to");
+    CHECK_EQ(published.vsync != 0, 1, "a snapped release publishes its vsync");
+    CHECK_EQ(rendered_drains, 1, "the flip drains the codec once");
+    CHECK_EQ(strcmp(p.present_source, "ndk"), 0, "the feedback source is learned at the first flip");
+
+    // The report arrives with the next frame's flip, one period late.
+    rendered_script[0] = (AVMediaCodecRendered){12500000, published.vsync + 40 * MS};
+    rendered_scripted = 1;
+    AVMediaCodecBuffer next = {.pts = 12540000};
+    struct mp_image image2 = {.pts = 12.54, .planes[3] = &next, .refs = 1};
+    struct vo_frame frame2 = {.current = &image2, .frame_id = 2,
+                               .pts = frame.pts + 40 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame2;
+    CHECK_EQ(present_queued(&vo), false, "the next frame waits for its window");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the next frame is released");
+    CHECK_EQ(p.present.measured, 1, "the report is matched to the earlier intent");
+    CHECK_EQ(p.present.hist[3], 1, "and read as one vsync late");
+    CHECK_EQ(p.present.ring[0].live, 0, "the matched intent is retired");
+    CHECK_EQ(p.present.ring[1].live, 1, "the new release is pending");
+    CHECK_EQ(rendered_scripted, 0, "every scripted report was consumed");
+
+    reset_video(&vo);
+    CHECK_EQ(p.present.ring[1].live, 0, "a seek forgets pending intents");
+    CHECK_EQ(p.present.measured, 1, "a seek keeps the session counters");
+
+    // A codec without feedback: the flip still records, the drain is refused
+    // once per flip, and nothing is matched.
+    rendered_source = "off:java";
+    p.present_source = NULL;
+    rendered_drains = 0;
+    frame.frame_id = 3;
+    frame.pts = EPOCH + 2000 * MS;
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    p.vsync_sample = frame.pts - 2 * 40 * MS;
+    CHECK_EQ(present_queued(&vo), false, "preparation waits again");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "released without feedback");
+    CHECK_EQ(strcmp(p.present_source, "off:java"), 0, "the source names why feedback is off");
+    CHECK_EQ(rendered_drains, 1, "an ENOSYS drain is not retried within a flip");
+    CHECK_EQ(p.present.measured, 1, "nothing is measured without feedback");
     CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
 
@@ -975,8 +1128,11 @@ int main(void)
     test_seek_during_preparation();
     test_expired_deadline_does_not_idle_the_vo();
     test_stats_log_on_failure_or_heartbeat();
+    test_present_reports_match_intents();
+    test_flip_records_intents_and_drains_reports();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
-         "and dropped still redraw/resume");
+         "dropped still redraw/resume, sparse statistics and video-plane "
+         "presentation feedback");
     return 0;
 }

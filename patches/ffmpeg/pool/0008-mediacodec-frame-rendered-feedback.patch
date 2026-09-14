@@ -1,0 +1,389 @@
+Subject: [PATCH] avcodec/mediacodec: report rendered frames through a drainable ring
+
+Register AMediaCodec_setOnFrameRenderedCallback (NDK, Android 13) on a
+surface-backed video decoder and keep its reports in a lock-free
+single-producer ring owned by the decoder context, which outlives
+avcodec_close while output buffers are referenced. The consumer drains
+through any buffer of that codec (av_mediacodec_drain_rendered), reads the
+presentation time a buffer was queued with (av_mediacodec_buffer_get_pts)
+and learns why feedback is off (av_mediacodec_rendered_source): the Java
+wrapper has no listener class to hand the platform, older NDKs lack the
+entry point, or the codec refused it. The callback is unregistered before
+the codec is deleted so no late delivery reaches a freed context.
+
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -29,6 +29,7 @@
+ #if CONFIG_MEDIACODEC
+ 
+ #include <jni.h>
++#include <string.h>
+ 
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/mem.h"
+@@ -117,6 +118,39 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+     return 0;
+ }
+ 
++int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
++{
++    return buffer->pts;
++}
++
++// Consumer side of the rendered-frame ring; see mediacodec_dec_rendered_push.
++int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
++                                 AVMediaCodecRendered *out, int max)
++{
++    MediaCodecDecContext *ctx = buffer->ctx;
++    unsigned head, tail;
++    int n = 0;
++
++    if (strcmp(ctx->rendered_source, "ndk"))
++        return AVERROR(ENOSYS);
++    if (max < 0)
++        return AVERROR(EINVAL);
++
++    head = atomic_load_explicit(&ctx->rendered_head, memory_order_relaxed);
++    tail = atomic_load_explicit(&ctx->rendered_tail, memory_order_acquire);
++    while (n < max && head != tail) {
++        out[n++] = ctx->rendered[head % FF_MEDIACODEC_RENDERED_RING];
++        head++;
++    }
++    atomic_store_explicit(&ctx->rendered_head, head, memory_order_release);
++    return n;
++}
++
++const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
++{
++    return buffer->ctx->rendered_source;
++}
++
+ #else
+ 
+ #include <stdlib.h>
+@@ -145,4 +179,20 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+     return AVERROR(ENOSYS);
+ }
+ 
++int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
++{
++    return AV_NOPTS_VALUE;
++}
++
++int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
++                                 AVMediaCodecRendered *out, int max)
++{
++    return AVERROR(ENOSYS);
++}
++
++const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
++{
++    return "off:platform";
++}
++
+ #endif
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -100,4 +100,42 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
+  */
+ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time);
+ 
++/**
++ * The presentation time the codec attached to this output buffer, in
++ * microseconds: the value a later AVMediaCodecRendered.media_time_us reports
++ * for it.
++ */
++int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer);
++
++/**
++ * One frame the surface has rendered, as reported by the platform's
++ * frame-rendered callback: the presentation time it was queued with and the
++ * `System#nanoTime()` (CLOCK_MONOTONIC) instant of the render. Delivery is
++ * informational, may be batched and delayed, and may skip frames.
++ */
++typedef struct AVMediaCodecRendered {
++    int64_t media_time_us;
++    int64_t system_nano;
++} AVMediaCodecRendered;
++
++/**
++ * Drain, in delivery order, the frames the codec owning `buffer` has rendered
++ * since the previous drain. The codec keeps a bounded ring; when nobody
++ * drains it, the newest reports are dropped.
++ *
++ * @return the number of entries written to `out`, or AVERROR(ENOSYS) when
++ * this codec delivers no feedback (see av_mediacodec_rendered_source).
++ */
++int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
++                                 AVMediaCodecRendered *out, int max);
++
++/**
++ * Where the rendered-frame feedback of the codec owning `buffer` comes from:
++ * "ndk" when AMediaCodec_setOnFrameRenderedCallback is registered, otherwise
++ * an "off:" reason — "off:java" (the Java wrapper has no listener class to
++ * hand the platform), "off:api" (the NDK predates Android 13), "off:codec"
++ * (the codec refused the callback), "off:surface" (no output surface).
++ */
++const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
++
+ #endif /* AVCODEC_MEDIACODEC_H */
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -1884,6 +1884,9 @@ typedef struct FFAMediaCodecNdk {
+     FFAMediaCodecOnAsyncNotifyCallback async_cb;
+     void *async_userdata;
+ 
++    FFAMediaCodecOnFrameRendered rendered_cb;
++    void *rendered_userdata;
++
+     // Available since API level 28.
+     media_status_t (*getName)(AMediaCodec*, char** out_name);
+     void (*releaseName)(AMediaCodec*, char* name);
+@@ -1893,6 +1896,12 @@ typedef struct FFAMediaCodecNdk {
+     media_status_t (*signalEndOfInputStream)(AMediaCodec *);
+     media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
+             struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
++
++    // Available since API level 33. Declared locally: the NDK typedef is
++    // guarded by __ANDROID_API__, and the symbol is resolved at run time.
++    media_status_t (*setOnFrameRenderedCallback)(AMediaCodec *,
++            void (*callback)(AMediaCodec *, void *, int64_t, int64_t),
++            void *userdata);
+ } FFAMediaCodecNdk;
+ 
+ static const FFAMediaFormat media_format_ndk;
+@@ -2131,6 +2140,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+     GET_SYMBOL(setInputSurface)
+     GET_SYMBOL(signalEndOfInputStream)
+     GET_SYMBOL(setAsyncNotifyCallback)
++    GET_SYMBOL(setOnFrameRenderedCallback)
+ 
+ #undef GET_SYMBOL
+ 
+@@ -2179,6 +2189,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
+ 
+     av_assert0(codec->api.class == &amediacodec_ndk_class);
+ 
++    // Delete drops the codec's callback looper without joining a message it
++    // has already taken; unregistering first guarantees no late delivery
++    // into a freed context.
++    if (codec->impl && codec->rendered_cb && codec->setOnFrameRenderedCallback)
++        codec->setOnFrameRenderedCallback(codec->impl, NULL, NULL);
+     if (codec->impl && (AMediaCodec_delete(codec->impl) != AMEDIA_OK))
+         ret = AVERROR_EXTERNAL;
+     if (codec->window)
+@@ -2494,6 +2509,40 @@ static int mediacodec_ndk_setAsyncNotifyCallback(FFAMediaCodec *ctx,
+     return 0;
+ }
+ 
++static void mediacodec_ndk_onFrameRendered(AMediaCodec *impl, void *userdata,
++                                           int64_t media_time_us,
++                                           int64_t system_nano)
++{
++    FFAMediaCodecNdk *codec = userdata;
++    codec->rendered_cb(&codec->api, codec->rendered_userdata, media_time_us,
++                       system_nano);
++}
++
++static int mediacodec_ndk_setOnFrameRenderedCallback(FFAMediaCodec *ctx,
++        FFAMediaCodecOnFrameRendered callback, void *userdata)
++{
++    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
++    media_status_t status;
++
++    if (!codec->setOnFrameRenderedCallback)
++        return AVERROR(ENOSYS);
++
++    codec->rendered_cb = callback;
++    codec->rendered_userdata = userdata;
++
++    status = codec->setOnFrameRenderedCallback(codec->impl,
++            callback ? mediacodec_ndk_onFrameRendered : NULL, codec);
++    if (status != AMEDIA_OK) {
++        codec->rendered_cb = NULL;
++        codec->rendered_userdata = NULL;
++        av_log(codec, AV_LOG_ERROR, "setOnFrameRenderedCallback failed, %d\n",
++               status);
++        return AVERROR_EXTERNAL;
++    }
++
++    return 0;
++}
++
+ static const FFAMediaFormat media_format_ndk = {
+     .class = &amediaformat_ndk_class,
+ 
+@@ -2556,6 +2605,7 @@ static const FFAMediaCodec media_codec_ndk = {
+     .cleanOutputBuffers = mediacodec_ndk_cleanOutputBuffers,
+     .signalEndOfInputStream = mediacodec_ndk_signalEndOfInputStream,
+     .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
++    .setOnFrameRenderedCallback = mediacodec_ndk_setOnFrameRenderedCallback,
+ };
+ 
+ FFAMediaFormat *ff_AMediaFormat_new(int ndk)
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -195,6 +195,11 @@ typedef struct FFAMediaCodecOnAsyncNotifyCallback {
+                          const char *detail);
+ } FFAMediaCodecOnAsyncNotifyCallback;
+ 
++// Called on a codec-owned thread once an output buffer released to the
++// surface has been rendered. Must not block or call back into the codec.
++typedef void (*FFAMediaCodecOnFrameRendered)(FFAMediaCodec *codec, void *userdata,
++                                             int64_t media_time_us, int64_t system_nano);
++
+ struct FFAMediaCodec {
+     const AVClass *class;
+ 
+@@ -241,6 +246,11 @@ struct FFAMediaCodec {
+     int (*setAsyncNotifyCallback)(FFAMediaCodec *codec,
+                                   const FFAMediaCodecOnAsyncNotifyCallback *callback,
+                                   void *userdata);
++
++    // NDK only, introduced in Android API 33 (T). NULL callback unregisters.
++    int (*setOnFrameRenderedCallback)(FFAMediaCodec *codec,
++                                      FFAMediaCodecOnFrameRendered callback,
++                                      void *userdata);
+ };
+ 
+ static inline char *ff_AMediaCodec_getName(FFAMediaCodec *codec)
+@@ -372,6 +382,17 @@ static inline int ff_AMediaCodec_setAsyncNotifyCallback(FFAMediaCodec *codec,
+     return codec->setAsyncNotifyCallback(codec, callback, userdata);
+ }
+ 
++// ENOSYS from the Java wrapper, which has no listener class to hand the
++// platform, and from an NDK too old to export the entry point.
++static inline int ff_AMediaCodec_setOnFrameRenderedCallback(FFAMediaCodec *codec,
++        FFAMediaCodecOnFrameRendered callback,
++        void *userdata)
++{
++    if (!codec->setOnFrameRenderedCallback)
++        return AVERROR(ENOSYS);
++    return codec->setOnFrameRenderedCallback(codec, callback, userdata);
++}
++
+ int ff_Build_SDK_INT(AVCodecContext *avctx);
+ 
+ enum FFAMediaFormatColorRange {
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -831,6 +831,61 @@ static int mediacodec_dec_get_audio_codec(AVCodecContext *avctx, MediaCodecDecCo
+     return 0;
+ }
+ 
++// Producer side of the rendered-frame ring: the codec's callback thread.
++// Never blocks; a full ring drops this report and counts it.
++static int mediacodec_dec_rendered_push(MediaCodecDecContext *s,
++                                        int64_t media_time_us,
++                                        int64_t system_nano)
++{
++    unsigned tail = atomic_load_explicit(&s->rendered_tail, memory_order_relaxed);
++    unsigned head = atomic_load_explicit(&s->rendered_head, memory_order_acquire);
++    if (tail - head == FF_MEDIACODEC_RENDERED_RING) {
++        atomic_fetch_add_explicit(&s->rendered_dropped, 1, memory_order_relaxed);
++        return 0;
++    }
++    s->rendered[tail % FF_MEDIACODEC_RENDERED_RING] = (AVMediaCodecRendered){
++        .media_time_us = media_time_us,
++        .system_nano = system_nano,
++    };
++    atomic_store_explicit(&s->rendered_tail, tail + 1, memory_order_release);
++    return 1;
++}
++
++static void mediacodec_dec_on_frame_rendered(FFAMediaCodec *codec, void *userdata,
++                                             int64_t media_time_us,
++                                             int64_t system_nano)
++{
++    mediacodec_dec_rendered_push(userdata, media_time_us, system_nano);
++}
++
++// Only a surface-backed video codec renders anything. Registration failures
++// are diagnostics, never errors: the decoder is complete without feedback.
++static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
++                                             MediaCodecDecContext *s)
++{
++    int ret;
++
++    if (avctx->codec_type != AVMEDIA_TYPE_VIDEO || !s->surface) {
++        s->rendered_source = "off:surface";
++        return;
++    }
++    if (!s->use_ndk_codec) {
++        s->rendered_source = "off:java";
++        return;
++    }
++    ret = ff_AMediaCodec_setOnFrameRenderedCallback(s->codec,
++            mediacodec_dec_on_frame_rendered, s);
++    if (ret == AVERROR(ENOSYS)) {
++        s->rendered_source = "off:api";
++    } else if (ret < 0) {
++        s->rendered_source = "off:codec";
++    } else {
++        s->rendered_source = "ndk";
++    }
++    av_log(avctx, AV_LOG_VERBOSE, "Frame-rendered feedback: %s\n",
++           s->rendered_source);
++}
++
+ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+                            const char *mime, FFAMediaFormat *format)
+ {
+@@ -841,6 +896,10 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+     atomic_init(&s->refcount, 1);
+     atomic_init(&s->hw_buffer_count, 0);
+     atomic_init(&s->serial, 1);
++    atomic_init(&s->rendered_head, 0);
++    atomic_init(&s->rendered_tail, 0);
++    atomic_init(&s->rendered_dropped, 0);
++    s->rendered_source = "off:surface";
+     s->current_input_buffer = -1;
+ 
+     if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
+@@ -864,6 +923,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+         goto fail;
+     }
+ 
++    mediacodec_dec_register_rendered(avctx, s);
++
+     status = ff_AMediaCodec_start(s->codec);
+     if (status < 0) {
+         char *desc = ff_AMediaFormat_toString(format);
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -32,8 +32,15 @@
+ #include "libavutil/pixfmt.h"
+ 
+ #include "avcodec.h"
++#include "mediacodec.h"
+ #include "mediacodec_wrapper.h"
+ 
++// Rendered-frame feedback ring. One producer (the codec's callback thread),
++// one consumer (whoever drains through av_mediacodec_drain_rendered), so
++// head/tail are plain SPSC atomics and the producer never blocks. Sized for
++// a few seconds of batched delivery at any frame rate a surface shows.
++#define FF_MEDIACODEC_RENDERED_RING 64
++
+ typedef struct MediaCodecDecContext {
+ 
+     AVCodecContext *avctx;
+@@ -72,6 +79,13 @@ typedef struct MediaCodecDecContext {
+ 
+     bool use_ndk_codec;
+     int profile_override; // CodecProfileLevel constant, 0 = derive from avctx
++
++    // Frame-rendered feedback; see av_mediacodec_drain_rendered.
++    const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
++    AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
++    atomic_uint rendered_head;        // consumer
++    atomic_uint rendered_tail;        // producer
++    atomic_uint rendered_dropped;     // producer: ring full
+ } MediaCodecDecContext;
+ 
+ int ff_mediacodec_dec_init(AVCodecContext *avctx,

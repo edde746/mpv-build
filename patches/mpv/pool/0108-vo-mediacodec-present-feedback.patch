@@ -1,0 +1,200 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -57,6 +57,7 @@
+ #include <limits.h>
+ #include <math.h>
+ #include <stdbool.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/resource.h>
+ #include <time.h>
+@@ -305,6 +306,84 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
+     return event ? "event" : "periodic";
+ }
+ 
++// Video-plane presentation feedback. flip_page records the vsync each release
++// aimed at, keyed by the presentation time the codec attached to the buffer,
++// and matches the codec's frame-rendered reports (drained through the buffer
++// at the next flip) back to it: the video plane's twin of the OSD plane's
++// EGL present probes. Delivery is batched and may skip frames, so the ring is
++// deep, and a report without an intent or an intent without a report is
++// counted rather than trusted.
++#define PRESENT_INTENTS 32 // ~1.3 s of 24p
++
++struct present_intent {
++    int64_t media_us;
++    int64_t vsync; // CLOCK_MONOTONIC vsync the release targeted, 0 untimed
++    bool live;
++};
++
++struct present_stats {
++    struct present_intent ring[PRESENT_INTENTS];
++    int next;
++    uint32_t measured;   // reports matched to a timed release
++    uint32_t untimed;    // reports matched to an untimed or unsnapped release
++    uint32_t unmatched;  // reports with no intent: stragglers across a reset
++    uint32_t overrun;    // intents overwritten before any report arrived
++    uint32_t hist[5];    // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
++    int64_t err_last_ns, err_worst_ns;
++};
++
++// Forget the intents; the counters describe the session.
++static void present_reset(struct present_stats *s)
++{
++    for (int n = 0; n < PRESENT_INTENTS; n++)
++        s->ring[n].live = false;
++    s->next = 0;
++}
++
++static void present_record(struct present_stats *s, int64_t media_us,
++                           int64_t vsync)
++{
++    struct present_intent *e = &s->ring[s->next];
++    if (e->live)
++        s->overrun++;
++    *e = (struct present_intent){.media_us = media_us, .vsync = vsync,
++                                 .live = true};
++    s->next = (s->next + 1) % PRESENT_INTENTS;
++}
++
++static void present_observe(struct present_stats *s, int64_t media_us,
++                            int64_t system_nano, int64_t period_ns)
++{
++    for (int n = 0; n < PRESENT_INTENTS; n++) {
++        struct present_intent *e = &s->ring[n];
++        if (!e->live || e->media_us != media_us)
++            continue;
++        e->live = false;
++        if (!e->vsync || period_ns <= 0) {
++            s->untimed++;
++            return;
++        }
++        int64_t err = system_nano - e->vsync;
++        s->measured++;
++        s->err_last_ns = err;
++        if (llabs(err) > llabs(s->err_worst_ns))
++            s->err_worst_ns = err;
++        double vsyncs = (double)err / period_ns;
++        s->hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
++              : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
++        return;
++    }
++    s->unmatched++;
++}
++
++// What a video-present line exists to catch: a frame the display showed off
++// its vsync, a release the VO could not time, or a report that never came.
++static uint64_t present_failures(const struct present_stats *s)
++{
++    return (uint64_t)s->untimed + s->overrun + s->hist[0] + s->hist[1] +
++           s->hist[3] + s->hist[4];
++}
++
+ // --- end mediacodec stats core
+ 
+ typedef AChoreographer *(*mp_get_choreographer_fn)(void);
+@@ -886,6 +965,9 @@ struct priv {
+     uint64_t frame_seq;
+     uint32_t stats_frames;
+     struct stats_cadence osd_stats;
++    struct present_stats present;
++    struct stats_cadence present_cadence;
++    const char *present_source; // NULL until the first release
+ 
+     // Choreographer vsync sampler
+     void *choreographer_lib;
+@@ -2932,6 +3014,23 @@ static uint64_t osd_failures(const struct osd_shared *s)
+            s->present_hist[3] + s->present_hist[4];
+ }
+ 
++static bool present_feedback_on(const struct priv *p)
++{
++    return p->present_source && !strcmp(p->present_source, "ndk");
++}
++
++static void present_log_stats(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    const struct present_stats *s = &p->present;
++    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
++               "measured=%u untimed=%u unmatched=%u overrun=%u\n",
++               why, s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
++               s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
++               s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
++               s->measured, s->untimed, s->unmatched, s->overrun);
++}
++
+ // One tick per OSD_STATS_INTERVAL_FRAMES flips; each line decides its own
+ // cadence through stats_due.
+ static void stats_tick(struct vo *vo)
+@@ -2948,6 +3047,12 @@ static void stats_tick(struct vo *vo)
+         if (why)
+             osd_log_stats_snapshot(vo, why, &s);
+     }
++    if (present_feedback_on(p)) {
++        const char *why = stats_due(&p->present_cadence,
++                                    present_failures(&p->present));
++        if (why)
++            present_log_stats(vo, why);
++    }
+ }
+ 
+ static void osd_init(struct vo *vo)
+@@ -3346,6 +3451,31 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     return VO_TRUE;
+ }
+ 
++// Record what this release aimed at, then take in what the codec has
++// rendered since the previous flip. A report for an intent that reset_video
++// dropped lands in unmatched, by design.
++static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
++                             int64_t vsync)
++{
++    struct priv *p = vo->priv;
++    const char *source = av_mediacodec_rendered_source(buffer);
++    if (!p->present_source || strcmp(source, p->present_source)) {
++        p->present_source = source;
++        MP_VERBOSE(vo, "video-present feedback: %s\n", source);
++    }
++    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), vsync);
++    AVMediaCodecRendered reports[16];
++    int n;
++    while ((n = av_mediacodec_drain_rendered(buffer, reports,
++                                             MP_ARRAY_SIZE(reports))) > 0)
++    {
++        for (int i = 0; i < n; i++) {
++            present_observe(&p->present, reports[i].media_time_us,
++                            reports[i].system_nano, p->queue_period);
++        }
++    }
++}
++
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -3379,6 +3509,7 @@ static void flip_page(struct vo *vo)
+             : av_mediacodec_release_buffer(buffer, 1);
+     if (ret >= 0)
+         p->submitted_frame_id = p->cur_frame_id;
++    present_feedback(vo, buffer, target.vsync);
+     mp_image_unrefp(&p->cur_image);
+     p->cur_pts = 0;
+     p->cur_frame_id = 0;
+@@ -3425,6 +3556,7 @@ static void reset_video(struct vo *vo)
+     p->prepared_epoch = 0;
+     mediacodec_timing_reset(&p->timing);
+     osd_cadence_reset(&p->cadence);
++    present_reset(&p->present);
+     p->osd_pts = MP_NOPTS_VALUE;
+     if (p->osd_threads_created) {
+         mp_mutex_lock(&p->osd_lock);
+@@ -3480,6 +3612,8 @@ static void uninit(struct vo *vo)
+     p->opts_cache = NULL;
+     mp_image_unrefp(&p->cur_image);
+ 
++    if (present_feedback_on(p))
++        present_log_stats(vo, "final");
+     osd_uninit(vo);
+ 
+     if (p->vsync_thread_created) {

@@ -56,8 +56,8 @@ stats = source[source.index(stats_start):source.index(stats_end) + len(stats_end
 functions = [
     "read_vsync_sample", "vsync_sample_is_fresh", "display_period",
     "update_queue_timing", "get_release_target", "prepare_osd",
-    "submit_deadline", "prepare_frame", "draw_frame", "flip_page",
-    "reset_video",
+    "submit_deadline", "prepare_frame", "draw_frame", "present_feedback",
+    "flip_page", "reset_video",
 ]
 driver = source[source.index("#define VSYNC_SAMPLE_MAX_AGE_NS"):
                 source.index("static int64_t read_vsync_sample")]
