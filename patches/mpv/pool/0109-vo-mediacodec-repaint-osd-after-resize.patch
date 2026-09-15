@@ -1,0 +1,54 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 11a28f4..283b703 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -1754,6 +1754,7 @@ struct osd_gl {
+     struct osd_comp_key pinned_comps[2];
+     int num_pinned_comps;
+     int surface_w, surface_h;       // the OSD surface, queried per present
++    int repaint_w, repaint_h;       // window size the last resize repaint targeted
+     PFNEGLCREATESYNCKHRPROC create_sync;
+     PFNEGLDESTROYSYNCKHRPROC destroy_sync;
+     PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
+@@ -2885,7 +2886,41 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+         };
+     }
+ 
++    // The window can change size between this buffer's dequeue - the surface
++    // size the draw used - and its queue: BLASTBufferQueue rejects the buffer
++    // ("rejecting buffer: active_size=... buffer{size=...}") and the swap
++    // showed nothing. A slot rendered for another canvas than the surface has
++    // now scales its letterbox bars onto the wrong axis instead: a portrait
++    // canvas presented on a landscape surface fills all but a 272-pixel strip
++    // of the picture black. Both happen on the PiP -> fullscreen rotation
++    // dance, and with no later OSD change the result stayed on screen until a
++    // seek repainted. Repaint at the size the window has now - the render pass
++    // reads it - once per distinct window size, so a surface that never agrees
++    // with its window cannot spin.
++    int window_w = ANativeWindow_getWidth(p->osd_window);
++    int window_h = ANativeWindow_getHeight(p->osd_window);
++    const struct osd_slot *slot = &p->osd_slots[r.slot];
++    bool window_moved = window_w > 0 && window_h > 0 &&
++                        (window_w != g->surface_w || window_h != g->surface_h);
++    bool canvas_stale = slot->canvas_w != g->surface_w ||
++                        slot->canvas_h != g->surface_h;
++    bool repaint = (window_moved || canvas_stale) &&
++                   (window_w != g->repaint_w || window_h != g->repaint_h);
++    if (repaint) {
++        g->repaint_w = window_w;
++        g->repaint_h = window_h;
++        MP_VERBOSE(vo, "OSD: presented a %dx%d canvas on a %dx%d surface with "
++                       "the window at %dx%d; repainting\n",
++                   slot->canvas_w, slot->canvas_h, g->surface_w, g->surface_h,
++                   window_w, window_h);
++    }
++
+     mp_mutex_lock(&p->osd_lock);
++    if (repaint && !s->terminate) {
++        osd_file_request(p, (struct osd_request){
++            .pts = r.pts, .epoch = s->epoch, .full = true,
++        });
++    }
+     s->swaps++;
+     s->swap_ns_last = t_done - t_swap;
+     if (s->swap_ns_last > s->swap_ns_max)
