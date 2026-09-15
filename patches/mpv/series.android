@@ -13,7 +13,6 @@
 0013-sd-ass-isolate-event-prefetch-renderer.patch
 0014-ass-mp-compact-high-overdraw-atlases.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
-0102-f-output-chain-wake-after-reset-harder.patch
 0010-player-pending-vid-property.patch
 0103-ao-audiotrack-output-stall-watchdog.patch
 0105-vo-mediacodec-separate-preparation-and-submission.patch

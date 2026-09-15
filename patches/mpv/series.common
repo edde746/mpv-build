@@ -4,3 +4,4 @@
 0201-aspect-sub-video-rect-aspect-option.patch
 0026-ad-spdif-recreate-muxer-on-reset.patch
 0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch
+0102-f-output-chain-wake-after-reset-harder.patch

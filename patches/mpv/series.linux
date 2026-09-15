@@ -1,4 +1,5 @@
-# Linux patch series for mpv. Empty today: the linux build ships an unpatched
-# mpv (the 0.40.0 archive pinned in overrides.linux) and every pool patch so
-# far is apple-only. build.sh applies this series on every run, so a line
-# added here starts applying without touching the driver.
+# Linux patch series for mpv, applied after series.common to the 0.40.0
+# archive pinned in overrides.linux. Empty today: every Linux-relevant fix so
+# far is cross-platform and lives in series.common. build.sh applies this
+# series on every run, so a line added here starts applying without touching
+# the driver.
