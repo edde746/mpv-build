@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 11a28f4..283b703 100644
+index 11a28f4..eba21b7 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -1754,6 +1754,7 @@ struct osd_gl {
@@ -10,7 +10,17 @@ index 11a28f4..283b703 100644
      PFNEGLCREATESYNCKHRPROC create_sync;
      PFNEGLDESTROYSYNCKHRPROC destroy_sync;
      PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
-@@ -2885,7 +2886,41 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+@@ -2826,6 +2827,9 @@ static struct osd_release osd_find_release(struct priv *p, uint64_t seq)
+     return (struct osd_release){0};
+ }
+ 
++// Locked; defined with the VO-thread side of the pipeline below.
++static void osd_file_request(struct priv *p, struct osd_request req);
++
+ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+                         struct osd_release release)
+ {
+@@ -2885,7 +2889,41 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
          };
      }
  
