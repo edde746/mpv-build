@@ -481,8 +481,8 @@ struct priv {
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
     double cur_duration, osd_pts;
     bool cur_synthetic, osd_threads_created, osd_missing_logged;
-    bool vsync_thread_created;
-    int vsync_lock, osd_lock, osd_wakeup;
+    bool vsync_attached;
+    int osd_lock, osd_wakeup;
     int64_t vsync_sample, queue_period, queue_period_changed, queue_offset;
     struct mediacodec_timing timing;
     struct osd_cadence cadence;
@@ -492,6 +492,10 @@ struct priv {
     struct present_stats present;
     const char *present_source;
 };
+
+// Stands in for the production process-lifetime sampler; only its lock is
+// touched by the extracted read_vsync_sample.
+static struct { int lock; } vsync_sampler;
 
 struct vo;
 struct vo_driver {
@@ -663,7 +667,7 @@ static bool present_queued(struct vo *vo)
 
 static void test_preparation_does_not_submit_early(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -703,7 +707,7 @@ static void test_preparation_does_not_submit_early(void)
 
 static void test_flip_records_intents_and_drains_reports(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {.pts = 12500000};
@@ -774,7 +778,7 @@ static void test_driver_refresh_and_cadence(void)
     for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
         int64_t period = llround(1e9 / rates[r].hz);
         int64_t duration = llround(1e9 / rates[r].fps);
-        struct priv p = {.vsync_thread_created = true};
+        struct priv p = {.vsync_attached = true};
         struct vo_internal in = {0};
         struct vo vo = {&p, &in, &driver, period, 0};
         struct mediacodec_timing reference = {0};
@@ -829,7 +833,7 @@ static void test_driver_refresh_and_cadence(void)
 
 static void test_refresh_transition_and_late_frame(void)
 {
-    struct priv p = {.vsync_thread_created = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -883,7 +887,7 @@ static void test_refresh_transition_and_late_frame(void)
 static void test_drop_pause_redraw_resume(void)
 {
     const int64_t period = 40 * MS, base = EPOCH + 1000 * MS;
-    struct priv p = {.vsync_thread_created = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, period, 0};
     AVMediaCodecBuffer a = {0}, b = {0}, c = {0};
@@ -966,7 +970,7 @@ static void test_clock_domain_drift(void)
     const int64_t period = 16666667, duration = 41708333;
     const int64_t drifts[] = {37 * MS, -37 * MS};
     for (size_t d = 0; d < sizeof(drifts) / sizeof(drifts[0]); d++) {
-        struct priv p = {.vsync_thread_created = true};
+        struct priv p = {.vsync_attached = true};
         struct vo_internal in = {0};
         struct vo vo = {&p, &in, &driver, period, 0};
         for (int i = 0; i < 24; i++) {
@@ -1005,7 +1009,7 @@ static void test_speed_change_admission(void)
     const int64_t period = 16666667;
     const int64_t durations[] = {41708333, 41708333, 41708333, 41708333,
                                  20854166, 20854166, 20854166, 20854166};
-    struct priv p = {.vsync_thread_created = true};
+    struct priv p = {.vsync_attached = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, period, 0};
     int64_t pts = EPOCH + 1000 * period;
@@ -1037,7 +1041,7 @@ static void test_speed_change_admission(void)
 // frame that no longer exists, and nothing may reach the codec.
 static void test_seek_during_preparation(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -1064,7 +1068,7 @@ static void test_seek_during_preparation(void)
 // core cannot hand over another frame while frame_queued is occupied.
 static void test_expired_deadline_does_not_idle_the_vo(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_thread_created = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};

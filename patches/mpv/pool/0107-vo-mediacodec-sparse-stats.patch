@@ -47,8 +47,8 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      uint32_t stats_frames;
 +    struct stats_cadence osd_stats;
  
-     // Choreographer vsync sampler
-     void *choreographer_lib;
+     // Choreographer vsync sampler (shared, see vsync_sampler); these are
+     // owned by that sampler's lock while attached.
 @@ -2845,14 +2879,10 @@ static void osd_invalidate_locked(struct priv *p)
      });
  }

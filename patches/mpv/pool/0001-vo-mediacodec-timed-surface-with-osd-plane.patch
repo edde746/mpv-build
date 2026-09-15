@@ -100,9 +100,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
+index 0000000..ca0d310
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,3192 @@
+@@ -0,0 +1,3235 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -894,19 +895,9 @@ new file mode 100644
 +    uint64_t frame_seq;
 +    uint32_t stats_frames;
 +
-+    // Choreographer vsync sampler
-+    void *choreographer_lib;
-+    mp_get_choreographer_fn get_choreographer;
-+    mp_post_frame_callback_fn post_frame_callback;
-+    mp_post_frame_callback_delayed_fn post_frame_callback_delayed;
-+    mp_post_frame_callback64_fn post_frame_callback64;
-+    mp_post_frame_callback_delayed64_fn post_frame_callback_delayed64;
-+    AChoreographer *choreographer;
-+    ALooper *vsync_looper;
-+    mp_thread vsync_thread;
-+    bool vsync_thread_created;
-+    mp_mutex vsync_lock;
-+    bool vsync_terminate;
++    // Choreographer vsync sampler (shared, see vsync_sampler); these are
++    // owned by that sampler's lock while attached.
++    bool vsync_attached;
 +    int64_t vsync_sample; // CLOCK_MONOTONIC
 +
 +    // VO thread only
@@ -940,135 +931,201 @@ new file mode 100644
 +    return now + delta;
 +}
 +
-+static void post_vsync_callback(struct vo *vo, bool delayed);
++// The Choreographer is per thread, and AOSP never frees it: getForThread()
++// stores it in a raw thread_local with no destructor, so a thread that exits
++// leaks its Looper (epoll + eventfd) and the DisplayEventReceiver socketpair
++// behind it. A sampler thread per vo instance therefore cost +4 fds per
++// playback session, strictly monotonic across 40 start/stop cycles. One
++// process-lifetime thread owns the Looper and Choreographer instead and
++// samples for whichever vo is attached; between clients it holds no frame
++// callback and sleeps in the Looper.
++static struct {
++    mp_static_mutex lock;
++    bool started;   // thread created (or creation attempted)
++    bool ready;     // looper and choreographer exist
++    bool failed;    // no Choreographer on this device/thread
++    void *lib;
++    mp_get_choreographer_fn get_choreographer;
++    mp_post_frame_callback_fn post_frame_callback;
++    mp_post_frame_callback_delayed_fn post_frame_callback_delayed;
++    mp_post_frame_callback64_fn post_frame_callback64;
++    mp_post_frame_callback_delayed64_fn post_frame_callback_delayed64;
++    AChoreographer *choreographer;
++    mp_thread thread;
++    struct vo *client; // the attached vo, or NULL
++    bool posted;       // a frame callback is outstanding
++} vsync_sampler = { .lock = MP_STATIC_MUTEX_INITIALIZER };
 +
-+static void record_vsync(struct vo *vo, int64_t frame_time)
++// vsync_sampler.lock held.
++static void post_vsync_callback(bool delayed);
++
++static void record_vsync(int64_t frame_time)
 +{
-+    struct priv *p = vo->priv;
-+
-+    mp_mutex_lock(&p->vsync_lock);
-+    p->vsync_sample = frame_time;
-+    bool terminate = p->vsync_terminate;
-+    mp_mutex_unlock(&p->vsync_lock);
-+
-+    if (!terminate)
-+        post_vsync_callback(vo, true);
++    mp_mutex_lock(&vsync_sampler.lock);
++    vsync_sampler.posted = false;
++    struct vo *vo = vsync_sampler.client;
++    if (vo) {
++        struct priv *p = vo->priv;
++        p->vsync_sample = frame_time;
++        post_vsync_callback(true);
++    }
++    mp_mutex_unlock(&vsync_sampler.lock);
 +}
 +
 +static void vsync_callback(long frame_time, void *arg)
 +{
-+    record_vsync(arg, restore_frame_time(frame_time));
++    record_vsync(restore_frame_time(frame_time));
 +}
 +
 +static void vsync_callback64(int64_t frame_time, void *arg)
 +{
-+    record_vsync(arg, frame_time);
++    record_vsync(frame_time);
 +}
 +
-+static void post_vsync_callback(struct vo *vo, bool delayed)
++// Safe from any thread: the Choreographer forwards a foreign-thread post to
++// its own Looper. The callback receives no vo pointer; it reads the attached
++// client under the lock, so a vo that detached before its callback fired is
++// never touched.
++static void post_vsync_callback(bool delayed)
 +{
-+    struct priv *p = vo->priv;
 +    const uint32_t delay_ms = delayed ? 500 : 0;
 +
-+    if (p->post_frame_callback_delayed64) {
++    if (!vsync_sampler.ready || vsync_sampler.posted)
++        return;
++    vsync_sampler.posted = true;
++    if (vsync_sampler.post_frame_callback_delayed64) {
 +        if (delay_ms) {
-+            p->post_frame_callback_delayed64(
-+                p->choreographer, vsync_callback64, vo, delay_ms);
++            vsync_sampler.post_frame_callback_delayed64(
++                vsync_sampler.choreographer, vsync_callback64, NULL, delay_ms);
 +        } else {
-+            p->post_frame_callback64(p->choreographer, vsync_callback64, vo);
++            vsync_sampler.post_frame_callback64(
++                vsync_sampler.choreographer, vsync_callback64, NULL);
 +        }
 +    } else if (delay_ms) {
-+        p->post_frame_callback_delayed(
-+            p->choreographer, vsync_callback, vo, delay_ms);
++        vsync_sampler.post_frame_callback_delayed(
++            vsync_sampler.choreographer, vsync_callback, NULL, delay_ms);
 +    } else {
-+        p->post_frame_callback(p->choreographer, vsync_callback, vo);
++        vsync_sampler.post_frame_callback(
++            vsync_sampler.choreographer, vsync_callback, NULL);
 +    }
 +}
 +
 +static MP_THREAD_VOID vsync_thread(void *arg)
 +{
-+    struct vo *vo = arg;
-+    struct priv *p = vo->priv;
 +    mp_thread_set_name("vo/vsync");
 +
 +    ALooper *looper = ALooper_prepare(0);
 +    AChoreographer *choreographer =
-+        looper ? p->get_choreographer() : NULL;
++        looper ? vsync_sampler.get_choreographer() : NULL;
++
++    mp_mutex_lock(&vsync_sampler.lock);
 +    if (!looper || !choreographer) {
-+        MP_WARN(vo, "Choreographer unavailable; timed release will not be "
-+                    "vsync-snapped.\n");
++        vsync_sampler.failed = true;
++        struct vo *vo = vsync_sampler.client;
++        if (vo) {
++            MP_WARN(vo, "Choreographer unavailable; timed release will not "
++                        "be vsync-snapped.\n");
++            ((struct priv *)vo->priv)->vsync_attached = false;
++            vsync_sampler.client = NULL;
++        }
++        mp_mutex_unlock(&vsync_sampler.lock);
 +        MP_THREAD_RETURN();
 +    }
++    vsync_sampler.choreographer = choreographer;
++    vsync_sampler.ready = true;
++    if (vsync_sampler.client)
++        post_vsync_callback(false);
++    mp_mutex_unlock(&vsync_sampler.lock);
 +
-+    ALooper_acquire(looper);
-+    mp_mutex_lock(&p->vsync_lock);
-+    p->vsync_looper = looper;
-+    p->choreographer = choreographer;
-+    bool terminate = p->vsync_terminate;
-+    mp_mutex_unlock(&p->vsync_lock);
-+
-+    if (!terminate)
-+        post_vsync_callback(vo, false);
-+
-+    while (!terminate) {
-+        if (ALooper_pollOnce(-1, NULL, NULL, NULL) == ALOOPER_POLL_ERROR)
-+            break;
-+        mp_mutex_lock(&p->vsync_lock);
-+        terminate = p->vsync_terminate;
-+        mp_mutex_unlock(&p->vsync_lock);
++    // Process lifetime: the Looper and the Choreographer registered on it
++    // must outlive every vo, which is the whole point of this thread.
++    while (ALooper_pollOnce(-1, NULL, NULL, NULL) != ALOOPER_POLL_ERROR) {
 +    }
 +
-+    mp_mutex_lock(&p->vsync_lock);
-+    p->vsync_looper = NULL;
-+    p->choreographer = NULL;
-+    p->vsync_sample = 0;
-+    mp_mutex_unlock(&p->vsync_lock);
-+    ALooper_release(looper);
++    mp_mutex_lock(&vsync_sampler.lock);
++    vsync_sampler.ready = false;
++    vsync_sampler.failed = true;
++    mp_mutex_unlock(&vsync_sampler.lock);
 +    MP_THREAD_RETURN();
++}
++
++// vsync_sampler.lock held. Resolves libandroid and starts the thread once per
++// process; a device without a usable Choreographer marks the sampler failed
++// and every later vo runs unsnapped.
++static void start_vsync_sampler(void)
++{
++    if (vsync_sampler.started)
++        return;
++    vsync_sampler.started = true;
++
++    void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
++    if (!lib) {
++        vsync_sampler.failed = true;
++        return;
++    }
++    vsync_sampler.get_choreographer = dlsym(lib, "AChoreographer_getInstance");
++    vsync_sampler.post_frame_callback =
++        dlsym(lib, "AChoreographer_postFrameCallback");
++    vsync_sampler.post_frame_callback_delayed =
++        dlsym(lib, "AChoreographer_postFrameCallbackDelayed");
++    vsync_sampler.post_frame_callback64 =
++        dlsym(lib, "AChoreographer_postFrameCallback64");
++    vsync_sampler.post_frame_callback_delayed64 =
++        dlsym(lib, "AChoreographer_postFrameCallbackDelayed64");
++
++    bool have64 = vsync_sampler.post_frame_callback64 &&
++                  vsync_sampler.post_frame_callback_delayed64;
++    bool have_legacy = vsync_sampler.post_frame_callback &&
++                       vsync_sampler.post_frame_callback_delayed;
++    if (!vsync_sampler.get_choreographer || (!have64 && !have_legacy)) {
++        dlclose(lib);
++        vsync_sampler.failed = true;
++        return;
++    }
++    if (!have64) {
++        vsync_sampler.post_frame_callback64 = NULL;
++        vsync_sampler.post_frame_callback_delayed64 = NULL;
++    }
++    vsync_sampler.lib = lib;
++
++    if (mp_thread_create(&vsync_sampler.thread, vsync_thread, NULL)) {
++        vsync_sampler.failed = true;
++        return;
++    }
++    mp_thread_detach(vsync_sampler.thread);
 +}
 +
 +static void init_vsync_sampler(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
-+    p->choreographer_lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
-+    if (!p->choreographer_lib)
-+        return;
 +
-+    p->get_choreographer =
-+        dlsym(p->choreographer_lib, "AChoreographer_getInstance");
-+    p->post_frame_callback =
-+        dlsym(p->choreographer_lib, "AChoreographer_postFrameCallback");
-+    p->post_frame_callback_delayed =
-+        dlsym(p->choreographer_lib, "AChoreographer_postFrameCallbackDelayed");
-+    p->post_frame_callback64 =
-+        dlsym(p->choreographer_lib, "AChoreographer_postFrameCallback64");
-+    p->post_frame_callback_delayed64 =
-+        dlsym(p->choreographer_lib, "AChoreographer_postFrameCallbackDelayed64");
-+
-+    bool have64 = p->post_frame_callback64 &&
-+                  p->post_frame_callback_delayed64;
-+    bool have_legacy = p->post_frame_callback &&
-+                       p->post_frame_callback_delayed;
-+    if (!p->get_choreographer || (!have64 && !have_legacy)) {
-+        dlclose(p->choreographer_lib);
-+        p->choreographer_lib = NULL;
++    mp_mutex_lock(&vsync_sampler.lock);
++    start_vsync_sampler();
++    if (vsync_sampler.failed) {
++        mp_mutex_unlock(&vsync_sampler.lock);
++        MP_WARN(vo, "Choreographer unavailable; timed release will not be "
++                    "vsync-snapped.\n");
 +        return;
 +    }
-+    if (!have64) {
-+        p->post_frame_callback64 = NULL;
-+        p->post_frame_callback_delayed64 = NULL;
-+    }
++    // One vo per core, and each detaches in its uninit, so the slot is free;
++    // several cores in one process simply take turns, the newest sampling.
++    vsync_sampler.client = vo;
++    p->vsync_attached = true;
++    p->vsync_sample = 0;
++    post_vsync_callback(false);
++    mp_mutex_unlock(&vsync_sampler.lock);
++}
 +
-+    mp_mutex_init(&p->vsync_lock);
-+    if (mp_thread_create(&p->vsync_thread, vsync_thread, vo)) {
-+        MP_WARN(vo, "Failed to start the Choreographer sampler; timed release "
-+                    "will not be vsync-snapped.\n");
-+        mp_mutex_destroy(&p->vsync_lock);
-+        dlclose(p->choreographer_lib);
-+        p->choreographer_lib = NULL;
-+        return;
-+    }
-+    p->vsync_thread_created = true;
++static void uninit_vsync_sampler(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    mp_mutex_lock(&vsync_sampler.lock);
++    if (vsync_sampler.client == vo)
++        vsync_sampler.client = NULL;
++    p->vsync_attached = false;
++    p->vsync_sample = 0;
++    mp_mutex_unlock(&vsync_sampler.lock);
 +}
 +
 +static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
@@ -2974,12 +3031,9 @@ new file mode 100644
 +
 +static int64_t read_vsync_sample(struct priv *p)
 +{
-+    if (!p->vsync_thread_created)
-+        return 0;
-+
-+    mp_mutex_lock(&p->vsync_lock);
-+    int64_t sample = p->vsync_sample;
-+    mp_mutex_unlock(&p->vsync_lock);
++    mp_mutex_lock(&vsync_sampler.lock);
++    int64_t sample = p->vsync_attached ? p->vsync_sample : 0;
++    mp_mutex_unlock(&vsync_sampler.lock);
 +    return sample;
 +}
 +
@@ -3259,17 +3313,7 @@ new file mode 100644
 +
 +    osd_uninit(vo);
 +
-+    if (p->vsync_thread_created) {
-+        mp_mutex_lock(&p->vsync_lock);
-+        p->vsync_terminate = true;
-+        if (p->vsync_looper)
-+            ALooper_wake(p->vsync_looper);
-+        mp_mutex_unlock(&p->vsync_lock);
-+        mp_thread_join(p->vsync_thread);
-+        mp_mutex_destroy(&p->vsync_lock);
-+    }
-+    if (p->choreographer_lib)
-+        dlclose(p->choreographer_lib);
++    uninit_vsync_sampler(vo);
 +
 +    hwdec_devices_remove(vo->hwdec_devs, &p->hwctx);
 +    av_buffer_unref(&p->hwctx.av_device_ref);

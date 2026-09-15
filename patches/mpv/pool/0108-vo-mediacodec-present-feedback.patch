@@ -102,8 +102,8 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +    struct stats_cadence present_cadence;
 +    const char *present_source; // NULL until the first release
  
-     // Choreographer vsync sampler
-     void *choreographer_lib;
+     // Choreographer vsync sampler (shared, see vsync_sampler); these are
+     // owned by that sampler's lock while attached.
 @@ -2932,6 +3014,23 @@ static uint64_t osd_failures(const struct osd_shared *s)
             s->present_hist[3] + s->present_hist[4];
  }
@@ -197,4 +197,4 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +        present_log_stats(vo, "final");
      osd_uninit(vo);
  
-     if (p->vsync_thread_created) {
+     uninit_vsync_sampler(vo);
