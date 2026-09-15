@@ -7,3 +7,4 @@
 0007-mediacodec-read-output-crop-on-mediatek.patch
 0008-mediacodec-frame-rendered-feedback.patch
 0009-mediacodec-async-decode-with-host-wakeup.patch
+0010-mediacodec-live-output-surface.patch

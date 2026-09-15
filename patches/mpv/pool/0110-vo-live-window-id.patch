@@ -1,0 +1,86 @@
+diff --git a/player/command.c b/player/command.c
+index e75d144..fe22c09 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -7982,6 +7982,13 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+         mpctx->ipc_ctx = mp_init_ipc(mpctx->clients, mpctx->global);
+     }
+ 
++    if (opt_ptr == &opts->vo->WinID && mpctx->video_out &&
++        vo_control(mpctx->video_out, VOCTRL_SET_WINDOW_ID, &opts->vo->WinID) == VO_TRUE)
++    {
++        // The VO moved to the new window itself; nothing to rebuild.
++        flags &= ~(uint64_t)UPDATE_VO;
++    }
++
+     if (flags & UPDATE_VO && mpctx->video_out) {
+         struct track *track = mpctx->current_track[0][STREAM_VIDEO];
+         uninit_video_out(mpctx);
+diff --git a/video/out/vo.h b/video/out/vo.h
+index a34324e..17d96c4 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -123,6 +123,11 @@ enum mp_voctrl {
+     /* private to vo_gpu and vo_gpu_next */
+     VOCTRL_EXTERNAL_RESIZE,
+ 
++    // --wid changed at runtime. A VO that can repoint its output at the new
++    // window without being recreated does so and returns VO_TRUE; anything
++    // else makes the core rebuild the video output as before.
++    VOCTRL_SET_WINDOW_ID,               // int64_t*
++
+     // Begin VO dragging.
+     VOCTRL_BEGIN_DRAGGING,
+ 
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index eba21b7..a3a38d3 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -72,6 +72,7 @@
+ #include <EGL/eglext.h>
+ 
+ #include <libavcodec/mediacodec.h>
++#include <libavutil/error.h>
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_mediacodec.h>
+ 
+@@ -3669,6 +3670,30 @@ static void set_paused(struct vo *vo, bool paused)
+     mp_mutex_unlock(&p->osd_lock);
+ }
+ 
++// Move the decoder's output to another Surface in place. Nothing of the vo
++// itself is bound to the window: timed release goes through the codec, the
++// OSD has its own plane, and the geometry is the embedder's. Only where the
++// platform cannot repoint a running decoder does the core rebuild instead.
++static int set_window_id(struct vo *vo, int64_t wid)
++{
++    struct priv *p = vo->priv;
++    if (wid == 0 || wid == -1)
++        return VO_NOTIMPL;
++    int ret = av_mediacodec_hwdevice_set_surface(p->hwctx.av_device_ref,
++                                                 (void *)(uintptr_t)wid);
++    if (ret == AVERROR(ENOSYS)) {
++        MP_VERBOSE(vo, "Platform cannot repoint the decoder; rebuilding.\n");
++        return VO_NOTIMPL;
++    }
++    if (ret < 0) {
++        MP_WARN(vo, "Repointing the decoder at the new Surface failed (%s); "
++                    "rebuilding.\n", av_err2str(ret));
++        return VO_NOTIMPL;
++    }
++    MP_VERBOSE(vo, "Video Surface replaced in place.\n");
++    return VO_TRUE;
++}
++
+ static int control(struct vo *vo, uint32_t request, void *data)
+ {
+     switch (request) {
+@@ -3676,6 +3701,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_UPDATE_RENDER_OPTS:
+         update_opts(vo);
+         return VO_TRUE;
++    case VOCTRL_SET_WINDOW_ID:
++        return set_window_id(vo, *(int64_t *)data);
+     case VOCTRL_RESET:
+         reset_video(vo);
+         return VO_TRUE;

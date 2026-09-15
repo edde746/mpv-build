@@ -22,3 +22,4 @@
 0108-vo-mediacodec-present-feedback.patch
 0109-vo-mediacodec-repaint-osd-after-resize.patch
 0111-vd-lavc-mediacodec-busy-policy.patch
+0110-vo-live-window-id.patch

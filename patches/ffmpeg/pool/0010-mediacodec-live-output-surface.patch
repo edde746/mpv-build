@@ -1,0 +1,370 @@
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index c849d7d..8083d6f 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -34,11 +34,43 @@
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/mem.h"
+ 
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_mediacodec.h"
+ #include "libavutil/thread.h"
+ 
+ #include "ffjni.h"
+ #include "mediacodecdec_common.h"
+ 
++// Every open MediaCodec decoder, so a hardware device's surface can be
++// swapped underneath the ones it created. Decoders register once their codec
++// exists and leave on close; a closed decoder's in-flight buffers still hold
++// the context, but nothing renders through them any more.
++static AVMutex registry_lock = AV_MUTEX_INITIALIZER;
++static MediaCodecDecContext **registry;
++static int registry_count;
++
++void ff_mediacodec_dec_register(MediaCodecDecContext *s)
++{
++    ff_mutex_lock(&registry_lock);
++    if (av_dynarray_add_nofree(&registry, &registry_count, s) < 0)
++        av_log(s->codec, AV_LOG_WARNING, "Decoder not registered for surface swaps\n");
++    ff_mutex_unlock(&registry_lock);
++}
++
++void ff_mediacodec_dec_unregister(MediaCodecDecContext *s)
++{
++    ff_mutex_lock(&registry_lock);
++    for (int i = 0; i < registry_count; i++) {
++        if (registry[i] != s)
++            continue;
++        registry[i] = registry[--registry_count];
++        break;
++    }
++    if (!registry_count)
++        av_freep(&registry);
++    ff_mutex_unlock(&registry_lock);
++}
++
+ AVMediaCodecContext *av_mediacodec_alloc_context(void)
+ {
+     return av_mallocz(sizeof(AVMediaCodecContext));
+@@ -171,6 +203,31 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+     return s->async_mode ? 1 : 0;
+ }
+ 
++int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
++{
++    AVHWDeviceContext *device = device_ref ? (AVHWDeviceContext *)device_ref->data : NULL;
++    AVMediaCodecDeviceContext *hwctx;
++    int ret = 0;
++
++    if (!device || device->type != AV_HWDEVICE_TYPE_MEDIACODEC || !surface)
++        return AVERROR(EINVAL);
++    hwctx = device->hwctx;
++
++    ff_mutex_lock(&registry_lock);
++    for (int i = 0; i < registry_count; i++) {
++        MediaCodecDecContext *s = registry[i];
++        if (!s->device_ref || s->device_ref->data != device_ref->data)
++            continue;
++        ret = ff_mediacodec_dec_set_surface(s->avctx, s, surface, NULL);
++        if (ret < 0)
++            break;
++    }
++    if (ret >= 0)
++        hwctx->surface = surface;
++    ff_mutex_unlock(&registry_lock);
++    return ret;
++}
++
+ #else
+ 
+ #include <stdlib.h>
+@@ -221,4 +278,9 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+     return AVERROR(ENOSYS);
+ }
+ 
++int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
++{
++    return AVERROR(ENOSYS);
++}
++
+ #endif
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 03c23b1..8cf6056 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -153,4 +153,17 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+                                       void (*wakeup)(void *opaque), void *opaque);
+ 
++/**
++ * Repoint every decoder opened from the MediaCodec hardware device `device_ref`
++ * at `surface` (an android.view.Surface jobject) without recreating it, and
++ * make `surface` the one later decoders on that device configure with.
++ * Buffers already dequeued from the codec render to the new surface when
++ * released.
++ *
++ * @return 0 on success, AVERROR(ENOSYS) when the platform cannot repoint a
++ * running decoder (Java API < 23, NDK API < 26), another negative value when
++ * a codec refused the surface — the device context is then left unchanged.
++ */
++int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface);
++
+ #endif /* AVCODEC_MEDIACODEC_H */
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index 479eecf..fa54396 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -194,6 +194,7 @@ struct JNIAMediaCodecFields {
+ 
+     jmethodID set_input_surface_id;
+     jmethodID signal_end_of_input_stream_id;
++    jmethodID set_output_surface_id;
+ 
+     jclass mediainfo_class;
+ 
+@@ -247,6 +248,7 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
+ 
+         { "android/media/MediaCodec", "setInputSurface", "(Landroid/view/Surface;)V", FF_JNI_METHOD, OFFSET(set_input_surface_id), 0 },
+         { "android/media/MediaCodec", "signalEndOfInputStream", "()V", FF_JNI_METHOD, OFFSET(signal_end_of_input_stream_id), 0 },
++        { "android/media/MediaCodec", "setOutputSurface", "(Landroid/view/Surface;)V", FF_JNI_METHOD, OFFSET(set_output_surface_id), 0 },
+ 
+     { "android/media/MediaCodec$BufferInfo", NULL, NULL, FF_JNI_CLASS, OFFSET(mediainfo_class), 1 },
+ 
+@@ -1792,6 +1794,25 @@ static int mediacodec_jni_signalEndOfInputStream(FFAMediaCodec *ctx)
+     return 0;
+ }
+ 
++static int mediacodec_jni_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *window)
++{
++    JNIEnv *env = NULL;
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
++
++    if (!codec->jfields.set_output_surface_id)
++        return AVERROR(ENOSYS);
++    if (!window || !window->surface)
++        return AVERROR(EINVAL);
++
++    JNI_GET_ENV_OR_RETURN(env, codec, AVERROR_EXTERNAL);
++
++    (*env)->CallVoidMethod(env, codec->object, codec->jfields.set_output_surface_id, window->surface);
++    if (ff_jni_exception_check(env, 1, codec) < 0)
++        return AVERROR_EXTERNAL;
++
++    return 0;
++}
++
+ static int mediacodec_jni_setAsyncNotifyCallback(FFAMediaCodec *codec,
+                                                  const FFAMediaCodecOnAsyncNotifyCallback *callback,
+                                                  void *userdata)
+@@ -1860,6 +1881,7 @@ static const FFAMediaCodec media_codec_jni = {
+     .cleanOutputBuffers = mediacodec_jni_cleanOutputBuffers,
+     .signalEndOfInputStream = mediacodec_jni_signalEndOfInputStream,
+     .setAsyncNotifyCallback = mediacodec_jni_setAsyncNotifyCallback,
++    .setOutputSurface = mediacodec_jni_setOutputSurface,
+ };
+ 
+ typedef struct FFAMediaFormatNdk {
+@@ -1893,6 +1915,7 @@ typedef struct FFAMediaCodecNdk {
+ 
+     // Available since API level 26.
+     media_status_t (*setInputSurface)(AMediaCodec*, ANativeWindow *);
++    media_status_t (*setOutputSurface)(AMediaCodec*, ANativeWindow *);
+     media_status_t (*signalEndOfInputStream)(AMediaCodec *);
+     media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
+             struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
+@@ -2138,6 +2161,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+     GET_SYMBOL(releaseName)
+ 
+     GET_SYMBOL(setInputSurface)
++    GET_SYMBOL(setOutputSurface)
+     GET_SYMBOL(signalEndOfInputStream)
+     GET_SYMBOL(setAsyncNotifyCallback)
+     GET_SYMBOL(setOnFrameRenderedCallback)
+@@ -2548,6 +2572,46 @@ static int mediacodec_ndk_setOnFrameRenderedCallback(FFAMediaCodec *ctx,
+     return 0;
+ }
+ 
++// Repoint the decoder's output. The codec acquires its own reference to the
++// new window's producer; the one wrapped here replaces the configure-time
++// window so release drops exactly what is still attached.
++static int mediacodec_ndk_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *window)
++{
++    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
++    ANativeWindow *native_window = NULL;
++    int owned = 0;
++    media_status_t status;
++
++    if (!codec->setOutputSurface)
++        return AVERROR(ENOSYS);
++    if (!window)
++        return AVERROR(EINVAL);
++
++    if (window->surface) {
++        JNIEnv *env = NULL;
++        JNI_GET_ENV_OR_RETURN(env, ctx, AVERROR_EXTERNAL);
++        native_window = ANativeWindow_fromSurface(env, window->surface);
++        owned = 1;
++    } else if (window->native_window) {
++        native_window = window->native_window;
++    }
++    if (!native_window)
++        return AVERROR(EINVAL);
++
++    status = codec->setOutputSurface(codec->impl, native_window);
++    if (status != AMEDIA_OK) {
++        if (owned)
++            ANativeWindow_release(native_window);
++        av_log(codec, AV_LOG_ERROR, "setOutputSurface failed, %d\n", status);
++        return AVERROR_EXTERNAL;
++    }
++
++    if (codec->window)
++        ANativeWindow_release(codec->window);
++    codec->window = owned ? native_window : NULL;
++    return 0;
++}
++
+ static const FFAMediaFormat media_format_ndk = {
+     .class = &amediaformat_ndk_class,
+ 
+@@ -2611,6 +2675,7 @@ static const FFAMediaCodec media_codec_ndk = {
+     .signalEndOfInputStream = mediacodec_ndk_signalEndOfInputStream,
+     .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
+     .setOnFrameRenderedCallback = mediacodec_ndk_setOnFrameRenderedCallback,
++    .setOutputSurface = mediacodec_ndk_setOutputSurface,
+ };
+ 
+ FFAMediaFormat *ff_AMediaFormat_new(int ndk)
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+index 224b5a2..911069e 100644
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -251,6 +251,10 @@ struct FFAMediaCodec {
+     int (*setOnFrameRenderedCallback)(FFAMediaCodec *codec,
+                                       FFAMediaCodecOnFrameRendered callback,
+                                       void *userdata);
++
++    // Java API 23 / NDK API 26: repoint a running surface-configured decoder
++    // at another Surface. NULL when the platform lacks the entry point.
++    int (*setOutputSurface)(FFAMediaCodec *codec, FFANativeWindow *window);
+ };
+ 
+ static inline char *ff_AMediaCodec_getName(FFAMediaCodec *codec)
+@@ -393,6 +397,16 @@ static inline int ff_AMediaCodec_setOnFrameRenderedCallback(FFAMediaCodec *codec
+     return codec->setOnFrameRenderedCallback(codec, callback, userdata);
+ }
+ 
++// ENOSYS where the platform cannot repoint a running decoder: Java below
++// API 23, NDK below API 26.
++static inline int ff_AMediaCodec_setOutputSurface(FFAMediaCodec *codec,
++                                                  FFANativeWindow *window)
++{
++    if (!codec->setOutputSurface)
++        return AVERROR(ENOSYS);
++    return codec->setOutputSurface(codec, window);
++}
++
+ int ff_Build_SDK_INT(AVCodecContext *avctx);
+ 
+ enum FFAMediaFormatColorRange {
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index cc9c2d8..1dce8c7 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -302,11 +302,40 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+ 
+         mediacodec_dec_uninit_async(s);
+         ff_mutex_destroy(&s->async_lock);
++        av_buffer_unref(&s->device_ref);
+         av_freep(&s->codec_name);
+         av_freep(&s);
+     }
+ }
+ 
++// Repoint a live decoder at another surface. The codec takes its own
++// reference; ours replaces the configure-time one so the old Surface can be
++// dropped by its owner the moment this returns. Called with the registry
++// locked, from whichever thread owns the surface — MediaCodec serializes it
++// against the decoding thread's own calls.
++int ff_mediacodec_dec_set_surface(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                  void *surface, void *native_window)
++{
++    FFANativeWindow *next, *prev;
++    int ret;
++
++    if (!s->codec || !s->surface)
++        return AVERROR(EINVAL);
++    next = ff_mediacodec_surface_ref(surface, native_window, s->codec);
++    if (!next)
++        return AVERROR(ENOMEM);
++    ret = ff_AMediaCodec_setOutputSurface(s->codec, next);
++    if (ret < 0) {
++        ff_mediacodec_surface_unref(next, s->codec);
++        return ret;
++    }
++    prev = s->surface;
++    s->surface = next;
++    ff_mediacodec_surface_unref(prev, s->codec);
++    av_log(s->codec, AV_LOG_VERBOSE, "Output surface replaced by %p\n", next);
++    return 0;
++}
++
+ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
+ {
+     AVMediaCodecBuffer *buffer = opaque;
+@@ -1076,6 +1105,11 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+                     AVMediaCodecDeviceContext *mediacodec_ctx = (AVMediaCodecDeviceContext *)device_ctx->hwctx;
+                     s->surface = ff_mediacodec_surface_ref(mediacodec_ctx->surface, mediacodec_ctx->native_window, avctx);
+                     av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
++                    if (s->surface) {
++                        s->device_ref = av_buffer_ref(avctx->hw_device_ctx);
++                        if (!s->device_ref)
++                            return AVERROR(ENOMEM);
++                    }
+                 }
+             }
+         }
+@@ -1264,6 +1298,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+ 
+     av_log(avctx, AV_LOG_DEBUG, "MediaCodec %p started successfully\n", s->codec);
+ 
++    ff_mediacodec_dec_register(s);
+     return 0;
+ 
+ fail:
+@@ -1542,6 +1577,7 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+     if (!s)
+         return 0;
+ 
++    ff_mediacodec_dec_unregister(s);
+     ff_mutex_lock(&s->async_lock);
+     s->wakeup = NULL;
+     s->wakeup_opaque = NULL;
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index bd8d449..f150e9f 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -105,6 +105,10 @@ typedef struct MediaCodecDecContext {
+     void *wakeup_opaque;
+     int wakeup_in_flight;  // calls running outside async_lock
+ 
++    // The hardware device this decoder was opened from; the surface-swap
++    // registry in mediacodec.c keys on it.
++    AVBufferRef *device_ref;
++
+     // Frame-rendered feedback; see av_mediacodec_drain_rendered.
+     const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
+     AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
+@@ -163,6 +167,12 @@ typedef struct MediaCodecAsyncOutput {
+     FFAMediaCodecBufferInfo info;
+ } MediaCodecAsyncOutput;
+ 
++// Surface-swap registry, see av_mediacodec_hwdevice_set_surface.
++void ff_mediacodec_dec_register(MediaCodecDecContext *s);
++void ff_mediacodec_dec_unregister(MediaCodecDecContext *s);
++int ff_mediacodec_dec_set_surface(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                  void *surface, void *native_window);
++
+ // The decoder context of an opened MediaCodec video/audio decoder, NULL for
+ // anything else. Implemented beside the decoder wrappers that own priv_data.
+ MediaCodecDecContext *ff_mediacodec_dec_from_avctx(AVCodecContext *avctx);
