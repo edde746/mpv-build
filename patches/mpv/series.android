@@ -23,3 +23,5 @@
 0109-vo-mediacodec-repaint-osd-after-resize.patch
 0111-vd-lavc-mediacodec-busy-policy.patch
 0110-vo-live-window-id.patch
+0112-vo-mediacodec-choreographer-refresh-rate.patch
+0113-vo-mediacodec-count-missed-frames.patch

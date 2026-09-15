@@ -1,0 +1,181 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index a3a38d3..f3ff8a9 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -396,6 +396,10 @@ typedef void (*mp_post_frame_callback64_fn)(
+     AChoreographer *, AChoreographer_frameCallback64, void *);
+ typedef void (*mp_post_frame_callback_delayed64_fn)(
+     AChoreographer *, AChoreographer_frameCallback64, void *, uint32_t);
++// API 30. Declared locally: the NDK typedef is guarded by __ANDROID_API__.
++typedef void (*mp_refresh_rate_callback)(int64_t vsync_period_ns, void *data);
++typedef void (*mp_register_refresh_rate_callback_fn)(
++    AChoreographer *, mp_refresh_rate_callback, void *);
+ 
+ // --- mediacodec geometry core
+ 
+@@ -1014,6 +1018,11 @@ static int64_t restore_frame_time(long frame_time)
+ // process-lifetime thread owns the Looper and Choreographer instead and
+ // samples for whichever vo is attached; between clients it holds no frame
+ // callback and sleeps in the Looper.
++//
++// The same Choreographer reports the display's vsync period (API 30) as it
++// changes: the grid the timed release snaps to. Media3 re-reads the refresh
++// rate on the main thread's display listener; here the period reaches the vo
++// on the Choreographer's own thread, before any frame is timed against it.
+ static struct {
+     mp_static_mutex lock;
+     bool started;   // thread created (or creation attempted)
+@@ -1025,10 +1034,12 @@ static struct {
+     mp_post_frame_callback_delayed_fn post_frame_callback_delayed;
+     mp_post_frame_callback64_fn post_frame_callback64;
+     mp_post_frame_callback_delayed64_fn post_frame_callback_delayed64;
++    mp_register_refresh_rate_callback_fn register_refresh_rate_callback;
+     AChoreographer *choreographer;
+     mp_thread thread;
+     struct vo *client; // the attached vo, or NULL
+-    bool posted;       // a frame callback is outstanding
++    int posted;        // frame callbacks outstanding
++    int64_t vsync_period; // from the refresh-rate callback, 0 until known
+ } vsync_sampler = { .lock = MP_STATIC_MUTEX_INITIALIZER };
+ 
+ // vsync_sampler.lock held.
+@@ -1037,7 +1048,7 @@ static void post_vsync_callback(bool delayed);
+ static void record_vsync(int64_t frame_time)
+ {
+     mp_mutex_lock(&vsync_sampler.lock);
+-    vsync_sampler.posted = false;
++    vsync_sampler.posted--;
+     struct vo *vo = vsync_sampler.client;
+     if (vo) {
+         struct priv *p = vo->priv;
+@@ -1047,6 +1058,27 @@ static void record_vsync(int64_t frame_time)
+     mp_mutex_unlock(&vsync_sampler.lock);
+ }
+ 
++// The display's vsync period changed (or is first known). A fresh phase
++// sample on the new grid is requested at once rather than at the next
++// 500 ms resample, and the attached vo re-times its next frame against it.
++static void refresh_rate_callback(int64_t vsync_period_ns, void *data)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    if (vsync_period_ns > 0 && vsync_period_ns != vsync_sampler.vsync_period) {
++        vsync_sampler.vsync_period = vsync_period_ns;
++        struct vo *vo = vsync_sampler.client;
++        if (vo) {
++            MP_VERBOSE(vo, "Choreographer vsync period: %.3f Hz\n",
++                       1e9 / vsync_period_ns);
++            ((struct priv *)vo->priv)->vsync_sample = 0;
++            post_vsync_callback(false);
++            vo_event(vo, VO_EVENT_WIN_STATE);
++            vo_wakeup(vo);
++        }
++    }
++    mp_mutex_unlock(&vsync_sampler.lock);
++}
++
+ static void vsync_callback(long frame_time, void *arg)
+ {
+     record_vsync(restore_frame_time(frame_time));
+@@ -1065,9 +1097,11 @@ static void post_vsync_callback(bool delayed)
+ {
+     const uint32_t delay_ms = delayed ? 500 : 0;
+ 
+-    if (!vsync_sampler.ready || vsync_sampler.posted)
++    // One resample may be outstanding; an urgent one may join it.
++    if (!vsync_sampler.ready || (delayed && vsync_sampler.posted) ||
++        vsync_sampler.posted > 1)
+         return;
+-    vsync_sampler.posted = true;
++    vsync_sampler.posted++;
+     if (vsync_sampler.post_frame_callback_delayed64) {
+         if (delay_ms) {
+             vsync_sampler.post_frame_callback_delayed64(
+@@ -1108,6 +1142,10 @@ static MP_THREAD_VOID vsync_thread(void *arg)
+     }
+     vsync_sampler.choreographer = choreographer;
+     vsync_sampler.ready = true;
++    if (vsync_sampler.register_refresh_rate_callback) {
++        vsync_sampler.register_refresh_rate_callback(
++            choreographer, refresh_rate_callback, NULL);
++    }
+     if (vsync_sampler.client)
+         post_vsync_callback(false);
+     mp_mutex_unlock(&vsync_sampler.lock);
+@@ -1147,6 +1185,8 @@ static void start_vsync_sampler(void)
+         dlsym(lib, "AChoreographer_postFrameCallback64");
+     vsync_sampler.post_frame_callback_delayed64 =
+         dlsym(lib, "AChoreographer_postFrameCallbackDelayed64");
++    vsync_sampler.register_refresh_rate_callback =
++        dlsym(lib, "AChoreographer_registerRefreshRateCallback");
+ 
+     bool have64 = vsync_sampler.post_frame_callback64 &&
+                   vsync_sampler.post_frame_callback_delayed64;
+@@ -3303,6 +3343,16 @@ static int64_t read_vsync_sample(struct priv *p)
+     return sample;
+ }
+ 
++// The vsync period the Choreographer reports, 0 where the platform does not
++// (below API 30, or before its first callback).
++static int64_t read_vsync_period(void)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    int64_t period = vsync_sampler.vsync_period;
++    mp_mutex_unlock(&vsync_sampler.lock);
++    return period;
++}
++
+ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+                                   int64_t mono_now)
+ {
+@@ -3311,14 +3361,24 @@ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+            sample <= mono_now + p->queue_period;
+ }
+ 
+-static int64_t display_period(struct vo *vo)
++// The Choreographer's own period where it reports one; else the core's
++// display_fps (the embedder's --display-fps-override, or what
++// VOCTRL_GET_DISPLAY_FPS returned) as a plausibility-bounded interval.
++static int64_t plausible_period(double period)
+ {
+-    double period = vo_get_vsync_interval(vo);
+     if (!isfinite(period) || period < 1e9 / 240.0 || period > 1e9 / 20.0)
+         return 0;
+     return llround(period);
+ }
+ 
++static int64_t display_period(struct vo *vo)
++{
++    int64_t period = plausible_period(read_vsync_period());
++    if (period)
++        return period;
++    return plausible_period(vo_get_vsync_interval(vo));
++}
++
+ // Keep the early OSD preparation horizon. prepare_frame separately tells the
+ // core when this queued frame may be submitted to the codec.
+ static void update_queue_timing(struct vo *vo, double frame_duration)
+@@ -3328,7 +3388,9 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
+     int64_t period = display_period(vo);
+ 
+     if (period != p->queue_period) {
+-        mediacodec_timing_reset(&p->timing);
++        // The media cadence anchor is period-independent; only the snap
++        // preference was made against the old grid.
++        p->timing.vsync_hysteresis_offset_ns = 0;
+         p->queue_period = period;
+         p->queue_period_changed = mono_now;
+     }
+@@ -3703,6 +3765,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return VO_TRUE;
+     case VOCTRL_SET_WINDOW_ID:
+         return set_window_id(vo, *(int64_t *)data);
++    case VOCTRL_GET_DISPLAY_FPS: {
++        int64_t period = plausible_period(read_vsync_period());
++        if (!period)
++            return VO_NOTIMPL;
++        *(double *)data = 1e9 / period;
++        return VO_TRUE;
++    }
+     case VOCTRL_RESET:
+         reset_video(vo);
+         return VO_TRUE;

@@ -54,7 +54,8 @@ stats = source[source.index(stats_start):source.index(stats_end) + len(stats_end
 # Compile production preparation, draw and flip, not a parallel scheduling model.
 # Only platform/codec/OSD side effects are replaced by the host harness.
 functions = [
-    "read_vsync_sample", "vsync_sample_is_fresh", "display_period",
+    "read_vsync_sample", "read_vsync_period", "vsync_sample_is_fresh",
+    "plausible_period", "display_period",
     "update_queue_timing", "get_release_target", "prepare_osd",
     "submit_deadline", "prepare_frame", "draw_frame", "present_feedback",
     "flip_page", "reset_video",

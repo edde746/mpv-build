@@ -392,7 +392,30 @@ static void test_present_reports_match_intents(void)
     CHECK_EQ(s.unmatched, 1, "a second report for a retired intent is unmatched");
     present_observe(&s, 4000, EPOCH, period);
     CHECK_EQ(s.unmatched, 2, "a report nobody intended is unmatched");
-    CHECK_EQ(present_failures(&s), 2, "late and untimed presents are failures, unmatched reports are not");
+    CHECK_EQ(present_failures(&s), 1, "an untimed present is a failure, unmatched reports are not");
+    CHECK_EQ(s.missed, 0, "two reports are not yet a reference to miss against");
+
+    // A device whose reports sit a constant distance from the intended vsync
+    // (Tensor reports the release timestamp, 0.8 of a period early) misses
+    // nothing; a report that leaves that steady distance by half a period
+    // is a miss, and the reference survives it.
+    struct present_stats t = {0};
+    const int64_t offset = -period * 8 / 10;
+    for (int n = 0; n < 6; n++) {
+        present_record(&t, n, EPOCH + n * period);
+        CHECK_EQ(present_observe(&t, n, EPOCH + n * period + offset + (n % 2) * MS, period),
+                 false, "a steady early report is not a miss");
+    }
+    CHECK_EQ(t.hist[1], 6, "the histogram still shows where the reports land");
+    CHECK_EQ(t.missed, 0, "nothing missed at a steady offset");
+    present_record(&t, 6, EPOCH + 6 * period);
+    CHECK_EQ(present_observe(&t, 6, EPOCH + 7 * period + offset, period), true,
+             "a frame shown a period after its siblings is a miss");
+    CHECK_EQ(t.missed, 1, "the miss is counted");
+    present_record(&t, 7, EPOCH + 7 * period);
+    CHECK_EQ(present_observe(&t, 7, EPOCH + 7 * period + offset, period), false,
+             "the next frame back on its vsync is not a miss");
+    CHECK_EQ(present_failures(&t), 1, "misses are failures");
 
     struct present_stats b = {0};
     const int64_t edges[] = {-2 * period, -period, -period / 2 + 1, 0,
@@ -493,9 +516,12 @@ struct priv {
     const char *present_source;
 };
 
-// Stands in for the production process-lifetime sampler; only its lock is
-// touched by the extracted read_vsync_sample.
-static struct { int lock; } vsync_sampler;
+// Stands in for the production process-lifetime sampler: its lock, and the
+// vsync period the Choreographer reported (0 until it has).
+static struct { int lock; int64_t vsync_period; } vsync_sampler;
+
+// Frames the VO reports to the core as dropped (vo_increment_drop_count).
+static int64_t drops;
 
 struct vo;
 struct vo_driver {
@@ -537,6 +563,7 @@ static unsigned core_wakeups;
 static void wakeup_core(struct vo *vo) { (void)vo; core_wakeups++; }
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
 static double vo_get_vsync_interval(struct vo *vo) { return vo->period; }
+static void vo_increment_drop_count(struct vo *vo, int64_t n) { (void)vo; drops += n; }
 static void vo_set_queue_params(struct vo *vo, int64_t offset, int count)
 {
     (void)count;
@@ -737,11 +764,13 @@ static void test_flip_records_intents_and_drains_reports(void)
     struct vo_frame frame2 = {.current = &image2, .frame_id = 2,
                                .pts = frame.pts + 40 * MS, .duration = 40 * MS};
     in.frame_queued = &frame2;
+    drops = 0;
     CHECK_EQ(present_queued(&vo), false, "the next frame waits for its window");
     clock_ns = in.wakeup_pts;
     CHECK_EQ(present_queued(&vo), true, "the next frame is released");
     CHECK_EQ(p.present.measured, 1, "the report is matched to the earlier intent");
     CHECK_EQ(p.present.hist[3], 1, "and read as one vsync late");
+    CHECK_EQ(drops, 0, "one report is no reference yet to call it a miss against");
     CHECK_EQ(p.present.ring[0].live, 0, "the matched intent is retired");
     CHECK_EQ(p.present.ring[1].live, 1, "the new release is pending");
     CHECK_EQ(rendered_scripted, 0, "every scripted report was consumed");
@@ -867,9 +896,11 @@ static void test_refresh_transition_and_late_frame(void)
     image.pts += 0.04;
     in.frame_queued = &frame;
     clock_ns = frame.pts + MS;
+    drops = 0;
     CHECK_EQ(present_queued(&vo), true, "late execution submits without waiting");
     CHECK_EQ(buffer.timestamp, 0, "late deadline renders untimed");
     CHECK_EQ(p.timing.frame_id, frame.frame_id, "late frame advances cadence");
+    CHECK_EQ(drops, 1, "a frame due before it reached the codec counts as dropped");
 
     buffer = (AVMediaCodecBuffer){0};
     frame.frame_id++;
@@ -882,6 +913,64 @@ static void test_refresh_transition_and_late_frame(void)
     clock_ns = in.wakeup_pts;
     CHECK_EQ(present_queued(&vo), true, "unknown period admits at fallback");
     CHECK_EQ(buffer.timestamp, frame.pts, "unknown period keeps raw timestamp");
+}
+
+static void test_choreographer_period_and_cadence_across_a_switch(void)
+{
+    // The Choreographer's own period wins over what the core assumes, and a
+    // frame that lands on its vsync is not a drop.
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    const int64_t period120 = llround(1e9 / 120);
+    vsync_sampler.vsync_period = period120;
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    drops = 0;
+    AVMediaCodecBuffer buffer = {.pts = 1000000};
+    struct mp_image image = {.pts = 1, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+        .pts = EPOCH + 1000 * MS, .duration = llround(1e9 / 24)};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 200 * MS;
+    CHECK_EQ(present_queued(&vo), false, "the frame waits for its window");
+    CHECK_EQ(p.queue_period, period120, "the reported vsync period is the grid");
+    clock_ns = in.wakeup_pts;
+    p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period120) * period120;
+    CHECK_EQ(present_queued(&vo), true, "the frame is released on the 120 Hz grid");
+    CHECK_EQ((published.vsync - p.vsync_sample) % period120, 0,
+             "the release targets a line of the reported grid");
+    uint64_t anchor = p.timing.frame_id;
+    int64_t target = p.timing.target_ns;
+    CHECK_EQ(anchor, 1, "the release anchors the media cadence");
+
+    // The panel drops to 60 Hz. The next frame is timed against the new grid
+    // from the cadence anchor the previous release established, not from a
+    // reset; the report for the first frame, on its vsync, is not a drop.
+    const int64_t period60 = llround(1e9 / 60);
+    vsync_sampler.vsync_period = period60;
+    rendered_script[0] = (AVMediaCodecRendered){1000000, published.vsync};
+    rendered_scripted = 1;
+    AVMediaCodecBuffer next = {.pts = 1041666};
+    struct mp_image image2 = {.pts = 1.041666, .planes[3] = &next, .refs = 1};
+    struct vo_frame frame2 = {.current = &image2, .frame_id = 2,
+        .pts = frame.pts + frame.duration, .duration = frame.duration};
+    in.frame_queued = &frame2;
+    CHECK_EQ(present_queued(&vo), false, "the next frame waits for its window");
+    CHECK_EQ(p.queue_period, period60, "the grid follows the reported period");
+    CHECK_EQ(p.timing.frame_id, anchor, "a period change keeps the cadence anchor");
+    CHECK_EQ(p.timing.target_ns, target, "and its target");
+    clock_ns = in.wakeup_pts;
+    p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period60) * period60;
+    CHECK_EQ(present_queued(&vo), true, "the next frame is released on the 60 Hz grid");
+    CHECK_EQ(next.timestamp != 0, true, "the release after a switch is timed");
+    CHECK_EQ((published.vsync - p.vsync_sample) % period60, 0,
+             "the release targets a line of the new grid");
+    CHECK_EQ(p.present.hist[2], 1, "the first frame landed on its vsync");
+    CHECK_EQ(drops, 0, "a frame shown on its vsync is not a drop");
+
+    vsync_sampler.vsync_period = 0;
+    CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
 
 static void test_drop_pause_redraw_resume(void)
@@ -1126,6 +1215,7 @@ int main(void)
     test_preparation_does_not_submit_early();
     test_driver_refresh_and_cadence();
     test_refresh_transition_and_late_frame();
+    test_choreographer_period_and_cadence_across_a_switch();
     test_drop_pause_redraw_resume();
     test_clock_domain_drift();
     test_speed_change_admission();
