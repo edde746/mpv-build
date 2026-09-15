@@ -38,15 +38,17 @@ from pathlib import Path
 
 lavc, work = map(Path, sys.argv[1:])
 
-def extract(path, name):
+def extract(path, name, ret='int'):
     source = (lavc / path).read_text()
-    match = re.search(r'^(?:static )?int ' + name + r'\([^;]*?\)\n\{.*?^\}', source, re.M | re.S)
+    match = re.search(r'^(?:static )?' + ret + ' ' + name + r'\([^;]*?\)\n\{.*?^\}', source, re.M | re.S)
     if not match:
         raise SystemExit(f'MediaCodec source region not found: {name} in {path}')
     return match.group(0)
 
 (work / 'mediacodec_input.inc').write_text(
     extract('mediacodecdec.c', 'video_max_input_size') + '\n\n' +
+    extract('mediacodecdec_common.c', 'mediacodec_dec_tag_pts', 'int64_t') + '\n\n' +
+    extract('mediacodecdec_common.c', 'ff_mediacodec_dec_dequeue_input', 'ssize_t') + '\n\n' +
     extract('mediacodecdec_common.c', 'ff_mediacodec_dec_send') + '\n')
 PY
 

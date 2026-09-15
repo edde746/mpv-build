@@ -21,3 +21,4 @@
 0107-vo-mediacodec-sparse-stats.patch
 0108-vo-mediacodec-present-feedback.patch
 0109-vo-mediacodec-repaint-osd-after-resize.patch
+0111-vd-lavc-mediacodec-busy-policy.patch

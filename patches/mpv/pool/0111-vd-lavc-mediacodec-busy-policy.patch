@@ -1,0 +1,177 @@
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 5e2e8d7..7c6e365 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -1338,11 +1338,20 @@ void lavc_process(struct mp_filter *f, struct lavc_state *state,
+         }
+         int ret_send = send(f, pkt);
+         if (ret_send == AVERROR(EAGAIN)) {
+-            // Should never happen, but can happen with broken decoders.
+-            MP_WARN(f, "could not consume packet\n");
+             mp_pin_out_unread(f->ppins[0], frame);
+-            mp_filter_wakeup(f);
+-            return;
++            switch (state->busy_policy) {
++            case LAVC_BUSY_WAKEUP:
++                // The decoder wakes this filter when either port can move.
++                return;
++            case LAVC_BUSY_POLL:
++                mp_filter_wakeup(f);
++                return;
++            default:
++                // Should never happen, but can happen with broken decoders.
++                MP_WARN(f, "could not consume packet\n");
++                mp_filter_wakeup(f);
++                return;
++            }
+         }
+         state->packets_sent = true;
+         demux_packet_pool_push(f->packet_pool, pkt);
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index a352dc0..04b40c9 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -107,11 +107,24 @@ extern const struct mp_decoder_fns vd_lavc;
+ extern const struct mp_decoder_fns ad_lavc;
+ extern const struct mp_decoder_fns ad_spdif;
+ 
++// How a decoder that answers EAGAIN on both send and receive is to be
++// treated. libavcodec's contract forbids that answer, so by default it is a
++// warning and an immediate retry; a decoder that is known to give it while
++// its hardware is busy is either polled (it bounded its own wait) or left
++// alone until it wakes the filter itself.
++enum lavc_busy_policy {
++    LAVC_BUSY_UNEXPECTED = 0,
++    LAVC_BUSY_POLL,
++    LAVC_BUSY_WAKEUP,
++};
++
+ // Convenience wrapper for lavc based decoders. Treat lavc_state as private;
+-// init to all-0 on init and resets.
++// init to all-0 on init and resets, except busy_policy, which the decoder
++// sets once it knows its codec.
+ struct lavc_state {
+     bool eof_returned;
+     bool packets_sent;
++    enum lavc_busy_policy busy_policy;
+ };
+ void lavc_process(struct mp_filter *f, struct lavc_state *state,
+                   int (*send)(struct mp_filter *f, struct demux_packet *pkt),
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 399e1d5..69c9c34 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -22,6 +22,7 @@
+ #include <stdbool.h>
+ 
+ #include <libavcodec/avcodec.h>
++#include <libavcodec/mediacodec.h>
+ #include <libavformat/version.h>
+ #include <libavutil/common.h>
+ #include <libavutil/hwcontext.h>
+@@ -57,6 +58,7 @@
+ #include "options/m_option.h"
+ 
+ static void init_avctx(struct mp_filter *vd);
++static void decoder_wakeup(void *opaque);
+ static void uninit_avctx(struct mp_filter *vd);
+ 
+ static int get_buffer2_direct(AVCodecContext *avctx, AVFrame *pic, int flags);
+@@ -209,6 +211,7 @@ typedef struct lavc_ctx {
+     enum AVDiscard skip_frame;
+     bool flushing;
+     struct lavc_state state;
++    bool requeue_progress; // decode_frame: send_queued_packet consumed one
+     const char *decoder;
+     bool hwdec_failed;
+     bool hwdec_notified;
+@@ -855,6 +858,24 @@ static void init_avctx(struct mp_filter *vd)
+     if (avcodec_open2(avctx, lavc_codec, NULL) < 0)
+         goto error;
+ 
++    // A MediaCodec decoder blocks the caller while its hardware is busy,
++    // which on this thread starves audio and the video output alike. Ask it
++    // to answer EAGAIN instead; whether it then wakes this filter itself
++    // decides how that answer is handled (see lavc_busy_policy).
++    switch (av_mediacodec_set_wakeup_callback(avctx, decoder_wakeup, vd)) {
++    case 1:
++        ctx->state.busy_policy = LAVC_BUSY_WAKEUP;
++        MP_VERBOSE(vd, "Decoder wakes the filter itself.\n");
++        break;
++    case 0:
++        ctx->state.busy_policy = LAVC_BUSY_POLL;
++        MP_VERBOSE(vd, "Decoder is polled while busy.\n");
++        break;
++    default:
++        ctx->state.busy_policy = LAVC_BUSY_UNEXPECTED;
++        break;
++    }
++
+     // Sometimes, the first packet contains information required for correct
+     // decoding of the rest of the stream. The only currently known case is the
+     // x264 build number (encoded in a SEI element), needed to enable a
+@@ -874,6 +895,12 @@ error:
+     uninit_avctx(vd);
+ }
+ 
++// On a codec-owned thread: the decoder can make progress again.
++static void decoder_wakeup(void *opaque)
++{
++    mp_filter_wakeup(opaque);
++}
++
+ static void reset_avctx(struct mp_filter *vd)
+ {
+     vd_ffmpeg_ctx *ctx = vd->priv;
+@@ -912,6 +939,10 @@ static void uninit_avctx(struct mp_filter *vd)
+     mp_free_av_packet(&ctx->avpkt);
+     av_buffer_unref(&ctx->cached_hw_frames_ctx);
+ 
++    // Returns only once no wakeup is still on its way to this filter.
++    if (ctx->avctx)
++        av_mediacodec_set_wakeup_callback(ctx->avctx, NULL, NULL);
++    ctx->state.busy_policy = LAVC_BUSY_UNEXPECTED;
+     avcodec_free_context(&ctx->avctx);
+ 
+     av_buffer_unref(&ctx->hwdec_dev);
+@@ -1225,8 +1256,12 @@ static int decode_frame(struct mp_filter *vd)
+     prepare_decoding(vd);
+ 
+     // Re-send old packets (typically after a hwdec fallback during init).
+-    if (ctx->num_requeue_packets)
++    ctx->requeue_progress = false;
++    if (ctx->num_requeue_packets) {
++        int before = ctx->num_requeue_packets;
+         send_queued_packet(vd);
++        ctx->requeue_progress = ctx->num_requeue_packets != before;
++    }
+ 
+     int ret = avcodec_receive_frame(avctx, ctx->pic);
+     if (ret < 0) {
+@@ -1309,8 +1344,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
+         return 0; // force retry
+     }
+ 
+-    if (ret == AVERROR(EAGAIN) && ctx->num_requeue_packets)
+-        return 0; // force retry, so send_queued_packet() gets called
++    if (ret == AVERROR(EAGAIN) && ctx->num_requeue_packets) {
++        // Force a retry so send_queued_packet() gets called. When the decoder
++        // refused the requeued packet on both ports, that retry would spin;
++        // it is then left to the caller's send, which reports the same
++        // EAGAIN and lets the busy policy wait for the decoder.
++        if (ctx->requeue_progress || ctx->state.busy_policy == LAVC_BUSY_UNEXPECTED)
++            return 0;
++        return ret;
++    }
+ 
+     if (ctx->num_delay_queue <= ctx->max_delay_queue && ret != AVERROR_EOF)
+         return ret;
+@@ -1408,7 +1450,7 @@ static void vd_lavc_reset(struct mp_filter *vd)
+ 
+     flush_all(vd);
+ 
+-    ctx->state = (struct lavc_state){0};
++    ctx->state = (struct lavc_state){.busy_policy = ctx->state.busy_policy};
+     ctx->framedrop_flags = 0;
+ }
+ 

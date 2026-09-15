@@ -6,3 +6,4 @@
 0006-mediacodec-select-decoder-despite-profile-mismatch.patch
 0007-mediacodec-read-output-crop-on-mediatek.patch
 0008-mediacodec-frame-rendered-feedback.patch
+0009-mediacodec-async-decode-with-host-wakeup.patch
