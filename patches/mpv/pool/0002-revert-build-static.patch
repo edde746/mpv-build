@@ -1,5 +1,5 @@
 diff --git forkSrcPrefix/osdep/mac/meson.build forkDstPrefix/osdep/mac/meson.build
-index 16605288419c54cb9d89680a6fafd6a2f315487e..a154dea05ea77243f760a05067ead7f32623b991 100644
+index 1660528..a154dea 100644
 --- forkSrcPrefix/osdep/mac/meson.build
 +++ forkDstPrefix/osdep/mac/meson.build
 @@ -6,12 +6,12 @@ swift_flags = ['-c', '-emit-library', '-static', '-sdk', macos_sdk_path,

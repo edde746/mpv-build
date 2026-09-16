@@ -816,7 +816,7 @@ index 911069e..1cdf601 100644
  
  enum FFAMediaFormatColorRange {
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 32af7e9..eb95a4f 100644
+index c7a7c42..96a7f76 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
 @@ -45,6 +45,7 @@
@@ -950,7 +950,7 @@ index 32af7e9..eb95a4f 100644
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
      { "dv_p7_mode", "Dolby Vision profile 7 handling",
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index 25fc2b8..a4ab30a 100644
+index 25fc2b8..549021e 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -778,6 +778,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex

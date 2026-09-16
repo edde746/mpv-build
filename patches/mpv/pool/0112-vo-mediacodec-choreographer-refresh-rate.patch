@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index a3a38d3..f3ff8a9 100644
+index 0e85b8c..47234a8 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -396,6 +396,10 @@ typedef void (*mp_post_frame_callback64_fn)(

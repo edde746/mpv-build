@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index e35e162..b6848f4 100644
+index e07d364..3c95106 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -207,6 +207,13 @@

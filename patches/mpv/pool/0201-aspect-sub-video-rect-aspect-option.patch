@@ -1,5 +1,5 @@
 diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
-index fa71dc0d1..545b46efc 100644
+index fa71dc0..545b46e 100644
 --- a/DOCS/man/options.rst
 +++ b/DOCS/man/options.rst
 @@ -1751,6 +1751,21 @@ Video
@@ -25,7 +25,7 @@ index fa71dc0d1..545b46efc 100644
      ``--correct-pts=no`` switches mpv to a mode where video timing is
      determined using a fixed framerate value (either using the
 diff --git a/options/options.c b/options/options.c
-index 716c3e6f1..91c223a9e 100644
+index 716c3e6..91c223a 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -166,6 +166,7 @@ static const m_option_t mp_vo_opt_list[] = {
@@ -37,7 +37,7 @@ index 716c3e6f1..91c223a9e 100644
      {"video-unscaled", OPT_CHOICE(unscaled,
          {"no", 0}, {"yes", 1}, {"downscale-big", 2})},
 diff --git a/options/options.h b/options/options.h
-index 12dafea1e..278c347c9 100644
+index 12dafea..278c347 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -51,6 +51,7 @@ typedef struct mp_vo_opts {
@@ -49,7 +49,7 @@ index 12dafea1e..278c347c9 100644
  
      struct m_geometry geometry;
 diff --git a/video/out/aspect.c b/video/out/aspect.c
-index 55c595096..8623f29d7 100644
+index 55c5950..8623f29 100644
 --- a/video/out/aspect.c
 +++ b/video/out/aspect.c
 @@ -198,6 +198,28 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,

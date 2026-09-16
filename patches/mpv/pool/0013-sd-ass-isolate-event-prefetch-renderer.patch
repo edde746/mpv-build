@@ -133,7 +133,7 @@ index 8db7c41..5541b4f 100644
      struct sd_times (*get_times)(struct sd *sd, double pts);
  };
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
-index 555b5af..dc438fc 100644
+index 555b5af..17f7d59 100644
 --- a/sub/sd_ass.c
 +++ b/sub/sd_ass.c
 @@ -40,23 +40,41 @@
@@ -454,7 +454,7 @@ index 5cbc6d0..fc2506b 100644
      struct sd_lavc_priv *priv = sd->priv;
      struct mp_subtitle_opts *opts = sd->opts;
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index ff36828..c1fa478 100644
+index 9b292e2..60a8d14 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -1396,7 +1396,8 @@ static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,

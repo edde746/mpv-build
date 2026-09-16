@@ -38,7 +38,7 @@ the window's peak phase error.
  1 file changed, 293 insertions(+), 51 deletions(-)
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index e2f5d24..159c7e5 100644
+index 803f6d4..ba696e4 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -91,6 +91,211 @@

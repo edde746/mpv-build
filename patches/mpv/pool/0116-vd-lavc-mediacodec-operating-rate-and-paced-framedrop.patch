@@ -1,5 +1,5 @@
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index 7c6e365..b6526d1 100644
+index a5bb0f3..ec3ba29 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
 @@ -189,6 +189,9 @@ struct priv {
@@ -79,7 +79,7 @@ index 7c6e365..b6526d1 100644
          p->dropped_frames += dropped;
      }
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index 04b40c9..f93993c 100644
+index 76862a1..0a59e06 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
 @@ -19,6 +19,7 @@
@@ -118,7 +118,7 @@ index 04b40c9..f93993c 100644
  
  int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 69c9c34..f837a28 100644
+index 34d2474..cc499f8 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
 @@ -143,6 +143,7 @@ struct hwdec_opts {

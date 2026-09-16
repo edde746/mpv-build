@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index e0db578..f82ba38 100644
+index f6bde77..dd57ec3 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -3928,6 +3928,15 @@ static void uninit(struct vo *vo)

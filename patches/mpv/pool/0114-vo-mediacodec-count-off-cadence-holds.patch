@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 3094f35..ae1b58c 100644
+index c338727..f6bde77 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -319,68 +319,102 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)

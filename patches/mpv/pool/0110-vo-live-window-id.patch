@@ -33,7 +33,7 @@ index a34324e..17d96c4 100644
      VOCTRL_BEGIN_DRAGGING,
  
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index eba21b7..a3a38d3 100644
+index 7d75af7..0e85b8c 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -72,6 +72,7 @@

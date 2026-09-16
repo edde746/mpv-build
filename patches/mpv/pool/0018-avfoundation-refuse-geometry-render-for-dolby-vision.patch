@@ -20,7 +20,7 @@ instead.
  1 file changed, 17 insertions(+)
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 7f48569..b4cf516 100644
+index ff4544f..c6e6d46 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -415,6 +415,9 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,

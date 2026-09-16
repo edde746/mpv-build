@@ -1,5 +1,5 @@
 diff --git a/options/options.c b/options/options.c
-index 716c3e6..46a97e1 100644
+index 91c223a..b8e3296 100644
 --- a/options/options.c
 +++ b/options/options.c
 @@ -244,6 +244,9 @@ static const m_option_t mp_vo_opt_list[] = {
@@ -13,7 +13,7 @@ index 716c3e6..46a97e1 100644
  #if HAVE_D3D11
      {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
 diff --git a/options/options.h b/options/options.h
-index 12dafea..433fe93 100644
+index 278c347..d8b594e 100644
 --- a/options/options.h
 +++ b/options/options.h
 @@ -85,6 +85,7 @@ typedef struct mp_vo_opts {

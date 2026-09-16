@@ -130,7 +130,7 @@ index 85f674b..6df8005 100644
  OSStatus ca_lock_device(AudioDeviceID device, pid_t *pid);
  OSStatus ca_unlock_device(AudioDeviceID device, pid_t *pid);
 diff --git forkSrcPrefix/meson.build forkDstPrefix/meson.build
-index fb10be5..8f588b2 100644
+index 42ece8e..f6f8e7f 100644
 --- forkSrcPrefix/meson.build
 +++ forkDstPrefix/meson.build
 @@ -838,8 +838,8 @@ if features['audiounit'] or features['coreaudio'] or features['avfoundation']

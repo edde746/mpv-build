@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 2c005c0..3094f35 100644
+index 47234a8..c338727 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -323,6 +323,13 @@ struct present_intent {

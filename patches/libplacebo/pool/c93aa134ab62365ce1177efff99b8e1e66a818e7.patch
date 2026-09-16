@@ -9,7 +9,7 @@ Fix https://github.com/mpv-android/mpv-android/issues/977 and https://github.com
  1 file changed, 1 insertion(+)
 
 diff --git a/src/opengl/utils.c b/src/opengl/utils.c
-index d96a3e74a..81be67af0 100644
+index d96a3e7..81be67a 100644
 --- a/src/opengl/utils.c
 +++ b/src/opengl/utils.c
 @@ -48,6 +48,7 @@ void gl_poll_callbacks(pl_gpu gpu)

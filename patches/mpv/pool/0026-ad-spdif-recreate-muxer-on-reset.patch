@@ -30,7 +30,7 @@ Signed-off-by: Nathan Lucas <nlucasgit@gmail.com>
  1 file changed, 69 insertions(+), 9 deletions(-)
 
 diff --git a/audio/decode/ad_spdif.c b/audio/decode/ad_spdif.c
-index 2c0c8d296634c..a42bab0d52825 100644
+index 2c0c8d2..a42bab0 100644
 --- a/audio/decode/ad_spdif.c
 +++ b/audio/decode/ad_spdif.c
 @@ -22,6 +22,7 @@

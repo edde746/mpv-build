@@ -87,7 +87,7 @@ index cb100ea..479eecf 100644
          ret = AVERROR_EXTERNAL;
      if (codec->window)
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 21ed553..32af7e9 100644
+index 21ed553..c7a7c42 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
 @@ -1010,17 +1010,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)

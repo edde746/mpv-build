@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 05e2417..a576ab8 100644
+index 5ac46d7..ca35b26 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -325,6 +325,20 @@ static int64_t cm_time_to_ns(CMTime time)

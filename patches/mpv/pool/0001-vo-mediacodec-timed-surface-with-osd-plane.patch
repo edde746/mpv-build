@@ -100,7 +100,7 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..ff36828
+index 0000000..9b292e2
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
 @@ -0,0 +1,3264 @@

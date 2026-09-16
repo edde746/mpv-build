@@ -62,7 +62,11 @@ def read(path: Path) -> str:
 def post_image(patch: Path) -> list[str]:
     """The patch's post-image: added lines plus context lines.
 
-    Hunk headers and the ---/+++ file markers are never part of it.
+    Hunk headers and the ---/+++ file markers are never part of it. An empty
+    post-image is a failure rather than an empty result: a pure deletion has
+    one, and so does a file that is not a diff at all, and writing either out
+    as an empty output file would report success for a chunk the harnesses go
+    on to compile.
     """
     lines = []
     for raw in read(patch).splitlines():
@@ -70,6 +74,8 @@ def post_image(patch: Path) -> list[str]:
             continue
         if raw.startswith(("+", " ")):
             lines.append(raw[1:])
+    if not lines:
+        fail(f"{patch}: the post-image is empty; is this a diff?")
     return lines
 
 
@@ -78,6 +84,43 @@ def unique(lines: list[str], pattern: re.Pattern, what: str, origin: Path) -> in
     if len(matches) != 1:
         fail(f"{origin}: expected exactly one {what}, found {len(matches)}")
     return matches[0]
+
+
+def conditional_contexts(text: str) -> list[tuple[tuple[int, int], ...]]:
+    """Per line, the enclosing `#if` frames: (frame id, which arm).
+
+    ffmpeg compiles one arm of every `#if`/`#else` chain, so two definitions of
+    the same name in different arms are alternatives, not a redefinition. The
+    ids are assigned in nesting order, which makes the frames of two lines
+    comparable position by position.
+    """
+    frames: list[tuple[int, int]] = []
+    contexts = []
+    opened = 0
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        contexts.append(tuple(frames))
+        if stripped.startswith("#if"):
+            frames.append((opened, 0))
+            opened += 1
+        elif stripped.startswith(("#else", "#elif")):
+            if frames:
+                frame, arm = frames[-1]
+                frames[-1] = (frame, arm + 1)
+        elif stripped.startswith("#endif"):
+            if frames:
+                frames.pop()
+    return contexts
+
+
+def mutually_exclusive(one: tuple[tuple[int, int], ...], other: tuple[tuple[int, int], ...]) -> bool:
+    """Whether two lines sit in arms that never compile together."""
+    for (frame, arm), (other_frame, other_arm) in zip(one, other):
+        if frame != other_frame:
+            break
+        if arm != other_arm:
+            return True
+    return False
 
 
 def extract_region(source: Path, marker: str, added_only: bool, patch: bool) -> list[str]:
@@ -146,9 +189,13 @@ def extract_defines(text: str, origin: Path, names: list[str], out: list[str]) -
         start = unique(lines, re.compile(r"#define " + re.escape(name) + r"\b"), f"#define {name}", origin)
         end = start
         # A continued macro is one definition: keep its backslashes intact, so
-        # the chunk must be emitted as one block, never line by line.
+        # the chunk must be emitted as one block, never line by line. A
+        # definition that runs off the end of the file is a truncated or
+        # malformed source, so name it rather than walking past the list.
         while lines[end].rstrip().endswith("\\"):
             end += 1
+            if end >= len(lines):
+                fail(f"{origin}: the #define {name} never ends: its last line is a continuation")
         out.append("\n".join(lines[start : end + 1]))
 
 
@@ -175,16 +222,32 @@ def extract_hunks(patch: Path) -> list[dict[str, object]]:
     lines of context and a whole function is rarely present in one piece.
     `post` is the hunk's post-image (added plus context lines) and `added` only
     its added lines.
+
+    A hunk ends where its header says it does. Anything after that belongs to
+    no hunk, which is what keeps `git format-patch`'s trailer -- notably the
+    blank line before its `-- \\n<version>` signature -- out of the last hunk's
+    post-image. Post-image is what the harnesses compile, so absorbing a line
+    the hunk does not have hands them a chunk the patch never wrote.
     """
     hunks: list[dict[str, object]] = []
     current: dict[str, object] | None = None
+    old_left = new_left = 0
     for line in read(patch).splitlines():
-        match = re.match(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)", line)
+        match = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@ ?(.*)", line)
         if match:
-            current = {"header": match.group(1), "post": [], "added": []}
+            # A bare offset (`@@ -1 +1 @@`) means one line.
+            old_left = int(match.group(1)) if match.group(1) is not None else 1
+            new_left = int(match.group(2)) if match.group(2) is not None else 1
+            current = {"header": match.group(3), "post": [], "added": []}
             hunks.append(current)
             continue
         if current is None or line.startswith(("+++", "---", "diff ", "index ")):
+            continue
+        if not (old_left or new_left):
+            continue
+        # `\ No newline at end of file` annotates the line before it and is not
+        # one of the hunk's lines.
+        if line.startswith("\\"):
             continue
         post = current["post"]
         added = current["added"]
@@ -192,8 +255,13 @@ def extract_hunks(patch: Path) -> list[dict[str, object]]:
         if line.startswith("+"):
             post.append(line[1:])
             added.append(line[1:])
-        elif line.startswith(" ") or not line:
-            post.append(line[1:] if line else "")
+            new_left -= 1
+        elif line.startswith("-"):
+            old_left -= 1
+        else:
+            post.append(line[1:] if line.startswith(" ") else line)
+            old_left -= 1
+            new_left -= 1
     return hunks
 
 
@@ -230,18 +298,36 @@ def extract_symbols(text: str, origin: Path, names: list[str], ret: str | None, 
     # can carry before the name. A permissive `.*` would let the match start
     # inside a comment that happens to mention `name()`, which spans into the
     # real definition and yields a bogus second match.
-    return_type = ret if ret else r"[A-Za-z_][A-Za-z0-9_ \t*]*?"
+    #
+    # An explicit one is a type, not a pattern: matched literally, and followed
+    # by whitespace or directly by the name, because a pointer return type ends
+    # in the `*` that touches it (`const char *av_mediacodec_rendered_source(`).
+    return_type = re.escape(ret) if ret else r"[A-Za-z_][A-Za-z0-9_ \t*]*?"
     for name in names:
         pattern = re.compile(
-            r"^(?:static\s+)?" + return_type + r"\s+" + re.escape(name) + r"\([^;{]*?\)\n\{.*?^\}",
+            r"^(?:static\s+)?"
+            + return_type
+            + r"(?:\s+|(?<=\*))"
+            + re.escape(name)
+            + r"\([^;{]*?\)\n\{.*?^\}",
             re.MULTILINE | re.DOTALL,
         )
         found = pattern.search(text)
         if found is None:
             fail(f"{origin}: no definition of {name}")
-        if len(pattern.findall(text)) > 1:
-            fail(f"{origin}: {name} is defined more than once")
-        out.append(found.group(0))
+        matches = list(pattern.finditer(text))
+        # Two definitions in different arms of one `#if`/`#else` chain are
+        # alternatives ffmpeg never compiles together -- mediacodec.c defines
+        # the rendered-frame ring once under `#if CONFIG_MEDIACODEC` and again
+        # as ENOSYS stubs under `#else`. Only definitions that could be
+        # compiled together are a redefinition.
+        contexts = conditional_contexts(text)
+        lines_of = [text.count("\n", 0, match.start()) for match in matches]
+        for i in range(len(matches)):
+            for j in range(i + 1, len(matches)):
+                if not mutually_exclusive(contexts[lines_of[i]], contexts[lines_of[j]]):
+                    fail(f"{origin}: {name} is defined more than once")
+        out.append(matches[0].group(0))
 
 
 def emit(path: Path, chunks: list[str], append: bool) -> None:
@@ -293,7 +379,7 @@ def main(argv: list[str]) -> int:
     sy = sub.add_parser("symbol", help="write function definitions out of a text file")
     common(sy, "text file", "output file")
     sy.add_argument("--fn", action="append", required=True)
-    sy.add_argument("--return", dest="ret", help="exact return type, e.g. 'int64_t'")
+    sy.add_argument("--return", dest="ret", help="exact return type, e.g. 'int64_t' or 'const char *'")
 
     args = parser.parse_args(argv)
 

@@ -169,7 +169,7 @@ index ec7bff9..438522c 100644
      libass/ass_types.h libass/ass.h libass/ass_priv.h libass/ass.c \
      libass/ass_library.h libass/ass_library.c \
 diff --git a/libass/ass.c b/libass/ass.c
-index 3805a3d..0241dc1 100644
+index 3805a3d..f0feb94 100644
 --- a/libass/ass.c
 +++ b/libass/ass.c
 @@ -140,6 +140,9 @@ int ass_alloc_event(ASS_Track *track)
@@ -192,7 +192,7 @@ index 3805a3d..0241dc1 100644
  
  void ass_free_style(ASS_Track *track, int sid)
 diff --git a/libass/ass.h b/libass/ass.h
-index 13fae57..e1ad021 100644
+index 13fae57..8d0bf15 100644
 --- a/libass/ass.h
 +++ b/libass/ass.h
 @@ -398,6 +398,21 @@ ASS_Renderer *ass_renderer_init(ASS_Library *);
@@ -239,7 +239,7 @@ index 13fae57..e1ad021 100644
   * \brief Set the source image size in pixels.
   * This affects some ASS tags like e.g. 3D transforms and
 diff --git a/libass/ass_cache.c b/libass/ass_cache.c
-index 47069c1..d99b599 100644
+index 47069c1..38dc2d2 100644
 --- a/libass/ass_cache.c
 +++ b/libass/ass_cache.c
 @@ -23,12 +23,12 @@
@@ -1671,19 +1671,18 @@ index 0a97960..9bcc671 100644
  
  char *ass_load_file(struct ass_library *library, const char *fname, FileNameSource hint, size_t *bufsize);
 diff --git a/libass/ass_render.c b/libass/ass_render.c
-index b80ed87..4d18271 100644
+index b80ed87..9dcf5d4 100644
 --- a/libass/ass_render.c
 +++ b/libass/ass_render.c
-@@ -20,6 +20,8 @@
+@@ -20,6 +20,7 @@
  #include "ass_compat.h"
  
  #include <assert.h>
-+#include <float.h>
 +#include <limits.h>
  #include <math.h>
  #include <string.h>
  #include <stdbool.h>
-@@ -28,6 +30,11 @@
+@@ -28,6 +29,11 @@
  #include <linebreak.h>
  #endif
  
@@ -1695,7 +1694,7 @@ index b80ed87..4d18271 100644
  #include "ass.h"
  #include "ass_outline.h"
  #include "ass_render.h"
-@@ -67,8 +74,36 @@ static bool text_info_init(TextInfo* text_info)
+@@ -67,8 +73,36 @@ static bool text_info_init(TextInfo* text_info)
      return true;
  }
  
@@ -1732,7 +1731,7 @@ index b80ed87..4d18271 100644
      free(text_info->glyphs);
      free(text_info->event_text);
      free(text_info->breaks);
-@@ -83,9 +118,15 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
+@@ -83,9 +117,15 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
      if (!text_info_init(&state->text_info))
          return false;
  
@@ -1749,7 +1748,7 @@ index b80ed87..4d18271 100644
      return ass_rasterizer_init(&priv->engine, &state->rasterizer, RASTERIZER_PRECISION);
  }
  
-@@ -97,6 +138,9 @@ static void render_context_done(RenderContext *state)
+@@ -97,6 +137,9 @@ static void render_context_done(RenderContext *state)
          ass_shaper_free(state->shaper);
  
      text_info_done(&state->text_info);
@@ -1759,7 +1758,7 @@ index b80ed87..4d18271 100644
  }
  
  ASS_Renderer *ass_renderer_init(ASS_Library *library)
-@@ -146,9 +190,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+@@ -146,9 +189,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
          !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
          goto fail;
  
@@ -1778,7 +1777,7 @@ index b80ed87..4d18271 100644
  
      if (!render_context_init(&priv->state, priv))
          goto fail;
-@@ -161,6 +211,43 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+@@ -161,6 +210,43 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
      ass_shaper_info(library);
      priv->settings.shaper = ASS_SHAPING_COMPLEX;
  
@@ -1822,7 +1821,7 @@ index b80ed87..4d18271 100644
      ass_msg(library, MSGL_V, "Initialized");
  
      return priv;
-@@ -172,28 +259,69 @@ fail:
+@@ -172,28 +258,69 @@ fail:
      return NULL;
  }
  
@@ -1894,7 +1893,7 @@ index b80ed87..4d18271 100644
  
      free(render_priv->settings.default_font);
      free(render_priv->settings.default_family);
-@@ -207,12 +335,108 @@ void ass_renderer_done(ASS_Renderer *render_priv)
+@@ -207,12 +334,108 @@ void ass_renderer_done(ASS_Renderer *render_priv)
   * \brief Create a new ASS_Image
   * Parameters are the same as ASS_Image fields.
   */
@@ -2007,7 +2006,7 @@ index b80ed87..4d18271 100644
      if (!img) {
          if (!source)
              ass_aligned_free(bitmap);
-@@ -235,6 +459,45 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
+@@ -235,6 +458,45 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
      return &img->result;
  }
  
@@ -2053,7 +2052,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Mapping between script and screen coordinates
   */
-@@ -386,23 +649,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
+@@ -386,23 +648,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
          // split up into left and right for karaoke, if needed
          if (lbrk > r[j].x0) {
              if (lbrk > r[j].x1) lbrk = r[j].x1;
@@ -2095,7 +2094,7 @@ index b80ed87..4d18271 100644
          }
      }
  
-@@ -473,24 +740,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
+@@ -473,24 +739,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
      if (brk > b_x0) {           // draw left part
          if (brk > b_x1)
              brk = b_x1;
@@ -2138,7 +2137,7 @@ index b80ed87..4d18271 100644
      }
      return tail;
  }
-@@ -511,6 +782,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -511,6 +781,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      double y0 = (bbox->y_min + bbox->y_max) / 2.0;
      double dx = (bbox->x_max - bbox->x_min) / 2.0 + 64;
      double dy = (bbox->y_max - bbox->y_min) / 2.0 + 64;
@@ -2146,7 +2145,7 @@ index b80ed87..4d18271 100644
  
      // Change input coordinates' origin to (x0, y0),
      // after that transformation x:[-dx, dx], y:[-dy, dy],
-@@ -526,9 +798,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -526,9 +797,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      double center[2] = { m[0][2] * w, m[1][2] * w };
      // Change output coordinates' origin to center,
      // m_xz and m_yz is skipped as it becomes 0 and no longer needed.
@@ -2161,7 +2160,7 @@ index b80ed87..4d18271 100644
  
      double delta[2] = {0};
      if (!first) {
-@@ -546,9 +820,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -546,9 +819,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      }
  
      // Minimal bounding box z coordinate
@@ -2175,7 +2174,7 @@ index b80ed87..4d18271 100644
      double mul[2] = { dx * w, dy * w };  // 1 / q_x, 1 / q_y
  
      // z0 = m_zz - |m_zx| * dx - |m_zy| * dy,
-@@ -625,11 +901,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -625,11 +900,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      mul[0] *= w;
      mul[1] *= w;
  
@@ -2196,7 +2195,7 @@ index b80ed87..4d18271 100644
      }
  
      if (first && offset) {
-@@ -720,12 +1000,12 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
+@@ -720,12 +999,12 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
  
      ASS_Vector pos;
      BitmapHashKey key;
@@ -2211,7 +2210,7 @@ index b80ed87..4d18271 100644
      if (!clip_bm)
          return;
  
-@@ -1145,7 +1425,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
+@@ -1145,7 +1424,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
  
      ass_apply_transition_effects(state);
      state->explicit = state->evt_type != EVENT_NORMAL ||
@@ -2220,7 +2219,7 @@ index b80ed87..4d18271 100644
  
      ass_reset_render_context(state, NULL);
      state->alignment = state->style->Alignment;
-@@ -1181,7 +1461,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
+@@ -1181,7 +1460,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
      if (info->drawing_text.str) {
          key.type = OUTLINE_DRAWING;
          key.u.drawing.text = info->drawing_text;
@@ -2229,7 +2228,7 @@ index b80ed87..4d18271 100644
          if (!val || !val->valid)
              return;
  
-@@ -1204,7 +1484,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
+@@ -1204,7 +1483,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
          k->italic = info->italic;
          k->flags = info->flags;
  
@@ -2238,7 +2237,7 @@ index b80ed87..4d18271 100644
          if (!val || !val->valid)
              return;
  
-@@ -1242,16 +1522,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
+@@ -1242,16 +1521,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
      case OUTLINE_GLYPH:
          {
              GlyphHashKey *k = &outline_key->u.glyph;
@@ -2263,7 +2262,7 @@ index b80ed87..4d18271 100644
              break;
          }
      case OUTLINE_DRAWING:
-@@ -1332,9 +1618,18 @@ static void calc_transform_matrix(RenderContext *state,
+@@ -1332,9 +1617,18 @@ static void calc_transform_matrix(RenderContext *state,
      double fry = ASS_PI / 180 * info->fry;
      double frz = ASS_PI / 180 * info->frz;
  
@@ -2285,7 +2284,7 @@ index b80ed87..4d18271 100644
  
      double fax = info->fax * info->scale_x / info->scale_y;
      double fay = info->fay * info->scale_y / info->scale_x;
-@@ -1408,8 +1703,10 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+@@ -1408,8 +1702,10 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
      key.outline = info->outline;
      if (!quantize_transform(m, pos, offset, first, &key))
          return;
@@ -2297,7 +2296,7 @@ index b80ed87..4d18271 100644
      if (!info->bm || !info->bm->buffer)
          info->bm = NULL;
  
-@@ -1522,18 +1819,22 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+@@ -1522,18 +1818,22 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
          }
  
          for (int i = 0; i < 3; i++) {
@@ -2322,7 +2321,7 @@ index b80ed87..4d18271 100644
      if (!info->bm_o || !info->bm_o->buffer) {
          info->bm_o = NULL;
          *pos_o = *pos;
-@@ -2451,11 +2752,16 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2451,11 +2751,16 @@ static void render_and_combine_glyphs(RenderContext *state,
      TextInfo *text_info = &state->text_info;
      int left = render_priv->settings.left_margin;
      device_x = (device_x - left) * render_priv->par_scale_x + left;
@@ -2339,7 +2338,7 @@ index b80ed87..4d18271 100644
      for (int i = 0; i < text_info->length; i++) {
          GlyphInfo *info = text_info->glyphs + i;
          if (info->starts_new_run) new_run = true;
-@@ -2491,12 +2797,17 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2491,12 +2796,17 @@ static void render_and_combine_glyphs(RenderContext *state,
  
              if (new_run) {
                  if (nb_bitmaps >= text_info->max_bitmaps) {
@@ -2359,7 +2358,7 @@ index b80ed87..4d18271 100644
                  }
                  current_info = &combined_info[nb_bitmaps];
  
-@@ -2513,9 +2824,6 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2513,9 +2823,6 @@ static void render_and_combine_glyphs(RenderContext *state,
                  filter->be = info->be;
  
                  int32_t shadow_mask_x, shadow_mask_y;
@@ -2369,7 +2368,7 @@ index b80ed87..4d18271 100644
                  filter->blur_x = quantize_blur(info->blur * blur_scale_x, &shadow_mask_x);
                  filter->blur_y = quantize_blur(info->blur * blur_scale_y, &shadow_mask_y);
                  if (flags & FILTER_NONZERO_SHADOW) {
-@@ -2530,12 +2838,16 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2530,12 +2837,16 @@ static void render_and_combine_glyphs(RenderContext *state,
                  current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
                  current_info->image = NULL;
  
@@ -2391,7 +2390,7 @@ index b80ed87..4d18271 100644
  
                  nb_bitmaps++;
                  new_run = false;
-@@ -2553,8 +2865,10 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2553,8 +2864,10 @@ static void render_and_combine_glyphs(RenderContext *state,
  
              if (current_info->bitmap_count >= current_info->max_bitmap_count) {
                  size_t new_size = 2 * current_info->max_bitmap_count;
@@ -2403,7 +2402,7 @@ index b80ed87..4d18271 100644
  
                  current_info->max_bitmap_count = new_size;
              }
-@@ -2571,10 +2885,8 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2571,10 +2884,8 @@ static void render_and_combine_glyphs(RenderContext *state,
  
      for (int i = 0; i < nb_bitmaps; i++) {
          CombinedBitmapInfo *info = &combined_info[i];
@@ -2415,7 +2414,7 @@ index b80ed87..4d18271 100644
  
          if (info->effect_type == EF_KARAOKE_KF)
              info->effect_timing = lround(d6_to_double(info->leftmost_x) +
-@@ -2591,9 +2903,22 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2591,9 +2902,22 @@ static void render_and_combine_glyphs(RenderContext *state,
          key.filter = info->filter;
          key.bitmap_count = info->bitmap_count;
          key.bitmaps = info->bitmaps;
@@ -2440,7 +2439,7 @@ index b80ed87..4d18271 100644
  
          if (val->bm.buffer)
              info->bm = &val->bm;
-@@ -2779,13 +3104,15 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2779,13 +3103,15 @@ static void add_background(RenderContext *state, EventImages *event_images)
      int h = bottom - top;
      if (w < 1 || h < 1)
          return;
@@ -2459,7 +2458,7 @@ index b80ed87..4d18271 100644
                                      clr, NULL);
      if (img) {
          img->next = event_images->imgs;
-@@ -2793,6 +3120,571 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2793,6 +3119,571 @@ static void add_background(RenderContext *state, EventImages *event_images)
      }
  }
  
@@ -3031,7 +3030,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Main ass rendering function, glues everything together
   * \param event event to render
-@@ -2800,9 +3692,10 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2800,9 +3691,10 @@ static void add_background(RenderContext *state, EventImages *event_images)
   * Process event, appending resulting ASS_Image's to images_root.
   */
  static bool
@@ -3044,7 +3043,7 @@ index b80ed87..4d18271 100644
      ASS_Renderer *render_priv = state->renderer;
      if (event->Style >= render_priv->track->n_styles) {
          ass_msg(render_priv->library, MSGL_WARN, "No style found");
-@@ -2813,13 +3706,52 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2813,13 +3705,52 @@ ass_render_event(RenderContext *state, ASS_Event *event,
          return false;
      }
  
@@ -3098,7 +3097,7 @@ index b80ed87..4d18271 100644
      if (text_info->length == 0) {
          // no valid symbols in the event; this can be smth like {comment}
          free_render_context(state);
-@@ -2843,7 +3775,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2843,7 +3774,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
  
      preliminary_layout(state);
  
@@ -3107,7 +3106,7 @@ index b80ed87..4d18271 100644
  
      int MarginL =
          (event->MarginL) ? event->MarginL : state->style->MarginL;
-@@ -2868,14 +3800,13 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2868,14 +3799,13 @@ ass_render_event(RenderContext *state, ASS_Event *event,
      align_lines(state, max_text_width);
  
      // determine text bounding box
@@ -3124,7 +3123,7 @@ index b80ed87..4d18271 100644
  
      // handle positioned events first: an event can be both positioned and
      // scrolling, and the scrolling effect overrides the position on one axis
-@@ -2992,9 +3923,31 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2992,9 +3922,31 @@ ass_render_event(RenderContext *state, ASS_Event *event,
  
      calculate_rotation_params(state, &bbox, device_x, device_y);
  
@@ -3157,7 +3156,7 @@ index b80ed87..4d18271 100644
      // VSFilter does *not* shift lines with a border > margin to be within the
      // frame, so negative values for top and left may occur
      event_images->top = device_y - text_info->lines[0].asc - text_info->border_top;
-@@ -3007,11 +3960,36 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -3007,11 +3959,36 @@ ass_render_event(RenderContext *state, ASS_Event *event,
          + 2 * text_info->border_x + 0.5;
      event_images->detect_collisions = state->detect_collisions;
      event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
@@ -3198,7 +3197,7 @@ index b80ed87..4d18271 100644
  
      ass_shaper_cleanup(state->shaper, text_info);
      free_render_context(state);
-@@ -3019,6 +3997,91 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -3019,6 +3996,91 @@ ass_render_event(RenderContext *state, ASS_Event *event,
      return true;
  }
  
@@ -3290,7 +3289,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Check cache limits and reset cache if they are exceeded
   */
-@@ -3029,21 +4092,6 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
+@@ -3029,21 +4091,6 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
      ass_cache_cut(cache->outline_cache, cache->glyph_max);
  }
  
@@ -3312,7 +3311,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Start a new frame
   */
-@@ -3075,8 +4123,6 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
+@@ -3075,8 +4122,6 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
              render_priv->fontselect, render_priv->num_emfonts);
      }
  
@@ -3321,7 +3320,7 @@ index b80ed87..4d18271 100644
      // PAR correction
      double par = render_priv->settings.par;
      bool lr_track = track->LayoutResX > 0 && track->LayoutResY > 0;
-@@ -3096,6 +4142,44 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
+@@ -3096,6 +4141,44 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
      render_priv->prev_images_root = render_priv->images_root;
      render_priv->images_root = NULL;
  
@@ -3366,7 +3365,7 @@ index b80ed87..4d18271 100644
      check_cache_limits(render_priv, &render_priv->cache);
  
      return true;
-@@ -3125,6 +4209,11 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
+@@ -3125,6 +4208,11 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
              return NULL;
      }
      if (render_priv->render_id != event->render_priv->render_id) {
@@ -3378,7 +3377,7 @@ index b80ed87..4d18271 100644
          memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
          event->render_priv->render_id = render_priv->render_id;
      }
-@@ -3132,6 +4221,20 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
+@@ -3132,6 +4220,20 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
      return event->render_priv;
  }
  
@@ -3399,7 +3398,7 @@ index b80ed87..4d18271 100644
  static int overlap(Rect *s1, Rect *s2)
  {
      if (s1->y0 >= s2->y1 || s2->y0 >= s1->y1 ||
-@@ -3343,6 +4446,48 @@ static int ass_detect_change(ASS_Renderer *priv)
+@@ -3343,6 +4445,48 @@ static int ass_detect_change(ASS_Renderer *priv)
      return diff;
  }
  
@@ -3448,7 +3447,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief free a single image.
   * \param img image as returned by ass_render_frame().
-@@ -3356,8 +4501,21 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
+@@ -3356,8 +4500,21 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
  
      ASS_ImagePriv *priv = (ASS_ImagePriv *) img;
      ass_cache_dec_ref(priv->source);
@@ -3472,7 +3471,7 @@ index b80ed87..4d18271 100644
  
      return next;
  }
-@@ -3393,14 +4551,97 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+@@ -3393,14 +4550,97 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                      realloc(priv->eimg,
                              priv->eimg_size * sizeof(EventImages));
              }
@@ -3576,7 +3575,7 @@ index b80ed87..4d18271 100644
      // call fix_collisions for each group of events with the same layer
      EventImages *last = priv->eimg;
 diff --git a/libass/ass_render.h b/libass/ass_render.h
-index e1eb7d2..23291b2 100644
+index e1eb7d2..2002a01 100644
 --- a/libass/ass_render.h
 +++ b/libass/ass_render.h
 @@ -20,6 +20,8 @@
@@ -4773,7 +4772,7 @@ index 01bb8a8..464ab40 100644
  
  unsigned ass_utf8_get_char(char **str)
 diff --git a/libass/ass_utils.h b/libass/ass_utils.h
-index 5b7cc7a..0f6b09c 100644
+index b078d50..11eba22 100644
 --- a/libass/ass_utils.h
 +++ b/libass/ass_utils.h
 @@ -55,6 +55,12 @@

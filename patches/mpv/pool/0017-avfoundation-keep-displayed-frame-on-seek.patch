@@ -22,7 +22,7 @@ held frame, and uninit still removes the image on teardown.
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 159c7e5..7f48569 100644
+index ba696e4..ff4544f 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -3769,7 +3769,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
