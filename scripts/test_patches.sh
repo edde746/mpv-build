@@ -12,11 +12,14 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 python3 - "$root" <<'PY'
+import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -199,20 +202,228 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     print("apply --check is sound for stacked series and unwinds on failure")
 
+# 4c. fetch-pinned's archive path. The strip has to leave exactly the source
+# tree the drivers build, and every way of getting that wrong has to fail loudly
+# rather than publish the wrong tree as a fetched success. These run against
+# `file://` pins, so no network and no retry sleeps: every case below fails
+# after the download, in the strip.
+def make_archive(path, rows):
+    """A tarball from (name, kind, payload) rows, written in order.
+
+    kind is "dir", "file", "link" (hardlink, payload = target name) or
+    "symlink" (payload = target). Built through tarfile rather than the host
+    `tar` so the member names -- absolute ones included -- are exactly as
+    written, and no platform adds its own members.
+    """
+    with tarfile.open(path, "w") as tar:
+        for name, kind, payload in rows:
+            info = tarfile.TarInfo(name)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            elif kind in ("link", "symlink"):
+                info.type = tarfile.LNKTYPE if kind == "link" else tarfile.SYMTYPE
+                info.linkname = payload
+                tar.addfile(info)
+            else:
+                data = payload.encode()
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    return path
+
+
+def fetch_archive(case, rows, expect=0, needles=(), expect_tree=None):
+    """Materialise one archive pin in a sandbox and assert what it left behind.
+
+    `expect_tree` runs inside the sandbox -- while the extracted tree still
+    exists -- and returns (condition, message) pairs to check.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        sandbox = Path(tmp)
+        (sandbox / "patches" / "widget").mkdir(parents=True)
+        (sandbox / "patches" / "widget" / "series.apple").write_text("", encoding="utf-8")
+        archive = make_archive(sandbox / "widget-1.0.tar.gz", rows)
+        (sandbox / "versions.json").write_text(
+            json.dumps(
+                {
+                    "components": {
+                        "widget": {
+                            "kind": "archive",
+                            "version": "1.0",
+                            "url": archive.as_uri(),
+                            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                            "platforms": ["apple"],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        destination = sandbox / "out" / "widget"
+        result = run(sandbox, "fetch-pinned", "widget", "apple", str(destination), expect=expect)
+        for needle in needles:
+            check(
+                needle in result.stderr,
+                f"{case}: expected {needle!r} in the error, got {result.stderr.strip()!r}",
+            )
+        if expect != 0:
+            check(
+                not destination.exists(),
+                f"{case}: a refused archive must not publish {destination.name}",
+            )
+        elif expect_tree is not None:
+            for condition, message in expect_tree(destination):
+                check(condition, f"{case}: {message}")
+
+
+def single_root(destination):
+    """The root directory's own entry is the one member the strip reduces to
+    nothing; the tree below it is what the drivers build."""
+    return [
+        (
+            (destination / "greeting.txt").read_text(encoding="utf-8") == "hello\n"
+            and (destination / "deep/nested.txt").read_text(encoding="utf-8") == "nested\n",
+            "a single-rooted archive must extract its tree with the top directory stripped",
+        ),
+        (
+            not (destination / "widget-1.0").exists(),
+            "the stripped top-level directory must not survive as a member",
+        ),
+    ]
+
+
+# A hardlink names its target by its pre-strip path, and tarfile resolves that
+# name against the members it is handed, so the strip has to rewrite it.
+# Otherwise the fetch dies with `linkname 'widget-1.0/greeting.txt' not found`.
+def hardlink(destination):
+    link = destination / "greeting.link"
+    return [
+        (
+            link.exists() and link.read_text(encoding="utf-8") == "hello\n",
+            "a hardlink must be rewritten through the strip and extract with its target's content",
+        )
+    ]
+
+
+# A symlink's target is relative to the member's own directory, which the strip
+# moves with it, so it is left alone.
+def symlink(destination):
+    link = destination / "latest"
+    return [
+        (
+            link.is_symlink() and os.readlink(link) == "greeting.txt",
+            "a symlink must survive the strip with its target intact; got "
+            f"{os.readlink(link) if link.is_symlink() else 'not a symlink'}",
+        )
+    ]
+
+
+fetch_archive(
+    "single root",
+    [
+        ("widget-1.0", "dir", None),
+        ("widget-1.0/greeting.txt", "file", "hello\n"),
+        ("widget-1.0/deep/nested.txt", "file", "nested\n"),
+    ],
+    expect_tree=single_root,
+)
+fetch_archive(
+    "hardlink",
+    [
+        ("widget-1.0", "dir", None),
+        ("widget-1.0/greeting.txt", "file", "hello\n"),
+        ("widget-1.0/greeting.link", "link", "widget-1.0/greeting.txt"),
+    ],
+    expect_tree=hardlink,
+)
+fetch_archive(
+    "symlink",
+    [
+        ("widget-1.0", "dir", None),
+        ("widget-1.0/greeting.txt", "file", "hello\n"),
+        ("widget-1.0/latest", "symlink", "greeting.txt"),
+    ],
+    expect_tree=symlink,
+)
+
+# An absolute member name's first part is the anchor "/", not a directory: it
+# passed the one-component count and the `.`/`..` test, and the strip then
+# published the tree *below* the root as the component.
+fetch_archive(
+    "absolute root",
+    [("/etc/pwned", "file", "pwned\n")],
+    expect=1,
+    needles=("cannot strip it",),
+)
+# A flat tarball's only top-level component is a file, so there is nothing to
+# drop; it must be refused rather than extracted empty.
+fetch_archive(
+    "flat archive",
+    [("greeting.txt", "file", "hello\n")],
+    expect=1,
+    needles=("is the whole archive",),
+)
+fetch_archive(
+    "two roots",
+    [("one/a.txt", "file", "a\n"), ("two/b.txt", "file", "b\n")],
+    expect=1,
+    needles=("2 top-level components",),
+)
+fetch_archive(
+    "escaping root",
+    [("../escape", "file", "x\n")],
+    expect=1,
+    needles=("cannot strip it",),
+)
+fetch_archive(
+    "escaping member",
+    [("widget-1.0", "dir", None), ("widget-1.0/../escape", "file", "x\n")],
+    expect=1,
+    needles=("escapes the extraction root",),
+)
+print("fetch-pinned's archive strip accepts the source tree and refuses the rest")
+
 # 5. This repository's own tree is valid, and every group is declared where
 # versions.json says it is.
 run(root, "check")
-# Every real component resolves for every platform, and every entry it names
-# exists: `check` above is what enforces the latter, this proves the former.
+# Every real component resolves for every platform to exactly series.common
+# followed by series.<platform>, in order, comments and blank lines dropped.
+# Running `resolve` at the default expect=0 only proves it did not crash:
+# cmd_resolve rejects an unknown platform and nothing else -- a missing series
+# file reads as empty -- so an empty or truncated resolution used to pass here.
 for component in sorted(p.name for p in (root / "patches").iterdir() if p.is_dir()):
+    component_dir = root / "patches" / component
     for platform in ("apple", "android", "linux", "windows"):
-        run(root, "resolve", component, platform)
+        expected = []
+        for series_name in ("series.common", f"series.{platform}"):
+            series_file = component_dir / series_name
+            if not series_file.is_file():
+                continue
+            expected += [
+                line.strip()
+                for line in series_file.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+        result = run(root, "resolve", component, platform)
+        resolved = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        check(
+            resolved == expected,
+            f"resolve {component} {platform} must return series.common then "
+            f"series.{platform}; got {resolved}, expected {expected}",
+        )
 
 # A component a group's build consumes must declare that group in versions.json;
 # check enforces it, so prove the enforcement fires on a real tree.
 with tempfile.TemporaryDirectory() as tmp:
     sandbox = Path(tmp)
     shutil.copytree(root / "patches", sandbox / "patches")
+    # `check` reads one file outside patches/ and platforms/: the apple group
+    # has no group.json, so its build list -- every library it compiles -- is
+    # read out of the Swift driver. Without it the apple group appears to build
+    # nothing and every apple component goes unchecked.
+    driver = Path("Sources/BuildScripts/XCFrameworkBuild/main.swift")
+    (sandbox / driver).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(root / driver, sandbox / driver)
     # `check` reads platforms/*/group.json and nothing else under platforms/.
     # The built subtrees are not inputs, they are gigabytes, and
     # platforms/android/prefix/<abi>/usr is a self-symlink, so copying them
@@ -268,6 +479,44 @@ with tempfile.TemporaryDirectory() as tmp:
         "ffmpeg" in result.stderr and "android" in result.stderr,
         "check must fail when a built component does not declare its group",
     )
+
+    # The apple set is the driver's build list, so a component only the driver
+    # names -- not a series file, not the manifest, which holds three libraries
+    # -- is held to its declared platforms too. Deriving the set from
+    # series.apple instead left all but ffmpeg and mpv unchecked.
+    versions["components"]["ffmpeg"]["platforms"] = ["apple", "android"]
+    versions["components"]["libplacebo"]["platforms"] = ["android"]
+    (sandbox / "versions.json").write_text(json.dumps(versions), encoding="utf-8")
+    result = run(sandbox, "check", expect=1)
+    check(
+        "apple builds 'libplacebo'" in result.stderr,
+        "check must hold every component the apple driver builds to its declared "
+        f"platforms; got: {result.stderr.strip()}",
+    )
+
+    # And the inputs it reads are required, not optional: a tree that builds
+    # components without pinning them has to say so instead of checking
+    # nothing. The synthetic fixtures above stay valid -- they carry neither
+    # platform groups nor a driver, so there is nothing to declare.
+    (sandbox / "versions.json").unlink()
+    result = run(sandbox, "check", expect=1)
+    check(
+        "versions.json" in result.stderr and "missing" in result.stderr,
+        f"check must report a missing versions.json, not skip the declaration check; "
+        f"got: {result.stderr.strip()}",
+    )
+
+    # A driver whose build list cannot be read is the same hole in a different
+    # shape: a reformatted `let builds:` line would empty the apple set and
+    # retire the check silently, so that has to be a problem of its own.
+    driver_copy = (sandbox / driver).read_text(encoding="utf-8")
+    (sandbox / driver).write_text("// reformatted: no build list here\n", encoding="utf-8")
+    result = run(sandbox, "check", expect=1)
+    check(
+        "builds: [BaseBuild]" in result.stderr,
+        f"check must refuse a driver whose build list it cannot read; got: {result.stderr.strip()}",
+    )
+    (sandbox / driver).write_text(driver_copy, encoding="utf-8")
 print("the repository's own patch tree passes check")
 
 if failures:

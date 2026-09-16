@@ -35,25 +35,53 @@ Commands:
         tree byte-identical to how it was found.
 
     patches.py fetch-pinned <component> <platform> <srcdir>
-        Clone the exact source `<component>` is pinned to for `<platform>`
-        in versions.json (override-aware), prove HEAD is the pinned commit,
-        and apply the resolved series. This is the one implementation of
-        the pin contract; the host regression harnesses call it instead of
-        each carrying their own copy.
+        Acquire the exact source `<component>` is pinned to for `<platform>`
+        in versions.json (override-aware) and apply the resolved series,
+        whichever kind that pin is. A `git` pin is a shallow clone at the
+        pinned ref whose HEAD is then proven equal to the pinned commit; an
+        `archive` pin is a download whose sha256 must match before anything
+        is extracted. This is the one implementation of the pin contract; the
+        host regression harnesses call it instead of each carrying their own
+        copy.
 
 `check` also enforces versions.json's `platforms` arrays: a component a
-group's build consumes must declare that group.
+group's build consumes must declare that group. A group's components come from
+its `platforms/<group>/group.json`, or -- for apple, which has no group.json --
+from the Swift driver's own `builds:` list, so every library that driver
+compiles is covered and not only the ones a series file or the manifest
+happens to mention.
 """
 
 import hashlib
+import http.client
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
 from pathlib import Path
 
 PLATFORMS = ("apple", "android", "linux", "windows")
 PATCHES_DIR = Path("patches")
 VERSIONS_PATH = Path("versions.json")
+
+# The apple group has no group.json: its build is defined by this Swift driver.
+APPLE_DRIVER = Path("Sources/BuildScripts/XCFrameworkBuild/main.swift")
+
+# Swift `Library` rawValues whose canonical versions.json component is not just
+# the lowercased name. The driver names libraries in its own spelling
+# (`libmpv`, `FFmpeg`), versions.json keys them canonically, and this is where
+# the two meet: keys.py's artifact names go through here too.
+COMPONENT_ALIASES = {"libmpv": "mpv"}
+
+
+def canonical_component(artifact: str) -> str:
+    return COMPONENT_ALIASES.get(artifact, artifact.lower())
 
 
 def fail(message):
@@ -122,30 +150,56 @@ def component_pins(component, platform):
 
 
 def cmd_fetch(component, platform, srcdir):
-    """Clone the component's pinned source for this platform and patch it.
+    """Materialise the component's pinned source for this platform and patch it.
 
     The single implementation of the pin contract: resolve the override-aware
-    pin, shallow-clone the ref, prove HEAD is the pinned commit, then apply the
-    resolved series.
+    pin, acquire the source (a shallow clone at the pinned ref, or an archive
+    whose sha256 is checked), and apply the resolved series.
     """
     require_platform(platform)
     pins = component_pins(component, platform)
-    if pins.get("kind") != "git":
-        fail(f"{component}: {platform} pins kind {pins.get('kind')!r}, not a git checkout")
-    url, ref, commit = pins.get("url"), pins.get("ref"), pins.get("commit")
-    if not url or not ref:
-        fail(f"{VERSIONS_PATH}: {component} has no {platform} url/ref to clone")
-    if not commit:
-        fail(f"{VERSIONS_PATH}: {component} has no {platform} commit to verify against")
-
+    kind = pins.get("kind")
     destination = Path(srcdir)
     if destination.exists():
-        fail(f"{srcdir!r} already exists; refusing to clone into it")
-    result = subprocess.run(
-        ["git", "clone", "--quiet", "--depth", "1", "--branch", ref, url, str(destination)]
-    )
-    if result.returncode != 0:
-        fail(f"{component}: could not clone {url} at {ref}")
+        fail(f"{srcdir!r} already exists; refusing to write into it")
+
+    if kind == "git":
+        _fetch_git(component, pins, destination)
+    elif kind == "archive":
+        _fetch_archive(component, pins, destination)
+    else:
+        fail(f"{component}: {platform} pins kind {kind!r}; cannot acquire that")
+
+    return cmd_apply(component, platform, srcdir, False)
+
+
+def _fetch_git(component, pins, destination):
+    url, ref, commit = pins.get("url"), pins.get("ref"), pins.get("commit")
+    if not url or not ref:
+        fail(f"{VERSIONS_PATH}: {component} has no url/ref to clone")
+    if not commit:
+        fail(f"{VERSIONS_PATH}: {component} has no commit to verify against")
+    # A source mirror (code.videolan.org is the only git source this repository
+    # fetches and has refused connections for minutes at a time) is covered by
+    # the same commit pin, so a mirror can only supply the same tree or fail.
+    sources = [url] + ([pins["mirror"]] if pins.get("mirror") else [])
+    clone = None
+    for source in sources:
+        for attempt in range(1, 4):
+            result = subprocess.run(
+                ["git", "clone", "--quiet", "--depth", "1", "--branch", ref, source, str(destination)]
+            )
+            if result.returncode == 0:
+                clone = source
+                break
+            shutil.rmtree(destination, ignore_errors=True)
+            if attempt < 3:
+                time.sleep(attempt)
+        if clone:
+            break
+        print(f"could not clone {source} at {ref}", file=sys.stderr)
+    if clone is None:
+        fail(f"{component}: no source produced {ref}")
     head = subprocess.run(
         ["git", "-C", str(destination), "rev-parse", "HEAD"],
         capture_output=True,
@@ -153,8 +207,148 @@ def cmd_fetch(component, platform, srcdir):
         check=True,
     ).stdout.strip()
     if head != commit:
+        shutil.rmtree(destination, ignore_errors=True)
         fail(f"{component}: {ref} is {head}, {VERSIONS_PATH} pins {commit}")
-    return cmd_apply(component, platform, srcdir, False)
+
+
+def _fetch_archive(component, pins, destination):
+    url, expected = pins.get("url"), pins.get("sha256")
+    if not url:
+        fail(f"{VERSIONS_PATH}: {component} has no url to download")
+    if not expected:
+        fail(f"{VERSIONS_PATH}: {component} has no sha256 to verify the archive against")
+    # Same source policy as the clone path: the primary source first, the
+    # optional mirror only once it has failed, and the same digest demanded of
+    # either. The 30s socket timeout matches the linux driver's own curl
+    # --connect-timeout.
+    sources = [url] + ([pins["mirror"]] if pins.get("mirror") else [])
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Unpack into a staging directory beside the destination -- same
+    # filesystem, so the move at the end is a rename -- and publish it as
+    # `destination` only once every member has landed. A failed fetch must not
+    # leave a half-tree behind for the next run's "already exists" guard.
+    staging = Path(
+        tempfile.mkdtemp(dir=destination.parent, prefix=f".{destination.name}.staging.")
+    )
+    installed = False
+    try:
+        with tempfile.TemporaryDirectory(dir=".") as work:
+            archive = Path(work) / "archive"
+            fetched = False
+            for source in sources:
+                for attempt in range(1, 4):
+                    try:
+                        with (
+                            urllib.request.urlopen(source, timeout=30) as response,
+                            archive.open("wb") as handle,
+                        ):
+                            shutil.copyfileobj(response, handle)
+                    except (OSError, http.client.HTTPException, ValueError) as error:
+                        print(f"could not download {source}: {error}", file=sys.stderr)
+                        archive.unlink(missing_ok=True)
+                        if attempt < 3:
+                            time.sleep(attempt)
+                        continue
+                    digest = sha256_file(archive)
+                    if digest == expected:
+                        fetched = True
+                        break
+                    # A mismatch is not a transient failure like a dropped
+                    # connection, but a retry covers a truncated transfer and
+                    # the mirror is the only other candidate for these bytes.
+                    print(
+                        f"{source}: sha256 {digest}, {VERSIONS_PATH} pins {expected}",
+                        file=sys.stderr,
+                    )
+                    archive.unlink(missing_ok=True)
+                    if attempt < 3:
+                        time.sleep(attempt)
+                if fetched:
+                    break
+            if not fetched:
+                fail(f"{component}: no source served the pinned archive")
+
+            try:
+                with tarfile.open(archive) as tar:
+                    tar.extractall(
+                        staging, members=_stripped_members(component, tar), filter="data"
+                    )
+            except Exception as error:
+                # Anything that makes the bytes unusable -- tar structure, the
+                # decompressor, the filesystem -- is a fetch failure, not a
+                # traceback. `fail` raises SystemExit, which passes through.
+                fail(f"{component}: cannot extract the downloaded archive: {error}")
+
+        os.replace(staging, destination)
+        installed = True
+    finally:
+        if not installed:
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(destination, ignore_errors=True)
+
+
+def _stripped_members(component, tar):
+    """The archive's members with their one top-level component dropped.
+
+    An archive pin is an upstream release tarball whose every member sits
+    under a single top-level directory (ffmpeg's `ffmpeg-7.1/`, mpv's
+    `mpv-0.40.0/`), and that directory is the source tree the drivers build,
+    so exactly one top-level component has to be there to drop. A flat
+    tarball, several roots, or an absolute/`..`/`.` root would otherwise
+    extract the wrong tree, or nothing at all, while the fetch still reported
+    success.
+    """
+    members = tar.getmembers()
+    roots = sorted({Path(member.name).parts[0] for member in members if Path(member.name).parts})
+    if len(roots) != 1:
+        fail(
+            f"{component}: archive has {len(roots)} top-level components "
+            f"({', '.join(roots) or 'none'}); exactly one is required to strip it"
+        )
+    # An absolute member name's first part is the anchor `"/"`, not a directory,
+    # so it passes the count and the `.`/`..` test and then strips to the tree
+    # below it: a tar rooted at `/etc` would publish `etc/...` as the component.
+    if roots[0] in (".", "..") or Path(roots[0]).is_absolute():
+        fail(f"{component}: archive's only top-level component is {roots[0]!r}; cannot strip it")
+
+    renamed = {}
+    stripped = []
+    for member in members:
+        parts = Path(member.name).parts[1:]
+        if not parts:
+            # The root directory's own entry ("mpv-0.40.0/"): it is the one
+            # member the strip legitimately reduces to nothing.
+            if member.isdir():
+                continue
+            fail(f"{component}: archive member {member.name!r} is the whole archive")
+        if Path(*parts).is_absolute() or ".." in parts:
+            fail(f"{component}: archive member {member.name!r} escapes the extraction root")
+        renamed[member.name] = str(Path(*parts))
+
+    for member in members:
+        if member.name not in renamed:
+            continue
+        # A hardlink names its target by the path it carried before the strip,
+        # and tarfile resolves that name against the members it is handed, so
+        # the rewrite has to follow it -- `tar --strip-components` does the
+        # same. A symlink's linkname is relative to the member's own directory,
+        # which the strip moves with it, so it is left alone.
+        if member.islnk():
+            target = renamed.get(member.linkname)
+            if target is None:
+                fail(
+                    f"{component}: archive hardlink {member.name!r} points at "
+                    f"{member.linkname!r}, which the strip does not carry"
+                )
+            member.linkname = target
+        member.name = renamed[member.name]
+        stripped.append(member)
+
+    if not stripped:
+        fail(f"{component}: archive holds no members to extract")
+    return stripped
 
 
 def group_components():
@@ -166,14 +360,73 @@ def group_components():
         for spec in (data.get("artifacts") or {}).values():
             names.update(spec.get("components") or ())
         consumed[path.parent.name] = names
-    # The apple group is defined in the Swift driver rather than a group.json:
-    # the components it builds are the ones its own patch series touch.
-    apple = consumed.setdefault("apple", set())
-    if PATCHES_DIR.is_dir():
-        for component_dir in sorted(PATCHES_DIR.iterdir()):
-            if component_dir.is_dir() and read_series(component_dir / "series.apple"):
-                apple.add(component_dir.name)
+    # The apple group is defined in the Swift driver rather than a group.json,
+    # so what it builds is read out of that driver's own `builds:` list: every
+    # library the group compiles, not just the ones keys.py publishes or the
+    # ones a series file happens to touch. Deriving it from `series.apple` left
+    # 16 of the 18 apple components unchecked, which is the "unread decoration"
+    # this check exists to catch.
+    consumed.setdefault("apple", set()).update(apple_driver_components())
     return consumed
+
+
+def apple_driver_components():
+    """The components the apple driver's build list names, canonicalized.
+
+    Empty when the driver is not in the tree; `cmd_check` reports that rather
+    than letting the apple group silently check nothing.
+    """
+    if not APPLE_DRIVER.is_file():
+        return set()
+    text = APPLE_DRIVER.read_text(encoding="utf-8")
+    entries = _swift_array_entries(text, "let builds: [BaseBuild] = [")
+    if entries is None:
+        return set()
+    libraries = _swift_class_libraries(text)
+    names = set()
+    for entry in entries:
+        inline = re.search(r"library:\s*\.(\w+)", entry)
+        if inline:
+            names.add(inline.group(1))
+            continue
+        # `BuildASS()` names a subclass; the library it builds is the value its
+        # own initializer hands to super.
+        constructed = re.search(r"\b(\w+)\(\)", entry)
+        if constructed and constructed.group(1) in libraries:
+            names.add(libraries[constructed.group(1)])
+    return {canonical_component(name) for name in names}
+
+
+def _swift_array_entries(text, header):
+    """The entries of the Swift array literal `header` opens, whitespace-stripped."""
+    start = text.find(header)
+    if start < 0:
+        return None
+    # Scan from just past the literal's opening bracket: the header carries the
+    # element type in brackets of its own, so counting from the header itself
+    # would close on that annotation.
+    depth = 1
+    for index in range(start + len(header), len(text)):
+        if text[index] == "[":
+            depth += 1
+        elif text[index] == "]":
+            depth -= 1
+            if depth == 0:
+                body = text[start + len(header) : index]
+                return [line.strip() for line in body.splitlines() if line.strip()]
+    return None
+
+
+def _swift_class_libraries(text):
+    """Swift class name -> the Library its initializer passes to super.init."""
+    classes = list(re.finditer(r"^(?:private )?class (\w+)", text, re.M))
+    libraries = {}
+    for position, match in enumerate(classes):
+        end = classes[position + 1].start() if position + 1 < len(classes) else len(text)
+        inherited = re.search(r"super\.init\(library:\s*\.(\w+)\)", text[match.end() : end])
+        if inherited:
+            libraries[match.group(1)] = inherited.group(1)
+    return libraries
 
 
 def check_platform_declarations(components, problems):
@@ -201,9 +454,34 @@ def check_platform_declarations(components, problems):
 
 def cmd_check():
     problems = []
+    consumed = {group: names for group, names in group_components().items() if names}
     if VERSIONS_PATH.is_file():
         components = json.loads(VERSIONS_PATH.read_text(encoding="utf-8")).get("components", {})
         check_platform_declarations(components, problems)
+    elif consumed:
+        # The declaration check is the whole reason this file is read, so a
+        # tree that builds components without pinning them is broken rather
+        # than exempt. Reporting nothing here would let every `platforms`
+        # array go unread behind a green run.
+        problems.append(
+            f"{VERSIONS_PATH}: missing; it is what declares the platforms that "
+            f"{', '.join(sorted(consumed))} build their components for"
+        )
+
+    if Path("platforms").is_dir():
+        # The apple group's only source of truth is the Swift driver's own
+        # build list: it has no group.json. Missing or unreadable, the group
+        # appears to build nothing and every apple component goes unchecked.
+        if not APPLE_DRIVER.is_file():
+            problems.append(
+                f"{APPLE_DRIVER}: missing; the apple group's build list is what "
+                f"its components are checked against"
+            )
+        elif not apple_driver_components():
+            problems.append(
+                f"{APPLE_DRIVER}: found no `let builds: [BaseBuild] = [...]` entries; "
+                f"the apple group's components cannot be checked against it"
+            )
 
     if not PATCHES_DIR.is_dir():
         # A tree with no patches at all is valid.

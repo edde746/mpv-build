@@ -36,7 +36,16 @@ for component in sys.argv[2].split():
 PY
 }
 
-eval "$( pin_block )"
+# Capture the substitution instead of inlining it: `eval "$( pin_block )"`
+# discards the resolver's exit status, because a failed substitution expands to
+# an empty command that `eval` reports as success. The run would then die much
+# further down, on `<first component>: versions.json pins kind ''`. Check the
+# status and name the real failure first.
+if ! pins="$( pin_block )"; then
+	echo >&2 "download.sh: resolving the android pins from versions.json failed"
+	exit 1
+fi
+eval "$pins"
 
 pin () {
 	table "pin_${1}_$2"
