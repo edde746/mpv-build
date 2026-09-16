@@ -1,8 +1,8 @@
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 1c1394d..d120023 100644
+index acd40cb..21ed553 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -769,6 +769,42 @@ static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
+@@ -753,6 +753,42 @@ static int dv_filter_packet(AVCodecContext *avctx, AVPacket *pkt)
  // --- end mediacodec dv filter
  #endif
  
@@ -45,7 +45,7 @@ index 1c1394d..d120023 100644
  static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
  {
      int ret;
-@@ -905,8 +941,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -889,8 +925,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      ff_AMediaFormat_setString(format, "mime", codec_mime);
  
      if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -58,7 +58,7 @@ index 1c1394d..d120023 100644
      } else {
          ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
          ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
-@@ -1020,6 +1060,11 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1004,6 +1044,11 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
                  return ret;
              }
  

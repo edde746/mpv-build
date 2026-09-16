@@ -27,7 +27,6 @@
 #define FFMIN(a, b) ((a) > (b) ? (b) : (a))
 #define FFALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define INPUT_DEQUEUE_TIMEOUT_US 8000
-#define MEDIACODEC_GENERATION_SHIFT 44
 
 enum AVCodecID {
     AV_CODEC_ID_NONE, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MPEG4,
@@ -50,8 +49,6 @@ typedef struct AVPacket {
 } AVPacket;
 
 typedef struct FFAMediaCodec FFAMediaCodec;
-typedef struct AVFifo AVFifo;
-typedef int AVMutex;
 
 typedef struct MediaCodecDecContext {
     FFAMediaCodec *codec;
@@ -59,10 +56,6 @@ typedef struct MediaCodecDecContext {
     int flushing;
     int eos;
     ssize_t current_input_buffer;
-    int async_mode;
-    AVMutex async_lock;
-    AVFifo *async_input;
-    int async_generation;
 } MediaCodecDecContext;
 
 static int64_t av_rescale_q(int64_t a, AVRational bq, AVRational cq)
@@ -105,35 +98,8 @@ static int ff_AMediaCodec_infoTryAgainLater(FFAMediaCodec *c, ssize_t index)
     return index == TRY_AGAIN_LATER;
 }
 
-// Asynchronous mode: the codec's offered input indices, as the callback
-// thread would have queued them, and which of them the codec still owns
-// (a stale offer from before a flush).
-static struct {
-    int32_t offers[8];
-    int count, next;
-    uint32_t codec_owned; // bit per index: getInputBuffer answers NULL
-} async;
-
-static void ff_mutex_lock(AVMutex *m) { (void)m; }
-static void ff_mutex_unlock(AVMutex *m) { (void)m; }
-static int mediacodec_dec_async_wait(MediaCodecDecContext *s, AVFifo *fifo, int64_t timeout_us)
-{
-    (void)s; (void)fifo; (void)timeout_us;
-    return 0;
-}
-static int av_fifo_read(AVFifo *fifo, void *buf, size_t nb_elems)
-{
-    (void)fifo; (void)nb_elems;
-    if (async.next >= async.count)
-        return -1;
-    *(int32_t *)buf = async.offers[async.next++];
-    return 0;
-}
-
 static uint8_t *ff_AMediaCodec_getInputBuffer(FFAMediaCodec *c, size_t index, size_t *size)
 {
-    if (async.codec_owned & (1u << index))
-        return NULL;
     *size = codec.buffer_size;
     return codec.buffer;
 }
@@ -182,7 +148,6 @@ static void reset(size_t buffer_size)
     memset(&codec, 0, sizeof(codec));
     codec.buffer_size = buffer_size;
     codec.next_index = 0;
-    memset(&async, 0, sizeof(async));
     memset(&ctx, 0, sizeof(ctx));
     ctx.current_input_buffer = -1;
     avctx.pkt_timebase = (AVRational){ 1, 90000 };
@@ -297,51 +262,12 @@ static void test_end_of_stream_and_back_pressure(void)
           "a pending flush refuses input");
 }
 
-static void test_asynchronous_offers_and_stale_indices(void)
-{
-    // Asynchronous mode takes offered indices, never dequeues, and tags the
-    // timestamp with the flush generation the codec passes back unchanged.
-    reset(1 << 20);
-    ctx.async_mode = 1;
-    ctx.async_generation = 2;
-    async.offers[0] = 5;
-    async.count = 1;
-    AVPacket pkt = packet(1 << 19, 90000);
-    int ret = ff_mediacodec_dec_send(&avctx, &ctx, &pkt, false);
-    check(ret == pkt.size && codec.queued == 1 && !codec.dequeued,
-          "an offered index carries the packet without a dequeue");
-    check(codec.queued_pts == ((int64_t)2 << 44) + 1000000,
-          "the timestamp carries the flush generation above the media time");
-    check(!errors, "asynchronous submission is not an error");
-
-    // An index offered before a flush that the codec owns again is skipped
-    // for the next offer; the packet is neither lost nor an error.
-    reset(1 << 20);
-    ctx.async_mode = 1;
-    async.offers[0] = 3;
-    async.offers[1] = 4;
-    async.count = 2;
-    async.codec_owned = 1u << 3;
-    ret = ff_mediacodec_dec_send(&avctx, &ctx, &pkt, false);
-    check(ret == pkt.size && codec.queued == 1,
-          "a stale offer is skipped and the packet queued on the next one");
-    check(!errors, "a stale offer is not an error");
-
-    // No offer at all is back-pressure, as in synchronous mode.
-    reset(1 << 20);
-    ctx.async_mode = 1;
-    ret = ff_mediacodec_dec_send(&avctx, &ctx, &pkt, false);
-    check(ret == AVERROR(EAGAIN) && !codec.queued,
-          "no offered index means try again with the whole packet");
-}
-
 int main(void)
 {
     test_max_input_size_matches_media3();
     test_packet_that_fits_is_queued_whole();
     test_oversized_access_unit_is_dropped_whole();
     test_end_of_stream_and_back_pressure();
-    test_asynchronous_offers_and_stale_indices();
     puts("PASS: MediaCodec input buffers are sized like Media3 and an access "
          "unit that still does not fit is dropped whole, never split");
     return 0;

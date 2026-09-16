@@ -47,7 +47,6 @@ def extract(path, name, ret='int'):
 
 (work / 'mediacodec_input.inc').write_text(
     extract('mediacodecdec.c', 'video_max_input_size') + '\n\n' +
-    extract('mediacodecdec_common.c', 'mediacodec_dec_tag_pts', 'int64_t') + '\n\n' +
     extract('mediacodecdec_common.c', 'ff_mediacodec_dec_dequeue_input', 'ssize_t') + '\n\n' +
     extract('mediacodecdec_common.c', 'ff_mediacodec_dec_send') + '\n')
 PY

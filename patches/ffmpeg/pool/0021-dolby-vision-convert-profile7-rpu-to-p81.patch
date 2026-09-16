@@ -1,0 +1,215 @@
+Subject: [PATCH] dovi: rewrite a profile 7 RPU as profile 8.1 in one place
+
+Both decode paths that can only take Dolby Vision profile 8.1 did the
+conversion themselves: the MediaCodec packet filter and the VideoToolbox
+sample appender. The same libdovi parse, convert and write sequence existed
+twice, with two different failure policies -- one warned once per stream and
+dropped the RPU, the other warned on every failure -- and nowhere to fix it
+once.
+
+libdovi's mode 2 conversion and its error handling now live in one helper,
+and both call sites use it. A failure is logged there, and the caller drops
+the NAL; the frame decodes through its base layer either way.
+
+Listed by both series.apple and series.android rather than promoted to
+series.common, which must also apply to the 7.1 tree linux builds from: the
+helper is only ever useful where libdovi is enabled. The libdovi configure
+registration travels with it, for the same reason: a series that enabled the
+helper without enabling the library would build the stub below and fail every
+profile 7 conversion at runtime.
+
+diff --git a/configure b/configure
+index a0eed36..539747c 100755
+--- a/configure
++++ b/configure
+@@ -1934,6 +1934,7 @@ EXTERNAL_LIBRARY_LIST="
+     libcelt
+     libcodec2
+     libdav1d
++    libdovi
+     libdc1394
+     libflite
+     libfontconfig
+@@ -7034,6 +7035,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
+ enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
+ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
+ enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
++enabled libdovi           && require libdovi libdovi/rpu_parser.h dovi_parse_unspec62_nalu -ldovi
+ enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
+ enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
+ enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index fb22541..c6d8108 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -98,6 +98,8 @@ OBJS-$(CONFIG_D3D12VA_ENCODE)          += d3d12va_encode.o hw_base_encode.o
+ OBJS-$(CONFIG_DEFLATE_WRAPPER)         += zlib_wrapper.o
+ OBJS-$(CONFIG_DOVI_RPUDEC)             += dovi_rpu.o dovi_rpudec.o
+ OBJS-$(CONFIG_DOVI_RPUENC)             += dovi_rpu.o dovi_rpuenc.o
++OBJS-$(CONFIG_MEDIACODEC)              += dovi_convert.o
++OBJS-$(CONFIG_VIDEOTOOLBOX)            += dovi_convert.o
+ OBJS-$(CONFIG_ERROR_RESILIENCE)        += error_resilience.o
+ OBJS-$(CONFIG_EVCPARSE)                += evc_parse.o evc_ps.o
+ OBJS-$(CONFIG_EXIF)                    += exif.o tiff_common.o
+@@ -1336,6 +1338,8 @@ SKIPHEADERS-$(CONFIG_VULKAN)           += ffv1_vulkan.h vulkan_video.h \
+                                           vulkan_encode.h vulkan_decode.h
+ SKIPHEADERS-$(CONFIG_V4L2_M2M)         += v4l2_buffers.h v4l2_context.h v4l2_m2m.h
+ SKIPHEADERS-$(CONFIG_ZLIB)             += zlib_wrapper.h
++SKIPHEADERS-$(CONFIG_MEDIACODEC)       += dovi_convert.h
++SKIPHEADERS-$(CONFIG_VIDEOTOOLBOX)     += dovi_convert.h
+ 
+ TESTPROGS = avcodec                                                     \
+             avpacket                                                    \
+diff --git a/libavcodec/dovi_convert.c b/libavcodec/dovi_convert.c
+new file mode 100644
+index 0000000..090cdb5
+--- /dev/null
++++ b/libavcodec/dovi_convert.c
+@@ -0,0 +1,94 @@
++/*
++ * Dolby Vision profile 7 to profile 8.1 RPU conversion, for the hardware
++ * decoders that only take profile 8.1.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config.h"
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "libavutil/error.h"
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++
++#include "dovi_convert.h"
++
++// --- dovi p7 conversion core
++
++#if CONFIG_LIBDOVI
++
++#include <libdovi/rpu_parser.h>
++
++int ff_dovi_convert_p7_rpu_to_p81(const uint8_t *nal, size_t size,
++                                  uint8_t **out, size_t *out_size, void *logctx)
++{
++    DoviRpuOpaque *rpu;
++    const DoviData *data;
++    const char *error;
++    int ret = 0;
++
++    *out = NULL;
++    *out_size = 0;
++
++    rpu = dovi_parse_unspec62_nalu(nal, size);
++    if (!rpu) {
++        av_log(logctx, AV_LOG_WARNING, "Failed to allocate a Dolby Vision RPU\n");
++        return AVERROR(ENOMEM);
++    }
++    error = dovi_rpu_get_error(rpu);
++    /* Mode 2: profile 8.1 compatible, mapping curves set to no-op. */
++    if (!error && dovi_convert_rpu_with_mode(rpu, 2) < 0)
++        error = dovi_rpu_get_error(rpu);
++    data = error ? NULL : dovi_write_unspec62_nalu(rpu);
++    if (!data) {
++        av_log(logctx, AV_LOG_WARNING, "Dolby Vision RPU conversion failed: %s\n",
++               error ? error : "unknown error");
++        ret = AVERROR_INVALIDDATA;
++    } else if (data->len > UINT32_MAX) {
++        // Every caller passes the converted size on as a uint32_t length;
++        // refuse a NAL that cannot survive that instead of truncating it.
++        ret = AVERROR_INVALIDDATA;
++    } else {
++        *out = av_memdup(data->data, data->len);
++        if (*out)
++            *out_size = data->len;
++        else
++            ret = AVERROR(ENOMEM);
++    }
++    if (data)
++        dovi_data_free(data);
++    dovi_rpu_free(rpu);
++    return ret;
++}
++
++#else
++
++int ff_dovi_convert_p7_rpu_to_p81(const uint8_t *nal, size_t size,
++                                  uint8_t **out, size_t *out_size, void *logctx)
++{
++    *out = NULL;
++    *out_size = 0;
++    av_log(logctx, AV_LOG_WARNING, "Dolby Vision profile 7 conversion needs libdovi\n");
++    return AVERROR(ENOSYS);
++}
++
++#endif
++
++// --- end dovi p7 conversion core
+diff --git a/libavcodec/dovi_convert.h b/libavcodec/dovi_convert.h
+new file mode 100644
+index 0000000..3517718
+--- /dev/null
++++ b/libavcodec/dovi_convert.h
+@@ -0,0 +1,47 @@
++/*
++ * Dolby Vision profile 7 to profile 8.1 RPU conversion.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_DOVI_CONVERT_H
++#define AVCODEC_DOVI_CONVERT_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/**
++ * Rewrite a Dolby Vision profile 7 RPU NAL as its profile 8.1 equivalent,
++ * through libdovi's compatibility mode 2 (mapping curves set to no-op), for
++ * the decoders that only take profile 8.1. A failure is logged here, once
++ * for every NAL it is called with, and leaves the caller to drop the NAL:
++ * the frame still decodes through its base layer.
++ *
++ * @param nal      the full UNSPEC62 NAL unit, header included
++ * @param size     its size in bytes
++ * @param out      the converted NAL, av_free() it; NULL on failure
++ * @param out_size its size in bytes
++ * @param logctx   an AVCodecContext or any other av_log() context
++ * @return >= 0 on success, a negative AVERROR value otherwise: ENOSYS when
++ *         FFmpeg was built without libdovi, ENOMEM, or INVALIDDATA for an
++ *         RPU libdovi would not take, or for one whose converted size no
++ *         longer fits the uint32_t length every caller passes on.
++ */
++int ff_dovi_convert_p7_rpu_to_p81(const uint8_t *nal, size_t size,
++                                  uint8_t **out, size_t *out_size, void *logctx);
++
++#endif /* AVCODEC_DOVI_CONVERT_H */

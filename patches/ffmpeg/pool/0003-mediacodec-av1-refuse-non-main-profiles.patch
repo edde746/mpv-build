@@ -1,16 +1,16 @@
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 416e62f..b1f42c7 100644
+index 2d40aec..acd40cb 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -40,6 +40,7 @@
- #if CONFIG_LIBDOVI
- #include <libdovi/rpu_parser.h>
- #endif
+@@ -37,6 +37,7 @@
+ #include "codec_internal.h"
+ #include "decode.h"
+ #include "libavutil/dovi_meta.h"
 +#include "av1_parse.h"
+ #include "dovi_convert.h"
  #include "h264_parse.h"
  #include "h264_ps.h"
- #include "hevc/parse.h"
-@@ -326,6 +327,59 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -330,6 +331,59 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
  }
  #endif
  
@@ -70,7 +70,7 @@ index 416e62f..b1f42c7 100644
  #if CONFIG_HEVC_MEDIACODEC_DECODER
  /*
   * Single-layer DV (profiles 5 and 8) goes to a "video/dolby-vision" decoder
-@@ -702,6 +756,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -726,6 +780,10 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      case AV_CODEC_ID_AV1:
          codec_mime = "video/av01";
  

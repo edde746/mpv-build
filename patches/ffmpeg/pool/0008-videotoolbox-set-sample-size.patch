@@ -8,14 +8,14 @@ with kCMBlockBufferBadLengthParameterErr when the CMSampleBuffer omits an
 explicit sample-size array. Provide the single sample size alongside the
 CMBlockBuffer instead of relying on CoreMedia to infer it from the block.
 ---
- libavcodec/videotoolbox.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
+ libavcodec/videotoolbox.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
-index 5bf6bd0..9c1d0aa 100644
+index 9d672bc..2fb0475 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -690,9 +690,11 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
+@@ -689,9 +689,11 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
      OSStatus status;
      CMBlockBufferRef  block_buf;
      CMSampleBufferRef sample_buf;
@@ -27,8 +27,7 @@ index 5bf6bd0..9c1d0aa 100644
  
      status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault,// structureAllocator
                                                  buffer,             // memoryBlock
-@@ -715,9 +717,9 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
-                                       fmt_desc,             // formatDescription
+@@ -713,8 +715,8 @@ static CMSampleBufferRef videotoolbox_sample_buffer_create(CMFormatDescriptionRe
                                        1,                    // numSamples
                                        0,                    // numSampleTimingEntries
                                        NULL,                 // sampleTimingArray
@@ -39,5 +38,3 @@ index 5bf6bd0..9c1d0aa 100644
                                        &sample_buf);
      }
  
--- 
-2.50.1 (Apple Git-155)

@@ -20,10 +20,10 @@ spec, so never set the compression bits.
  1 file changed, 7 insertions(+), 5 deletions(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
-index 2995eea..5d23e4d 100644
+index eda463d..933ac15 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -1010,7 +1010,7 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
+@@ -990,7 +990,7 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
  {
      uint8_t buf[24] = { 0 };
      uint16_t flags;
@@ -32,7 +32,7 @@ index 2995eea..5d23e4d 100644
  
      if (!videotoolbox_dovi_is_apple_hevc(dovi))
          return NULL;
-@@ -1018,11 +1018,9 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
+@@ -998,11 +998,9 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
      profile = videotoolbox_dovi_effective_profile(dovi);
      el_present = dovi->el_present_flag;
      bl_compatibility_id = dovi->dv_bl_signal_compatibility_id;
@@ -44,7 +44,7 @@ index 2995eea..5d23e4d 100644
      }
  
      buf[0] = dovi->dv_version_major;
-@@ -1033,8 +1031,12 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
+@@ -1013,8 +1011,12 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
              (!!el_present) << 1 |
              !!dovi->bl_present_flag;
      AV_WB16(buf + 2, flags);
@@ -59,6 +59,3 @@ index 2995eea..5d23e4d 100644
  
      return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
  }
--- 
-2.50.1 (Apple Git-155)
-

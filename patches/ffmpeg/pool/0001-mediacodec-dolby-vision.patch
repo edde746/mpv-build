@@ -1,23 +1,3 @@
-diff --git a/configure b/configure
-index a0eed36..539747c 100755
---- a/configure
-+++ b/configure
-@@ -1934,6 +1934,7 @@ EXTERNAL_LIBRARY_LIST="
-     libcelt
-     libcodec2
-     libdav1d
-+    libdovi
-     libdc1394
-     libflite
-     libfontconfig
-@@ -7034,6 +7035,7 @@ enabled libcelt           && require libcelt celt/celt.h celt_decode -lcelt0 &&
- enabled libcaca           && require_pkg_config libcaca caca caca.h caca_create_canvas
- enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lcodec2
- enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
-+enabled libdovi           && require libdovi libdovi/rpu_parser.h dovi_parse_unspec62_nalu -ldovi
- enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
- enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
- enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
 index 283bbe7..d662a26 100644
 --- a/libavcodec/mediacodec_wrapper.c
@@ -65,28 +45,25 @@ index 18d0796..191e1a5 100644
  typedef struct FFAMediaFormat FFAMediaFormat;
  struct FFAMediaFormat {
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index ea9362b..42ea55e 100644
+index ea9362b..2d40aec 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -36,6 +36,10 @@
+@@ -36,6 +36,8 @@
  #include "avcodec.h"
  #include "codec_internal.h"
  #include "decode.h"
 +#include "libavutil/dovi_meta.h"
-+#if CONFIG_LIBDOVI
-+#include <libdovi/rpu_parser.h>
-+#endif
++#include "dovi_convert.h"
  #include "h264_parse.h"
  #include "h264_ps.h"
  #include "hevc/parse.h"
-@@ -59,8 +63,30 @@ typedef struct MediaCodecH264DecContext {
+@@ -59,8 +61,29 @@ typedef struct MediaCodecH264DecContext {
      int use_ndk_codec;
      // Ref. MediaFormat KEY_OPERATING_RATE
      int operating_rate;
 +    int dolby_vision;
 +    int dv_p7_mode;
 +    int dv_filter; // DV_FILTER_*
-+    int dv_filter_warned;
 +    // Native DV decoders on MediaTek-class chipsets wedge when they also
 +    // receive HDR10+ SEI (xbmc#24584, androidx/media#3085).
 +    int dv_strip_hdr10plus;
@@ -110,7 +87,7 @@ index ea9362b..42ea55e 100644
  static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
  {
      MediaCodecH264DecContext *s = avctx->priv_data;
-@@ -69,6 +95,8 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+@@ -69,6 +92,8 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
      s->ctx = NULL;
  
      av_packet_unref(&s->buffered_pkt);
@@ -119,7 +96,7 @@ index ea9362b..42ea55e 100644
  
      return 0;
  }
-@@ -305,12 +333,396 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -305,12 +330,383 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
  }
  #endif
  
@@ -425,9 +402,8 @@ index ea9362b..42ea55e 100644
 +                return ret;
 +            drop = ret;
 +        } else if (type == 62 && s->dv_filter == DV_FILTER_CONVERT) {
-+#if CONFIG_LIBDOVI
-+            drop = 1; // DV_FILTER_CONVERT is only ever selected with libdovi
-+#endif
++            // DV_FILTER_CONVERT is only ever selected with libdovi.
++            drop = 1;
 +        }
 +        if (!drop) {
 +            sc = next_sc;
@@ -453,32 +429,20 @@ index ea9362b..42ea55e 100644
 +                    return ret;
 +            }
 +        } else if (type == 62 && s->dv_filter == DV_FILTER_CONVERT) {
-+#if CONFIG_LIBDOVI
 +            static const uint8_t sc4[4] = { 0, 0, 0, 1 };
-+            DoviRpuOpaque *rpu = dovi_parse_unspec62_nalu(nal, next_region - nal);
-+            const DoviData *rpu_out = NULL;
-+
-+            /* Mode 2: profile 8.1 compatible, mapping curves set to no-op. */
-+            if (rpu && !dovi_rpu_get_error(rpu) && !dovi_convert_rpu_with_mode(rpu, 2))
-+                rpu_out = dovi_write_unspec62_nalu(rpu);
++            uint8_t *p81 = NULL;
++            size_t p81_size = 0;
 +
 +            ret = 0;
-+            if (rpu_out && rpu_out->data && rpu_out->len) {
++            if (ff_dovi_convert_p7_rpu_to_p81(nal, next_region - nal,
++                                              &p81, &p81_size, avctx) >= 0) {
 +                ret = dv_out_append(s, &out_size, sc4, sizeof(sc4));
 +                if (ret >= 0)
-+                    ret = dv_out_append(s, &out_size, rpu_out->data, rpu_out->len);
-+            } else if (!s->dv_filter_warned) {
-+                av_log(avctx, AV_LOG_WARNING,
-+                       "Dolby Vision RPU conversion failed, dropping RPU NAL\n");
-+                s->dv_filter_warned = 1;
++                    ret = dv_out_append(s, &out_size, p81, p81_size);
 +            }
-+            if (rpu_out)
-+                dovi_data_free(rpu_out);
-+            if (rpu)
-+                dovi_rpu_free(rpu);
++            av_free(p81);
 +            if (ret < 0)
 +                return ret;
-+#endif
 +        }
 +        sc = next_sc;
 +    }
@@ -516,7 +480,7 @@ index ea9362b..42ea55e 100644
  
      FFAMediaFormat *format = NULL;
      MediaCodecH264DecContext *s = avctx->priv_data;
-@@ -351,6 +763,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -351,6 +747,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
          ret = hevc_set_extradata(avctx, format);
          if (ret < 0)
              goto done;
@@ -526,7 +490,7 @@ index ea9362b..42ea55e 100644
          break;
  #endif
  #if CONFIG_MPEG2_MEDIACODEC_DECODER
-@@ -450,6 +865,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -450,6 +849,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
  
      s->ctx->delay_flush = s->delay_flush;
      s->ctx->use_ndk_codec = s->use_ndk_codec;
@@ -536,7 +500,7 @@ index ea9362b..42ea55e 100644
  
      if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
          s->ctx = NULL;
-@@ -475,6 +893,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -475,6 +877,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      }
  
  done:
@@ -544,7 +508,7 @@ index ea9362b..42ea55e 100644
      if (format) {
          ff_AMediaFormat_delete(format);
      }
-@@ -553,6 +972,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -553,6 +956,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
  
          /* fetch new packet or eof */
          ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
@@ -566,7 +530,7 @@ index ea9362b..42ea55e 100644
          if (ret == AVERROR_EOF) {
              AVPacket null_pkt = { 0 };
              ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
-@@ -600,6 +1034,18 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -600,6 +1018,18 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                     OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
      { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
              OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },

@@ -11,14 +11,14 @@ metadata because its base is not BT.2020 YCbCr. Also enable
 VideoToolbox's per-frame HDR display metadata propagation/generation
 where the OS supports it.
 ---
- libavcodec/videotoolbox.c | 121 ++++++++++++++++++++++++++++++++++++++
- 1 file changed, 121 insertions(+)
+ libavcodec/videotoolbox.c | 101 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 101 insertions(+)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
-index 294fc4e..374a3c7 100644
+index 9ad862d..9d672bc 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -121,6 +121,8 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
+@@ -123,6 +123,8 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
  }
  
  static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx);
@@ -27,7 +27,7 @@ index 294fc4e..374a3c7 100644
  
  static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
  {
-@@ -141,6 +143,7 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+@@ -143,6 +145,7 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
      if (!videotoolbox_dovi_should_preserve_attachments(avctx) &&
          (ret = av_vt_pixbuf_set_attachments(avctx, ref->pixbuf, frame)) < 0)
          return ret;
@@ -35,7 +35,7 @@ index 294fc4e..374a3c7 100644
  
      frame->data[3] = (uint8_t*)ref->pixbuf;
  
-@@ -872,6 +875,80 @@ static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx)
+@@ -876,6 +879,60 @@ static int videotoolbox_dovi_should_preserve_attachments(AVCodecContext *avctx)
      return videotoolbox_dovi_is_apple_hevc(videotoolbox_dovi_get_conf(avctx));
  }
  
@@ -50,26 +50,6 @@ index 294fc4e..374a3c7 100644
 +    return dovi && (dovi->dv_profile == 8 ||
 +           (dovi->dv_profile == 7 && dovi->rpu_present_flag &&
 +            dovi->bl_present_flag));
-+}
-+
-+static CFDictionaryRef videotoolbox_copy_buffer_attachments(CVBufferRef buffer,
-+                                                            CVAttachmentMode attachment_mode)
-+{
-+#if (TARGET_OS_OSX  && defined(__MAC_12_0)    && __MAC_OS_X_VERSION_MAX_ALLOWED  >= __MAC_12_0)    || \
-+    (TARGET_OS_IOS  && defined(__IPHONE_15_0) && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_15_0) || \
-+    (TARGET_OS_TV   && defined(__TVOS_15_0)   && __TV_OS_VERSION_MAX_ALLOWED     >= __TVOS_15_0)
-+    if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *))
-+        return CVBufferCopyAttachments(buffer, attachment_mode);
-+#endif
-+
-+#if (TARGET_OS_OSX  && (!defined(__MAC_12_0)    || __MAC_OS_X_VERSION_MIN_REQUIRED  < __MAC_12_0))    || \
-+    (TARGET_OS_IOS  && (!defined(__IPHONE_15_0) || __IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_15_0)) || \
-+    (TARGET_OS_TV   && (!defined(__TVOS_15_0)   || __TV_OS_VERSION_MIN_REQUIRED     < __TVOS_15_0))
-+    CFDictionaryRef dict = CVBufferGetAttachments(buffer, attachment_mode);
-+    return dict ? CFDictionaryCreateCopy(NULL, dict) : NULL;
-+#else
-+    return NULL;
-+#endif
 +}
 +
 +static void videotoolbox_dovi_tag_output_attachments(AVCodecContext *avctx,
@@ -100,7 +80,7 @@ index 294fc4e..374a3c7 100644
 +
 +    if (CVBufferGetAttachment(pixbuf, kCVImageBufferCGColorSpaceKey, NULL))
 +        return;
-+    attachments = videotoolbox_copy_buffer_attachments(pixbuf, kCVAttachmentMode_ShouldPropagate);
++    attachments = av_vt_cv_buffer_copy_attachments(pixbuf, kCVAttachmentMode_ShouldPropagate);
 +    if (!attachments)
 +        return;
 +
@@ -116,7 +96,7 @@ index 294fc4e..374a3c7 100644
  enum PlezyDoviConversionMode {
      PLEZY_DOVI_AUTO,
      PLEZY_DOVI_DISABLED,
-@@ -940,6 +1017,20 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
+@@ -981,6 +1038,20 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
                              kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                           kCFBooleanTrue);
  
@@ -137,7 +117,7 @@ index 294fc4e..374a3c7 100644
      avc_info = CFDictionaryCreateMutable(kCFAllocatorDefault,
                                           1,
                                           &kCFTypeDictionaryKeyCallBacks,
-@@ -1124,6 +1215,36 @@ static int videotoolbox_start(AVCodecContext *avctx)
+@@ -1165,6 +1236,36 @@ static int videotoolbox_start(AVCodecContext *avctx)
                                            &decoder_cb,               // outputCallback
                                            &videotoolbox->session);   // decompressionSessionOut
  
@@ -174,5 +154,3 @@ index 294fc4e..374a3c7 100644
      if (decoder_spec)
          CFRelease(decoder_spec);
      if (buf_attr)
--- 
-2.50.1 (Apple Git-155)

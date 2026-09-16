@@ -13,38 +13,22 @@ frame is submitted to VideoToolbox. Profile 7 uses the same libdovi P8.1
 conversion path as the slice callback so raw P7 RPUs are never mixed into
 the synthetic P8.1 VideoToolbox session.
 ---
- libavcodec/videotoolbox.c | 47 ++++++++++++++++++++++++++++++++++++++++++++-
- libavcodec/vt_internal.h  |  3 +++
- 2 files changed, 49 insertions(+), 1 deletion(-)
-
-diff --git a/libavcodec/vt_internal.h b/libavcodec/vt_internal.h
---- a/libavcodec/vt_internal.h
-+++ b/libavcodec/vt_internal.h
-@@ -46,6 +46,9 @@ typedef struct VTContext {
-     uint8_t                     sps[3];
-     bool                        reconfig_needed;
- 
-+    // Whether Dolby Vision RPU append diagnostics have been logged.
-+    int                         dovi_rpu_log_done;
-+
-     void *logctx;
- } VTContext;
- 
+ libavcodec/videotoolbox.c | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index 2fb0475..eda463d 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -1483,6 +1483,49 @@ static int videotoolbox_hevc_decode_slice(AVCodecContext *avctx,
+@@ -1412,6 +1412,36 @@ static int videotoolbox_hevc_decode_slice(AVCodecContext *avctx,
      return videotoolbox_common_decode_slice(avctx, buffer, size);
  }
  
 +static int videotoolbox_hevc_append_dovi_rpus(AVCodecContext *avctx)
 +{
 +    HEVCContext *h = avctx->priv_data;
-+    VTContext *vtctx = avctx->internal->hwaccel_priv_data;
 +    const AVDOVIDecoderConfigurationRecord *dovi = videotoolbox_dovi_get_conf(avctx);
 +    int convert_p7 = videotoolbox_dovi_needs_p81_conversion(dovi);
-+    int appended = 0;
 +
 +    if (!videotoolbox_dovi_is_apple_hevc(dovi))
 +        return 0;
@@ -65,17 +49,6 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
 +                   convert_p7 ? "convert" : "append");
 +            continue;
 +        }
-+        appended++;
-+    }
-+
-+    if (appended > 0 && videotoolbox_dovi_log_enabled() && !vtctx->dovi_rpu_log_done) {
-+        enum PlezyDoviConversionMode mode = videotoolbox_dovi_conversion_mode();
-+        vtctx->dovi_rpu_log_done = 1;
-+        av_log(avctx, AV_LOG_INFO,
-+               "[Plezy DV] appended %d %s RPU NAL(s) to VideoToolbox sample "
-+               "(mode=%s).\n",
-+               appended, convert_p7 ? "converted P8.1" : "native",
-+               videotoolbox_dovi_conversion_mode_name(mode));
 +    }
 +
 +    return 0;
@@ -84,7 +57,7 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
  
  static int videotoolbox_hevc_decode_params(AVCodecContext *avctx,
                                             int type,
-@@ -1498,7 +1534,9 @@ static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
+@@ -1428,7 +1458,9 @@ static int videotoolbox_hevc_end_frame(AVCodecContext *avctx)
      VTContext *vtctx = avctx->internal->hwaccel_priv_data;
      int ret;
  
@@ -95,5 +68,3 @@ diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
      vtctx->bitstream_size = 0;
      return ret;
  }
--- 
-2.50.1 (Apple Git-155)

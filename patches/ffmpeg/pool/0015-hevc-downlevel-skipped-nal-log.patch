@@ -15,9 +15,10 @@ verbose level.
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 8ec2c20..2cbd3ae 100644
 --- a/libavcodec/hevc/hevcdec.c
 +++ b/libavcodec/hevc/hevcdec.c
-@@ -3666,7 +3666,7 @@ static int decode_nal_unit(HEVCContext *s, int nal_idx)
+@@ -3666,7 +3666,7 @@ static int decode_nal_unit(HEVCContext *s, unsigned nal_idx)
      case HEVC_NAL_UNSPEC62:
          break;
      default:
@@ -26,5 +27,3 @@ diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
                 "Skipping NAL unit %d\n", s->nal_unit_type);
      }
  
--- 
-2.50.1 (Apple Git-155)

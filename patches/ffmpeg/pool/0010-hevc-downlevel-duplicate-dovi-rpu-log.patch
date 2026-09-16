@@ -11,9 +11,10 @@ normal playback.
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 8a845f5..8ec2c20 100644
 --- a/libavcodec/hevc/hevcdec.c
 +++ b/libavcodec/hevc/hevcdec.c
-@@ -3743,7 +3743,7 @@ static int hevc_frame_start(HEVCContext *s)
+@@ -3743,7 +3743,7 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
          H2645NAL *nal = &s->pkt.nals[s->pkt.nb_nals - 1];
          if (s->rpu_buf) {
              av_buffer_unref(&s->rpu_buf);
@@ -22,5 +23,3 @@ diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
          }
  
          s->rpu_buf = av_buffer_alloc(nal->raw_size - 2);
--- 
-2.50.1 (Apple Git-155)

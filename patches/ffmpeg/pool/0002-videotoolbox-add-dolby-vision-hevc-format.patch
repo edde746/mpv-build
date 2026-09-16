@@ -8,11 +8,11 @@ for Apple-supported single-layer HEVC Dolby Vision profiles. This lets
 VideoToolbox see the compressed Dolby Vision configuration before decode
 instead of receiving only a plain HEVC hvcC description.
 ---
- libavcodec/videotoolbox.c | 81 +++++++++++++++++++++++++++++++++++++-
- 1 file changed, 80 insertions(+), 1 deletion(-)
+ libavcodec/videotoolbox.c | 79 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 78 insertions(+), 1 deletion(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
-index ccba249..3c4b321 100644
+index 79fb501..4b01c8a 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
 @@ -24,6 +24,7 @@
@@ -152,5 +152,3 @@ index ccba249..3c4b321 100644
          break;
      case AV_CODEC_ID_MPEG1VIDEO :
          videotoolbox->cm_codec_type = kCMVideoCodecType_MPEG1Video;
--- 
-2.50.1 (Apple Git-155)

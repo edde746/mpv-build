@@ -8,14 +8,14 @@ to decoded pixel buffers. Do not overwrite those attachments with FFmpeg's
 container-level color fields for frames decoded through the Apple Dolby
 Vision HEVC path.
 ---
- libavcodec/videotoolbox.c | 11 ++++++++++-
- 1 file changed, 10 insertions(+), 1 deletion(-)
+ libavcodec/videotoolbox.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
 
 diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
-index df551d0..294fc4e 100644
+index e75159a..9ad862d 100644
 --- a/libavcodec/videotoolbox.c
 +++ b/libavcodec/videotoolbox.c
-@@ -116,6 +116,8 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
+@@ -122,6 +122,8 @@ int ff_videotoolbox_buffer_append(VTContext *vtctx,
      return 0;
  }
  
@@ -24,7 +24,7 @@ index df551d0..294fc4e 100644
  static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
  {
      int ret;
-@@ -132,7 +134,8 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
+@@ -138,7 +140,8 @@ static int videotoolbox_postproc_frame(void *avctx, AVFrame *frame)
      frame->crop_top = 0;
      frame->crop_bottom = 0;
  
@@ -34,7 +34,7 @@ index df551d0..294fc4e 100644
          return ret;
  
      frame->data[3] = (uint8_t*)ref->pixbuf;
-@@ -865,6 +868,11 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
+@@ -868,6 +871,11 @@ static int videotoolbox_dovi_is_apple_hevc(const AVDOVIDecoderConfigurationRecor
      }
  }
  
@@ -46,5 +46,3 @@ index df551d0..294fc4e 100644
  enum PlezyDoviConversionMode {
      PLEZY_DOVI_AUTO,
      PLEZY_DOVI_DISABLED,
--- 
-2.50.1 (Apple Git-155)

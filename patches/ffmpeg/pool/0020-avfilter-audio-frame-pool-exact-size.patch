@@ -20,6 +20,7 @@ Video pools are untouched. Drop this patch once the pinned FFmpeg carries
 that commit.
 
 diff --git a/libavfilter/audio.c b/libavfilter/audio.c
+index 7d87e9e..2d34adc 100644
 --- a/libavfilter/audio.c
 +++ b/libavfilter/audio.c
 @@ -67,7 +67,12 @@ AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples)

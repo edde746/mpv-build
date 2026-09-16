@@ -29,6 +29,3 @@ index ccba249..79fb501 100644
      CFDictionarySetValue(buffer_attributes, kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey, kCFBooleanTrue);
  #endif
  
--- 
-2.50.1 (Apple Git-155)
-

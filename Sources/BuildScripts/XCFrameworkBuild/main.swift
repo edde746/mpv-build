@@ -383,9 +383,14 @@ private class BuildFFMPEG: BaseBuild {
         //        if platform == .isimulator || platform == .tvsimulator {
         //            arguments.append("--assert-level=1")
         //        }
+        // libdovi is what makes Dolby Vision profile 7 conversion possible:
+        // patch 0021 registers it with configure and #if CONFIG_LIBDOVI guards
+        // the real conversion, so without --enable-libdovi the VideoToolbox
+        // path keeps asking for profile 8.1 and always gets ENOSYS back.
         let dependencyLibrary = [
             Library.libfreetype, .libharfbuzz, .libfribidi, .libass, .vulkan,
-            .libshaderc, .lcms2, .libplacebo, .libdav1d, .libuavs3d, .openssl,
+            .libshaderc, .lcms2, .libplacebo, .libdav1d, .libdovi, .libuavs3d,
+            .openssl,
         ]
         for library in dependencyLibrary {
             let path =

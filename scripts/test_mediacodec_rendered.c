@@ -25,7 +25,6 @@ typedef struct MediaCodecDecContext {
     AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
     atomic_uint rendered_head;
     atomic_uint rendered_tail;
-    atomic_uint rendered_dropped;
 } MediaCodecDecContext;
 
 typedef struct MediaCodecBuffer {
@@ -73,14 +72,12 @@ static void test_reports_drain_in_delivery_order(void)
           "the source names the registered callback");
 }
 
-static void test_full_ring_drops_the_newest_and_counts(void)
+static void test_full_ring_drops_the_newest(void)
 {
     AVMediaCodecRendered out[FF_MEDIACODEC_RENDERED_RING + 8];
     reset("ndk");
     for (int n = 0; n < FF_MEDIACODEC_RENDERED_RING + 3; n++)
         mediacodec_dec_rendered_push(&ctx, n, n);
-    check(atomic_load(&ctx.rendered_dropped) == 3,
-          "reports beyond the ring's capacity are dropped and counted");
     int n = av_mediacodec_drain_rendered(&buffer, out, FF_MEDIACODEC_RENDERED_RING + 8);
     check(n == FF_MEDIACODEC_RENDERED_RING &&
           out[0].media_time_us == 0 &&
@@ -143,10 +140,10 @@ static void test_single_producer_single_consumer_is_lossless_when_drained(void)
 int main(void)
 {
     test_reports_drain_in_delivery_order();
-    test_full_ring_drops_the_newest_and_counts();
+    test_full_ring_drops_the_newest();
     test_feedback_off_is_enosys();
     test_single_producer_single_consumer_is_lossless_when_drained();
-    puts("PASS: rendered-frame reports drain in order, a full ring drops and "
-         "counts the newest, and a codec without feedback answers ENOSYS");
+    puts("PASS: rendered-frame reports drain in order, a full ring drops the "
+         "newest, and a codec without feedback answers ENOSYS");
     return 0;
 }

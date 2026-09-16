@@ -1,5 +1,5 @@
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index c849d7d..8083d6f 100644
+index 7c55d1e..e5873dd 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
 @@ -34,11 +34,43 @@
@@ -46,8 +46,8 @@ index c849d7d..8083d6f 100644
  AVMediaCodecContext *av_mediacodec_alloc_context(void)
  {
      return av_mallocz(sizeof(AVMediaCodecContext));
-@@ -171,6 +203,31 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
-     return s->async_mode ? 1 : 0;
+@@ -166,6 +198,31 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+     return 0;
  }
  
 +int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
@@ -65,7 +65,7 @@ index c849d7d..8083d6f 100644
 +        MediaCodecDecContext *s = registry[i];
 +        if (!s->device_ref || s->device_ref->data != device_ref->data)
 +            continue;
-+        ret = ff_mediacodec_dec_set_surface(s->avctx, s, surface, NULL);
++        ret = ff_mediacodec_dec_set_surface(s, surface, NULL);
 +        if (ret < 0)
 +            break;
 +    }
@@ -78,7 +78,7 @@ index c849d7d..8083d6f 100644
  #else
  
  #include <stdlib.h>
-@@ -221,4 +278,9 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -216,4 +273,9 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
      return AVERROR(ENOSYS);
  }
  
@@ -89,10 +89,10 @@ index c849d7d..8083d6f 100644
 +
  #endif
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 03c23b1..8cf6056 100644
+index a4abbb1..14e3e6f 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -153,4 +153,17 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+@@ -157,4 +157,17 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
  int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
                                        void (*wakeup)(void *opaque), void *opaque);
  
@@ -268,13 +268,13 @@ index 224b5a2..911069e 100644
  
  enum FFAMediaFormatColorRange {
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index cc9c2d8..1dce8c7 100644
+index 5dfe7c7..25fc2b8 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -302,11 +302,40 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+@@ -269,11 +269,40 @@ static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+             s->surface = NULL;
+         }
  
-         mediacodec_dec_uninit_async(s);
-         ff_mutex_destroy(&s->async_lock);
 +        av_buffer_unref(&s->device_ref);
          av_freep(&s->codec_name);
          av_freep(&s);
@@ -286,8 +286,8 @@ index cc9c2d8..1dce8c7 100644
 +// dropped by its owner the moment this returns. Called with the registry
 +// locked, from whichever thread owns the surface — MediaCodec serializes it
 +// against the decoding thread's own calls.
-+int ff_mediacodec_dec_set_surface(AVCodecContext *avctx, MediaCodecDecContext *s,
-+                                  void *surface, void *native_window)
++int ff_mediacodec_dec_set_surface(MediaCodecDecContext *s, void *surface,
++                                  void *native_window)
 +{
 +    FFANativeWindow *next, *prev;
 +    int ret;
@@ -312,7 +312,7 @@ index cc9c2d8..1dce8c7 100644
  static void mediacodec_buffer_release(void *opaque, uint8_t *data)
  {
      AVMediaCodecBuffer *buffer = opaque;
-@@ -1076,6 +1105,11 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+@@ -781,6 +810,11 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
                      AVMediaCodecDeviceContext *mediacodec_ctx = (AVMediaCodecDeviceContext *)device_ctx->hwctx;
                      s->surface = ff_mediacodec_surface_ref(mediacodec_ctx->surface, mediacodec_ctx->native_window, avctx);
                      av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
@@ -324,7 +324,7 @@ index cc9c2d8..1dce8c7 100644
                  }
              }
          }
-@@ -1264,6 +1298,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -964,6 +998,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
  
      av_log(avctx, AV_LOG_DEBUG, "MediaCodec %p started successfully\n", s->codec);
  
@@ -332,21 +332,21 @@ index cc9c2d8..1dce8c7 100644
      return 0;
  
  fail:
-@@ -1542,6 +1577,7 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+@@ -1235,6 +1270,7 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
      if (!s)
          return 0;
  
 +    ff_mediacodec_dec_unregister(s);
-     ff_mutex_lock(&s->async_lock);
-     s->wakeup = NULL;
-     s->wakeup_opaque = NULL;
+     if (s->codec) {
+         if (atomic_load(&s->hw_buffer_count) == 0) {
+             ff_AMediaCodec_stop(s->codec);
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index bd8d449..f150e9f 100644
+index 69c7905..fec4fe9 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
-@@ -105,6 +105,10 @@ typedef struct MediaCodecDecContext {
-     void *wakeup_opaque;
-     int wakeup_in_flight;  // calls running outside async_lock
+@@ -83,6 +83,10 @@ typedef struct MediaCodecDecContext {
+     // busy codec answers EAGAIN on both ports instead of blocking it.
+     bool host_polls;
  
 +    // The hardware device this decoder was opened from; the surface-swap
 +    // registry in mediacodec.c keys on it.
@@ -355,15 +355,15 @@ index bd8d449..f150e9f 100644
      // Frame-rendered feedback; see av_mediacodec_drain_rendered.
      const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
      AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
-@@ -163,6 +167,12 @@ typedef struct MediaCodecAsyncOutput {
-     FFAMediaCodecBufferInfo info;
- } MediaCodecAsyncOutput;
+@@ -132,6 +136,12 @@ typedef struct MediaCodecBuffer {
+ 
+ } MediaCodecBuffer;
  
 +// Surface-swap registry, see av_mediacodec_hwdevice_set_surface.
 +void ff_mediacodec_dec_register(MediaCodecDecContext *s);
 +void ff_mediacodec_dec_unregister(MediaCodecDecContext *s);
-+int ff_mediacodec_dec_set_surface(AVCodecContext *avctx, MediaCodecDecContext *s,
-+                                  void *surface, void *native_window);
++int ff_mediacodec_dec_set_surface(MediaCodecDecContext *s, void *surface,
++                                  void *native_window);
 +
  // The decoder context of an opened MediaCodec video/audio decoder, NULL for
  // anything else. Implemented beside the decoder wrappers that own priv_data.

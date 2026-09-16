@@ -1,0 +1,239 @@
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index dc31246..7c55d1e 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -34,6 +34,8 @@
+ #include "libavcodec/avcodec.h"
+ #include "libavutil/mem.h"
+ 
++#include "libavutil/thread.h"
++
+ #include "ffjni.h"
+ #include "mediacodecdec_common.h"
+ 
+@@ -151,6 +153,19 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
+     return buffer->ctx->rendered_source;
+ }
+ 
++int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
++                                      void (*wakeup)(void *opaque), void *opaque)
++{
++    MediaCodecDecContext *s = ff_mediacodec_dec_from_avctx(avctx);
++
++    if (!s)
++        return AVERROR(ENOSYS);
++    // Registration only: this decides how the decoder answers a busy codec,
++    // and `wakeup` is never called (see the header).
++    s->host_polls = wakeup != NULL;
++    return 0;
++}
++
+ #else
+ 
+ #include <stdlib.h>
+@@ -195,4 +210,10 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
+     return "off:platform";
+ }
+ 
++int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
++                                      void (*wakeup)(void *opaque), void *opaque)
++{
++    return AVERROR(ENOSYS);
++}
++
+ #endif
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 77c44fc..a4abbb1 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -138,4 +138,23 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+  */
+ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+ 
++/**
++ * Tell a MediaCodec decoder that its caller polls instead of being blocked
++ * while the codec is busy: a codec that cannot take or produce a buffer then
++ * answers EAGAIN from both avcodec_send_packet() and avcodec_receive_frame()
++ * rather than being waited on inside the decoder, and that answer means the
++ * host should try again shortly. Without this the decoder keeps libavcodec's
++ * contract of never returning EAGAIN from both calls.
++ *
++ * `wakeup` is the registration: non-NULL to ask for the EAGAIN contract,
++ * NULL to go back to blocking. It is never called — MediaCodec reports
++ * nothing between those calls that a callback would be for — so the host
++ * polls; this is how it asks to.
++ *
++ * @return 0, or AVERROR(ENOSYS) when `avctx` is not an opened MediaCodec
++ * decoder.
++ */
++int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
++                                      void (*wakeup)(void *opaque), void *opaque);
++
+ #endif /* AVCODEC_MEDIACODEC_H */
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index cb100ea..479eecf 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -2194,6 +2194,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
+     // into a freed context.
+     if (codec->impl && codec->rendered_cb && codec->setOnFrameRenderedCallback)
+         codec->setOnFrameRenderedCallback(codec->impl, NULL, NULL);
++    if (codec->impl && codec->async_userdata && codec->setAsyncNotifyCallback) {
++        struct AMediaCodecOnAsyncNotifyCallback none = { 0 };
++        codec->setAsyncNotifyCallback(codec->impl, none, NULL);
++        codec->async_userdata = NULL;
++    }
+     if (codec->impl && (AMediaCodec_delete(codec->impl) != AMEDIA_OK))
+         ret = AVERROR_EXTERNAL;
+     if (codec->window)
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 21ed553..32af7e9 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -1010,17 +1010,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     while (1) {
+         if (s->ctx->current_input_buffer < 0 && !s->ctx->draining) {
+             /* poll for input space */
+-            index = ff_AMediaCodec_dequeueInputBuffer(s->ctx->codec, 0);
++            index = ff_mediacodec_dec_dequeue_input(s->ctx, 0);
+             if (index < 0) {
++                if (index != AVERROR(EAGAIN))
++                    return index;
+                 /* no space, block for an output frame to appear */
+                 ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+                 /* Try again if both input port and output port return EAGAIN.
+                  * If no data is consumed and no frame in output, it can make
+                  * both avcodec_send_packet() and avcodec_receive_frame()
+-                 * return EAGAIN, which violate the design.
++                 * return EAGAIN, which violate the design. A host that
++                 * registered a wakeup (av_mediacodec_set_wakeup_callback)
++                 * accepts exactly that answer instead of being held here
++                 * for as long as the codec takes.
+                  */
+-                if (ff_AMediaCodec_infoTryAgainLater(s->ctx->codec, index) &&
+-                    ret == AVERROR(EAGAIN))
++                if (ret == AVERROR(EAGAIN) && !ff_mediacodec_dec_host_polls(s->ctx))
+                     continue;
+                 return ret;
+             }
+@@ -1112,6 +1127,17 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
+     NULL
+ };
+ 
++MediaCodecDecContext *ff_mediacodec_dec_from_avctx(AVCodecContext *avctx)
++{
++    MediaCodecH264DecContext *s;
++
++    if (!avctx || !avctx->codec || av_codec_is_encoder(avctx->codec) ||
++        !avctx->codec->wrapper_name || strcmp(avctx->codec->wrapper_name, "mediacodec"))
++        return NULL;
++    s = avctx->priv_data;
++    return s ? s->ctx : NULL;
++}
++
+ #define OFFSET(x) offsetof(MediaCodecH264DecContext, x)
+ #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+ static const AVOption ff_mediacodec_vdec_options[] = {
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index c1021f1..5dfe7c7 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -22,7 +22,6 @@
+ 
+ #include <string.h>
+ #include <sys/types.h>
+-
+ #include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+ #include "libavutil/hwcontext_mediacodec.h"
+@@ -718,6 +717,25 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
+         av_assert0(0);
+ }
+ 
++// A free input slot: the index, AVERROR(EAGAIN) when none is available within
++// timeout_us, another negative value on a codec error.
++ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout_us)
++{
++    ssize_t index = ff_AMediaCodec_dequeueInputBuffer(s->codec, timeout_us);
++
++    if (ff_AMediaCodec_infoTryAgainLater(s->codec, index))
++        return AVERROR(EAGAIN);
++    return index < 0 ? AVERROR_EXTERNAL : index;
++}
++
++// Whether the host asked to be answered EAGAIN on both ports rather than
++// being held while the codec is busy
++// (av_mediacodec_set_wakeup_callback).
++int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s)
++{
++    return s->host_polls;
++}
++
+ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContext *s)
+ {
+     FFAMediaCodec *codec = s->codec;
+@@ -983,8 +1001,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+     while (offset < pkt->size || (need_draining && !s->draining)) {
+         ssize_t index = s->current_input_buffer;
+         if (index < 0) {
+-            index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
+-            if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
++            index = ff_mediacodec_dec_dequeue_input(s, input_dequeue_timeout_us);
++            if (index == AVERROR(EAGAIN)) {
+                 av_log(avctx, AV_LOG_TRACE, "No input buffer available, try again later\n");
+                 break;
+             }
+@@ -1001,7 +1019,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+             av_log(avctx, AV_LOG_ERROR, "Failed to get input buffer\n");
+             return AVERROR_EXTERNAL;
+         }
+-
+         /*
+          * One input buffer is one access unit (ACodec flags every buffer
+          * ENDOFFRAME); splitting a packet across buffers hands the decoder
+@@ -1033,7 +1050,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+         if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
+             pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+         }
+-
+         if (need_draining) {
+             uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
+ 
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 512601f..69c7905 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -79,6 +79,9 @@ typedef struct MediaCodecDecContext {
+ 
+     bool use_ndk_codec;
+     int profile_override; // CodecProfileLevel constant, 0 = derive from avctx
++    // The host registered through av_mediacodec_set_wakeup_callback, so a
++    // busy codec answers EAGAIN on both ports instead of blocking it.
++    bool host_polls;
+ 
+     // Frame-rendered feedback; see av_mediacodec_drain_rendered.
+     const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
+@@ -111,6 +114,14 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
+ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
+                                   MediaCodecDecContext *s);
+ 
++// A free input slot: the index, AVERROR(EAGAIN) when none is available within
++// timeout_us, another negative value on a codec error.
++ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout_us);
++
++// Whether the host asked to be answered EAGAIN on both ports rather than held
++// while the codec is busy (av_mediacodec_set_wakeup_callback).
++int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s);
++
+ typedef struct MediaCodecBuffer {
+ 
+     MediaCodecDecContext *ctx;
+@@ -121,4 +132,8 @@ typedef struct MediaCodecBuffer {
+ 
+ } MediaCodecBuffer;
+ 
++// The decoder context of an opened MediaCodec video/audio decoder, NULL for
++// anything else. Implemented beside the decoder wrappers that own priv_data.
++MediaCodecDecContext *ff_mediacodec_dec_from_avctx(AVCodecContext *avctx);
++
+ #endif /* AVCODEC_MEDIACODECDEC_COMMON_H */

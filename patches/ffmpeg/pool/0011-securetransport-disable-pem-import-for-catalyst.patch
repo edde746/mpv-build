@@ -12,7 +12,7 @@ trust for normal HTTPS connections.
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/libavformat/tls_securetransport.c b/libavformat/tls_securetransport.c
-index 0000000000..0000000000 100644
+index a5a3bd8..732e71c 100644
 --- a/libavformat/tls_securetransport.c
 +++ b/libavformat/tls_securetransport.c
 @@ -37,6 +37,11 @@
@@ -27,7 +27,7 @@ index 0000000000..0000000000 100644
  
  // We use a private API call here; it's good enough for WebKit.
  SecIdentityRef SecIdentityCreate(CFAllocatorRef allocator, SecCertificateRef certificate, SecKeyRef privateKey);
-@@ -70,7 +74,7 @@ static int print_tls_error(URLContext *h, int ret)
+@@ -70,7 +75,7 @@ static int print_tls_error(URLContext *h, int ret)
  
  static int import_pem(URLContext *h, char *path, CFArrayRef *array)
  {
@@ -36,5 +36,3 @@ index 0000000000..0000000000 100644
      return AVERROR_PATCHWELCOME;
  #else
      AVIOContext *s = NULL;
--- 
-2.50.1 (Apple Git-155)

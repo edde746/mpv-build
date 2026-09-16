@@ -15,6 +15,8 @@
 #define CONFIG_LIBDOVI 1
 #define AV_INPUT_BUFFER_PADDING_SIZE 64
 #define AVERROR(e) (-(e))
+#define AVERROR_INVALIDDATA (-0x41444E49)
+#define AVERROR_ENOMEM (-(12))
 #define AV_LOG_WARNING 24
 #define FFMAX(a, b) ((a) > (b) ? (a) : (b))
 #define FFMIN(a, b) ((a) > (b) ? (b) : (a))
@@ -39,9 +41,9 @@ typedef struct AVCodecContext {
     void *priv_data;
 } AVCodecContext;
 
+
 typedef struct MediaCodecH264DecContext {
     int dv_filter;
-    int dv_filter_warned;
     int dv_strip_hdr10plus;
     AVBufferRef *dv_out;
     uint8_t *dv_sei_scratch;
@@ -53,6 +55,19 @@ static int buffer_allocs, scratch_allocs, warnings, live_buffers;
 static void av_log(void *avctx, int level, const char *fmt, ...)
 {
     warnings++;
+}
+
+static void *av_memdup(const void *p, size_t size)
+{
+    void *copy = malloc(size);
+    if (copy)
+        memcpy(copy, p, size);
+    return copy;
+}
+
+static void av_free(void *ptr)
+{
+    free(ptr);
 }
 
 static int av_buffer_is_writable(const AVBufferRef *buf)
@@ -159,6 +174,7 @@ static void dovi_rpu_free(DoviRpuOpaque *rpu)
     free(rpu);
 }
 
+#include "dovi_convert.inc"
 #include "mediacodec_dv_filter.inc"
 
 // --- access-unit builder
@@ -438,7 +454,8 @@ static void test_convert_rewrites_rpu(void)
     check(!warnings, "successful conversion does not warn");
 
     // A poisoned RPU is dropped rather than forwarded as profile 7 metadata,
-    // with a single warning for the session.
+    // and the failure is reported (the shared converter's policy, one warning
+    // per failed NAL with libdovi's reason).
     struct au bad = {0}, dropped = {0};
     slice(&bad, IDR, 200);
     slice(&dropped, IDR, 200);
@@ -450,7 +467,7 @@ static void test_convert_rewrites_rpu(void)
         filter("poisoned RPU");
         expect_bytes(&dropped, "unconvertible RPU is dropped");
     }
-    check(warnings == 1, "conversion failure warns once");
+    check(warnings == 2, "each conversion failure is warned about");
 }
 
 static void test_emptied_access_unit(void)
