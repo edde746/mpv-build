@@ -43,23 +43,10 @@ fi
 
 if [[ -z "$source_dir" ]]; then
     source_dir="$workdir/source"
-    python3 - "$root" "$source_dir" <<'PY'
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-root, source = map(Path, sys.argv[1:])
-entry = json.loads((root / 'versions.json').read_text())['components']['ffmpeg']
-pin = entry | (entry.get('overrides', {}).get('android') or {})
-subprocess.run(['git', 'clone', '--quiet', '--depth', '1', '--branch', pin['ref'],
-                pin['url'], str(source)], check=True)
-head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-if head != pin['commit']:
-    raise SystemExit(f"ffmpeg {pin['ref']} is {head}, expected {pin['commit']}")
-subprocess.run([sys.executable, 'scripts/patches.py', 'apply', 'ffmpeg', 'android', str(source)],
-               cwd=root, check=True)
-PY
+    # The pin contract lives in scripts/patches.py: it resolves the
+    # override-aware pin, clones the ref, proves HEAD is the pinned commit
+    # and applies the resolved ffmpeg/android series.
+    (cd "$root" && python3 scripts/patches.py fetch-pinned ffmpeg android "$source_dir")
 fi
 source_dir="$(cd "$source_dir" && pwd)"
 

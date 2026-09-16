@@ -18,22 +18,18 @@ done
 
 if [[ -z "$source_dir" ]]; then
     source_dir="$workdir/source"
-    python3 - "$root" "$source_dir" <<'PY'
-import json
-import subprocess
-import sys
-from pathlib import Path
-root, source = map(Path, sys.argv[1:])
-entry = json.loads((root / 'versions.json').read_text())['components']['libass']
-pin = entry | (entry.get('overrides', {}).get('android') or {})
-subprocess.run(['git', 'clone', '--quiet', '--depth', '1', '--branch', pin['ref'],
-                pin['url'], str(source)], check=True)
-head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-if head != pin['commit']:
-    raise SystemExit(f"libass {pin['ref']} is {head}, expected {pin['commit']}")
-subprocess.run([sys.executable, 'scripts/patches.py', 'apply', 'libass', 'android', str(source)],
-               cwd=root, check=True)
-PY
+    # The pin contract lives in scripts/patches.py: it resolves the
+    # override-aware pin, clones the ref, proves HEAD is the pinned commit
+    # and applies the resolved libass/linux series.
+    (cd "$root" && python3 scripts/patches.py fetch-pinned libass linux "$source_dir")
+fi
+
+# libass declares separate series for linux and windows, both empty: every
+# patch it carries is cross-platform and lives in series.common. Fail loudly if
+# that stops being true rather than silently applying a platform series here.
+if [[ -s "$root/patches/libass/series.linux" ]]; then
+    echo "FAIL: patches/libass/series.linux is no longer empty; this harness applies series.common only" >&2
+    exit 1
 fi
 
 build="$workdir/build"

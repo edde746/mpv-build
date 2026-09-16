@@ -11,26 +11,16 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 patch_file="$root/patches/mpv/pool/0019-avfoundation-configurable-compressed-audio.patch"
 
-python3 - "$patch_file" <<'PY'
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
+
+python3 "$root/scripts/extract.py" hunks "$patch_file" "$workdir/hunks.json"
+python3 - "$workdir/hunks.json" <<'PY'
+import json
 import re
 import sys
 
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-hunks = []
-current = None
-for line in lines:
-    match = re.match(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)", line)
-    if match:
-        current = {"header": match.group(1), "post": [], "added": []}
-        hunks.append(current)
-        continue
-    if current is None or line.startswith(("+++", "---", "diff ", "index ")):
-        continue
-    if line.startswith("+"):
-        current["post"].append(line[1:])
-        current["added"].append(line[1:])
-    elif line.startswith(" ") or not line:
-        current["post"].append(line[1:] if line else "")
+hunks = json.load(open(sys.argv[1], encoding="utf-8"))
 
 failures = []
 added = "\n".join(line for hunk in hunks for line in hunk["added"])

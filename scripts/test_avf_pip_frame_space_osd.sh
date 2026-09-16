@@ -21,33 +21,10 @@ patch_file="$root/patches/mpv/pool/0024-avfoundation-frame-space-osd-in-pip.patc
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-python3 - "$patch_file" "$workdir/frame_space_core.inc" <<'PY'
-import sys
-
-inside = False
-found_end = False
-output = []
-for raw in open(sys.argv[1], encoding="utf-8").read().splitlines():
-    if raw.startswith(("+++", "---", "diff ", "index ", "@@")):
-        continue
-    if not raw.startswith("+"):
-        continue
-    line = raw[1:]
-    if "--- avf frame-space osd core" in line:
-        inside = True
-    if inside:
-        output.append(line)
-    if inside and "--- end avf frame-space osd core" in line:
-        found_end = True
-        break
-
-required = ("avf_frame_space_geometry", "avf_map_subtitle_rect")
-if not found_end or not all(any(name in line for line in output) for name in required):
-    print(f"FAIL: frame-space osd core region not found in {sys.argv[1]}", file=sys.stderr)
-    sys.exit(1)
-open(sys.argv[2], "w", encoding="utf-8").write("\n".join(output) + "\n")
-PY
-
+# The frame-space core ships as added lines of patch 0024.
+python3 "$root/scripts/extract.py" region "$patch_file" "$workdir/frame_space_core.inc" \
+    --start "avf frame-space osd core" --patch --added-only \
+    --require "avf_frame_space_geometry" --require "avf_map_subtitle_rect"
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_avf_pip_frame_space_osd.c"
 

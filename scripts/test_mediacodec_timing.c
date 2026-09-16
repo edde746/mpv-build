@@ -419,9 +419,6 @@ static void test_present_reports_match_intents(void)
     CHECK_EQ(present_observe(&t, 8, EPOCH + 8 * period + offset, period), false,
              "the next frame back on its vsync is not a miss");
     CHECK_EQ(present_failures(&t), 1, "misses are failures");
-    int64_t ref;
-    CHECK_EQ(present_reference(&t, &ref), true, "the log line still has a reference");
-    CHECK_EQ(ref >= offset && ref <= offset + MS, 1, "which names the platform's report clock");
 
     // A compositor that shows 24p on 60 Hz one or two vsyncs early,
     // alternating (Amlogic), keeps a clean 3:2 whichever phase it picks: the

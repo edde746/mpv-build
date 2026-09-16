@@ -10,27 +10,9 @@ patch_file="$root/patches/mpv/pool/0001-vo-mediacodec-timed-surface-with-osd-pla
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-python3 - "$patch_file" "$workdir/mediacodec_geometry_core.inc" <<'PY'
-import sys
-
-inside = False
-found_end = False
-output = []
-for raw in open(sys.argv[1], encoding="utf-8").read().splitlines():
-    if not raw.startswith("+") or raw.startswith("+++"):
-        continue
-    line = raw[1:]
-    if line == "// --- mediacodec geometry core":
-        inside = True
-    if inside:
-        output.append(line)
-    if line == "// --- end mediacodec geometry core" and inside:
-        found_end = True
-        break
-if not found_end:
-    sys.exit(f"FAIL: production geometry region not found in {sys.argv[1]}")
-open(sys.argv[2], "w", encoding="utf-8").write("\n".join(output) + "\n")
-PY
+# The geometry core ships as added lines of patch 0001.
+python3 "$root/scripts/extract.py" region "$patch_file" "$workdir/mediacodec_geometry_core.inc" \
+    --start "mediacodec geometry core" --patch --added-only --require "mediacodec_osd_geometry"
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_mediacodec_geometry.c"

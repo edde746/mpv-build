@@ -12,44 +12,23 @@ trap 'rm -rf "$workdir"' EXIT
 
 if [[ -z "$source_dir" ]]; then
     source_dir="$workdir/source"
-    python3 - "$root" "$source_dir" <<'PY'
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-root, source = map(Path, sys.argv[1:])
-entry = json.loads((root / 'versions.json').read_text())['components']['ffmpeg']
-pin = entry | (entry.get('overrides', {}).get('android') or {})
-subprocess.run(['git', 'clone', '--quiet', '--depth', '1', '--branch', pin['ref'],
-                pin['url'], str(source)], check=True)
-head = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
-if head != pin['commit']:
-    raise SystemExit(f"ffmpeg {pin['ref']} is {head}, expected {pin['commit']}")
-subprocess.run([sys.executable, 'scripts/patches.py', 'apply', 'ffmpeg', 'android', str(source)],
-               cwd=root, check=True)
-PY
+    # The pin contract lives in scripts/patches.py: it resolves the
+    # override-aware pin, clones the ref, proves HEAD is the pinned commit
+    # and applies the resolved ffmpeg/android series.
+    (cd "$root" && python3 scripts/patches.py fetch-pinned ffmpeg android "$source_dir")
 fi
 
-python3 - "$source_dir/libavcodec" "$workdir" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-lavc, work = map(Path, sys.argv[1:])
-
-def extract(path, name, ret='int'):
-    source = (lavc / path).read_text()
-    match = re.search(r'^(?:static )?' + ret + ' ' + name + r'\([^;]*?\)\n\{.*?^\}', source, re.M | re.S)
-    if not match:
-        raise SystemExit(f'MediaCodec source region not found: {name} in {path}')
-    return match.group(0)
-
-(work / 'mediacodec_input.inc').write_text(
-    extract('mediacodecdec.c', 'video_max_input_size') + '\n\n' +
-    extract('mediacodecdec_common.c', 'ff_mediacodec_dec_dequeue_input', 'ssize_t') + '\n\n' +
-    extract('mediacodecdec_common.c', 'ff_mediacodec_dec_send') + '\n')
-PY
+# The production input sizing and submission path, sliced out of the patched
+# tree by the shared extractor. The return types are named so a rewritten
+# function fails here rather than matching something else nearby.
+E="$root/scripts/extract.py"
+python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec.c" \
+    "$workdir/mediacodec_input.inc" --fn video_max_input_size --return int
+python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
+    "$workdir/mediacodec_input.inc" --append \
+    --fn ff_mediacodec_dec_dequeue_input --return ssize_t
+python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
+    "$workdir/mediacodec_input.inc" --append --fn ff_mediacodec_dec_send --return int
 
 # FFmpeg builds its own sources without -Wsign-compare.
 cc -O2 -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare \

@@ -16,34 +16,20 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 patch_file="$root/patches/mpv/pool/0015-avfoundation-bound-pcm-lookahead.patch"
 
-python3 - "$patch_file" <<'PY'
-import re, sys
+workdir="$(mktemp -d)"
+trap 'rm -rf "$workdir"' EXIT
 
-hunks = []  # (enclosing function, post-image text, added-only text)
-current = None
-for line in open(sys.argv[1], encoding="utf-8").read().splitlines():
-    m = re.match(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@ ?(.*)", line)
-    if m:
-        current = {"func": m.group(1), "post": [], "added": []}
-        hunks.append(current)
-        continue
-    if current is None or line.startswith(("+++", "---", "diff ", "index ")):
-        continue
-    if line.startswith("+"):
-        current["post"].append(line[1:])
-        current["added"].append(line[1:])
-    elif line.startswith(" ") or not line:
-        current["post"].append(line[1:] if line else "")
+python3 "$root/scripts/extract.py" hunks "$patch_file" "$workdir/hunks.json"
+python3 - "$workdir/hunks.json" <<'PY'
+import json
+import re
+import sys
 
-def hunk_func(header):
-    # "static void uninit(struct ao *ao)" -> "uninit". Exact names matter:
-    # a substring test would let uninit satisfy a check meant for init.
-    m = re.search(r"(\w+)\s*\(", header)
-    return m.group(1) if m else ""
+hunks = json.load(open(sys.argv[1], encoding="utf-8"))
 
 def added_in(func_name):
     return "\n".join("\n".join(h["added"])
-                     for h in hunks if hunk_func(h["func"]) == func_name)
+                     for h in hunks if h["func"] == func_name)
 
 failures = []
 
@@ -112,7 +98,7 @@ for h in hunks:
                 osx = None
             depth -= 1
         elif osx is None and any(s in t for s in sentinels) and not t.startswith("//"):
-            failures.append(f"'{t[:56]}' in {hunk_func(h['func'])}() is outside a "
+            failures.append(f"'{t[:56]}' in {h['func']}() is outside a "
                             "TARGET_OS_OSX gate; the bound must not exist on "
                             "tvOS or iOS")
             break
