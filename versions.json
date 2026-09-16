@@ -29,7 +29,6 @@
           "version": "0.40.0",
           "url": "https://github.com/mpv-player/mpv/archive/refs/tags/v0.40.0.tar.gz",
           "sha256": "10a0f4654f62140a6dd4d380dcf0bbdbdcf6e697556863dc499c296182f081a3",
-          "commit": "e48ac7ce08462f5e33af6ef9deeac6fa87eef01e",
           "provenance": "GitHub reports annotated tag object 287d7cdb78975ae350d7c2a287eae3c2072c93f7 as a valid PGP signature over release commit e48ac7ce08462f5e33af6ef9deeac6fa87eef01e; the complete tag archive was then hashed. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared v0.41.0 git pin is a later deliberate step."
         }
       }

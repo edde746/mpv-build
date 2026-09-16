@@ -142,13 +142,10 @@ PATCHES_ROOT = Path("patches")
 
 CHECKSUM_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
-# Swift Library rawValues whose canonical versions.json component is not just
-# the lowercased name.
-CANONICAL_OVERRIDES = {"libmpv": "mpv"}
-
-
-def canonical_component(artifact: str) -> str:
-    return CANONICAL_OVERRIDES.get(artifact, artifact.lower())
+# The artifact-name -> versions.json component rule, including its alias table,
+# lives in scripts/patches.py: `check` needs it to compare the Swift driver's
+# Library names against versions.json, and one rule cannot have two homes.
+canonical_component = patches.canonical_component
 
 
 @dataclass(frozen=True)
@@ -320,6 +317,19 @@ def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
     for field, value in (entry.get("overrides", {}).get(group) or {}).items():
         if field in ("version", "url", "ref", "sha256", "commit"):
             pins[field] = value
+    # An archive pin's identity is its sha256; ref and commit only mean
+    # something for a git pin. Folding an override in must not carry the base
+    # entry's ref or commit -- describing an unrelated tag and tree -- into the
+    # key of a pin that acquires an archive. ffmpeg's linux override is the 7.1
+    # archive while its base pin is the n8.0.1 tag, and mpv's is the 0.40.0
+    # archive against the v0.41.0 tag, so an inherited ref there is wrong twice
+    # over: no tool reads it for an archive, and a bump to the base git pin
+    # moved the archive's key for no reason. This is also the invariant
+    # platforms/android/download.sh's pin_block relies on when it reads an
+    # archive's ref back as empty.
+    if resolved_kind(versions, component, group) != "git":
+        pins.pop("commit", None)
+        pins.pop("ref", None)
     for field in ("version", "url"):
         if field not in pins:
             raise SystemExit(f"{VERSIONS_PATH}: {component} has no {field}")
@@ -333,21 +343,6 @@ def _series_entries(path: Path) -> list[str]:
     # The series format lives in scripts/patches.py; this is the same reader so
     # a rule change cannot land in one and miss the other.
     return patches.read_series(path)
-
-
-def patch_entries(root: Path, component: str, group: str) -> list[tuple[str, str]]:
-    """(name, sha256) of every patch in the component's resolved series, in order."""
-    directory = root / PATCHES_ROOT / component
-    names = _series_entries(directory / "series.common") + _series_entries(
-        directory / f"series.{group}"
-    )
-    entries = []
-    for name in names:
-        pool_file = directory / "pool" / name
-        if not pool_file.is_file():
-            raise SystemExit(f"{directory / 'pool' / name}: named by a series file but missing")
-        entries.append((name, _sha256_file(pool_file)))
-    return entries
 
 
 def patch_entries(root: Path, component: str, group: str) -> list[tuple[str, str]]:
@@ -840,18 +835,6 @@ def cmd_keys(args, root: Path, group: Group) -> int:
     return 0
 
 
-def cmd_versions(args, root: Path, group: Group | None) -> int:
-    """Print `<component><TAB><version>` for every component, sorted.
-
-    The base pin, not a platform override: this is what release notes and
-    release tags want. It replaces the workflows' regex reads of the Swift
-    driver, which stopped carrying versions when pins moved to versions.json.
-    """
-    for component, entry in sorted(load_versions(root)["components"].items()):
-        print(f"{component}\t{entry['version']}")
-    return 0
-
-
 def cmd_groups(args, root: Path, group: Group | None) -> int:
     """Print every group's name, space-separated.
 
@@ -1080,12 +1063,6 @@ def main(argv: list[str]) -> int:
         "groups", help="print every platform group's name, space-separated"
     )
     groups.set_defaults(func=cmd_groups)
-
-    # No --platform-group either: base pins, not a platform's overrides.
-    versions = subparsers.add_parser(
-        "versions", help="print every component's pinned upstream version"
-    )
-    versions.set_defaults(func=cmd_versions)
 
     variants = subparsers.add_parser(
         "variants",

@@ -319,6 +319,38 @@ with tempfile.TemporaryDirectory() as tmp:
     check(before["libmpv"] != bumped["libmpv"], "an mpv pin bump must move libmpv's key")
     check(before["libass"] == bumped["libass"], "an mpv pin bump must not move libass's key")
 
+    # An archive override's key is the bytes it fetches. `resolved_pins` folds
+    # the override over the base entry, so before 9b6c68d the base git pin's
+    # ref -- and commit -- leaked into it: bumping the base pin, which names a
+    # different tree entirely, moved the archive's key for no reason. The same
+    # is true of the fold's other direction, so the sha256 must still move it.
+    def archive_override(base_ref, base_commit, sha256):
+        versions = json.loads(json.dumps(VERSIONS))
+        versions["components"]["mpv"]["ref"] = base_ref
+        versions["components"]["mpv"]["commit"] = base_commit
+        versions["components"]["mpv"]["overrides"] = {
+            "apple": {
+                "kind": "archive",
+                "version": "0.41.0",
+                "url": "https://github.com/mpv-player/mpv/archive/refs/tags/v0.41.0.tar.gz",
+                "sha256": sha256,
+            }
+        }
+        write_versions(repo, versions)
+        return keys(repo)
+
+    archived = archive_override("v0.41.0", "1" * 40, "a" * 64)
+    rebased = archive_override("v0.42.0", "2" * 40, "a" * 64)
+    check(
+        archived["libmpv"] == rebased["libmpv"],
+        "an archive override's key must not inherit the base git pin's ref or commit",
+    )
+    repinned = archive_override("v0.41.0", "1" * 40, "b" * 64)
+    check(
+        archived["libmpv"] != repinned["libmpv"],
+        "an archive override's key must move with the sha256 it actually fetches",
+    )
+
     # A component keys.py needs must exist.
     versions = json.loads(json.dumps(VERSIONS))
     del versions["components"]["mpv"]
