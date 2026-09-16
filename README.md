@@ -235,6 +235,16 @@ unit that does not fit its input buffer is dropped whole and the decoder
 flushed, never split across buffers. Pass an already-patched source directory
 as the first argument to run offline.
 
+Run the MediaCodec end-of-stream regression with `bash scripts/test_mediacodec_eos.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and drives
+the asynchronous decoder's drain through the production send and receive:
+after a flush has advanced the timestamp generation, an EOS the codec reports
+with a timestamp of its own (0, -1) still ends the drain and its buffer goes
+back unrendered, an EOS flagged on an echoed last frame delivers the frame
+first, output finished before the flush is still dropped without pre-empting
+a drain that has not started, and the polled decoder reads the flag alone.
+Pass an already-patched source directory as the first argument to run offline.
+
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding
