@@ -213,7 +213,52 @@ for component in sorted(p.name for p in (root / "patches").iterdir() if p.is_dir
 with tempfile.TemporaryDirectory() as tmp:
     sandbox = Path(tmp)
     shutil.copytree(root / "patches", sandbox / "patches")
-    shutil.copytree(root / "platforms", sandbox / "platforms")
+    # `check` reads platforms/*/group.json and nothing else under platforms/.
+    # The built subtrees are not inputs, they are gigabytes, and
+    # platforms/android/prefix/<abi>/usr is a self-symlink, so copying them
+    # fails outright on a checkout that has ever been built ("Too many levels
+    # of symbolic links"). symlinks=True keeps any other build link from being
+    # followed as well.
+    built = ("deps", "prefix", "sdk")
+    shutil.copytree(
+        root / "platforms",
+        sandbox / "platforms",
+        symlinks=True,
+        ignore=shutil.ignore_patterns(*built),
+    )
+    # The sandbox is only as good as its inputs. Two independent checks, so a
+    # future `check` input added under platforms/ cannot silently vanish into
+    # the copy:
+    #
+    # 1. The group.json set matches exactly, and is not empty: an empty pair of
+    #    sets would satisfy equality while proving nothing.
+    copied_groups = sorted(path.parent.name for path in (sandbox / "platforms").glob("*/group.json"))
+    source_groups = sorted(path.parent.name for path in (root / "platforms").glob("*/group.json"))
+    check(
+        copied_groups and copied_groups == source_groups,
+        f"the sandbox must mirror every platforms/*/group.json; copied {copied_groups}, "
+        f"source has {source_groups}",
+    )
+    # 2. Every file git tracks under platforms/ survives the copy. Ignoring a
+    #    name is only sound while that name is build output: a tracked
+    #    platforms/<group>/deps (or /sdk, /prefix) would be dropped here and
+    #    silently validated as absent, which is exactly the divergence this
+    #    guards. Untracked build output is invisible to git and stays dropped.
+    #    A tree without git (an extracted archive) can still answer 1, so this
+    #    one is skipped there rather than failing the run.
+    tracked = subprocess.run(
+        ["git", "ls-files", "platforms"], cwd=root, capture_output=True, text=True
+    )
+    if tracked.returncode == 0:
+        missing = [name for name in tracked.stdout.split() if not (sandbox / name).exists()]
+        check(
+            not missing,
+            f"the sandbox dropped tracked platforms/ files {missing}; an ignore pattern "
+            f"({', '.join(built)}) must only cover build output",
+        )
+    else:
+        print("no git checkout to list tracked platforms/ files from; skipped")
+
     shutil.copy2(root / "versions.json", sandbox / "versions.json")
     versions = json.loads((sandbox / "versions.json").read_text(encoding="utf-8"))
     versions["components"]["ffmpeg"]["platforms"] = ["apple"]

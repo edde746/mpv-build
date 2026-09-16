@@ -26,6 +26,9 @@ jobs:
       - name: Test patch framework
         run: bash scripts/test_patches.sh
 
+      - name: Test shared extractor
+        run: bash scripts/test_extract.sh
+
       - name: Test content keys
         run: bash scripts/test_keys.sh
 
@@ -48,8 +51,10 @@ jobs:
           python3 - <<'PY'
           import hashlib
           import json
+          import shutil
           import subprocess
           import sys
+          import tempfile
           from pathlib import Path
 
           # The group list is discovered from platforms/*/group.json by keys.py,
@@ -60,8 +65,13 @@ jobs:
               raise SystemExit('keys.py groups reported no platform groups')
 
           components = json.loads(Path('versions.json').read_text(encoding='utf-8'))['components']
-          work = Path('.ci-sources')
-          work.mkdir(exist_ok=True)
+          # A fresh directory per run, deliberately outside the checkout: the
+          # gate below has to acquire and apply every series itself, so nothing
+          # may survive from an earlier run into this one. A persisted or
+          # self-hosted workspace, `clean: false` or `act` would otherwise find
+          # a pre-existing clone and skip the only check that proves a series
+          # still applies.
+          work = Path(tempfile.mkdtemp(prefix='ci-sources-'))
 
           def resolve(component, group):
             result = subprocess.run(
@@ -89,11 +99,11 @@ jobs:
                 continue
               dest = work / f'{component}-{group}'
               print(f'{component}/{group}: checking {len(series)} patch(es)')
-              if not dest.exists():
-                # fetch-pinned lands the series for real: applied is what the
-                # harnesses below need, and a patch that does not apply aborts
-                # the step.
-                fetch(component, group, dest)
+              # fetch-pinned lands the series for real: applied is what the
+              # harnesses below need, and a patch that does not apply aborts
+              # the step. Nothing above may skip it: `checked` counts only
+              # series that were actually acquired and applied here.
+              fetch(component, group, dest)
               checked += 1
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
@@ -109,6 +119,7 @@ jobs:
           if checked == 0:
             raise SystemExit('no (component, group) series resolved; expected at least mpv/apple')
           print(f'checked {checked} series')
+          shutil.rmtree(work, ignore_errors=True)
           PY
 
   build:

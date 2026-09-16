@@ -22,6 +22,11 @@ jobs:
       - name: Resolve the latest upstream tags
         id: latest
         run: |
+          # GitHub runs this with `bash -e {0}`: no pipefail, so a failed
+          # ls-remote would be masked by `tail` and resolve to an empty tag.
+          # The guard below refuses to write an empty pin, but the lookup
+          # failing is itself a failure and must not read as "already current".
+          set -o pipefail
           mpv_latest="$(git ls-remote --tags --refs https://github.com/mpv-player/mpv \
             | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
           ffmpeg_latest="$(git ls-remote --tags --refs https://github.com/FFmpeg/FFmpeg \
@@ -39,23 +44,57 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
 
           path = Path('versions.json')
           document = json.loads(path.read_text(encoding='utf-8'))
           components = document['components']
 
+          # The same rule as check-deps, which owns the other half of the pin
+          # bump: an empty resolution is a failed lookup rather than a version,
+          # and only a strictly newer tag moves a pin.
+          def parsed(tag):
+              """The tag's numbers, or None when it carries none to compare."""
+              numbers = re.findall(r'\d+', tag)
+              return tuple(int(number) for number in numbers) or None
+
+          def accept(current, latest):
+              """True when the resolved tag may replace the pin."""
+              if not latest:
+                  return False
+              current_numbers, latest_numbers = parsed(current), parsed(latest)
+              if current_numbers is None or latest_numbers is None:
+                  return latest != current
+              return latest_numbers > current_numbers
+
           found = {}
           for component, env in (('mpv', 'MPV'), ('ffmpeg', 'FFMPEG')):
               latest = os.environ[env]
-              if latest and latest != components[component]['version']:
+              current = components[component]['version']
+              if accept(current, latest):
                   found[component] = latest
+              elif latest:
+                  print(f'{component}: keeping {current}, resolved tag is {latest!r}')
 
+          # Read README.md before anything is written: it renders the same pins
+          # as shields badges, and a missing or unreadable file must fail the
+          # step before versions.json has been modified, not after.
+          readme = Path('README.md')
+          readme_text = readme.read_text(encoding='utf-8')
+
+          outputs = Path(os.environ['GITHUB_OUTPUT'])
           if not found:
               print('both pins are already current')
-              Path(os.environ['GITHUB_OUTPUT']).open('a').write('changed=false\n')
+              outputs.open('a').write('changed=false\n')
               raise SystemExit(0)
-          Path(os.environ['GITHUB_OUTPUT']).open('a').write('changed=true\n')
+          # The PR text names what moves, not what the resolver found: a
+          # component already at the latest tag must not appear in the title or
+          # the commit message.
+          summary = ', '.join(
+              f'{component} {latest}' for component, latest in sorted(found.items())
+          )
+          outputs.open('a').write(f'changed=true\nsummary={summary}\n')
 
           # versions.json is only half the pin: ref, commit and provenance must
           # be re-derived and audited by a human, so this step records the new
@@ -66,6 +105,16 @@ jobs:
               print(f'{component}: -> {latest}')
 
           path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+
+          # README.md renders the same pins as shields badges, so it is the
+          # other half of the bump: without this it silently drifts from
+          # versions.json. Only the components whose pin moved are rewritten.
+          for component, latest in sorted(found.items()):
+              readme_text = re.sub(
+                  rf'{component}-.*-blue', rf'{component}-{latest}-blue', readme_text, count=1
+              )
+          readme.write_text(readme_text, encoding='utf-8')
+
           Path('/tmp/BUMPED.txt').write_text(
               '\n'.join(f'{component} -> {latest}' for component, latest in sorted(found.items())),
               encoding='utf-8',
@@ -93,9 +142,10 @@ jobs:
         with:
           add-paths: |
             ./versions.json
+            ./README.md
           branch: "create-pull-request/pin-bump"
           delete-branch: true
-          title: "bump pins: ${{ steps.latest.outputs.mpv != '' && format('mpv {0}', steps.latest.outputs.mpv) || '' }}${{ steps.latest.outputs.mpv != '' && steps.latest.outputs.ffmpeg != '' && ' && ' || '' }}${{ steps.latest.outputs.ffmpeg != '' && format('ffmpeg {0}', steps.latest.outputs.ffmpeg) || '' }}"
+          title: "bump pins: ${{ steps.bump.outputs.summary }}"
           body: |
             Latest upstream tags:
 
@@ -107,7 +157,7 @@ jobs:
             re-derived and audited against the upstream tag records, and
             `python3 scripts/patches.py check` plus a full CI run prove the series still
             applies to the new sources.
-          commit-message: "chore: bump pins to mpv ${{ steps.latest.outputs.mpv }} / ffmpeg ${{ steps.latest.outputs.ffmpeg }}"
+          commit-message: "chore: bump pins to ${{ steps.bump.outputs.summary }}"
 
   check-deps:
     # The prebuilt dependency pins track third-party release tags of their build
@@ -147,6 +197,10 @@ jobs:
       - name: Resolve the latest release tag
         id: latest
         run: |
+          # GitHub runs this with `bash -e {0}`: no pipefail, so a failed
+          # ls-remote would be masked by `tail` and resolve to an empty tag --
+          # and an empty tag must never reach the pin rewrite below.
+          set -o pipefail
           latest="$(git ls-remote --tags --refs https://github.com/${{ matrix.repository }} \
             | sed 's#.*refs/tags/##' | grep -Ev '\^\{\}$' | sort -V | tail -n1)"
           echo "latest tag: ${latest}"
@@ -158,27 +212,55 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
 
-          latest = os.environ['LATEST_TAG']
+          def parsed(tag):
+              """The tag's numbers, or None when it carries none to compare."""
+              numbers = re.findall(r'\d+', tag)
+              return tuple(int(number) for number in numbers) or None
+
+          def accept(current, latest):
+              """True when the resolved tag may replace the pin.
+
+              An empty resolution is a failed lookup, not a version: accepting
+              it would rewrite every component to `""` behind a green run. And
+              a tag that only re-spells the same release (a `v` prefix coming
+              or going) must not churn the pins, so an equal parsed version
+              stays put. Only a strictly newer tag moves a pin.
+              """
+              if not latest:
+                  return False
+              current_numbers, latest_numbers = parsed(current), parsed(latest)
+              if current_numbers is None or latest_numbers is None:
+                  return latest != current
+              return latest_numbers > current_numbers
+
+          latest = os.environ['LATEST_TAG'].strip()
           wanted = os.environ['COMPONENTS'].split()
           path = Path('versions.json')
           document = json.loads(path.read_text(encoding='utf-8'))
           components = document['components']
 
           changed = []
+          moved = []
           for component in wanted:
               current = components[component]['version']
-              if current != latest:
-                  components[component]['version'] = latest
-                  changed.append(f'{component}: {current} -> {latest}')
+              if not accept(current, latest):
+                  print(f'{component}: keeping {current}, resolved tag is {latest!r}')
+                  continue
+              components[component]['version'] = latest
+              moved.append(component)
+              changed.append(f'{component}: {current} -> {latest}')
 
           outputs = Path(os.environ['GITHUB_OUTPUT'])
           if not changed:
               print(f'every pin already at {latest}')
               outputs.open('a').write('changed=false\n')
               raise SystemExit(0)
-          outputs.open('a').write('changed=true\n')
+          # The PR text names the components whose pin moved, not the whole
+          # matrix row: a component already at the tag is not an update.
+          outputs.open('a').write(f'changed=true\nchanged_components={" ".join(moved)}\n')
           changed_path = Path('/tmp/BUMPED.txt')
           changed_path.write_text('\n'.join(changed) + '\n', encoding='utf-8')
           print(changed_path.read_text(), end='')
@@ -205,9 +287,9 @@ jobs:
           body: |
             https://github.com/${{ matrix.repository }}/releases/tag/${{ steps.latest.outputs.tag }}
 
-            Updated `versions.json` components: `${{ matrix.components }}`.
+            Updated `versions.json` components: `${{ steps.bump.outputs.changed_components }}`.
 
             Per `versions.json`'s `refreshContract`, audit the release before merging: the
             `url`, `ref`, `commit` and `provenance` fields must be re-derived from the new
             tag and verified, and a full CI run must prove the patch series still applies.
-          commit-message: "chore: bump ${{ matrix.components }} to ${{ steps.latest.outputs.tag }}"
+          commit-message: "chore: bump ${{ steps.bump.outputs.changed_components }} to ${{ steps.latest.outputs.tag }}"

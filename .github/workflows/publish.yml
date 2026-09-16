@@ -105,6 +105,9 @@ jobs:
       - name: Test patch framework
         run: ./scripts/test_patches.sh
 
+      - name: Test shared extractor
+        run: ./scripts/test_extract.sh
+
       - name: Test content keys
         run: ./scripts/test_keys.sh
 
@@ -118,10 +121,11 @@ jobs:
       # The stale libraries of the apple group, comma-separated: the `libs=`
       # argument the apple build legs need.
       stale_apple: ${{ steps.stale.outputs.stale_apple }}
-      # JSON arrays. `stale_groups` is empty when every group is published,
-      # which is what skips the build/publish jobs and the manifest commit.
+      # The stale groups with both delimiters (`,apple,android,`), so a gate is
+      # an exact `contains(..., ',<group>,')` test rather than a substring
+      # guess. Empty when every group is already published, which is what skips
+      # the build, publish and manifest jobs.
       stale_groups: ${{ steps.stale.outputs.stale_groups }}
-      groups: ${{ steps.stale.outputs.groups }}
     steps:
       - uses: actions/checkout@v4
 
@@ -137,14 +141,13 @@ jobs:
           # The group list and the per-group platform variants are discovered,
           # not restated here: keys.py reads them out of platforms/*/group.json.
           groups="$(python3 scripts/keys.py groups)"
-          echo "groups=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "${groups}")" >> "$GITHUB_OUTPUT"
           echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
 
           stale_groups=""
           for group in ${groups}; do
             stale="$(python3 scripts/keys.py stale --platform-group "${group}" | paste -sd, -)"
             if [ -n "${stale}" ]; then
-              stale_groups="${stale_groups} ${group}"
+              stale_groups="${stale_groups},${group}"
               echo "${group}: rebuilding ${stale}" >> "$GITHUB_STEP_SUMMARY"
             else
               echo "${group}: binaries already published for this tree" >> "$GITHUB_STEP_SUMMARY"
@@ -157,12 +160,19 @@ jobs:
               echo "stale_apple=${stale}" >> "$GITHUB_OUTPUT"
             fi
           done
-          echo "stale_groups=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "${stale_groups}")" >> "$GITHUB_OUTPUT"
+          # Both delimiters, so `contains(..., ',<group>,')` is an exact test:
+          # a bare trailing group (`...,apple`) would otherwise not match.
+          # Empty when nothing is stale, which is what skips the later jobs.
+          if [ -n "${stale_groups}" ]; then
+            echo "stale_groups=${stale_groups}," >> "$GITHUB_OUTPUT"
+          else
+            echo "stale_groups=" >> "$GITHUB_OUTPUT"
+          fi
 
   build-apple:
     name: Build apple ${{ matrix.name }}
     needs: plan
-    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'apple')
+    if: contains(needs.plan.outputs.stale_groups, ',apple,')
     permissions:
       contents: read
     runs-on: macos-26
@@ -234,11 +244,6 @@ jobs:
         with:
           pattern: apple-*
           path: ./dist/partials
-
-      - name: Collect release assets
-        run: |
-          mkdir -p dist/release
-          find dist/partials -type f -exec cp -v {} dist/release/ \;
 
       - name: Merge platform XCFrameworks
         run: |
@@ -324,7 +329,7 @@ jobs:
   build-android:
     name: Build android ${{ matrix.abi }}
     needs: plan
-    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'android')
+    if: contains(needs.plan.outputs.stale_groups, ',android,')
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -374,7 +379,7 @@ jobs:
   build-linux:
     name: Build linux ${{ matrix.arch }}
     needs: plan
-    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'linux')
+    if: contains(needs.plan.outputs.stale_groups, ',linux,')
     permissions:
       contents: read
     # The aarch64 leg runs on GitHub's native arm runner: toolchain/linux.txt
@@ -412,7 +417,7 @@ jobs:
   build-windows:
     name: Build windows ${{ matrix.arch }}
     needs: plan
-    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'windows')
+    if: contains(needs.plan.outputs.stale_groups, ',windows,')
     permissions:
       contents: read
     # Both target arches cross-compile from an x86_64 host: winbuild's
@@ -528,7 +533,11 @@ jobs:
     # own group.json (via `keys.py groups`/`variants`) rather than being
     # restated here.
     needs: [plan, build-android, build-linux, build-windows]
-    if: needs.plan.outputs.stale_groups != '[]'
+    # always(): a group with nothing stale has a *skipped* build job, and a
+    # skipped need would otherwise skip this job -- silently publishing nothing
+    # and leaving the commit unpinnable. The per-row gate below decides which
+    # rows actually act; `!cancelled()` keeps a superseded run from publishing.
+    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -538,13 +547,10 @@ jobs:
         include:
           - group: android
             artifacts: android-*
-            pattern: ./*.tar.gz
           - group: linux
             artifacts: linux-*
-            pattern: ./*.tar.zst
           - group: windows
             artifacts: windows-*
-            pattern: ./*.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -554,14 +560,18 @@ jobs:
       - name: Skip groups with nothing stale
         id: stale
         run: |
-          if python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.loads(sys.argv[1]) else 1)' \
-              '${{ needs.plan.outputs.stale_groups }}' '${{ matrix.group }}'; then
+          if [[ "${{ needs.plan.outputs.stale_groups }}" == *",${{ matrix.group }},"* ]]; then
             echo "stale=true" >> "$GITHUB_OUTPUT"
           else
             echo "stale=false" >> "$GITHUB_OUTPUT"
             echo "${{ matrix.group }}: nothing stale, keeping the committed section"
           fi
 
+      # actions/download-artifact has no fail-on-empty input: a pattern that
+      # matches nothing logs "Total of 0 artifact(s) downloaded" and succeeds,
+      # and record-platform below only records what exists. The run is still
+      # closed by `keys.py verify` two steps down: it fails whenever the
+      # manifest does not describe the artifacts this commit has to publish.
       - name: Download platform builds
         if: steps.stale.outputs.stale == 'true'
         uses: actions/download-artifact@v4
@@ -616,7 +626,9 @@ jobs:
     # rather than restating per-group job names, so a group added to
     # platforms/*/group.json cannot be silently skipped.
     needs: [plan, publish-apple, publish]
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != '[]'
+    # always(): this gate is what proves a group that was stale actually
+    # published, so it must run even when one of them failed.
+    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -632,12 +644,12 @@ jobs:
       - name: Check every stale group published
         run: |
           python3 - <<'PY'
-          import json
           import os
           import sys
           from pathlib import Path
 
-          stale = json.loads(os.environ['STALE_GROUPS'])
+          # ",apple,android," -> ["apple", "android"]
+          stale = [g for g in os.environ['STALE_GROUPS'].strip(',').split(',') if g]
           present = {p.name[len('manifest-'):] for p in Path('dist/manifests').glob('manifest-*')}
           missing = [group for group in stale if group not in present]
           if missing:

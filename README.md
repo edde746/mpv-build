@@ -119,8 +119,10 @@ the pinned `commit`; an `archive` pin is downloaded, checked against the pinned
 the resolved series. The harnesses that build against a source tree also accept
 an already-patched source directory as their first argument, which is how they
 run offline. The harnesses that slice the patch files directly need no source
-tree at all, and `test_patches.sh` and `test_keys.sh` are regression tests of
-the Python tools themselves rather than of a source tree.
+tree at all, and `test_patches.sh`, `test_extract.sh` and `test_keys.sh` are
+regression tests of the Python tools themselves rather than of a source tree:
+`patches.py`'s series rules and archive fetching, `extract.py`'s slicing and
+hunk parsing over the whole pool, and `keys.py`'s content keys and gates.
 
 ## How to build
 
