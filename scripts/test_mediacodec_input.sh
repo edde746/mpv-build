@@ -28,6 +28,8 @@ python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
     "$workdir/mediacodec_input.inc" --append \
     --fn ff_mediacodec_dec_dequeue_input --return ssize_t
 python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
+    "$workdir/mediacodec_input.inc" --append --fn mediacodec_dec_tag_pts --return int64_t
+python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
     "$workdir/mediacodec_input.inc" --append --fn ff_mediacodec_dec_send --return int
 
 # FFmpeg builds its own sources without -Wsign-compare.

@@ -5,6 +5,7 @@
 // MediaCodec wrapper is a recording fake.
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -27,6 +28,9 @@
 #define FFMIN(a, b) ((a) > (b) ? (b) : (a))
 #define FFALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 #define INPUT_DEQUEUE_TIMEOUT_US 8000
+// Mirrors the production constant; the harness slices the tagging function
+// itself, not the macro it reads.
+#define MEDIACODEC_GENERATION_SHIFT 44
 
 enum AVCodecID {
     AV_CODEC_ID_NONE, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_MPEG4,
@@ -50,13 +54,39 @@ typedef struct AVPacket {
 
 typedef struct FFAMediaCodec FFAMediaCodec;
 
+typedef pthread_mutex_t AVMutex;
+#define ff_mutex_lock(m)   pthread_mutex_lock(m)
+#define ff_mutex_unlock(m) pthread_mutex_unlock(m)
+
+typedef struct AVFifo AVFifo;
+
 typedef struct MediaCodecDecContext {
     FFAMediaCodec *codec;
     int draining;
     int flushing;
     int eos;
     ssize_t current_input_buffer;
+    // Asynchronous mode is never taken here (see the stubs below); the paths
+    // that consult it are extracted production code, so the state exists.
+    int async_mode;
+    int async_generation;
+    AVMutex async_lock;
+    AVFifo *async_input;
 } MediaCodecDecContext;
+
+// The asynchronous branch of ff_mediacodec_dec_dequeue_input: the harness
+// drives the synchronous decoder, so nothing is ever queued and the wait is
+// never entered.
+static int mediacodec_dec_async_wait(MediaCodecDecContext *s, AVFifo *fifo,
+                                     int64_t timeout_us)
+{
+    return 0;
+}
+
+static int av_fifo_read(AVFifo *fifo, void *buf, int size)
+{
+    return -1;
+}
 
 static int64_t av_rescale_q(int64_t a, AVRational bq, AVRational cq)
 {

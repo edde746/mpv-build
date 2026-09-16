@@ -1,8 +1,8 @@
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index 5e2e8d7..a5bb0f3 100644
+index 5e2e8d7..7c6e365 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -1338,11 +1338,17 @@ void lavc_process(struct mp_filter *f, struct lavc_state *state,
+@@ -1338,11 +1338,20 @@ void lavc_process(struct mp_filter *f, struct lavc_state *state,
          }
          int ret_send = send(f, pkt);
          if (ret_send == AVERROR(EAGAIN)) {
@@ -12,6 +12,9 @@ index 5e2e8d7..a5bb0f3 100644
 -            mp_filter_wakeup(f);
 -            return;
 +            switch (state->busy_policy) {
++            case LAVC_BUSY_WAKEUP:
++                // The decoder wakes this filter when either port can move.
++                return;
 +            case LAVC_BUSY_POLL:
 +                mp_filter_wakeup(f);
 +                return;
@@ -25,20 +28,22 @@ index 5e2e8d7..a5bb0f3 100644
          state->packets_sent = true;
          demux_packet_pool_push(f->packet_pool, pkt);
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index a352dc0..76862a1 100644
+index a352dc0..04b40c9 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
-@@ -107,11 +107,22 @@ extern const struct mp_decoder_fns vd_lavc;
+@@ -107,11 +107,24 @@ extern const struct mp_decoder_fns vd_lavc;
  extern const struct mp_decoder_fns ad_lavc;
  extern const struct mp_decoder_fns ad_spdif;
  
 +// How a decoder that answers EAGAIN on both send and receive is to be
 +// treated. libavcodec's contract forbids that answer, so by default it is a
 +// warning and an immediate retry; a decoder that is known to give it while
-+// its hardware is busy is polled, because it bounded its own wait.
++// its hardware is busy is either polled (it bounded its own wait) or left
++// alone until it wakes the filter itself.
 +enum lavc_busy_policy {
 +    LAVC_BUSY_UNEXPECTED = 0,
 +    LAVC_BUSY_POLL,
++    LAVC_BUSY_WAKEUP,
 +};
 +
  // Convenience wrapper for lavc based decoders. Treat lavc_state as private;
@@ -53,7 +58,7 @@ index a352dc0..76862a1 100644
  void lavc_process(struct mp_filter *f, struct lavc_state *state,
                    int (*send)(struct mp_filter *f, struct demux_packet *pkt),
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 399e1d5..34d2474 100644
+index 399e1d5..69c9c34 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
 @@ -22,6 +22,7 @@
@@ -68,7 +73,7 @@ index 399e1d5..34d2474 100644
  #include "options/m_option.h"
  
  static void init_avctx(struct mp_filter *vd);
-+static void mediacodec_poll_token(void *opaque);
++static void decoder_wakeup(void *opaque);
  static void uninit_avctx(struct mp_filter *vd);
  
  static int get_buffer2_direct(AVCodecContext *avctx, AVFrame *pic, int flags);
@@ -80,15 +85,19 @@ index 399e1d5..34d2474 100644
      const char *decoder;
      bool hwdec_failed;
      bool hwdec_notified;
-@@ -855,6 +858,20 @@ static void init_avctx(struct mp_filter *vd)
+@@ -855,6 +858,24 @@ static void init_avctx(struct mp_filter *vd)
      if (avcodec_open2(avctx, lavc_codec, NULL) < 0)
          goto error;
  
 +    // A MediaCodec decoder blocks the caller while its hardware is busy,
 +    // which on this thread starves audio and the video output alike. Ask it
-+    // to answer EAGAIN instead; the answer says how to handle that (see
-+    // lavc_busy_policy).
-+    switch (av_mediacodec_set_wakeup_callback(avctx, mediacodec_poll_token, NULL)) {
++    // to answer EAGAIN instead; whether it then wakes this filter itself
++    // decides how that answer is handled (see lavc_busy_policy).
++    switch (av_mediacodec_set_wakeup_callback(avctx, decoder_wakeup, vd)) {
++    case 1:
++        ctx->state.busy_policy = LAVC_BUSY_WAKEUP;
++        MP_VERBOSE(vd, "Decoder wakes the filter itself.\n");
++        break;
 +    case 0:
 +        ctx->state.busy_policy = LAVC_BUSY_POLL;
 +        MP_VERBOSE(vd, "Decoder is polled while busy.\n");
@@ -101,30 +110,31 @@ index 399e1d5..34d2474 100644
      // Sometimes, the first packet contains information required for correct
      // decoding of the rest of the stream. The only currently known case is the
      // x264 build number (encoded in a SEI element), needed to enable a
-@@ -874,6 +891,12 @@ error:
+@@ -874,6 +895,12 @@ error:
      uninit_avctx(vd);
  }
  
-+// The registration that asks a MediaCodec decoder to answer EAGAIN rather
-+// than block its caller. It is a token, not a callback: nothing calls it.
-+static void mediacodec_poll_token(void *opaque)
++// On a codec-owned thread: the decoder can make progress again.
++static void decoder_wakeup(void *opaque)
 +{
++    mp_filter_wakeup(opaque);
 +}
 +
  static void reset_avctx(struct mp_filter *vd)
  {
      vd_ffmpeg_ctx *ctx = vd->priv;
-@@ -912,6 +935,9 @@ static void uninit_avctx(struct mp_filter *vd)
+@@ -912,6 +939,10 @@ static void uninit_avctx(struct mp_filter *vd)
      mp_free_av_packet(&ctx->avpkt);
      av_buffer_unref(&ctx->cached_hw_frames_ctx);
  
++    // Returns only once no wakeup is still on its way to this filter.
 +    if (ctx->avctx)
 +        av_mediacodec_set_wakeup_callback(ctx->avctx, NULL, NULL);
 +    ctx->state.busy_policy = LAVC_BUSY_UNEXPECTED;
      avcodec_free_context(&ctx->avctx);
  
      av_buffer_unref(&ctx->hwdec_dev);
-@@ -1225,8 +1251,12 @@ static int decode_frame(struct mp_filter *vd)
+@@ -1225,8 +1256,12 @@ static int decode_frame(struct mp_filter *vd)
      prepare_decoding(vd);
  
      // Re-send old packets (typically after a hwdec fallback during init).
@@ -138,7 +148,7 @@ index 399e1d5..34d2474 100644
  
      int ret = avcodec_receive_frame(avctx, ctx->pic);
      if (ret < 0) {
-@@ -1309,8 +1339,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
+@@ -1309,8 +1344,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
          return 0; // force retry
      }
  
@@ -156,7 +166,7 @@ index 399e1d5..34d2474 100644
  
      if (ctx->num_delay_queue <= ctx->max_delay_queue && ret != AVERROR_EOF)
          return ret;
-@@ -1408,7 +1445,7 @@ static void vd_lavc_reset(struct mp_filter *vd)
+@@ -1408,7 +1450,7 @@ static void vd_lavc_reset(struct mp_filter *vd)
  
      flush_all(vd);
  
