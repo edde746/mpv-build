@@ -375,9 +375,9 @@ static void test_present_reports_match_intents(void)
 {
     struct present_stats s = {0};
     const int64_t period = 16666667;
-    present_record(&s, 1000, EPOCH);
-    present_record(&s, 2000, EPOCH + 3 * period);
-    present_record(&s, 3000, 0);
+    present_record(&s, 1000, EPOCH, period);
+    present_record(&s, 2000, EPOCH + 3 * period, period);
+    present_record(&s, 3000, 0, period);
     present_observe(&s, 2000, EPOCH + 3 * period + MS, period);
     CHECK_EQ(s.measured, 1, "a report matches its intent by media time, in any order");
     CHECK_EQ(s.hist[2], 1, "a present within half a period is on time");
@@ -393,29 +393,79 @@ static void test_present_reports_match_intents(void)
     present_observe(&s, 4000, EPOCH, period);
     CHECK_EQ(s.unmatched, 2, "a report nobody intended is unmatched");
     CHECK_EQ(present_failures(&s), 1, "an untimed present is a failure, unmatched reports are not");
-    CHECK_EQ(s.missed, 0, "two reports are not yet a reference to miss against");
+    CHECK_EQ(s.missed, 0, "reports out of release order are never read as a hold");
 
     // A device whose reports sit a constant distance from the intended vsync
     // (Tensor reports the release timestamp, 0.8 of a period early) misses
-    // nothing; a report that leaves that steady distance by half a period
-    // is a miss, and the reference survives it.
+    // nothing; a frame it holds a vsync too long is a miss, and the short
+    // hold that catches up afterwards is the same event.
     struct present_stats t = {0};
     const int64_t offset = -period * 8 / 10;
     for (int n = 0; n < 6; n++) {
-        present_record(&t, n, EPOCH + n * period);
+        present_record(&t, n, EPOCH + n * period, period);
         CHECK_EQ(present_observe(&t, n, EPOCH + n * period + offset + (n % 2) * MS, period),
                  false, "a steady early report is not a miss");
     }
     CHECK_EQ(t.hist[1], 6, "the histogram still shows where the reports land");
     CHECK_EQ(t.missed, 0, "nothing missed at a steady offset");
-    present_record(&t, 6, EPOCH + 6 * period);
+    present_record(&t, 6, EPOCH + 6 * period, period);
     CHECK_EQ(present_observe(&t, 6, EPOCH + 7 * period + offset, period), true,
-             "a frame shown a period after its siblings is a miss");
+             "a frame held two vsyncs where one was due is a miss");
     CHECK_EQ(t.missed, 1, "the miss is counted");
-    present_record(&t, 7, EPOCH + 7 * period);
+    present_record(&t, 7, EPOCH + 7 * period, period);
     CHECK_EQ(present_observe(&t, 7, EPOCH + 7 * period + offset, period), false,
+             "the zero-length hold that catches up is not a second miss");
+    present_record(&t, 8, EPOCH + 8 * period, period);
+    CHECK_EQ(present_observe(&t, 8, EPOCH + 8 * period + offset, period), false,
              "the next frame back on its vsync is not a miss");
     CHECK_EQ(present_failures(&t), 1, "misses are failures");
+    int64_t ref;
+    CHECK_EQ(present_reference(&t, &ref), true, "the log line still has a reference");
+    CHECK_EQ(ref >= offset && ref <= offset + MS, 1, "which names the platform's report clock");
+
+    // A compositor that shows 24p on 60 Hz one or two vsyncs early,
+    // alternating (Amlogic), keeps a clean 3:2 whichever phase it picks: the
+    // intended holds are 3,2,3,2 and the shown ones 2,3,2,3. A 4:1 pair is
+    // one lost slot, counted once; a 1-vsync hold on its own is a miss too.
+    struct present_stats a = {0};
+    const int64_t frame = 41708333, period60 = 16683333;
+    const int64_t intended[] = {0, 3, 5, 8, 10, 13, 15, 18, 20, 23, 25, 28, 30, 33};
+    const int64_t shown[] = {-1, 1, 4, 6, 9, 11, 14, 16, 20, 21, 24, 26, 29, 30};
+    for (size_t n = 0; n < sizeof(intended) / sizeof(intended[0]); n++) {
+        present_record(&a, n, EPOCH + intended[n] * period60, frame);
+        bool missed = present_observe(&a, n, EPOCH + shown[n] * period60 - 5 * MS,
+                                      period60);
+        CHECK_EQ(missed, n == 8 || n == 13, "3:2 in either phase is clean; "
+                 "the 4-vsync hold and the lone 1-vsync hold are misses");
+    }
+    CHECK_EQ(a.missed, 2, "two lost slots in the run");
+    CHECK_EQ(a.hist[0] + a.hist[1], 13, "every report but the slipped one landed early");
+
+    // Only neighbouring releases on one grid read as a hold: a refresh-rate
+    // switch, a seek and a report lost in between each start over.
+    struct present_stats g = {0};
+    present_record(&g, 1, EPOCH, period);
+    present_observe(&g, 1, EPOCH, period);
+    present_record(&g, 2, EPOCH + period, period);
+    present_observe(&g, 2, EPOCH + 3 * period, period / 2);
+    CHECK_EQ(g.missed, 0, "a hold across a period switch is not judged");
+    present_record(&g, 3, EPOCH + 4 * period, period);
+    present_observe(&g, 3, EPOCH + 5 * period, period / 2);
+    CHECK_EQ(g.missed, 1, "the next hold on the new grid is");
+    present_reset(&g);
+    present_record(&g, 4, EPOCH + 9 * period, period);
+    present_observe(&g, 4, EPOCH + 9 * period, period / 2);
+    CHECK_EQ(g.missed, 1, "a seek starts over");
+    present_record(&g, 5, EPOCH + 10 * period, period);
+    present_record(&g, 6, EPOCH + 11 * period, period);
+    present_observe(&g, 6, EPOCH + 12 * period, period / 2);
+    CHECK_EQ(g.missed, 1, "a report missing in between starts over");
+    present_record(&g, 7, EPOCH + 12 * period, period + 1);
+    present_observe(&g, 7, EPOCH + 13 * period, period / 2);
+    CHECK_EQ(g.missed, 1, "two half-periods for a period-long frame is its cadence");
+    present_record(&g, 8, EPOCH + 14 * period, period);
+    present_observe(&g, 8, EPOCH + 13 * period + 3 * (period / 2), period / 2);
+    CHECK_EQ(g.missed, 2, "a ratio a rounding away from a whole number is that number");
 
     struct present_stats b = {0};
     const int64_t edges[] = {-2 * period, -period, -period / 2 + 1, 0,
@@ -423,18 +473,18 @@ static void test_present_reports_match_intents(void)
     const int buckets[] = {0, 1, 2, 2, 2, 3, 4};
     const int counts[] = {1, 1, 1, 2, 3, 1, 1}; // the bucket's count after each edge
     for (size_t n = 0; n < sizeof(edges) / sizeof(edges[0]); n++) {
-        present_record(&b, n, EPOCH);
+        present_record(&b, n, EPOCH, period);
         present_observe(&b, n, EPOCH + edges[n], period);
         CHECK_EQ(b.hist[buckets[n]], counts[n],
                  "bucket edges sit at odd half periods like the OSD probes");
     }
-    present_record(&b, 100, EPOCH);
+    present_record(&b, 100, EPOCH, period);
     present_observe(&b, 100, EPOCH + period, 0);
     CHECK_EQ(b.untimed, 1, "an unknown period cannot bucket and reads as untimed");
 
     struct present_stats o = {0};
     for (int n = 0; n < PRESENT_INTENTS + 2; n++)
-        present_record(&o, n, EPOCH);
+        present_record(&o, n, EPOCH, period);
     CHECK_EQ(o.overrun, 2, "intents that never got a report are counted when overwritten");
     present_reset(&o);
     present_observe(&o, PRESENT_INTENTS + 1, EPOCH, period);

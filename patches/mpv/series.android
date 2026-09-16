@@ -25,3 +25,4 @@
 0110-vo-live-window-id.patch
 0112-vo-mediacodec-choreographer-refresh-rate.patch
 0113-vo-mediacodec-count-missed-frames.patch
+0114-vo-mediacodec-count-off-cadence-holds.patch
