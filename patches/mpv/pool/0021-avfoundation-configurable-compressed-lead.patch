@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index c9365f7..c1a9469 100644
+index 497e99d..7de0b3e 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -115,10 +115,23 @@ - (void)invalidate;
@@ -26,7 +26,7 @@ index c9365f7..c1a9469 100644
  #if TARGET_OS_OSX
      // The bounded PCM lookahead is macOS-only. That is where --volume is
      // driven from a slider or the keyboard and the lag is felt; on tvOS and
-@@ -153,13 +166,10 @@ - (void)invalidate;
+@@ -153,12 +166,9 @@ - (void)invalidate;
  #define SPDIF_FRAMES_PER_BURST 1536
  
  #define AVP_TICK_NS         MP_TIME_MS_TO_NS(50)
@@ -40,7 +40,6 @@ index c9365f7..c1a9469 100644
 +#define AVP_START_LEAD_NS(p) (2 * (p)->avp_lead_ns)
  // Minimum priming before the transport is started.
  #define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
- // Deadline for the item to become ready once primed.
 @@ -168,9 +178,9 @@ - (void)invalidate;
  #define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
  // History kept behind the loader's read position for offset-0 restarts.
@@ -87,7 +86,7 @@ index c9365f7..c1a9469 100644
              break;
          // One pull can extract every burst buffered in the stash, so demand
          // room for a full stash's worth of payload before pulling.
-@@ -1131,11 +1151,16 @@ static int init(struct ao *ao)
+@@ -1131,10 +1151,15 @@ static int init(struct ao *ao)
          // traps, and an idle timer costs nothing.
          dispatch_resume(p->avp_timer);
  
@@ -103,8 +102,7 @@ index c9365f7..c1a9469 100644
 +        p->es_size = AVP_ES_HISTORY_BYTES + 1024 * 1024 +
 +                     (int)(2 * p->opt_compressed_lead * AVP_ES_LEAD_BYTES_PER_S);
          p->es_buf = talloc_size(ao, p->es_size);
-         p->au_buf = talloc_size(ao, p->spdif_burst_size);
- 
+         // the lead bound is what actually paces the stream
 @@ -1340,6 +1365,7 @@ static void uninit(struct ao *ao)
      .priv_size      = sizeof(struct priv),
      .priv_defaults  = &(const struct priv){

@@ -73,10 +73,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..9b7b4e1
+index 0000000..f3f96cd
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,2818 @@
+@@ -0,0 +1,2708 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -213,10 +213,8 @@ index 0000000..9b7b4e1
 +    int64_t last_display_recovery_ns;
 +    int64_t last_video_enqueue_ns;
 +    int64_t last_media_pts_ns;
-+    int64_t last_present_host_ns;
 +    bool last_media_pts_valid;
 +    bool timebase_anchor_valid;
-+    bool timebase_paused;
 +    bool playback_paused;
 +    double timebase_rate;
 +
@@ -397,29 +395,10 @@ index 0000000..9b7b4e1
 +    p->next_media_pts_ns = 0;
 +    p->next_media_pts_valid = false;
 +    p->last_media_pts_ns = 0;
-+    p->last_present_host_ns = 0;
 +    p->last_media_pts_valid = false;
 +    p->timebase_anchor_valid = false;
-+    p->timebase_paused = false;
 +    p->playback_paused = false;
 +    p->timebase_rate = 1.0;
-+}
-+
-+static double infer_timebase_rate(struct priv *p, int64_t media_pts_ns,
-+                                  int64_t present_host_ns)
-+{
-+    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
-+
-+    if (!p->last_media_pts_valid || !p->last_present_host_ns)
-+        return rate;
-+
-+    int64_t media_delta = media_pts_ns - p->last_media_pts_ns;
-+    int64_t host_delta = present_host_ns - p->last_present_host_ns;
-+    if (media_delta <= 0 || host_delta <= MP_TIME_MS_TO_NS(5))
-+        return rate;
-+
-+    double inferred = (double)media_delta / (double)host_delta;
-+    return inferred >= 0.05 && inferred <= 8.0 ? inferred : rate;
 +}
 +
 +static void update_media_timebase_for_frame(struct vo *vo)
@@ -433,12 +412,11 @@ index 0000000..9b7b4e1
 +        ? p->next_present_host_ns
 +        : now;
 +    int64_t media_pts_ns = p->next_media_pts_ns;
-+    double rate = p->playback_paused
-+        ? 0.0
-+        : infer_timebase_rate(p, media_pts_ns, present_host_ns);
++    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++    if (p->playback_paused)
++        rate = 0.0;
 +
-+    bool should_anchor = !p->timebase_anchor_valid || p->timebase_paused ||
-+        p->playback_paused || fabs(rate - p->timebase_rate) > 0.01;
++    bool should_anchor = !p->timebase_anchor_valid || p->playback_paused;
 +
 +    if (!should_anchor) {
 +        int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
@@ -456,11 +434,9 @@ index 0000000..9b7b4e1
 +        }
 +        p->timebase_rate = rate;
 +        p->timebase_anchor_valid = true;
-+        p->timebase_paused = p->playback_paused;
 +    }
 +
 +    p->last_media_pts_ns = media_pts_ns;
-+    p->last_present_host_ns = present_host_ns;
 +    p->last_media_pts_valid = true;
 +}
 +
@@ -482,11 +458,9 @@ index 0000000..9b7b4e1
 +            p->timebase, 0.0, media_time, cm_time_from_ns(mp_time_ns()));
 +        if (err != noErr)
 +            MP_WARN(vo, "Failed to pause AVFoundation media timebase: %d\n", (int)err);
-+        p->timebase_paused = true;
 +        return;
 +    }
 +
-+    p->timebase_paused = false;
 +    p->timebase_anchor_valid = false;
 +}
 +
@@ -583,7 +557,6 @@ index 0000000..9b7b4e1
 +    p->last_not_ready_drop_ns = 0;
 +    p->last_video_enqueue_ns = 0;
 +    p->timebase_anchor_valid = false;
-+    p->timebase_paused = p->playback_paused;
 +    p->osd_change_id = 0;
 +    p->osd_needs_enqueue = false;
 +
@@ -711,6 +684,63 @@ index 0000000..9b7b4e1
 +    return p->render_geometry;
 +}
 +
++// Create the timed OSD sample-buffer layer, in inline mode only. Its lifetime
++// follows the composite_osd/pip_composite_osd options, so sync_osd_layer_frame
++// can call this again after the user turns compositing back off.
++static void ensure_osd_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->osdLayer || !should_use_inline_osd_layer(p) || !p->displayLayer)
++        return;
++
++    AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
++    CMTimebaseRef osdTimebase = p->timebase;
++    dispatch_main_sync_safe(^{
++        AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
++        osdLayer.frame = osdDisplayLayer.frame;
++        osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
++#if !TARGET_OS_IPHONE
++        osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++#endif
++        osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
++        osdLayer.backgroundColor = NULL;
++        osdLayer.opaque = NO;
++        osdLayer.videoGravity = AVLayerVideoGravityResize;
++        osdLayer.controlTimebase = osdTimebase;
++
++        CALayer *parent = osdDisplayLayer.superlayer;
++        if (parent) {
++            [parent addSublayer:osdLayer];
++            osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
++        } else {
++            [osdDisplayLayer addSublayer:osdLayer];
++            osdLayer.frame = osdDisplayLayer.bounds;
++            MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
++        }
++        p->osdLayer = osdLayer;
++    });
++    [osdDisplayLayer release];
++}
++
++// Drop the timed OSD layer; the composite path owns the OSD from then on.
++static void release_osd_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->osdLayer)
++        return;
++
++    AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
++    p->osdLayer = nil;
++    if (osdLayer) {
++        dispatch_main_sync_safe(^{
++            [osdLayer removeFromSuperlayer];
++        });
++        [osdLayer release];
++    }
++}
++
 +// Helper to sync OSD layer frame with display layer frame.
 +static void sync_osd_layer_frame(struct vo *vo)
 +{
@@ -719,7 +749,14 @@ index 0000000..9b7b4e1
 +    update_avfoundation_geometry(vo);
 +    invalidate_render_geometry(vo);
 +
-+    if (!should_use_inline_osd_layer(p) || !p->osdLayer || !p->displayLayer)
++    // The layer's lifetime follows the option: create it when inline mode
++    // comes back, drop it when compositing takes the OSD over.
++    if (!should_use_inline_osd_layer(p)) {
++        release_osd_layer(vo);
++        return;
++    }
++    ensure_osd_layer(vo);
++    if (!p->osdLayer || !p->displayLayer)
 +        return;
 +    AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
 +    AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
@@ -2187,122 +2224,10 @@ index 0000000..9b7b4e1
 +            return composited;
 +    }
 +
-+    if (!p->cachedSubtitleImage || !ensure_ci_compositor(vo))
++    if (!p->cachedSubtitleImage)
 +        return NULL;
 +
-+    size_t videoW = CVPixelBufferGetWidth(videoBuffer);
-+    size_t videoH = CVPixelBufferGetHeight(videoBuffer);
-+
-+    struct avf_render_geometry geometry = get_render_geometry(vo, (int)videoW, (int)videoH);
-+    size_t outW = geometry.w > 0 ? (size_t)geometry.w : videoW;
-+    size_t outH = geometry.h > 0 ? (size_t)geometry.h : videoH;
-+    if (!outW || !outH)
-+        return NULL;
-+
-+    struct mp_rect src = geometry.src;
-+    struct mp_rect dst = geometry.dst;
-+    if (src.x1 <= src.x0 || src.y1 <= src.y0 || dst.x1 <= dst.x0 || dst.y1 <= dst.y0)
-+        return NULL;
-+
-+    CGRect outputRect = CGRectMake(0, 0, outW, outH);
-+
-+    OSType outputFormat = ci_output_format_for_source(sourceFormat);
-+
-+    // Ensure output pool matches dimensions and format
-+    if (!create_output_pool(vo, (int)outW, (int)outH, outputFormat))
-+        return NULL;
-+
-+    // Get output buffer from pool
-+    CVPixelBufferRef outputBuffer = NULL;
-+    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
-+        kCFAllocatorDefault, p->outputPool, &outputBuffer);
-+
-+    if (status != kCVReturnSuccess || !outputBuffer) {
-+        MP_ERR(vo, "Failed to get output buffer from pool: %d\n", status);
-+        return NULL;
-+    }
-+
-+    copy_pixel_buffer_metadata(videoBuffer, outputBuffer, outputFormat);
-+
-+    // Use autoreleasepool to ensure CIImage objects are released promptly
-+    @autoreleasepool {
-+        // Create CIImages - preserve color space from source for HDR
-+        CGColorSpaceRef srcColorSpace = CVImageBufferGetColorSpace(videoBuffer);
-+        CGColorSpaceRef fallbackColorSpace = NULL;
-+        if (!srcColorSpace) {
-+            fallbackColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-+            srcColorSpace = fallbackColorSpace;
-+        }
-+
-+        CIImage *videoImage;
-+        if (srcColorSpace) {
-+            NSDictionary *videoOptions = @{
-+                kCIImageColorSpace: (__bridge id)srcColorSpace
-+            };
-+            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer options:videoOptions];
-+        } else {
-+            videoImage = [CIImage imageWithCVPixelBuffer:videoBuffer];
-+        }
-+
-+        if (fallbackColorSpace)
-+            CGColorSpaceRelease(fallbackColorSpace);
-+
-+        if (!videoImage) {
-+            CVPixelBufferRelease(outputBuffer);
-+            return NULL;
-+        }
-+
-+        CGRect srcRect = CGRectMake(src.x0, videoH - src.y1,
-+                                   src.x1 - src.x0, src.y1 - src.y0);
-+        CGFloat dstW = dst.x1 - dst.x0;
-+        CGFloat dstH = dst.y1 - dst.y0;
-+        CGFloat dstY = outH - dst.y1;
-+
-+        videoImage = [videoImage imageByCroppingToRect:srcRect];
-+        videoImage = [videoImage imageByApplyingTransform:
-+            CGAffineTransformMakeTranslation(-srcRect.origin.x, -srcRect.origin.y)];
-+        videoImage = [videoImage imageByApplyingTransform:
-+            CGAffineTransformMakeScale(dstW / srcRect.size.width, dstH / srcRect.size.height)];
-+        videoImage = [videoImage imageByApplyingTransform:
-+            CGAffineTransformMakeTranslation(dst.x0, dstY)];
-+
-+        CIImage *background = [[CIImage imageWithColor:
-+            [CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:outputRect];
-+        videoImage = [videoImage imageByCompositingOverImage:background];
-+
-+        CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
-+
-+        if (!subtitleImage) {
-+            CVPixelBufferRelease(outputBuffer);
-+            return NULL;
-+        }
-+
-+        // Scale subtitle to match output dimensions
-+        CGSize subSize = subtitleImage.extent.size;
-+
-+        if (subSize.width != (CGFloat)outW || subSize.height != (CGFloat)outH) {
-+            CGFloat scaleX = (CGFloat)outW / subSize.width;
-+            CGFloat scaleY = (CGFloat)outH / subSize.height;
-+            subtitleImage = [subtitleImage imageByApplyingTransform:
-+                CGAffineTransformMakeScale(scaleX, scaleY)];
-+        }
-+
-+        // Composite subtitle over video
-+        CIImage *composited = [subtitleImage imageByCompositingOverImage:videoImage];
-+
-+        // Render to output buffer, preserving color space
-+        CGColorSpaceRef outputColorSpace = CVImageBufferGetColorSpace(videoBuffer);
-+        if (outputColorSpace) {
-+            [p->ciContext render:composited
-+                 toCVPixelBuffer:outputBuffer
-+                          bounds:outputRect
-+                      colorSpace:outputColorSpace];
-+        } else {
-+            [p->ciContext render:composited toCVPixelBuffer:outputBuffer bounds:outputRect colorSpace:nil];
-+        }
-+    }
-+
-+    return outputBuffer;
++    return render_video_geometry_frame(vo, videoBuffer, true);
 +}
 +
 +static int preinit(struct vo *vo)
@@ -2357,36 +2282,9 @@ index 0000000..9b7b4e1
 +    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
 +        MP_WARN(vo, "Core Image fallback compositor unavailable\n");
 +
-+    // Create a timed OSD sample-buffer layer only if not in composite mode.
-+    if (!p->opts->composite_osd) {
-+        AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
-+        CMTimebaseRef osdTimebase = p->timebase;
-+        dispatch_main_sync_safe(^{
-+            AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
-+            osdLayer.frame = osdDisplayLayer.frame;
-+            osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
-+#if !TARGET_OS_IPHONE
-+            osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
-+#endif
-+            osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
-+            osdLayer.backgroundColor = NULL;
-+            osdLayer.opaque = NO;
-+            osdLayer.videoGravity = AVLayerVideoGravityResize;
-+            osdLayer.controlTimebase = osdTimebase;
-+
-+            CALayer *parent = osdDisplayLayer.superlayer;
-+            if (parent) {
-+                [parent addSublayer:osdLayer];
-+                osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
-+            } else {
-+                [osdDisplayLayer addSublayer:osdLayer];
-+                osdLayer.frame = osdDisplayLayer.bounds;
-+                MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
-+            }
-+            p->osdLayer = osdLayer;
-+        });
-+        [osdDisplayLayer release];
-+    }
++    // The OSD layer's lifetime follows the option: created here, kept in step
++    // by sync_osd_layer_frame.
++    ensure_osd_layer(vo);
 +
 +    vo->hwdec_devs = hwdec_devices_create();
 +    p->hwctx = (struct mp_hwdec_ctx){
@@ -2761,14 +2659,7 @@ index 0000000..9b7b4e1
 +        p->swUploadPool = NULL;
 +    }
 +
-+    AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
-+    p->osdLayer = nil;
-+    if (osdLayer) {
-+        dispatch_main_sync_safe(^{
-+            [osdLayer removeFromSuperlayer];
-+        });
-+        [osdLayer release];
-+    }
++    release_osd_layer(vo);
 +
 +    [p->ciContext release];
 +    p->ciContext = nil;
@@ -2817,7 +2708,6 @@ index 0000000..9b7b4e1
 +        bool was_paused = p->playback_paused;
 +        reset_media_timing(p);
 +        p->playback_paused = was_paused;
-+        p->timebase_paused = was_paused;
 +        sample_buffer_renderer_flush(p->displayLayer, true);
 +        sample_buffer_renderer_flush(p->osdLayer, true);
 +        if (p->presentation_host && p->timebase) {

@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 78da5e1..545cb1a 100644
+index fd174fd..d5b25c8 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -22,6 +22,7 @@
@@ -41,8 +41,8 @@ index 78da5e1..545cb1a 100644
  };
  
  #define IEC61937_HEADER_SIZE 8
-@@ -573,12 +598,92 @@ static void avp_teardown_item(struct ao *ao)
-     p->au_len = 0;
+@@ -572,12 +598,92 @@ static void avp_teardown_item(struct ao *ao)
+     p->avp_start_seeked = false;
  }
  
 +#if TARGET_OS_OSX

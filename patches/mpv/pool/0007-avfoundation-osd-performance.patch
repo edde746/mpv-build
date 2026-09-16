@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 9b7b4e1..e585f7d 100644
+index bf35bb5..05e2417 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -18,6 +18,10 @@
@@ -45,7 +45,7 @@ index 9b7b4e1..e585f7d 100644
 +        int renders, skipped, empty, frames;
 +        int64_t total_ns, max_ns;
 +        int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
-+        int64_t enqueue_ns, video_sample_ns, wait_ns;
++        int64_t enqueue_ns, video_sample_ns;
 +        // Scheduling margin of enqueued OSD samples: sample PTS minus the
 +        // timebase position at enqueue. Negative/small lead means the
 +        // presentation deadline was already missed on the CPU side.
@@ -589,7 +589,7 @@ index 9b7b4e1..e585f7d 100644
  }
  
  static bool ensure_ci_compositor(struct vo *vo)
-@@ -2472,6 +2815,42 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
+@@ -2472,6 +2815,41 @@ static bool enqueue_video_sample(struct vo *vo, CMSampleBufferRef buf)
      return true;
  }
  
@@ -608,7 +608,7 @@ index 9b7b4e1..e585f7d 100644
 +        MP_VERBOSE(vo,
 +            "osd-perf: n=%d avg=%.2fms max=%.2fms "
 +            "[clear %.2f blend %.2f cg %.2f bounds %.2f] enq %.2f | "
-+            "vid %.3f wait %.3f (/frame) | "
++            "vid %.3f (/frame) | "
 +            "margin avg=%.1f min=%.1fms drops=%d | "
 +            "skip=%d empty=%d osd=%dx%d\n",
 +            p->perf.renders,
@@ -620,7 +620,6 @@ index 9b7b4e1..e585f7d 100644
 +            p->perf.bounds_ns / n / 1e6,
 +            p->perf.enqueue_ns / n / 1e6,
 +            p->perf.video_sample_ns / nf / 1e6,
-+            p->perf.wait_ns / nf / 1e6,
 +            p->perf.lead_sum_ns / ne / 1e6,
 +            p->perf.enq_count ? p->perf.lead_min_ns / 1e6 : 0.0,
 +            p->perf.enq_drops,
@@ -632,7 +631,7 @@ index 9b7b4e1..e585f7d 100644
  static void flip_page(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -2483,23 +2862,47 @@ static void flip_page(struct vo *vo)
+@@ -2483,23 +2862,42 @@ static void flip_page(struct vo *vo)
          CMSampleBufferRef osd_buf = NULL;
          bool osd_needed = false;
  
@@ -654,13 +653,7 @@ index 9b7b4e1..e585f7d 100644
  
          bool osd_enqueued = !osd_needed;
  
--        if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
-+        t = mp_time_ns();
-+        bool video_ready = video_buf &&
-+            wait_until_ready_for_more_media_data(vo, p->next_present_host_ns);
-+        p->perf.wait_ns += mp_time_ns() - t;
-+
-+        if (video_ready) {
+         if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
              if (!p->presentation_host)
                  update_media_timebase_for_frame(vo);
  

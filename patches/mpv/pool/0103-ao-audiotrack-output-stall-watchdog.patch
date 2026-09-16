@@ -50,11 +50,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  #include <stdlib.h>
  
  #include "ao.h"
-@@ -35,6 +37,28 @@
- 
+@@ -36,6 +38,28 @@
  static mp_static_mutex jni_static_lock = MP_STATIC_MUTEX_INITIALIZER;
  static int jni_static_use_count = 0;
-+
+ 
 +// Output stall watchdog. A healthy blocking write returns within one buffer
 +// duration (75-150 ms PCM, a few hundred ms passthrough); a device whose HAL
 +// stopped consuming keeps the writer inside AudioTrack.write for good, and
@@ -76,10 +75,11 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    RAW_PAYLOAD,
 +    RAW_DTS_HEADER,
 +};
- 
++
  struct priv {
      jobject audiotrack;
-@@ -102,11 +126,33 @@
+     jint samplerate;
+@@ -101,11 +125,33 @@ struct priv {
      bool cfg_route_reload;
      int cfg_session_id;
  
@@ -114,7 +114,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  };
  
  static struct JNIByteBuffer {
-@@ -434,20 +480,6 @@
+@@ -433,20 +479,6 @@ static int AudioTrack_New(struct ao *ao)
      return 0;
  }
  
@@ -135,12 +135,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
  {
      p->smooth_count = 0;
-@@ -457,6 +489,58 @@
-     p->smooth_head = 0;
-     p->smooth_reported = 0;
+@@ -458,6 +490,58 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
      p->smooth_reported_ns = 0;
-+}
-+
+ }
+ 
 +// Forget everything derived from the current track's buffer and clock: what
 +// stop() needs after a flush, and what a replacement track needs from zero.
 +static void AudioTrack_resetClock(struct priv *p)
@@ -158,9 +156,9 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    p->raw_pending = 0;
 +    p->raw_input_len = 0;
 +    AudioTrack_resetPlayheadSmoothing(p);
-+    // A stop/reset may complete while the old JNI write is still live. Keep
-+    // it observable if start() resumes before that write returns.
-+    atomic_store(&p->write_outstanding, p->write_inflight);
++    // The worker sets write_outstanding before the JNI call a stop/reset can
++    // interrupt, so it survives the reset without being copied; only the
++    // stall clock restarts.
 +    atomic_store(&p->write_progress_ns, mp_time_ns());
 +}
 +
@@ -191,14 +189,15 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    }
 +    mp_mutex_unlock(&p->track_lock);
 +    return ret;
- }
- 
++}
++
  // A direct/offload track's playback head advances in HAL-period steps (8192
-@@ -642,15 +726,6 @@
-     }
+ // frames at 192 kHz), larger than a 24p frame. Like media3's
+ // AudioTrackPositionTracker: average the last (head - clock) offsets, bound
+@@ -642,15 +726,6 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
      return MPCLAMP(delay, 0.0, 2.0);
  }
--
+ 
 -enum {
 -    RAW_SYNC_PA = 0,
 -    RAW_SYNC_PB,
@@ -207,10 +206,11 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 -    RAW_PAYLOAD,
 -    RAW_DTS_HEADER,
 -};
- 
+-
  #define IEC61937_AC3  0x01
  #define IEC61937_DTS1 0x0b
-@@ -1005,6 +1080,35 @@
+ #define IEC61937_DTS2 0x0c
+@@ -1002,6 +1077,35 @@ static void AudioTrack_checkRouteChange(struct ao *ao)
      }
  }
  
@@ -246,7 +246,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -1012,7 +1116,16 @@
+@@ -1009,7 +1113,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
@@ -264,7 +264,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          AudioTrack_checkRouteChange(ao);
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
-@@ -1028,17 +1141,32 @@
+@@ -1025,17 +1138,32 @@ static MP_THREAD_VOID ao_thread(void *arg)
              ts += MP_TIME_S_TO_NS(delay);
              int samples = p->raw_pending ? 0 :
                  ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
@@ -303,12 +303,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              } else {
                  MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
              }
-@@ -1050,24 +1178,125 @@
+@@ -1047,25 +1175,126 @@ static MP_THREAD_VOID ao_thread(void *arg)
      MP_THREAD_RETURN();
  }
  
--static void uninit(struct ao *ao)
--{
 +// Watches the worker from outside its lock. While the core wants playback
 +// and a write is outstanding, a playback head that does not move for
 +// STALL_TIMEOUT_NS means the device stopped consuming: pause the track to
@@ -319,8 +317,8 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +static MP_THREAD_VOID monitor_thread(void *arg)
 +{
 +    struct ao *ao = arg;
-     struct priv *p = ao->priv;
-     JNIEnv *env = MP_JNI_GET_ENV(ao);
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
 +    mp_thread_set_name("ao/at-monitor");
 +    uint32_t last_head = 0;
 +    bool have_head = false;
@@ -396,10 +394,10 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    MP_THREAD_RETURN();
 +}
 +
-+static void uninit(struct ao *ao)
-+{
-+    struct priv *p = ao->priv;
-+    JNIEnv *env = MP_JNI_GET_ENV(ao);
+ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
 +
 +    // Terminate before interrupting the write: a worker released from a
 +    // stuck track must find the flag rather than start another write.
@@ -422,17 +420,18 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  
      if (p->thread_created)
          mp_thread_join(p->thread);
-+
+ 
 +    mp_mutex_lock(&p->monitor_lock);
 +    mp_cond_signal(&p->monitor_wakeup);
 +    mp_mutex_unlock(&p->monitor_lock);
 +
 +    if (p->monitor_created)
 +        mp_thread_join(p->monitor);
- 
++
      if (p->audiotrack) {
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
-@@ -1085,6 +1314,9 @@
+         MP_JNI_EXCEPTION_LOG(ao);
+@@ -1082,6 +1311,9 @@ static void uninit(struct ao *ao)
  
      MP_JNI_GLOBAL_FREEP(&p->timestamp);
  
@@ -442,7 +441,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      mp_cond_destroy(&p->wakeup);
      mp_mutex_destroy(&p->lock);
  
-@@ -1100,6 +1332,10 @@
+@@ -1097,6 +1329,10 @@ static int init(struct ao *ao)
  
      mp_mutex_init(&p->lock);
      mp_cond_init(&p->wakeup);
@@ -453,7 +452,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  
      if (init_jni(ao) < 0)
          return -1;
-@@ -1308,6 +1544,12 @@
+@@ -1305,6 +1541,12 @@ static int init(struct ao *ao)
      }
      p->thread_created = true;
  
@@ -466,7 +465,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      return 1;
  
  error:
-@@ -1318,46 +1560,44 @@
+@@ -1315,46 +1557,44 @@ error:
  static void stop(struct ao *ao)
  {
      struct priv *p = ao->priv;

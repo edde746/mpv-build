@@ -100,10 +100,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..ca0d310
+index 0000000..ff36828
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,3235 @@
+@@ -0,0 +1,3264 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -191,6 +191,7 @@ index 0000000..ca0d310
 +#include "video/mp_image.h"
 +#include "video/out/opengl/common.h"
 +#include "video/out/opengl/egl_helpers.h"
++#include "video/out/opengl/utils.h"
 +#include "vo.h"
 +
 +// --- mediacodec timing core
@@ -431,6 +432,38 @@ index 0000000..ca0d310
 +#define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
 +#define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
 +
++// Median of at most OSD_MEDIAN_MAX samples: the middle one, or the mean of
++// the middle two. Insertion sort; the rings here are far smaller than a sort
++// would pay for, and no caller's ring is larger than this.
++#define OSD_MEDIAN_MAX 8
++
++static int64_t median_ns(const int64_t *v, int n)
++{
++    int64_t sorted[OSD_MEDIAN_MAX];
++    for (int i = 0; i < n; i++)
++        sorted[i] = v[i];
++    for (int i = 1; i < n; i++) {
++        int64_t key = sorted[i];
++        int j = i - 1;
++        while (j >= 0 && sorted[j] > key) {
++            sorted[j + 1] = sorted[j];
++            j--;
++        }
++        sorted[j + 1] = key;
++    }
++    return n & 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
++}
++
++// The same statistic in seconds, for the media-pts cadence. Its deltas are
++// container timestamps, so nanosecond rounding loses nothing.
++static double median_seconds(const double *v, int n)
++{
++    int64_t ns[OSD_MEDIAN_MAX];
++    for (int i = 0; i < n; i++)
++        ns[i] = llround(v[i] * 1e9);
++    return median_ns(ns, n) / 1e9;
++}
++
 +// Media-pts cadence of the frames the VO flips, as the ExoPlayer overlay
 +// estimates it: median of the last eight consecutive deltas, trusted after
 +// four. A frame_id gap (frames the VO dropped), a non-positive delta (seek,
@@ -475,18 +508,7 @@ index 0000000..ca0d310
 +{
 +    if (c->count < OSD_CADENCE_MIN_SAMPLES)
 +        return 0;
-+    double sorted[OSD_CADENCE_SAMPLES];
-+    for (int n = 0; n < c->count; n++) {
-+        double v = c->deltas[n];
-+        int i = n;
-+        while (i > 0 && sorted[i - 1] > v) {
-+            sorted[i] = sorted[i - 1];
-+            i--;
-+        }
-+        sorted[i] = v;
-+    }
-+    return c->count & 1 ? sorted[c->count / 2]
-+                        : (sorted[c->count / 2 - 1] + sorted[c->count / 2]) / 2;
++    return median_seconds(c->deltas, c->count);
 +}
 +
 +struct osd_spec {
@@ -689,19 +711,7 @@ index 0000000..ca0d310
 +    l->last_release = release_ns;
 +    if (l->count < OSD_CADENCE_MIN_SAMPLES)
 +        return;
-+    int64_t sorted[OSD_SWAP_LEAD_SAMPLES];
-+    for (int n = 0; n < l->count; n++) {
-+        int64_t v = l->intervals[n];
-+        int i = n;
-+        while (i > 0 && sorted[i - 1] > v) {
-+            sorted[i] = sorted[i - 1];
-+            i--;
-+        }
-+        sorted[i] = v;
-+    }
-+    int64_t median = l->count & 1 ? sorted[l->count / 2]
-+        : (sorted[l->count / 2 - 1] + sorted[l->count / 2]) / 2;
-+    int64_t lead = median / 2;
++    int64_t lead = median_ns(l->intervals, l->count) / 2;
 +    l->lead = lead < OSD_SWAP_LEAD_MIN_NS ? OSD_SWAP_LEAD_MIN_NS
 +            : lead > OSD_SWAP_LEAD_MAX_NS ? OSD_SWAP_LEAD_MAX_NS : lead;
 +}
@@ -855,7 +865,6 @@ index 0000000..ca0d310
 +    uint32_t render_hist[5];    // render: <=10, <=25, <=42, <=84, >84 ms
 +    uint32_t stale;             // results cancelled or missing their release
 +    uint32_t swaps, late;       // present
-+    int64_t late_ns_max;        // present
 +    int64_t lead_ns_last, lead_ns_min; // present: release - queued
 +    bool have_lead_min;
 +    int64_t swap_ns_last, swap_ns_max; // present: eglSwapBuffers duration
@@ -1313,6 +1322,33 @@ index 0000000..ca0d310
 +    }
 +}
 +
++// Render the OSD for pts on the canvas res describes, folding a render that
++// repeats an uploaded one into that render's atlas. Returns the list, owned
++// by the caller, and its duration.
++static struct sub_bitmap_list *osd_slot_render(struct vo *vo, struct osd_render_state *rs,
++                                               double pts, struct mp_osd_res res,
++                                               int draw_flags, int64_t *render_ns)
++{
++    int64_t t0 = mp_time_ns();
++    struct sub_bitmap_list *sbs =
++        osd_render(vo->osd, res, pts, draw_flags, osd_gl_formats);
++    *render_ns = mp_time_ns() - t0;
++    if (sbs)
++        osd_dedup_items(vo->priv, rs, sbs);
++    return sbs;
++}
++
++// Publish sbs as slot's frame: the bitmap list and the canvas it was
++// rendered on.
++static void osd_slot_store(struct osd_slot *dst, struct sub_bitmap_list *sbs,
++                           int w, int h, struct mp_osd_res res)
++{
++    talloc_free(dst->sbs);
++    dst->sbs = sbs;
++    dst->canvas_w = w;
++    dst->canvas_h = h;
++}
++
 +// Render the OSD for pts into slot. Returns whether the slot holds a frame
 +// that differs from the last one posted (or a forced repaint).
 +static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
@@ -1333,13 +1369,10 @@ index 0000000..ca0d310
 +
 +    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
 +
-+    int64_t t0 = mp_time_ns();
-+    struct sub_bitmap_list *sbs =
-+        osd_render(vo->osd, res, pts, 0, osd_gl_formats);
-+    int64_t render_ns = mp_time_ns() - t0;
++    int64_t render_ns;
++    struct sub_bitmap_list *sbs = osd_slot_render(vo, rs, pts, res, 0, &render_ns);
 +    if (!sbs)
 +        return false;
-+    osd_dedup_items(p, rs, sbs);
 +
 +    bool changed = rs->force_full || sbs->change_id != rs->posted_change_id;
 +    if (render_ns > MP_TIME_MS_TO_NS(100)) {
@@ -1357,11 +1390,7 @@ index 0000000..ca0d310
 +        return false;
 +    }
 +
-+    struct osd_slot *dst = &p->osd_slots[slot];
-+    talloc_free(dst->sbs);
-+    dst->sbs = sbs;
-+    dst->canvas_w = w;
-+    dst->canvas_h = h;
++    osd_slot_store(&p->osd_slots[slot], sbs, w, h, res);
 +    return true;
 +}
 +
@@ -1471,21 +1500,14 @@ index 0000000..ca0d310
 +    if (w <= 0 || h <= 0)
 +        return;
 +    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-+    int64_t t0 = mp_time_ns();
++    int64_t render_ns;
 +    struct sub_bitmap_list *sbs =
-+        osd_render(vo->osd, res, event_start + 0.001, 0, osd_gl_formats);
-+    double render_s = (mp_time_ns() - t0) / 1e9;
-+    if (sbs)
-+        osd_dedup_items(p, rs, sbs);
++        osd_slot_render(vo, rs, event_start + 0.001, res, 0, &render_ns);
++    double render_s = render_ns / 1e9;
 +    mp_mutex_lock(&p->osd_lock);
 +    bool keep = sbs && p->osd.epoch == epoch;
-+    if (keep) {
-+        struct osd_slot *dst = &p->osd_slots[slot];
-+        talloc_free(dst->sbs);
-+        dst->sbs = sbs;
-+        dst->canvas_w = w;
-+        dst->canvas_h = h;
-+    }
++    if (keep)
++        osd_slot_store(&p->osd_slots[slot], sbs, w, h, res);
 +    osd_prefetch_store(&p->osd.prefetch, event_start, events, epoch,
 +                       keep ? slot : -1, render_s);
 +    mp_mutex_unlock(&p->osd_lock);
@@ -1676,7 +1698,6 @@ index 0000000..ca0d310
 +    PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 +    PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
 +    struct osd_vertex *vertices;
-+    int num_vertices;
 +    PFNEGLPRESENTATIONTIMEANDROIDPROC presentation_time;
 +    PFNEGLGETNEXTFRAMEIDANDROIDPROC next_frame_id;
 +    PFNEGLGETFRAMETIMESTAMPSANDROIDPROC frame_timestamps;
@@ -1743,19 +1764,6 @@ index 0000000..ca0d310
 +        return 0;
 +    }
 +    return shader;
-+}
-+
-+static bool osd_gl_has_extension(const char *exts, const char *name)
-+{
-+    size_t len = strlen(name);
-+    while (exts && *exts) {
-+        const char *end = strchr(exts, ' ');
-+        size_t n = end ? (size_t)(end - exts) : strlen(exts);
-+        if (n == len && !strncmp(exts, name, len))
-+            return true;
-+        exts = end ? end + 1 : NULL;
-+    }
-+    return false;
 +}
 +
 +static void osd_comp_release(struct osd_gl *g, struct osd_comp *c);
@@ -1891,51 +1899,56 @@ index 0000000..ca0d310
 +    gl->ClearColor(0, 0, 0, 0);
 +
 +    const char *exts = eglQueryString(g->display, EGL_EXTENSIONS);
-+    if (osd_gl_has_extension(exts, "EGL_ANDROID_presentation_time")) {
-+        g->presentation_time = (PFNEGLPRESENTATIONTIMEANDROIDPROC)
-+            eglGetProcAddress("eglPresentationTimeANDROID");
-+    }
-+    if (!g->presentation_time) {
-+        MP_WARN(vo, "OSD: EGL_ANDROID_presentation_time unavailable; the OSD "
-+                    "plane cannot be pinned to the video's vsync.\n");
-+    }
-+    if (osd_gl_has_extension(exts, "EGL_KHR_fence_sync")) {
-+        g->create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
-+        g->destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
-+        g->client_wait_sync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
-+        if (!g->create_sync || !g->destroy_sync || !g->client_wait_sync)
-+            g->create_sync = NULL;
-+    }
++    // eglQueryString returns NULL when the display cannot be queried, e.g.
++    // while contexts are being torn down; gl_check_extension is strstr()-based,
++    // so skip the queries rather than walking the NULL.
 +    g->ts_source = "off:no-ext";
-+    if (osd_gl_has_extension(exts, "EGL_ANDROID_get_frame_timestamps")) {
-+        g->next_frame_id = (PFNEGLGETNEXTFRAMEIDANDROIDPROC)
-+            eglGetProcAddress("eglGetNextFrameIdANDROID");
-+        g->frame_timestamps = (PFNEGLGETFRAMETIMESTAMPSANDROIDPROC)
-+            eglGetProcAddress("eglGetFrameTimestampsANDROID");
-+        PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC supported =
-+            (PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC)
-+            eglGetProcAddress("eglGetFrameTimestampSupportedANDROID");
-+        if (g->next_frame_id && g->frame_timestamps && supported &&
-+            eglSurfaceAttrib(g->display, g->surface, EGL_TIMESTAMPS_ANDROID,
-+                             EGL_TRUE))
-+        {
-+            // TV compositors often lack a present fence; the composition
-+            // stamps are a vsync earlier, a constant bias.
-+            static const struct { EGLint kind; const char *name; } kinds[] = {
-+                {EGL_DISPLAY_PRESENT_TIME_ANDROID, "present"},
-+                {EGL_FIRST_COMPOSITION_START_TIME_ANDROID, "comp-start"},
-+                {EGL_COMPOSITION_LATCH_TIME_ANDROID, "comp-latch"},
-+            };
-+            g->ts_source = "off:unsupported";
-+            for (int n = 0; n < MP_ARRAY_SIZE(kinds); n++) {
-+                if (supported(g->display, g->surface, kinds[n].kind)) {
-+                    g->ts_kind = kinds[n].kind;
-+                    g->ts_source = kinds[n].name;
-+                    break;
++    if (exts) {
++        if (gl_check_extension(exts, "EGL_ANDROID_presentation_time")) {
++            g->presentation_time = (PFNEGLPRESENTATIONTIMEANDROIDPROC)
++                eglGetProcAddress("eglPresentationTimeANDROID");
++        }
++        if (!g->presentation_time) {
++            MP_WARN(vo, "OSD: EGL_ANDROID_presentation_time unavailable; the OSD "
++                        "plane cannot be pinned to the video's vsync.\n");
++        }
++        if (gl_check_extension(exts, "EGL_KHR_fence_sync")) {
++            g->create_sync = (PFNEGLCREATESYNCKHRPROC)eglGetProcAddress("eglCreateSyncKHR");
++            g->destroy_sync = (PFNEGLDESTROYSYNCKHRPROC)eglGetProcAddress("eglDestroySyncKHR");
++            g->client_wait_sync = (PFNEGLCLIENTWAITSYNCKHRPROC)eglGetProcAddress("eglClientWaitSyncKHR");
++            if (!g->create_sync || !g->destroy_sync || !g->client_wait_sync)
++                g->create_sync = NULL;
++        }
++        if (gl_check_extension(exts, "EGL_ANDROID_get_frame_timestamps")) {
++            g->next_frame_id = (PFNEGLGETNEXTFRAMEIDANDROIDPROC)
++                eglGetProcAddress("eglGetNextFrameIdANDROID");
++            g->frame_timestamps = (PFNEGLGETFRAMETIMESTAMPSANDROIDPROC)
++                eglGetProcAddress("eglGetFrameTimestampsANDROID");
++            PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC supported =
++                (PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC)
++                eglGetProcAddress("eglGetFrameTimestampSupportedANDROID");
++            if (g->next_frame_id && g->frame_timestamps && supported &&
++                eglSurfaceAttrib(g->display, g->surface, EGL_TIMESTAMPS_ANDROID,
++                                 EGL_TRUE))
++            {
++                // TV compositors often lack a present fence; the composition
++                // stamps are a vsync earlier, a constant bias.
++                static const struct { EGLint kind; const char *name; } kinds[] = {
++                    {EGL_DISPLAY_PRESENT_TIME_ANDROID, "present"},
++                    {EGL_FIRST_COMPOSITION_START_TIME_ANDROID, "comp-start"},
++                    {EGL_COMPOSITION_LATCH_TIME_ANDROID, "comp-latch"},
++                };
++                g->ts_source = "off:unsupported";
++                for (int n = 0; n < MP_ARRAY_SIZE(kinds); n++) {
++                    if (supported(g->display, g->surface, kinds[n].kind)) {
++                        g->ts_kind = kinds[n].kind;
++                        g->ts_source = kinds[n].name;
++                        break;
++                    }
 +                }
++            } else {
++                g->ts_source = "off:enable-failed";
 +            }
-+        } else {
-+            g->ts_source = "off:enable-failed";
 +        }
 +    }
 +    MP_VERBOSE(vo, "OSD plane: GLES2 on EGL, presentation time %s, "
@@ -2028,14 +2041,35 @@ index 0000000..ca0d310
 +        g->uploading = NULL;
 +}
 +
-+// Locked. Pin what the present stage draws now and next: the present slot
-+// and the queue head; deeper frames retain CPU snapshots, not GPU residency.
++// Locked. The slots the present stage draws now and next: the frame on
++// screen and the queue head. Both GPU caches take their residency from here,
++// so neither can evict a surface the other is about to draw; deeper frames
++// retain CPU snapshots, not GPU residency.
++static int osd_live_slots(const struct osd_shared *s, int slots[2])
++{
++    slots[0] = s->present_slot;
++    slots[1] = osd_result_slot(&s->results);
++    return 2;
++}
++
++// Locked. The slots worth preparing for the GPU, in that order: the posted
++// result, then the next frame's pre-render, then the next event's.
++static int osd_ahead_slots(const struct osd_shared *s, int slots[3])
++{
++    slots[0] = osd_result_slot(&s->results);
++    slots[1] = s->spec.valid ? s->spec.slot : -1;
++    slots[2] = s->prefetch.valid ? s->prefetch.slot : -1;
++    return 3;
++}
++
++// Locked. Pin the live slots' atlases against eviction.
 +static void osd_tex_pin_live(struct priv *p, struct osd_gl *g)
 +{
 +    struct osd_shared *s = &p->osd;
++    int slots[2];
++    int num_slots = osd_live_slots(s, slots);
 +    g->num_pinned = 0;
-+    int slots[2] = {s->present_slot, osd_result_slot(&s->results)};
-+    for (int n = 0; n < 2; n++) {
++    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
 +        struct sub_bitmap_list *sbs = p->osd_slots[slots[n]].sbs;
@@ -2099,6 +2133,22 @@ index 0000000..ca0d310
 +    return e;
 +}
 +
++// Create *tex if it has none and bind it: linear both ways, clamped at the
++// edges, for both GPU caches.
++static void osd_gl_bind_texture(struct GL *gl, GLuint *tex)
++{
++    if (!*tex) {
++        gl->GenTextures(1, tex);
++        gl->BindTexture(GL_TEXTURE_2D, *tex);
++        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        return;
++    }
++    gl->BindTexture(GL_TEXTURE_2D, *tex);
++}
++
 +// Upload the next band of e; true once the atlas is complete.
 +static bool osd_tex_band(struct osd_gl *g, struct osd_tex *e)
 +{
@@ -2108,16 +2158,7 @@ index 0000000..ca0d310
 +    int64_t t0 = mp_time_ns();
 +    enum sub_bitmap_format fmt = e->src_fmt;
 +    GLenum glfmt = fmt == SUBBITMAP_LIBASS ? GL_LUMINANCE : GL_RGBA;
-+    if (!e->tex) {
-+        gl->GenTextures(1, &e->tex);
-+        gl->BindTexture(GL_TEXTURE_2D, e->tex);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-+    } else {
-+        gl->BindTexture(GL_TEXTURE_2D, e->tex);
-+    }
++    osd_gl_bind_texture(gl, &e->tex);
 +    if (e->rows_done == 0) {
 +        // Storage: reused when it fits and is not wildly oversized, so a
 +        // dialogue line does not keep a sign's tens of megabytes alive.
@@ -2188,12 +2229,9 @@ index 0000000..ca0d310
 +{
 +    struct osd_shared *s = &p->osd;
 +    osd_tex_pin_live(p, g);
-+    int slots[3] = {
-+        osd_result_slot(&s->results),
-+        s->spec.valid ? s->spec.slot : -1,
-+        s->prefetch.valid ? s->prefetch.slot : -1,
-+    };
-+    for (int n = 0; n < 3; n++) {
++    int slots[3];
++    int num_slots = osd_ahead_slots(s, slots);
++    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
 +        struct sub_bitmap_list *sbs = p->osd_slots[slots[n]].sbs;
@@ -2332,13 +2370,14 @@ index 0000000..ca0d310
 +        g->composing = NULL;
 +}
 +
-+// Locked. The active frame and queue head are never evicted.
++// Locked. Pin the live slots' composed canvases against eviction.
 +static void osd_comp_pin_live(struct priv *p, struct osd_gl *g)
 +{
 +    struct osd_shared *s = &p->osd;
++    int slots[2];
++    int num_slots = osd_live_slots(s, slots);
 +    g->num_pinned_comps = 0;
-+    int slots[2] = {s->present_slot, osd_result_slot(&s->results)};
-+    for (int n = 0; n < 2; n++) {
++    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
 +        struct osd_comp_key key = osd_comp_key_of(&p->osd_slots[slots[n]]);
@@ -2437,15 +2476,10 @@ index 0000000..ca0d310
 +            g->composing = NULL;
 +        return true;
 +    }
-+    if (!c->tex) {
-+        gl->GenTextures(1, &c->tex);
-+        gl->BindTexture(GL_TEXTURE_2D, c->tex);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-+        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    osd_gl_bind_texture(gl, &c->tex);
++    // A composed canvas is never trimmed, so its FBO lives with its texture.
++    if (!c->fbo)
 +        gl->GenFramebuffers(1, &c->fbo);
-+    }
 +    bool first = c->item == 0 && c->part == 0;
 +    if (first && (c->w != g->surface_w || c->h != g->surface_h)) {
 +        gl->BindTexture(GL_TEXTURE_2D, c->tex);
@@ -2507,12 +2541,9 @@ index 0000000..ca0d310
 +{
 +    struct osd_shared *s = &p->osd;
 +    osd_comp_pin_live(p, g);
-+    int slots[3] = {
-+        osd_result_slot(&s->results),
-+        s->spec.valid ? s->spec.slot : -1,
-+        s->prefetch.valid ? s->prefetch.slot : -1,
-+    };
-+    for (int n = 0; n < 3; n++) {
++    int slots[3];
++    int num_slots = osd_ahead_slots(s, slots);
++    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
 +        struct osd_comp_key key = osd_comp_key_of(&p->osd_slots[slots[n]]);
@@ -2761,11 +2792,8 @@ index 0000000..ca0d310
 +            s->lead_ns_min = lead;
 +            s->have_lead_min = true;
 +        }
-+        if (-lead > OSD_LATE_THRESHOLD_NS) {
++        if (-lead > OSD_LATE_THRESHOLD_NS)
 +            s->late++;
-+            if (-lead > s->late_ns_max)
-+                s->late_ns_max = -lead;
-+        }
 +    }
 +    mp_mutex_unlock(&p->osd_lock);
 +}
@@ -2900,7 +2928,8 @@ index 0000000..ca0d310
 +               s.render_hist[3], s.render_hist[4],
 +               s.spec.hits, s.spec.misses, s.spec.skips, s.spec.horizon_skips,
 +               s.prefetch.count, s.coalesced, s.stale, s.swaps, s.late,
-+               (int)(s.late_ns_max / 1000000), (int)(s.lead_ns_last / 1000000),
++               s.late ? (int)(-s.lead_ns_min / 1000000) : 0,
++               (int)(s.lead_ns_last / 1000000),
 +               s.have_lead_min ? mp_tprintf(16, "%d", (int)(s.lead_ns_min / 1000000)) : "n/a",
 +               (int)(s.swap_lead_ns / 1000000),
 +               (int)(s.swap_ns_last / 1000000), (int)(s.swap_ns_max / 1000000),

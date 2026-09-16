@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index e585f7d..a5056ca 100644
+index 05e2417..a576ab8 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -325,6 +325,20 @@ static int64_t cm_time_to_ns(CMTime time)
@@ -35,7 +35,7 @@ index e585f7d..a5056ca 100644
          if (err != noErr) {
              MP_WARN(vo, "Failed to anchor AVFoundation media timebase: %d\n", (int)err);
          }
-@@ -429,12 +444,11 @@ static void set_media_timebase_paused(struct vo *vo, bool paused)
+@@ -429,11 +444,10 @@ static void set_media_timebase_paused(struct vo *vo, bool paused)
      if (paused) {
          CMTime media_time = CMTimebaseGetTime(p->timebase);
          if (!CMTIME_IS_NUMERIC(media_time)) {
@@ -50,4 +50,3 @@ index e585f7d..a5056ca 100644
 +            p->timebase, 0.0, media_time, source_time);
          if (err != noErr)
              MP_WARN(vo, "Failed to pause AVFoundation media timebase: %d\n", (int)err);
-         p->timebase_paused = true;

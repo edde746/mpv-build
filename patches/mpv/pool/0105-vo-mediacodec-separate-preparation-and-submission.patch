@@ -141,7 +141,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
   *    frame is due, and between requests it pre-renders the next frame's pts
   *    from the observed cadence so a regular request is served without
   *    calling libass at all. Pre-rendering never runs past the subtitle
-@@ -217,6 +218,59 @@
+@@ -218,6 +219,59 @@ static int64_t mediacodec_timing_release(struct mediacodec_timing *timing,
      return snapped - period_ns * 8 / 10;
  }
  
@@ -201,9 +201,9 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // --- end mediacodec timing core
  
  typedef AChoreographer *(*mp_get_choreographer_fn)(void);
-@@ -325,9 +379,9 @@
- #define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
- #define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
+@@ -358,9 +412,9 @@ static double median_seconds(const double *v, int n)
+     return median_ns(ns, n) / 1e9;
+ }
  
 -// Media-pts cadence of the frames the VO flips, as the ExoPlayer overlay
 -// estimates it: median of the last eight consecutive deltas, trusted after
@@ -214,7 +214,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
  struct osd_cadence {
      double deltas[OSD_CADENCE_SAMPLES];
-@@ -771,6 +825,9 @@
+@@ -780,6 +834,9 @@ struct priv {
      uint64_t cur_frame_id;
      double cur_duration;
      uint64_t cur_seq;    // sequence of the frame draw_frame received
@@ -224,7 +224,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      double osd_pts;      // render pts of the last real frame
  
      struct mp_hwdec_ctx hwctx;
-@@ -977,7 +1034,7 @@
+@@ -1042,7 +1099,7 @@ static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
  
      AVHWDeviceContext *ctx = (void *)device_ref->data;
      AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
@@ -233,7 +233,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  
      if (av_hwdevice_ctx_init(device_ref) < 0)
          av_buffer_unref(&device_ref);
-@@ -2761,7 +2818,7 @@
+@@ -2842,7 +2899,7 @@ static void osd_init(struct vo *vo)
      JNIEnv *env = mp_jni_get_env(vo->log);
      if (env) {
          p->osd_window = ANativeWindow_fromSurface(env,
@@ -242,7 +242,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      }
      if (!p->osd_window) {
          MP_ERR(vo, "Failed to wrap the OSD surface; "
-@@ -2853,14 +2910,28 @@
+@@ -2934,14 +2991,28 @@ static int preinit(struct vo *vo)
      init_vsync_sampler(vo);
      osd_init(vo);
  
@@ -274,7 +274,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  
  struct release_target {
      int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
-@@ -2894,8 +2965,8 @@
+@@ -2972,8 +3043,8 @@ static int64_t display_period(struct vo *vo)
      return llround(period);
  }
  
@@ -285,7 +285,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  static void update_queue_timing(struct vo *vo, double frame_duration)
  {
      struct priv *p = vo->priv;
-@@ -2908,20 +2979,16 @@
+@@ -2986,20 +3057,16 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
          p->queue_period_changed = mono_now;
      }
  
@@ -310,7 +310,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      }
  }
  
-@@ -2946,7 +3013,7 @@
+@@ -3024,7 +3091,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
  
      result.timestamp = mediacodec_timing_release(
          &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
@@ -319,15 +319,16 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      if (result.timestamp && sample && raw_target > mono_now)
          result.vsync = result.timestamp + p->queue_period * 8 / 10;
      return result;
-@@ -2978,52 +3045,136 @@
+@@ -3056,52 +3123,136 @@ static void update_opts(struct vo *vo)
          vo->want_redraw = true;
  }
  
+-static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 +// Preparation does not own or submit the decoder image. The core can discard
 +// a queued frame on seek/drop while this bounded OSD request is in flight.
 +static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool synthetic)
-+{
-+    struct priv *p = vo->priv;
+ {
+     struct priv *p = vo->priv;
 +    uint64_t seq = ++p->frame_seq;
 +    double pts = frame->current->pts;
 +    if (!synthetic && p->cadence.last_frame_id != frame->frame_id) {
@@ -349,7 +350,9 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +    }
 +    return seq;
 +}
-+
+ 
+-    if (frame->redraw || frame->repeat)
+-        return VO_TRUE;
 +// When this frame may be handed to the codec. The buffer is presented at the
 +// vsync get_release_target picks, not at its raw deadline: cadence correction
 +// and snapping place that vsync up to the prediction bound plus most of a
@@ -363,7 +366,18 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +    struct priv *p = vo->priv;
 +    if (frame->pts <= 0 || frame->display_synced)
 +        return 0;
-+
+ 
+-    update_queue_timing(vo, frame->duration);
+-    mp_image_unrefp(&p->cur_image);
+-    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
+-    p->cur_pts = frame->pts;
+-    p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
+-    p->cur_duration = p->cur_image ? frame->duration : 0;
+-    if (!p->cur_image) {
+-        mediacodec_timing_reset(&p->timing);
+-        osd_cadence_reset(&p->cadence);
+-        p->osd_pts = MP_NOPTS_VALUE;
+-        return VO_TRUE;
 +    int64_t lead = mediacodec_codec_lead(p->queue_period);
 +    int64_t raw_deadline = frame->pts - lead;
 +    int64_t mono_now = monotonic_now_ns();
@@ -398,11 +412,17 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +            mp_mutex_unlock(&p->osd_lock);
 +        }
 +        return 0;
-+    }
+     }
 +    if (frame->redraw || frame->repeat || !frame->current ||
 +        mediacodec_synthetic_still(frame->still, frame->pts, frame->duration))
 +        return 0;
-+
+ 
+-    p->cur_seq = ++p->frame_seq;
+-    double pts = p->cur_image->pts;
+-    if (pts == MP_NOPTS_VALUE) {
+-        osd_cadence_reset(&p->cadence);
+-    } else {
+-        osd_cadence_observe(&p->cadence, frame->frame_id, pts);
 +    // Called on each event-loop wake, including after refresh-rate changes.
 +    // Never rely on the offset the core observed before this frame was drawn.
 +    update_queue_timing(vo, frame->duration);
@@ -413,66 +433,30 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +        p->prepared_seq = prepare_osd(vo, frame, false);
 +        p->prepared_frame_id = frame->frame_id;
 +        p->prepared_epoch = p->osd.epoch;
-+    }
+     }
 +    return submit_deadline(vo, frame);
 +}
 +
- static bool draw_frame(struct vo *vo, struct vo_frame *frame)
- {
-     struct priv *p = vo->priv;
--
-     if (frame->redraw || frame->repeat)
-         return VO_TRUE;
++static bool draw_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (frame->redraw || frame->repeat)
++        return VO_TRUE;
  
--    update_queue_timing(vo, frame->duration);
+-    if (!p->osd_threads_created) {
+-        p->osd_pts = pts;
 +    bool synthetic = mediacodec_synthetic_still(
 +        frame->still, frame->pts, frame->duration);
-     mp_image_unrefp(&p->cur_image);
--    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
++    mp_image_unrefp(&p->cur_image);
 +    if (!frame->current) {
 +        if (!synthetic) {
 +            mediacodec_timing_reset(&p->timing);
 +            osd_cadence_reset(&p->cadence);
 +            p->osd_pts = MP_NOPTS_VALUE;
 +        }
-+        return VO_TRUE;
-+    }
-+
-+    p->osd_pts = frame->current->pts;
-+    if (frame->frame_id && frame->frame_id == p->submitted_frame_id)
-+        return VO_TRUE;
-+
-+    p->cur_image = mp_image_new_ref(frame->current);
-     p->cur_pts = frame->pts;
--    p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
--    p->cur_duration = p->cur_image ? frame->duration : 0;
--    if (!p->cur_image) {
--        mediacodec_timing_reset(&p->timing);
--        osd_cadence_reset(&p->cadence);
--        p->osd_pts = MP_NOPTS_VALUE;
--        return VO_TRUE;
--    }
--
--    p->cur_seq = ++p->frame_seq;
--    double pts = p->cur_image->pts;
--    if (pts == MP_NOPTS_VALUE) {
--        osd_cadence_reset(&p->cadence);
-+    p->cur_frame_id = frame->frame_id;
-+    p->cur_duration = frame->duration;
-+    p->cur_synthetic = synthetic;
-+    if (!synthetic && p->prepared_seq &&
-+        p->prepared_frame_id == frame->frame_id)
-+    {
-+        p->cur_seq = p->prepared_seq;
-     } else {
--        osd_cadence_observe(&p->cadence, frame->frame_id, pts);
--    }
--
--    if (!p->osd_threads_created) {
--        p->osd_pts = pts;
--        return VO_TRUE;
--    }
--
+         return VO_TRUE;
+     }
+ 
 -    // Ask for this frame's OSD now, up to --video-timing-offset plus the
 -    // queue lead before it is due; flip_page publishes where it will land.
 -    mp_mutex_lock(&p->osd_lock);
@@ -485,7 +469,20 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 -    });
 -    p->osd.frames++;
 -    mp_mutex_unlock(&p->osd_lock);
--
++    p->osd_pts = frame->current->pts;
++    if (frame->frame_id && frame->frame_id == p->submitted_frame_id)
++        return VO_TRUE;
+ 
++    p->cur_image = mp_image_new_ref(frame->current);
++    p->cur_pts = frame->pts;
++    p->cur_frame_id = frame->frame_id;
++    p->cur_duration = frame->duration;
++    p->cur_synthetic = synthetic;
++    if (!synthetic && p->prepared_seq &&
++        p->prepared_frame_id == frame->frame_id)
++    {
++        p->cur_seq = p->prepared_seq;
++    } else {
 +        if (!synthetic)
 +            update_queue_timing(vo, frame->duration);
 +        p->cur_seq = prepare_osd(vo, frame, synthetic);
@@ -493,7 +490,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      return VO_TRUE;
  }
  
-@@ -3048,12 +3199,18 @@
+@@ -3126,12 +3277,18 @@ static void flip_page(struct vo *vo)
          return;
      }
  
@@ -513,7 +510,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      mp_image_unrefp(&p->cur_image);
      p->cur_pts = 0;
      p->cur_frame_id = 0;
-@@ -3096,6 +3253,11 @@
+@@ -3174,6 +3331,11 @@ static void reset_video(struct vo *vo)
      p->cur_pts = 0;
      p->cur_frame_id = 0;
      p->cur_duration = 0;
@@ -525,7 +522,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      mediacodec_timing_reset(&p->timing);
      osd_cadence_reset(&p->cadence);
      p->osd_pts = MP_NOPTS_VALUE;
-@@ -3177,6 +3339,7 @@
+@@ -3245,6 +3407,7 @@ const struct vo_driver video_out_mediacodec = {
      .name = "mediacodec",
      .preinit = preinit,
      .query_format = query_format,

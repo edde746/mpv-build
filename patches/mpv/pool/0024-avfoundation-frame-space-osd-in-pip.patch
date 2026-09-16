@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 475201d..c377841 100644
+index b4cf516..854d9a1 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -418,6 +418,9 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,

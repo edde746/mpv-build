@@ -22,7 +22,7 @@ held frame, and uninit still removes the image on teardown.
  1 file changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index d7f6f46..c253d27 100644
+index 159c7e5..7f48569 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -3769,7 +3769,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
@@ -40,10 +40,9 @@ index d7f6f46..c253d27 100644
          clear_subtitle_state(vo);
          p->not_ready_drop_count = 0;
          p->last_not_ready_drop_ns = 0;
-@@ -3781,7 +3787,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+@@ -3781,6 +3787,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
          reset_media_timing(p);
          p->playback_paused = was_paused;
-         p->timebase_paused = was_paused;
 -        sample_buffer_renderer_flush(p->displayLayer, true);
 +        sample_buffer_renderer_flush(p->displayLayer, false);
          sample_buffer_renderer_flush(p->osdLayer, true);

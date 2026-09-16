@@ -1,8 +1,8 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 352fd16..e0db578 100644
+index 3094f35..ae1b58c 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -318,20 +318,42 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
+@@ -319,68 +319,102 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
  
  struct present_intent {
      int64_t media_us;
@@ -18,14 +18,14 @@ index 352fd16..e0db578 100644
 -// vsync on a given device (Tensor reports the release timestamp, 0.8 of a
 -// period early, for every frame). A miss is a report that lands away from
 -// where this device's reports steadily land, by at least half a period.
+-#define PRESENT_REFERENCE_SAMPLES 8
 +// Where a report lands relative to its vsync says which clock the platform
 +// reports, not whether the frame was shown on time: Tensor and MediaTek
 +// report the latch of the intended vsync, 0.8 of a period early, for every
 +// frame; Amlogic latches one or two vsyncs before the timestamp and reports
-+// that, alternating by frame. The reference -- the median of the recent
-+// errors -- is kept for the log line, where it names that class.
- #define PRESENT_REFERENCE_SAMPLES 8
- 
++// that, alternating by frame. Which class a device is in is what the
++// histogram below names.
++
 +// What the viewer can see is a hold: the time between two consecutive
 +// frames' reports, in vsyncs. A frame of duration d on a display of period p
 +// is legitimately held floor(d/p) or ceil(d/p) vsyncs -- 2 or 3 for 24p on
@@ -42,7 +42,7 @@ index 352fd16..e0db578 100644
 +    int64_t period_ns;   // the grid the frame was timed on
 +    bool long_hold;      // the hold that ended at this report was too long
 +};
-+
+ 
  struct present_stats {
      struct present_intent ring[PRESENT_INTENTS];
      int next;
@@ -51,10 +51,11 @@ index 352fd16..e0db578 100644
      uint32_t measured;   // reports matched to a timed release
      uint32_t untimed;    // reports matched to an untimed or unsnapped release
      uint32_t unmatched;  // reports with no intent: stragglers across a reset
-@@ -340,26 +362,29 @@ struct present_stats {
+     uint32_t overrun;    // intents overwritten before any report arrived
+     uint32_t hist[5];    // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
      int64_t err_last_ns, err_worst_ns;
-     int64_t err_recent[PRESENT_REFERENCE_SAMPLES]; // the reference's samples
-     unsigned err_count;
+-    int64_t err_recent[PRESENT_REFERENCE_SAMPLES]; // the reference's samples
+-    unsigned err_count;
 -    uint32_t missed;     // reports half a period or more off the reference
 +    uint32_t missed;     // holds off the frame's legitimate cadence
      uint32_t late;       // releases due before they reached the codec
@@ -84,19 +85,25 @@ index 352fd16..e0db578 100644
                                   .live = true};
      s->next = (s->next + 1) % PRESENT_INTENTS;
  }
-@@ -385,8 +410,34 @@ static bool present_reference(const struct present_stats *s, int64_t *ref)
-     return true;
- }
  
--// Returns whether the display showed a timed frame off the vsync its
--// siblings land on.
+-static int64_t median_ns(const int64_t *v, int n); // with the cadence below
+-
+-// The steady-state report error on this device: the median of the recent
+-// reports, once there are enough of them to be one. Robust to a few misses.
+-static bool present_reference(const struct present_stats *s, int64_t *ref)
 +// Whether the hold that ended at [report] -- the previous matched frame's
 +// time on screen -- lost the viewer a slot. Only neighbouring releases on
 +// one grid can be read as a hold: a report missing in between, a seek or a
 +// refresh-rate switch each start over.
 +static bool present_hold_missed(struct present_stats *s,
 +                                const struct present_hold *report)
-+{
+ {
+-    if (s->err_count < PRESENT_REFERENCE_SAMPLES / 2)
+-        return false;
+-    unsigned n = s->err_count < PRESENT_REFERENCE_SAMPLES
+-               ? s->err_count : PRESENT_REFERENCE_SAMPLES;
+-    *ref = median_ns(s->err_recent, n);
+-    return true;
 +    const struct present_hold *prev = &s->prev;
 +    bool missed = false;
 +    bool long_hold = false;
@@ -115,21 +122,23 @@ index 352fd16..e0db578 100644
 +    s->prev = *report;
 +    s->prev.long_hold = long_hold;
 +    return missed;
-+}
-+
+ }
+ 
+-// Returns whether the display showed a timed frame off the vsync its
+-// siblings land on.
 +// Returns whether the display held the previous frame off its cadence.
  static bool present_observe(struct present_stats *s, int64_t media_us,
                              int64_t system_nano, int64_t period_ns)
  {
-@@ -407,11 +458,12 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
+@@ -401,11 +435,10 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
          double vsyncs = (double)err / period_ns;
          s->hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
                : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
 -        int64_t ref;
 -        bool missed = present_reference(s, &ref) &&
 -                      llabs(err - ref) >= period_ns / 2;
-         s->err_recent[s->err_count % PRESENT_REFERENCE_SAMPLES] = err;
-         s->err_count++;
+-        s->err_recent[s->err_count % PRESENT_REFERENCE_SAMPLES] = err;
+-        s->err_count++;
 +        bool missed = present_hold_missed(s, &(struct present_hold){
 +            .valid = true, .seq = e->seq, .system_nano = system_nano,
 +            .duration_ns = e->duration_ns, .period_ns = period_ns,
@@ -137,7 +146,7 @@ index 352fd16..e0db578 100644
          if (missed)
              s->missed++;
          return missed;
-@@ -420,9 +472,8 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
+@@ -414,9 +447,8 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
      return false;
  }
  
@@ -149,7 +158,23 @@ index 352fd16..e0db578 100644
  static uint64_t present_failures(const struct present_stats *s)
  {
      return (uint64_t)s->untimed + s->overrun + s->missed;
-@@ -3662,8 +3713,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3216,14 +3248,11 @@ static void present_log_stats(struct vo *vo, const char *why)
+ {
+     struct priv *p = vo->priv;
+     const struct present_stats *s = &p->present;
+-    int64_t ref = 0;
+-    bool have_ref = present_reference(s, &ref);
+-    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s refMs=%s "
++    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
+                "measured=%u missed=%u untimed=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
+                why, s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
+                s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
+                s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
+-               have_ref ? mp_tprintf(16, "%d", (int)(ref / 1000000)) : "n/a",
+                s->measured, s->missed, s->untimed, s->late, s->unsnapped,
+                s->unmatched, s->overrun);
+ }
+@@ -3677,8 +3706,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  // instead, and the core's own drop count (frame-drop-count) only moves for a
  // frame that is a whole duration late on admission, which preparation makes
  // rare. So the count the viewer can see in an overlay is kept here: a frame
@@ -160,7 +185,7 @@ index 352fd16..e0db578 100644
  static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
                               struct release_target target)
  {
-@@ -3673,7 +3724,8 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
+@@ -3688,7 +3717,8 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
          p->present_source = source;
          MP_VERBOSE(vo, "video-present feedback: %s\n", source);
      }

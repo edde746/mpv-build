@@ -1,8 +1,8 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index c1a9469..e3fa4e9 100644
+index 7de0b3e..4384a70 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
-@@ -112,6 +112,7 @@ - (void)invalidate;
+@@ -99,6 +99,7 @@ - (void)invalidate;
      bool avp_start_seeked;       // seek-to-start workaround already tried
      bool avp_eof;
      int64_t avp_start_deadline;  // mp_time_ns() deadline; -1 = healthy
@@ -10,7 +10,7 @@ index c1a9469..e3fa4e9 100644
      int avp_last_item_status;    // last logged AVPlayerItemStatus
      int avp_last_tcs;            // last logged AVPlayerTimeControlStatus
      int avp_heartbeat;           // verbose position log divider
-@@ -505,6 +506,19 @@ static void avp_update_transport(struct ao *ao)
+@@ -441,6 +442,19 @@ static void avp_update_transport(struct ao *ao)
          p->avp_start_deadline = -1; // playing; nothing left to supervise
          return;
      }
@@ -30,19 +30,17 @@ index c1a9469..e3fa4e9 100644
      if (now < p->avp_start_deadline)
          return;
      if (!p->avp_start_seeked) {
-@@ -611,6 +625,7 @@ static void avp_create_item(struct ao *ao)
+@@ -535,5 +549,6 @@ static void avp_create_item(struct ao *ao)
      p->avp_eof = false;
      p->avp_rate_applied = false;
      p->avp_start_seeked = false;
 +    p->avp_primed_pts = 0;
-     p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
-     p->au_len = 0;
+     p->avp_start_deadline = 0; // armed by avp_update_transport
      p->avp_last_item_status = -1;
-@@ -646,6 +661,7 @@ static void avp_teardown_item(struct ao *ao)
+@@ -567,5 +582,6 @@ static void avp_teardown_item(struct ao *ao)
      p->avp_eof = false;
      p->avp_rate_applied = false;
      p->avp_start_seeked = false;
 +    p->avp_primed_pts = 0;
-     p->au_len = 0;
  }
  

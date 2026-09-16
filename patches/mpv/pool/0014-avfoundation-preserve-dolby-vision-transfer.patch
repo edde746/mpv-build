@@ -8,7 +8,7 @@ Subject: [PATCH] fix(avfoundation): preserve Dolby Vision transfer metadata
  1 file changed, 21 insertions(+)
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index ce6a430..e2291eb 100644
+index b6848f4..e2f5d24 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -1156,6 +1156,22 @@ static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,

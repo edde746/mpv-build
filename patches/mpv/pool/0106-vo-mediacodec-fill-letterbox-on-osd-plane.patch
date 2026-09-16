@@ -1,7 +1,7 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -757,10 +757,13 @@
+@@ -767,10 +767,13 @@ static const struct m_sub_options mediacodec_conf = {
  #define OSD_PRESENT_PROBES 16
  
  // One rendered OSD frame: the sub bitmap list for a canvas_w x canvas_h
@@ -16,7 +16,19 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  };
  
  struct osd_request {
-@@ -1261,6 +1264,10 @@
+@@ -1293,8 +1296,9 @@ static struct sub_bitmap_list *osd_slot_render(struct vo *vo, struct osd_render_
+     return sbs;
+ }
+ 
+-// Publish sbs as slot's frame: the bitmap list and the canvas it was
+-// rendered on.
++// Publish sbs as slot's frame: the bitmap list, the canvas it was rendered
++// on, and that render's letterbox, which the present stage fills opaque
++// black; see osd_gl_fill_letterbox.
+ static void osd_slot_store(struct osd_slot *dst, struct sub_bitmap_list *sbs,
+                            int w, int h, struct mp_osd_res res)
+ {
+@@ -1302,6 +1306,10 @@ static void osd_slot_store(struct osd_slot *dst, struct sub_bitmap_list *sbs,
      dst->sbs = sbs;
      dst->canvas_w = w;
      dst->canvas_h = h;
@@ -24,21 +36,10 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +    dst->mt = res.mt;
 +    dst->mr = res.mr;
 +    dst->mb = res.mb;
-     return true;
  }
  
-@@ -1384,6 +1391,10 @@
-         dst->sbs = sbs;
-         dst->canvas_w = w;
-         dst->canvas_h = h;
-+        dst->ml = res.ml;
-+        dst->mt = res.mt;
-+        dst->mr = res.mr;
-+        dst->mb = res.mb;
-     }
-     osd_prefetch_store(&p->osd.prefetch, event_start, events, epoch,
-                        keep ? slot : -1, render_s);
-@@ -2476,6 +2487,61 @@
+ // Render the OSD for pts into slot. Returns whether the slot holds a frame
+@@ -2559,6 +2567,61 @@ static bool osd_upload_ahead(struct vo *vo, struct osd_gl *g, int64_t until)
      return false;
  }
  
@@ -100,7 +101,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *slot)
  {
      struct priv *p = vo->priv;
-@@ -2487,6 +2553,7 @@
+@@ -2570,6 +2633,7 @@ static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *
      g->surface_h = sh;
      gl->Viewport(0, 0, sw, sh);
      gl->Clear(GL_COLOR_BUFFER_BIT);

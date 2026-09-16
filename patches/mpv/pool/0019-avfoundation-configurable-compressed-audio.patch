@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 545cb1a..102c53d 100644
+index d5b25c8..a7a6bba 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -109,6 +109,10 @@ - (void)invalidate;

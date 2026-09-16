@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
-index 2a83027..78da5e1 100644
+index 2a83027..fd174fd 100644
 --- a/audio/out/ao_avfoundation.m
 +++ b/audio/out/ao_avfoundation.m
 @@ -25,6 +25,9 @@
@@ -12,7 +12,7 @@ index 2a83027..78da5e1 100644
  #import <AVFoundation/AVFoundation.h>
  #import <Foundation/Foundation.h>
  #import <CoreAudioTypes/CoreAudioTypes.h>
-@@ -38,15 +41,115 @@ @interface AVObserver : NSObject {
+@@ -38,15 +41,106 @@ @interface AVObserver : NSObject {
  - (void)handleRestartNotification:(NSNotification*)notification;
  @end
  
@@ -68,13 +68,6 @@ index 2a83027..78da5e1 100644
 +    int es_len;
 +    int64_t es_head;             // stream offset of es_buf[0]
 +    int64_t es_pts;              // ns of audio appended since the item epoch
-+    // Last complete access unit, kept to satisfy far-offset probes: the
-+    // system estimates duration/bitrate by reading near the end of the fake
-+    // endless resource, and refusing those reads parks preroll forever.
-+    // Probe offsets are never reached by playback, which starts at zero, so
-+    // any valid access units satisfy them.
-+    uint8_t *au_buf;
-+    int au_len;
 +    bool avp_playing;            // desired transport state
 +    bool avp_rate_applied;       // rate 1 has been handed to AVPlayer
 +    bool avp_start_seeked;       // seek-to-start workaround already tried
@@ -102,8 +95,6 @@ index 2a83027..78da5e1 100644
 +#define AVP_START_LEAD_NS   MP_TIME_S_TO_NS(4)
 +// Minimum priming before the transport is started.
 +#define AVP_START_MIN_NS    MP_TIME_S_TO_NS(1)
-+// Deadline for the item to become ready once primed.
-+#define AVP_READY_GRACE_NS  MP_TIME_S_TO_NS(5)
 +// Deadline for the playhead to move once the rate is applied.
 +#define AVP_START_GRACE_NS  MP_TIME_S_TO_NS(2)
 +// History kept behind the loader's read position for offset-0 restarts.
@@ -128,7 +119,7 @@ index 2a83027..78da5e1 100644
  static int64_t CMTimeGetNanoseconds(CMTime time)
  {
      time = CMTimeConvertScale(time, 1000000000, kCMTimeRoundingMethod_Default);
-@@ -58,6 +161,418 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+@@ -58,6 +161,398 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
      return CMTimeMake(time, 1000000000);
  }
  
@@ -231,8 +222,6 @@ index 2a83027..78da5e1 100644
 +        MP_WARN(ao, "discarding burst without syncframe\n");
 +        return;
 +    }
-+    memcpy(p->au_buf, dst, payload_len);
-+    p->au_len = payload_len;
 +    p->es_len += payload_len;
 +    p->es_pts += CMTimeGetNanoseconds(
 +        CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
@@ -344,22 +333,6 @@ index 2a83027..78da5e1 100644
 +            [dr respondWithData:chunk];
 +            MP_TRACE(ao, "served %lld bytes at offset %lld\n",
 +                     (long long)n, (long long)off);
-+        } else if (off > write_head && p->au_len > 0) {
-+            // Far-offset probe past the write head: duration/bitrate
-+            // estimation reading near the "end" of the endless resource.
-+            // Satisfy it with copies of the latest access unit; playback
-+            // starts at zero and never reaches these offsets.
-+            int64_t n = MPMIN(req_end - off, 256 * 1024);
-+            NSMutableData *chunk = [NSMutableData dataWithCapacity:n];
-+            while ((int64_t)chunk.length + p->au_len <= n)
-+                [chunk appendBytes:p->au_buf length:p->au_len];
-+            if (chunk.length == 0)
-+                [chunk appendBytes:p->au_buf length:MPMIN(p->au_len, n)];
-+            if (chunk.length > n)
-+                [chunk setLength:n];
-+            [dr respondWithData:chunk];
-+            MP_VERBOSE(ao, "synthesized %lu probe bytes at offset %lld\n",
-+                       (unsigned long)chunk.length, (long long)off);
 +        }
 +        if (!dr.requestsAllDataToEndOfResource &&
 +            dr.currentOffset >= dr.requestedOffset + (int64_t)dr.requestedLength) {
@@ -508,8 +481,7 @@ index 2a83027..78da5e1 100644
 +    p->avp_eof = false;
 +    p->avp_rate_applied = false;
 +    p->avp_start_seeked = false;
-+    p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
-+    p->au_len = 0;
++    p->avp_start_deadline = 0; // armed by avp_update_transport
 +    p->avp_last_item_status = -1;
 +    p->avp_last_tcs = -1;
 +}
@@ -541,7 +513,6 @@ index 2a83027..78da5e1 100644
 +    p->avp_eof = false;
 +    p->avp_rate_applied = false;
 +    p->avp_start_seeked = false;
-+    p->au_len = 0;
 +}
 +
  static void feed(struct ao *ao)
@@ -571,7 +542,7 @@ index 2a83027..78da5e1 100644
      p->end_time_av = -1;
      [p->synchronizer setRate:1];
      [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
-@@ -155,17 +687,53 @@ static void stop(struct ao *ao)
+@@ -155,17 +687,50 @@ static void stop(struct ao *ao)
  {
      struct priv *p = ao->priv;
  
@@ -609,9 +580,6 @@ index 2a83027..78da5e1 100644
 +                    [p->player setRate:1];
 +                    if (p->avp_start_deadline >= 0)
 +                        p->avp_start_deadline = mp_time_ns() + AVP_START_GRACE_NS;
-+                } else {
-+                    // priming/readiness supervision resumes from now
-+                    p->avp_start_deadline = mp_time_ns() + AVP_READY_GRACE_NS;
 +                }
 +                avp_timer_arm(p);
 +                feed_avp(ao);
@@ -653,7 +621,7 @@ index 2a83027..78da5e1 100644
      switch (cmd) {
      case AOCONTROL_GET_MUTE:
          *(bool*)arg = [p->renderer isMuted];
-@@ -215,21 +802,183 @@ - (void)handleRestartNotification:(NSNotification*)notification {
+@@ -215,21 +802,181 @@ - (void)handleRestartNotification:(NSNotification*)notification {
  }
  @end
  
@@ -829,8 +797,6 @@ index 2a83027..78da5e1 100644
 +        p->stash = talloc_size(ao, p->stash_size);
 +        p->es_size = AVP_ES_RING_BYTES;
 +        p->es_buf = talloc_size(ao, p->es_size);
-+        p->au_buf = talloc_size(ao, p->spdif_burst_size);
-+
 +        // the lead bound is what actually paces the stream
 +        ao->device_buffer = ao->samplerate * 2;
 +

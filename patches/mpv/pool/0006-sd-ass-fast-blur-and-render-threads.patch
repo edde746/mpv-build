@@ -8,8 +8,9 @@ the library defaulted to. On blur-heavy motion-tracked signs that is a
 large share of the per-frame cost behind late signs and post-cut bleed
 on Fire TV (edde746/plezy#2242).
 
-Only these two options: MOTION_CACHE and CACHE_LAYOUT stay off, as on
-the ExoPlayer path.
+Those are the only two knobs set. No other libass feature is turned on
+here, so everything else stays at its upstream default, as on the
+ExoPlayer path.
 
 diff --git a/sub/sd_ass.c b/sub/sd_ass.c
 index ece372a..81d9bef 100644

@@ -454,15 +454,16 @@ index 5cbc6d0..fc2506b 100644
      struct sd_lavc_priv *priv = sd->priv;
      struct mp_subtitle_opts *opts = sd->opts;
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 69189c9..0c8c65d 100644
+index ff36828..c1fa478 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -1311,7 +1311,7 @@ static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
+@@ -1396,7 +1396,8 @@ static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
      struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-     int64_t t0 = mp_time_ns();
+     int64_t render_ns;
      struct sub_bitmap_list *sbs =
--        osd_render(vo->osd, res, event_start + 0.001, 0, osd_gl_formats);
-+        osd_render(vo->osd, res, event_start + 0.001, OSD_DRAW_PREFETCH, osd_gl_formats);
-     double render_s = (mp_time_ns() - t0) / 1e9;
-     if (sbs)
-         osd_dedup_items(p, rs, sbs);
+-        osd_slot_render(vo, rs, event_start + 0.001, res, 0, &render_ns);
++        osd_slot_render(vo, rs, event_start + 0.001, res,
++                        OSD_DRAW_PREFETCH, &render_ns);
+     double render_s = render_ns / 1e9;
+     mp_mutex_lock(&p->osd_lock);
+     bool keep = sbs && p->osd.epoch == epoch;

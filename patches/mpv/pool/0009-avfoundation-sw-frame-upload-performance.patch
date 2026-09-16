@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index a5056ca..fe16972 100644
+index ca35b26..a9a5144 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -24,11 +24,13 @@
@@ -296,7 +296,7 @@ index a5056ca..fe16972 100644
  }
  
  static void clear_subtitle_cache(struct priv *p)
-@@ -3110,6 +3264,11 @@ static void uninit(struct vo *vo)
+@@ -3110,4 +3264,9 @@ static void uninit(struct vo *vo)
          p->swUploadPool = NULL;
      }
  
@@ -305,6 +305,4 @@ index a5056ca..fe16972 100644
 +        p->video_format_desc = NULL;
 +    }
 +
-     AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
-     p->osdLayer = nil;
-     if (osdLayer) {
+     release_osd_layer(vo);

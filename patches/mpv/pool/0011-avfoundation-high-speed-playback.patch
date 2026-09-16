@@ -1,13 +1,10 @@
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index fe16972..d4c5906 100644
+index df0a7ac..e35e162 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
-@@ -180,6 +180,15 @@
-     bool timebase_paused;
+@@ -180,5 +180,12 @@
      bool playback_paused;
      double timebase_rate;
-+    int64_t anchor_media_pts_ns;
-+    int64_t anchor_present_host_ns;
 +
 +    // Periodic presentation-pacing diagnostics (logged every ~5s)
 +    int64_t diag_window_start_ns;
@@ -18,106 +15,19 @@ index fe16972..d4c5906 100644
  
      // Track if OSD callback was invoked this frame
      bool osd_callback_invoked;
-@@ -390,24 +399,11 @@ static void reset_media_timing(struct priv *p)
+@@ -390,6 +399,8 @@ static void reset_media_timing(struct priv *p)
      p->timebase_anchor_valid = false;
-     p->timebase_paused = false;
      p->playback_paused = false;
 -    p->timebase_rate = 1.0;
--}
--
--static double infer_timebase_rate(struct priv *p, int64_t media_pts_ns,
--                                  int64_t present_host_ns)
--{
--    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
--
--    if (!p->last_media_pts_valid || !p->last_present_host_ns)
--        return rate;
--
--    int64_t media_delta = media_pts_ns - p->last_media_pts_ns;
--    int64_t host_delta = present_host_ns - p->last_present_host_ns;
--    if (media_delta <= 0 || host_delta <= MP_TIME_MS_TO_NS(5))
--        return rate;
--
--    double inferred = (double)media_delta / (double)host_delta;
--    return inferred >= 0.05 && inferred <= 8.0 ? inferred : rate;
-+    // Keep a previously inferred rate across seeks/track switches; the
-+    // player's speed persists, so the first post-seek anchor starts correct.
++    // Keep the nominal rate across seeks. Unlike the frame/timestamp mapping,
++    // the player's speed persists, so the first post-seek anchor starts correct.
 +    p->timebase_rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
-+    p->anchor_media_pts_ns = 0;
-+    p->anchor_present_host_ns = 0;
  }
  
  static void update_media_timebase_for_frame(struct vo *vo)
-@@ -421,18 +417,58 @@ static void update_media_timebase_for_frame(struct vo *vo)
-         ? p->next_present_host_ns
-         : now;
-     int64_t media_pts_ns = p->next_media_pts_ns;
--    double rate = p->playback_paused
--        ? 0.0
--        : infer_timebase_rate(p, media_pts_ns, present_host_ns);
-+
-+    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
-+
-+    // Infer the playback rate over the span since the last anchor point.
-+    // Present timestamps jitter by up to ~1ms frame to frame, so a
-+    // frame-to-frame estimate is too noisy at high rates (error scales with
-+    // rate / span) and would re-anchor the timebase on nearly every frame.
-+    bool inferred_valid = false;
-+    double inferred = rate;
-+    int64_t span_host_ns = 0;
-+    if (p->timebase_anchor_valid && p->anchor_present_host_ns) {
-+        int64_t media_delta = media_pts_ns - p->anchor_media_pts_ns;
-+        span_host_ns = present_host_ns - p->anchor_present_host_ns;
-+        if (media_delta > 0 && span_host_ns >= MP_TIME_MS_TO_NS(5)) {
-+            double candidate = (double)media_delta / (double)span_host_ns;
-+            if (candidate >= 0.05 && candidate <= 8.0) {
-+                inferred = candidate;
-+                inferred_valid = true;
-+            }
-+        }
-+    }
-+
-+    // Accept a rate change only if it exceeds what timing jitter could
-+    // explain at the current span: one frame in only detects real speed
-+    // changes, longer spans detect progressively finer drift (1% floor).
-+    bool rate_changed = false;
-+    if (inferred_valid && !p->playback_paused) {
-+        double noise_gate = (double)MP_TIME_MS_TO_NS(3) / (double)span_host_ns;
-+        double gate = MPMAX(0.01, noise_gate);
-+        if (fabs(inferred - rate) > gate * rate) {
-+            rate = inferred;
-+            rate_changed = true;
-+        }
-+    }
-+    if (p->playback_paused)
-+        rate = 0.0;
- 
-     bool should_anchor = !p->timebase_anchor_valid || p->timebase_paused ||
--        p->playback_paused || fabs(rate - p->timebase_rate) > 0.01;
-+        p->playback_paused || rate_changed;
- 
-     if (!should_anchor) {
-         int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
-         int64_t projected_ns = timebase_ns +
-             (int64_t)((double)(present_host_ns - now) * p->timebase_rate);
--        should_anchor = llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20);
-+        if (llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20)) {
-+            should_anchor = true;
-+            // Accumulated drift means the anchored rate was off; adopt the
-+            // span-inferred rate (accurate by now) so the same drift does
-+            // not simply build up again.
-+            if (inferred_valid && span_host_ns >= MP_TIME_MS_TO_NS(100))
-+                rate = inferred;
-+        }
-     }
- 
-     if (should_anchor) {
-@@ -446,6 +482,9 @@ static void update_media_timebase_for_frame(struct vo *vo)
+@@ -446,5 +446,6 @@ static void update_media_timebase_for_frame(struct vo *vo)
          p->timebase_rate = rate;
          p->timebase_anchor_valid = true;
-         p->timebase_paused = p->playback_paused;
-+        p->anchor_media_pts_ns = media_pts_ns;
-+        p->anchor_present_host_ns = present_host_ns;
 +        p->diag_anchor_count++;
      }
  
