@@ -9,10 +9,9 @@
 #   parse/rasterize    parser and rasterizer speedups, no API change
 #   threads            thread-safe caches, per-event threaded rendering
 #                      (ass_set_threads), the image pool, the static-event
-#                      layout cache (ASS_FEATURE_CACHE_LAYOUT,
-#                      ASS_FEATURE_MOTION_CACHE), and the build-system
-#                      threading option; the fork's font-guard and
-#                      layout-cache fixes are folded in
+#                      layout cache, and the build-system threading option;
+#                      the fork's font-guard and layout-cache fixes are
+#                      folded in
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch

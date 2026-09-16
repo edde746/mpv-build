@@ -1,5 +1,5 @@
 # Windows patch series for libass. Empty, and expected to stay small: the
-# windows build already gets fork parity a different way -- pin_packages.py
-# points mpv-winbuild-cmake's libass package at the versions.json url
-# (edde746/libass) instead of upstream libass/libass, so every fork commit is
-# in the build without being carried as a patch here.
+# windows driver already applies series.common through pin_packages.py, which
+# stages the resolved series (series.common then series.windows) into the
+# winbuild checkout as packages/libass-NNNN-<pool>.patch. A windows-only patch
+# would be one more staged file, not a change to that mechanism.

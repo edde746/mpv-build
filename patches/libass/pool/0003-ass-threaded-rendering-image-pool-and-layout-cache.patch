@@ -191,76 +191,11 @@ index 3805a3d..0241dc1 100644
  }
  
  void ass_free_style(ASS_Track *track, int sid)
-@@ -1829,6 +1832,16 @@ int ass_track_set_feature(ASS_Track *track, ASS_Feature feature, int enable)
-         // bundled with the incompatible-extensions umbrella above.
-         requested = FEATURE_MASK(ASS_FEATURE_FAST_BLUR);
-         break;
-+    case ASS_FEATURE_MOTION_CACHE:
-+        // A performance/quality knob, opted into on its own rather than
-+        // bundled with the incompatible-extensions umbrella above.
-+        requested = FEATURE_MASK(ASS_FEATURE_MOTION_CACHE);
-+        break;
-+    case ASS_FEATURE_CACHE_LAYOUT:
-+        // A performance knob, opted into on its own rather than bundled with
-+        // the incompatible-extensions umbrella above.
-+        requested = FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT);
-+        break;
-     default:
-         if (!(FEATURE_MASK(feature) & supported))
-             return -1;
 diff --git a/libass/ass.h b/libass/ass.h
 index 13fae57..e1ad021 100644
 --- a/libass/ass.h
 +++ b/libass/ass.h
-@@ -302,6 +302,47 @@ typedef enum {
-      */
-     ASS_FEATURE_FAST_BLUR,
- 
-+    /**
-+     * Reuse blurred bitmap/composite cache entries across tiny subpixel
-+     * motion deltas.
-+     *
-+     * Motion-tracked signs are often authored as many frame-sized events whose
-+     * vector geometry, blur and colors are effectively stable, but whose
-+     * position/origin values jitter by subpixel amounts. Normally libass keeps
-+     * a separate transformed bitmap for each subpixel phase. When this feature
-+     * is enabled, blurred glyph and drawing bitmap keys are snapped from the
-+     * usual 1/8-pixel phase grid to a 1/4-pixel phase grid, allowing
-+     * visually-near-identical frames to reuse more transformed and blurred
-+     * work.
-+     *
-+     * This is incompatible with VSFilter and disabled by default.
-+     */
-+    ASS_FEATURE_MOTION_CACHE,
-+
-+    /**
-+     * Retain cached static subtitle layouts across inactive periods.
-+     *
-+     * The parse/shape/layout pipeline (text parsing, HarfBuzz/FriBidi shaping,
-+     * glyph retrieval, wrapping, reordering, alignment, bounding box and
-+     * rotation setup) is a pure function of the event and the renderer
-+     * configuration for events that contain no time-dependent overrides. Yet it
-+     * is re-run identically on every frame an event is visible, which for
-+     * typical dialogue and signs is the dominant cost and almost entirely
-+     * redundant. The renderer normally snapshots that laid-out state while an
-+     * event remains active on consecutive frames, then promptly releases it.
-+     * Enabling this feature retains snapshots for inactive events too, which
-+     * avoids rebuilding them after seeks or when replaying the same track at the
-+     * cost of potentially retaining substantially more memory.
-+     *
-+     * Only events with no time-dependent tags (\t, \move, \fad/\fade,
-+     * \k/\K/\kf/\ko) and no scrolling/banner transition effect are cached;
-+     * everything else falls back to the normal per-frame path. The cached and
-+     * non-cached paths produce byte-identical output.
-+     *
-+     * This is a performance-only extension and disabled by default.
-+     */
-+    ASS_FEATURE_CACHE_LAYOUT,
-+
-     // New enum values can be added here in new ABI-compatible library releases.
- } ASS_Feature;
- 
-@@ -398,6 +439,21 @@ ASS_Renderer *ass_renderer_init(ASS_Library *);
+@@ -398,6 +398,21 @@ ASS_Renderer *ass_renderer_init(ASS_Library *);
   */
  void ass_renderer_done(ASS_Renderer *priv);
  
@@ -282,7 +217,7 @@ index 13fae57..e1ad021 100644
  /**
   * \brief Set the frame size in pixels, including margins.
   * The renderer will never return images that are outside of the frame area.
-@@ -416,6 +472,20 @@ void ass_renderer_done(ASS_Renderer *priv);
+@@ -416,6 +431,20 @@ void ass_renderer_done(ASS_Renderer *priv);
   */
  void ass_set_frame_size(ASS_Renderer *priv, int w, int h);
  
@@ -717,7 +652,7 @@ index 47069c1..d99b599 100644
 +            uintptr_t last_used = atomic_exchange_explicit(&item->last_used_frame, cache->cur_frame, memory_order_acquire);
 +
 +            if (last_used != cache->cur_frame) {
-+                ass_assert1(!item->promote_next);
++                ass_assert(!item->promote_next);
 +                item->promote_next = client->promote_first;
 +                client->promote_first = item;
              }
@@ -823,7 +758,7 @@ index 47069c1..d99b599 100644
 -
 -    cache->cache_size += item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
 +    size_t size = desc->construct_func(new_key, value, priv);
-+    ass_assert1(size);
++    ass_assert(size);
 +
 +    atomic_fetch_add_explicit(&cache->cache_size, size + (size == 1 ? 0 : CACHE_ITEM_SIZE), memory_order_relaxed);
 +
@@ -846,8 +781,8 @@ index 47069c1..d99b599 100644
  static inline void destroy_item(const CacheDesc *desc, CacheItem *item)
  {
 -    assert(item->desc == desc);
-+    ass_assert1(item->desc == desc);
-+    ass_assert2(!atomic_load_explicit(&item->next, memory_order_acquire) && !item->prev);
++    ass_assert(item->desc == desc);
++    ass_assert(!atomic_load_explicit(&item->next, memory_order_acquire) && !item->prev);
      char *value = (char *) item + CACHE_ITEM_SIZE;
 -    desc->destruct_func(value + align_cache(desc->value_size), value);
 +    if (desc->key_destruct_func)
@@ -863,15 +798,15 @@ index 47069c1..d99b599 100644
      CacheItem *item = value_to_item(value);
 -    assert(item->size && item->ref_count);
 -    item->ref_count++;
-+    ass_assert2(atomic_load_explicit(&item->size, memory_order_acquire));
-+    ass_assert2(atomic_load_explicit(&item->ref_count, memory_order_acquire));
++    ass_assert(atomic_load_explicit(&item->size, memory_order_acquire));
++    ass_assert(atomic_load_explicit(&item->ref_count, memory_order_acquire));
 +    inc_ref(&item->ref_count);
 +}
 +
 +static void dec_ref_item(CacheItem *item)
 +{
-+    ass_assert2(atomic_load_explicit(&item->size, memory_order_acquire));
-+    ass_assert2(atomic_load_explicit(&item->ref_count, memory_order_acquire));
++    ass_assert(atomic_load_explicit(&item->size, memory_order_acquire));
++    ass_assert(atomic_load_explicit(&item->ref_count, memory_order_acquire));
 +    if (dec_ref(&item->ref_count) == 0)
 +        destroy_item(item->desc, item);
  }
@@ -897,11 +832,11 @@ index 47069c1..d99b599 100644
 +    for (CacheClient *client = set->first_client; client; client = client->next) {
 +        while (client->promote_first) {
 +            CacheItem *item = client->promote_first;
-+            ass_assert2(item->prev);
-+            ass_assert2(item->queue_prev || !item->queue_next);
-+            ass_assert2(item->cache->queue_last);
-+            ass_assert2(item->queue_next != item);
-+            ass_assert2(item->queue_prev != &item->queue_next);
++            ass_assert(item->prev);
++            ass_assert(item->queue_prev || !item->queue_next);
++            ass_assert(item->cache->queue_last);
++            ass_assert(item->queue_next != item);
++            ass_assert(item->queue_prev != &item->queue_next);
 +
 +            // Skip if we're already at the end of the queue
 +            if (!item->queue_prev || item->queue_next) {
@@ -915,7 +850,7 @@ index 47069c1..d99b599 100644
 +                *item->cache->queue_last = item;
 +                item->cache->queue_last = &item->queue_next;
 +
-+                ass_assert2(item->queue_prev != &item->queue_next);
++                ass_assert(item->queue_prev != &item->queue_next);
 +            }
  
 -        cache->cache_size -= item->size + (item->size == 1 ? 0 : CACHE_ITEM_SIZE);
@@ -930,18 +865,18 @@ index 47069c1..d99b599 100644
  {
 -    if (cache->cache_size <= max_size)
 -        return;
-+    ass_assert1(cache->queue_last);
++    ass_assert(cache->queue_last);
  
 -    do {
 +    while (atomic_load_explicit(&cache->cache_size, memory_order_relaxed) > max_size && cache->queue_first) {
          CacheItem *item = cache->queue_first;
 -        if (!item)
-+        ass_assert2(item->prev);
-+        ass_assert2(atomic_load_explicit(&item->size, memory_order_acquire));
-+        ass_assert2(item->queue_prev == &cache->queue_first);
-+        ass_assert2(item->queue_next != item);
-+        ass_assert2(item->queue_prev != &item->queue_next);
-+        ass_assert2(!item->promote_next);
++        ass_assert(item->prev);
++        ass_assert(atomic_load_explicit(&item->size, memory_order_acquire));
++        ass_assert(item->queue_prev == &cache->queue_first);
++        ass_assert(item->queue_next != item);
++        ass_assert(item->queue_prev != &item->queue_next);
++        ass_assert(!item->promote_next);
 +
 +        if (atomic_load_explicit(&item->last_used_frame, memory_order_relaxed) == cache->cur_frame) {
 +            // everything after this must have been last used this frame
@@ -954,7 +889,7 @@ index 47069c1..d99b599 100644
 -            item->queue_prev = NULL;
 -            continue;
 +        if (item->queue_next) {
-+            ass_assert2(item->queue_next->queue_prev != &item->queue_next->queue_next);
++            ass_assert(item->queue_next->queue_prev != &item->queue_next->queue_next);
 +            item->queue_next->queue_prev = &cache->queue_first;
 +        } else {
 +            cache->queue_last = &cache->queue_first;
@@ -1005,9 +940,9 @@ index 47069c1..d99b599 100644
 -                item->cache = NULL;
 -            else
 -                destroy_item(cache->desc, item);
-+            ass_assert2(item->queue_prev || !item->queue_next);
-+            ass_assert2(item->prev);
-+            ass_assert2(atomic_load_explicit(&item->size, memory_order_acquire));
++            ass_assert(item->queue_prev || !item->queue_next);
++            ass_assert(item->prev);
++            ass_assert(atomic_load_explicit(&item->size, memory_order_acquire));
 +            CacheItem *next = atomic_load_explicit(&item->next, memory_order_relaxed);
 +
 +            atomic_store_explicit(&item->next, NULL, memory_order_relaxed);
@@ -1027,7 +962,7 @@ index 47069c1..d99b599 100644
 +        atomic_store_explicit(&cache->map[i], NULL, memory_order_release);
      }
  
-+    ass_assert2(!atomic_load_explicit(&cache->cache_size, memory_order_acquire));
++    ass_assert(!atomic_load_explicit(&cache->cache_size, memory_order_acquire));
 +
      cache->queue_first = NULL;
      cache->queue_last = &cache->queue_first;
@@ -1760,23 +1695,7 @@ index b80ed87..4d18271 100644
  #include "ass.h"
  #include "ass_outline.h"
  #include "ass_render.h"
-@@ -39,6 +46,7 @@
- #define MAX_LINES_INITIAL 64
- #define MAX_BITMAPS_INITIAL 16
- #define MAX_SUB_BITMAPS_INITIAL 64
-+#define MAX_LAYER_SORT_RANGE 64
- #define SUBPIXEL_MASK 63
- #define STROKER_PRECISION 16     // stroker error in integer units, unrelated to final accuracy
- #define RASTERIZER_PRECISION 16  // rasterizer spline approximation error in 1/64 pixel units
-@@ -46,6 +54,7 @@
- #define MAX_PERSP_SCALE 16.0
- #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
- #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
-+#define MOTION_CACHE_SUBPIXEL_STEP 2  // snap 1/8-pixel phases to a 1/4-pixel grid
- 
- 
- static bool text_info_init(TextInfo* text_info)
-@@ -67,8 +76,36 @@ static bool text_info_init(TextInfo* text_info)
+@@ -67,8 +74,36 @@ static bool text_info_init(TextInfo* text_info)
      return true;
  }
  
@@ -1813,7 +1732,7 @@ index b80ed87..4d18271 100644
      free(text_info->glyphs);
      free(text_info->event_text);
      free(text_info->breaks);
-@@ -83,9 +120,15 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
+@@ -83,9 +118,15 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
      if (!text_info_init(&state->text_info))
          return false;
  
@@ -1830,7 +1749,7 @@ index b80ed87..4d18271 100644
      return ass_rasterizer_init(&priv->engine, &state->rasterizer, RASTERIZER_PRECISION);
  }
  
-@@ -97,6 +140,9 @@ static void render_context_done(RenderContext *state)
+@@ -97,6 +138,9 @@ static void render_context_done(RenderContext *state)
          ass_shaper_free(state->shaper);
  
      text_info_done(&state->text_info);
@@ -1840,7 +1759,7 @@ index b80ed87..4d18271 100644
  }
  
  ASS_Renderer *ass_renderer_init(ASS_Library *library)
-@@ -146,9 +192,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+@@ -146,9 +190,15 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
          !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
          goto fail;
  
@@ -1859,7 +1778,7 @@ index b80ed87..4d18271 100644
  
      if (!render_context_init(&priv->state, priv))
          goto fail;
-@@ -161,6 +213,43 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+@@ -161,6 +211,43 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
      ass_shaper_info(library);
      priv->settings.shaper = ASS_SHAPING_COMPLEX;
  
@@ -1903,7 +1822,7 @@ index b80ed87..4d18271 100644
      ass_msg(library, MSGL_V, "Initialized");
  
      return priv;
-@@ -172,28 +261,70 @@ fail:
+@@ -172,28 +259,69 @@ fail:
      return NULL;
  }
  
@@ -1972,11 +1891,10 @@ index b80ed87..4d18271 100644
      free(render_priv->eimg);
 -
 -    render_context_done(&render_priv->state);
-+    free(render_priv->eimg_sorted);
  
      free(render_priv->settings.default_font);
      free(render_priv->settings.default_family);
-@@ -207,12 +338,108 @@ void ass_renderer_done(ASS_Renderer *render_priv)
+@@ -207,12 +335,108 @@ void ass_renderer_done(ASS_Renderer *render_priv)
   * \brief Create a new ASS_Image
   * Parameters are the same as ASS_Image fields.
   */
@@ -2089,7 +2007,7 @@ index b80ed87..4d18271 100644
      if (!img) {
          if (!source)
              ass_aligned_free(bitmap);
-@@ -235,6 +462,45 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
+@@ -235,6 +459,45 @@ static ASS_Image *my_draw_bitmap(unsigned char *bitmap, int bitmap_w,
      return &img->result;
  }
  
@@ -2135,7 +2053,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Mapping between script and screen coordinates
   */
-@@ -386,23 +652,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
+@@ -386,23 +649,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
          // split up into left and right for karaoke, if needed
          if (lbrk > r[j].x0) {
              if (lbrk > r[j].x1) lbrk = r[j].x1;
@@ -2177,7 +2095,7 @@ index b80ed87..4d18271 100644
          }
      }
  
-@@ -473,24 +743,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
+@@ -473,24 +740,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
      if (brk > b_x0) {           // draw left part
          if (brk > b_x1)
              brk = b_x1;
@@ -2220,7 +2138,7 @@ index b80ed87..4d18271 100644
      }
      return tail;
  }
-@@ -511,6 +785,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -511,6 +782,7 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      double y0 = (bbox->y_min + bbox->y_max) / 2.0;
      double dx = (bbox->x_max - bbox->x_min) / 2.0 + 64;
      double dy = (bbox->y_max - bbox->y_min) / 2.0 + 64;
@@ -2228,7 +2146,7 @@ index b80ed87..4d18271 100644
  
      // Change input coordinates' origin to (x0, y0),
      // after that transformation x:[-dx, dx], y:[-dy, dy],
-@@ -526,9 +801,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -526,9 +798,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      double center[2] = { m[0][2] * w, m[1][2] * w };
      // Change output coordinates' origin to center,
      // m_xz and m_yz is skipped as it becomes 0 and no longer needed.
@@ -2243,7 +2161,7 @@ index b80ed87..4d18271 100644
  
      double delta[2] = {0};
      if (!first) {
-@@ -546,9 +823,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -546,9 +820,11 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      }
  
      // Minimal bounding box z coordinate
@@ -2257,7 +2175,7 @@ index b80ed87..4d18271 100644
      double mul[2] = { dx * w, dy * w };  // 1 / q_x, 1 / q_y
  
      // z0 = m_zz - |m_zx| * dx - |m_zy| * dy,
-@@ -625,11 +904,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
+@@ -625,11 +901,15 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
      mul[0] *= w;
      mul[1] *= w;
  
@@ -2278,71 +2196,7 @@ index b80ed87..4d18271 100644
      }
  
      if (first && offset) {
-@@ -648,6 +931,63 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
-     return true;
- }
- 
-+static inline double scale_by_pow2(double value, int exponent)
-+{
-+    // These small exponents cover normal subtitle scaling. Multiplication by
-+    // an exactly represented power of two has the same result as ldexp on a
-+    // binary floating-point implementation, but avoids an out-of-line libm
-+    // call on platforms without a scale opcode.
-+#if FLT_RADIX == 2
-+    switch (exponent) {
-+    case -4: return value * 0x1p-4;
-+    case -3: return value * 0x1p-3;
-+    case -2: return value * 0x1p-2;
-+    case -1: return value * 0x1p-1;
-+    case  0: return value;
-+    case  1: return value * 0x1p1;
-+    case  2: return value * 0x1p2;
-+    case  3: return value * 0x1p3;
-+    case  4: return value * 0x1p4;
-+    default: break;
-+    }
-+#endif
-+    return ldexp(value, exponent);
-+}
-+
-+static int32_t round_to_step(int32_t value, int32_t step)
-+{
-+    if (step <= 1)
-+        return value;
-+
-+    int64_t v = value;
-+    if (v >= 0)
-+        return (int32_t) (((v + step / 2) / step) * step);
-+    return (int32_t) (-(((-v + step / 2) / step) * step));
-+}
-+
-+static void snap_subpixel_offset(int32_t *offset, int *pos)
-+{
-+    int32_t snapped = round_to_step(*offset, MOTION_CACHE_SUBPIXEL_STEP);
-+    if (snapped >= (1 << SUBPIXEL_ORDER)) {
-+        snapped -= 1 << SUBPIXEL_ORDER;
-+        (*pos)++;
-+    }
-+    *offset = snapped;
-+}
-+
-+static void snap_motion_cache_key(BitmapHashKey *key, ASS_Vector *pos)
-+{
-+    snap_subpixel_offset(&key->offset.x, &pos->x);
-+    snap_subpixel_offset(&key->offset.y, &pos->y);
-+}
-+
-+static bool motion_cache_enabled(RenderContext *state, GlyphInfo *info)
-+{
-+    return (state->renderer->track->parser_priv->feature_flags &
-+            FEATURE_MASK(ASS_FEATURE_MOTION_CACHE)) &&
-+           (info->blur > 0 || info->be);
-+}
-+
- static void restore_transform(double m[3][3], const BitmapHashKey *key)
- {
-     const ASS_Rect *bbox = &key->outline->cbox;
-@@ -720,12 +1060,12 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
+@@ -720,12 +1000,12 @@ static void blend_vector_clip(RenderContext *state, ASS_Image *head)
  
      ASS_Vector pos;
      BitmapHashKey key;
@@ -2357,7 +2211,7 @@ index b80ed87..4d18271 100644
      if (!clip_bm)
          return;
  
-@@ -1145,7 +1485,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
+@@ -1145,7 +1425,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
  
      ass_apply_transition_effects(state);
      state->explicit = state->evt_type != EVENT_NORMAL ||
@@ -2366,7 +2220,7 @@ index b80ed87..4d18271 100644
  
      ass_reset_render_context(state, NULL);
      state->alignment = state->style->Alignment;
-@@ -1181,7 +1521,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
+@@ -1181,7 +1461,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
      if (info->drawing_text.str) {
          key.type = OUTLINE_DRAWING;
          key.u.drawing.text = info->drawing_text;
@@ -2375,7 +2229,7 @@ index b80ed87..4d18271 100644
          if (!val || !val->valid)
              return;
  
-@@ -1204,7 +1544,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
+@@ -1204,7 +1484,7 @@ get_outline_glyph(RenderContext *state, GlyphInfo *info)
          k->italic = info->italic;
          k->flags = info->flags;
  
@@ -2384,7 +2238,7 @@ index b80ed87..4d18271 100644
          if (!val || !val->valid)
              return;
  
-@@ -1242,16 +1582,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
+@@ -1242,16 +1522,22 @@ size_t ass_outline_construct(void *key, void *value, void *priv)
      case OUTLINE_GLYPH:
          {
              GlyphHashKey *k = &outline_key->u.glyph;
@@ -2409,7 +2263,7 @@ index b80ed87..4d18271 100644
              break;
          }
      case OUTLINE_DRAWING:
-@@ -1332,9 +1678,18 @@ static void calc_transform_matrix(RenderContext *state,
+@@ -1332,9 +1618,18 @@ static void calc_transform_matrix(RenderContext *state,
      double fry = ASS_PI / 180 * info->fry;
      double frz = ASS_PI / 180 * info->frz;
  
@@ -2431,12 +2285,10 @@ index b80ed87..4d18271 100644
  
      double fax = info->fax * info->scale_x / info->scale_y;
      double fay = info->fay * info->scale_y / info->scale_x;
-@@ -1408,8 +1763,12 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+@@ -1408,8 +1703,10 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
      key.outline = info->outline;
      if (!quantize_transform(m, pos, offset, first, &key))
          return;
-+    if (motion_cache_enabled(state, info))
-+        snap_motion_cache_key(&key, pos);
  
 -    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
 +    info->bm = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
@@ -2445,25 +2297,12 @@ index b80ed87..4d18271 100644
      if (!info->bm || !info->bm->buffer)
          info->bm = NULL;
  
-@@ -1510,8 +1869,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
-         w *= STROKER_PRECISION / POSITION_PRECISION;
-         frexp(w * (FFMAX(mxx, myx) + mzx * rz), &k->scale_ord_x);
-         frexp(w * (FFMAX(mxy, myy) + mzy * rz), &k->scale_ord_y);
--        bord_x = ldexp(bord_x, k->scale_ord_x);
--        bord_y = ldexp(bord_y, k->scale_ord_y);
-+        bord_x = scale_by_pow2(bord_x, k->scale_ord_x);
-+        bord_y = scale_by_pow2(bord_y, k->scale_ord_y);
-         if (!(bord_x < OUTLINE_MAX && bord_y < OUTLINE_MAX))
-             return;
-         k->border.x = ass_lrint(bord_x / STROKER_PRECISION);
-@@ -1522,18 +1881,24 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
+@@ -1522,18 +1819,22 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
          }
  
          for (int i = 0; i < 3; i++) {
--            m[i][0] = ldexp(m2[i][0], -k->scale_ord_x);
--            m[i][1] = ldexp(m2[i][1], -k->scale_ord_y);
-+            m[i][0] = scale_by_pow2(m2[i][0], -k->scale_ord_x);
-+            m[i][1] = scale_by_pow2(m2[i][1], -k->scale_ord_y);
+             m[i][0] = ldexp(m2[i][0], -k->scale_ord_x);
+             m[i][1] = ldexp(m2[i][1], -k->scale_ord_y);
              m[i][2] = m2[i][2];
          }
      }
@@ -2475,8 +2314,6 @@ index b80ed87..4d18271 100644
      if (!key.outline || !key.outline->valid ||
              !quantize_transform(m, pos_o, offset, false, &key))
          return;
-+    if (motion_cache_enabled(state, info))
-+        snap_motion_cache_key(&key, pos_o);
  
 -    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
 +    info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
@@ -2485,7 +2322,7 @@ index b80ed87..4d18271 100644
      if (!info->bm_o || !info->bm_o->buffer) {
          info->bm_o = NULL;
          *pos_o = *pos;
-@@ -2451,11 +2816,16 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2451,11 +2752,16 @@ static void render_and_combine_glyphs(RenderContext *state,
      TextInfo *text_info = &state->text_info;
      int left = render_priv->settings.left_margin;
      device_x = (device_x - left) * render_priv->par_scale_x + left;
@@ -2502,7 +2339,7 @@ index b80ed87..4d18271 100644
      for (int i = 0; i < text_info->length; i++) {
          GlyphInfo *info = text_info->glyphs + i;
          if (info->starts_new_run) new_run = true;
-@@ -2491,12 +2861,17 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2491,12 +2797,17 @@ static void render_and_combine_glyphs(RenderContext *state,
  
              if (new_run) {
                  if (nb_bitmaps >= text_info->max_bitmaps) {
@@ -2522,7 +2359,7 @@ index b80ed87..4d18271 100644
                  }
                  current_info = &combined_info[nb_bitmaps];
  
-@@ -2513,9 +2888,6 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2513,9 +2824,6 @@ static void render_and_combine_glyphs(RenderContext *state,
                  filter->be = info->be;
  
                  int32_t shadow_mask_x, shadow_mask_y;
@@ -2532,7 +2369,7 @@ index b80ed87..4d18271 100644
                  filter->blur_x = quantize_blur(info->blur * blur_scale_x, &shadow_mask_x);
                  filter->blur_y = quantize_blur(info->blur * blur_scale_y, &shadow_mask_y);
                  if (flags & FILTER_NONZERO_SHADOW) {
-@@ -2530,12 +2902,16 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2530,12 +2838,16 @@ static void render_and_combine_glyphs(RenderContext *state,
                  current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
                  current_info->image = NULL;
  
@@ -2554,7 +2391,7 @@ index b80ed87..4d18271 100644
  
                  nb_bitmaps++;
                  new_run = false;
-@@ -2553,8 +2929,10 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2553,8 +2865,10 @@ static void render_and_combine_glyphs(RenderContext *state,
  
              if (current_info->bitmap_count >= current_info->max_bitmap_count) {
                  size_t new_size = 2 * current_info->max_bitmap_count;
@@ -2566,7 +2403,7 @@ index b80ed87..4d18271 100644
  
                  current_info->max_bitmap_count = new_size;
              }
-@@ -2571,10 +2949,8 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2571,10 +2885,8 @@ static void render_and_combine_glyphs(RenderContext *state,
  
      for (int i = 0; i < nb_bitmaps; i++) {
          CombinedBitmapInfo *info = &combined_info[i];
@@ -2578,7 +2415,7 @@ index b80ed87..4d18271 100644
  
          if (info->effect_type == EF_KARAOKE_KF)
              info->effect_timing = lround(d6_to_double(info->leftmost_x) +
-@@ -2591,9 +2967,22 @@ static void render_and_combine_glyphs(RenderContext *state,
+@@ -2591,9 +2903,22 @@ static void render_and_combine_glyphs(RenderContext *state,
          key.filter = info->filter;
          key.bitmap_count = info->bitmap_count;
          key.bitmaps = info->bitmaps;
@@ -2603,7 +2440,7 @@ index b80ed87..4d18271 100644
  
          if (val->bm.buffer)
              info->bm = &val->bm;
-@@ -2779,13 +3168,15 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2779,13 +3104,15 @@ static void add_background(RenderContext *state, EventImages *event_images)
      int h = bottom - top;
      if (w < 1 || h < 1)
          return;
@@ -2622,7 +2459,7 @@ index b80ed87..4d18271 100644
                                      clr, NULL);
      if (img) {
          img->next = event_images->imgs;
-@@ -2793,6 +3184,571 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2793,6 +3120,571 @@ static void add_background(RenderContext *state, EventImages *event_images)
      }
  }
  
@@ -2759,9 +2596,9 @@ index b80ed87..4d18271 100644
 +    }
 +}
 +
-+// In the default bounded mode, drop snapshots that were not used in the
-+// immediately preceding frame. Detach the stale entries under the registry
-+// lock, then release their cache references outside it.
++// Drop snapshots that were not used in the immediately preceding frame. Detach
++// the stale entries under the registry lock, then release their cache references
++// outside it.
 +static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame)
 +{
 +    LayoutSnapshot *stale = NULL;
@@ -3194,7 +3031,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Main ass rendering function, glues everything together
   * \param event event to render
-@@ -2800,9 +3756,10 @@ static void add_background(RenderContext *state, EventImages *event_images)
+@@ -2800,9 +3692,10 @@ static void add_background(RenderContext *state, EventImages *event_images)
   * Process event, appending resulting ASS_Image's to images_root.
   */
  static bool
@@ -3207,7 +3044,7 @@ index b80ed87..4d18271 100644
      ASS_Renderer *render_priv = state->renderer;
      if (event->Style >= render_priv->track->n_styles) {
          ass_msg(render_priv->library, MSGL_WARN, "No style found");
-@@ -2813,13 +3770,52 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2813,13 +3706,52 @@ ass_render_event(RenderContext *state, ASS_Event *event,
          return false;
      }
  
@@ -3261,7 +3098,7 @@ index b80ed87..4d18271 100644
      if (text_info->length == 0) {
          // no valid symbols in the event; this can be smth like {comment}
          free_render_context(state);
-@@ -2843,7 +3839,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2843,7 +3775,7 @@ ass_render_event(RenderContext *state, ASS_Event *event,
  
      preliminary_layout(state);
  
@@ -3270,7 +3107,7 @@ index b80ed87..4d18271 100644
  
      int MarginL =
          (event->MarginL) ? event->MarginL : state->style->MarginL;
-@@ -2868,14 +3864,13 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2868,14 +3800,13 @@ ass_render_event(RenderContext *state, ASS_Event *event,
      align_lines(state, max_text_width);
  
      // determine text bounding box
@@ -3287,7 +3124,7 @@ index b80ed87..4d18271 100644
  
      // handle positioned events first: an event can be both positioned and
      // scrolling, and the scrolling effect overrides the position on one axis
-@@ -2992,9 +3987,31 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -2992,9 +3923,31 @@ ass_render_event(RenderContext *state, ASS_Event *event,
  
      calculate_rotation_params(state, &bbox, device_x, device_y);
  
@@ -3320,7 +3157,7 @@ index b80ed87..4d18271 100644
      // VSFilter does *not* shift lines with a border > margin to be within the
      // frame, so negative values for top and left may occur
      event_images->top = device_y - text_info->lines[0].asc - text_info->border_top;
-@@ -3007,11 +4024,36 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -3007,11 +3960,36 @@ ass_render_event(RenderContext *state, ASS_Event *event,
          + 2 * text_info->border_x + 0.5;
      event_images->detect_collisions = state->detect_collisions;
      event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
@@ -3361,7 +3198,7 @@ index b80ed87..4d18271 100644
  
      ass_shaper_cleanup(state->shaper, text_info);
      free_render_context(state);
-@@ -3019,6 +4061,91 @@ ass_render_event(RenderContext *state, ASS_Event *event,
+@@ -3019,6 +3997,91 @@ ass_render_event(RenderContext *state, ASS_Event *event,
      return true;
  }
  
@@ -3453,7 +3290,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Check cache limits and reset cache if they are exceeded
   */
-@@ -3029,21 +4156,6 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
+@@ -3029,21 +4092,6 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
      ass_cache_cut(cache->outline_cache, cache->glyph_max);
  }
  
@@ -3475,7 +3312,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief Start a new frame
   */
-@@ -3075,8 +4187,6 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
+@@ -3075,8 +4123,6 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
              render_priv->fontselect, render_priv->num_emfonts);
      }
  
@@ -3484,7 +3321,7 @@ index b80ed87..4d18271 100644
      // PAR correction
      double par = render_priv->settings.par;
      bool lr_track = track->LayoutResX > 0 && track->LayoutResY > 0;
-@@ -3096,6 +4206,52 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
+@@ -3096,6 +4142,44 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
      render_priv->prev_images_root = render_priv->images_root;
      render_priv->images_root = NULL;
  
@@ -3494,108 +3331,42 @@ index b80ed87..4d18271 100644
 +    // per-track feature toggles. Whenever the gen advances (here or via a
 +    // setter), flush the snapshot registry so stale entries stop pinning cache
 +    // entries.
-+    if (!render_priv->layout_seen.valid ||
-+        render_priv->layout_seen.track != track ||
-+        render_priv->layout_seen.play_res_x != track->PlayResX ||
-+        render_priv->layout_seen.play_res_y != track->PlayResY ||
-+        render_priv->layout_seen.layout_res_x != track->LayoutResX ||
-+        render_priv->layout_seen.layout_res_y != track->LayoutResY ||
-+        render_priv->layout_seen.wrap_style != track->WrapStyle ||
-+        render_priv->layout_seen.kerning != track->Kerning ||
-+        render_priv->layout_seen.scaled_border_and_shadow != track->ScaledBorderAndShadow ||
-+        render_priv->layout_seen.feature_flags != track->parser_priv->feature_flags ||
-+        render_priv->layout_seen.num_emfonts != render_priv->num_emfonts) {
++    LayoutSeen seen;
++    memset(&seen, 0, sizeof(seen));     // define the padding the memcmp sees
++    seen.track = track;
++    seen.play_res_x = track->PlayResX;
++    seen.play_res_y = track->PlayResY;
++    seen.layout_res_x = track->LayoutResX;
++    seen.layout_res_y = track->LayoutResY;
++    seen.wrap_style = track->WrapStyle;
++    seen.kerning = track->Kerning;
++    seen.scaled_border_and_shadow = track->ScaledBorderAndShadow;
++    seen.feature_flags = track->parser_priv->feature_flags;
++    seen.num_emfonts = render_priv->num_emfonts;
++    if (memcmp(&seen, &render_priv->layout_seen, sizeof(seen))) {
 +        render_priv->layout_gen++;
-+        render_priv->layout_seen.valid = true;
-+        render_priv->layout_seen.track = track;
-+        render_priv->layout_seen.play_res_x = track->PlayResX;
-+        render_priv->layout_seen.play_res_y = track->PlayResY;
-+        render_priv->layout_seen.layout_res_x = track->LayoutResX;
-+        render_priv->layout_seen.layout_res_y = track->LayoutResY;
-+        render_priv->layout_seen.wrap_style = track->WrapStyle;
-+        render_priv->layout_seen.kerning = track->Kerning;
-+        render_priv->layout_seen.scaled_border_and_shadow = track->ScaledBorderAndShadow;
-+        render_priv->layout_seen.feature_flags = track->parser_priv->feature_flags;
-+        render_priv->layout_seen.num_emfonts = render_priv->num_emfonts;
++        render_priv->layout_seen = seen;
 +    }
 +    if (render_priv->layout_gen != render_priv->layout_gen_flushed) {
 +        ass_renderer_clear_layout_cache(render_priv);
 +        render_priv->layout_gen_flushed = render_priv->layout_gen;
 +    }
 +
-+    // By default, snapshots cover runs of consecutive active frames only. The
-+    // opt-in feature keeps the old persistent behavior for seek/replay-heavy
-+    // clients. Pruning happens before workers start, after the previous frame is
-+    // complete, so registry entries cannot be in use here.
++    // Snapshots cover runs of consecutive active frames only. Keeping the
++    // laid-out state of every event ever seen would avoid rebuilding it after a
++    // seek or a replay, but it pins that event's glyphs, outlines and fonts for
++    // the renderer's whole lifetime, so the retained set would grow without
++    // bound with the track. Pruning happens before workers start, after the
++    // previous frame is complete, so registry entries cannot be in use here.
 +    render_priv->layout_frame++;
-+    if (!(track->parser_priv->feature_flags &
-+            FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT)) &&
-+            render_priv->layout_frame > 1 && render_priv->layout_cache)
++    if (render_priv->layout_frame > 1 && render_priv->layout_cache)
 +        layout_cache_prune(render_priv, render_priv->layout_frame - 1);
 +
 +    ass_cache_promote(&render_priv->cache.client_set);
      check_cache_limits(render_priv, &render_priv->cache);
  
      return true;
-@@ -3105,6 +4261,12 @@ static int cmp_event_layer(const void *p1, const void *p2)
- {
-     ASS_Event *e1 = ((EventImages *) p1)->event;
-     ASS_Event *e2 = ((EventImages *) p2)->event;
-+    if (!e1 && !e2)
-+        return 0;
-+    if (e1 && !e2)
-+        return -1;
-+    if (!e1 && e2)
-+        return 1;
-     if (e1->Layer < e2->Layer)
-         return -1;
-     if (e1->Layer > e2->Layer)
-@@ -3116,6 +4278,44 @@ static int cmp_event_layer(const void *p1, const void *p2)
-     return 0;
- }
- 
-+static bool stable_sort_events_by_layer(ASS_Renderer *render_priv,
-+                                        EventImages *events, int cnt,
-+                                        int min_layer, int max_layer)
-+{
-+    long long layer_range_ll = (long long) max_layer - min_layer + 1;
-+    if (layer_range_ll <= 0 || layer_range_ll > MAX_LAYER_SORT_RANGE)
-+        return false;
-+
-+    if (cnt > render_priv->eimg_sorted_size) {
-+        EventImages *sorted =
-+            ass_realloc_array(render_priv->eimg_sorted, cnt, sizeof(*sorted));
-+        if (!sorted)
-+            return false;
-+        render_priv->eimg_sorted = sorted;
-+        render_priv->eimg_sorted_size = cnt;
-+    }
-+
-+    int layer_range = (int) layer_range_ll;
-+    int counts[MAX_LAYER_SORT_RANGE] = { 0 };
-+    int offsets[MAX_LAYER_SORT_RANGE];
-+    for (int i = 0; i < cnt; i++)
-+        counts[(int) ((long long) events[i].event->Layer - min_layer)]++;
-+
-+    int pos = 0;
-+    for (int i = 0; i < layer_range; i++) {
-+        offsets[i] = pos;
-+        pos += counts[i];
-+    }
-+
-+    for (int i = 0; i < cnt; i++) {
-+        int layer = (int) ((long long) events[i].event->Layer - min_layer);
-+        render_priv->eimg_sorted[offsets[layer]++] = events[i];
-+    }
-+
-+    memcpy(events, render_priv->eimg_sorted, cnt * sizeof(*events));
-+    return true;
-+}
-+
- static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
-                                        ASS_Event *event)
- {
-@@ -3125,6 +4325,11 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
+@@ -3125,6 +4209,11 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
              return NULL;
      }
      if (render_priv->render_id != event->render_priv->render_id) {
@@ -3607,7 +3378,7 @@ index b80ed87..4d18271 100644
          memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
          event->render_priv->render_id = render_priv->render_id;
      }
-@@ -3132,6 +4337,20 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
+@@ -3132,6 +4221,20 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
      return event->render_priv;
  }
  
@@ -3628,7 +3399,7 @@ index b80ed87..4d18271 100644
  static int overlap(Rect *s1, Rect *s2)
  {
      if (s1->y0 >= s2->y1 || s2->y0 >= s1->y1 ||
-@@ -3343,6 +4562,48 @@ static int ass_detect_change(ASS_Renderer *priv)
+@@ -3343,6 +4446,48 @@ static int ass_detect_change(ASS_Renderer *priv)
      return diff;
  }
  
@@ -3677,7 +3448,7 @@ index b80ed87..4d18271 100644
  /**
   * \brief free a single image.
   * \param img image as returned by ass_render_frame().
-@@ -3356,8 +4617,21 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
+@@ -3356,8 +4501,21 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
  
      ASS_ImagePriv *priv = (ASS_ImagePriv *) img;
      ass_cache_dec_ref(priv->source);
@@ -3701,30 +3472,12 @@ index b80ed87..4d18271 100644
  
      return next;
  }
-@@ -3383,6 +4657,10 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
- 
-     // render events separately
-     int cnt = 0;
-+    bool readorder_sorted = true;
-+    int last_read_order = INT_MIN;
-+    int min_layer = INT_MAX;
-+    int max_layer = INT_MIN;
-     for (int i = 0; i < track->n_events; i++) {
-         ASS_Event *event = track->events + i;
-         if ((event->Start <= now)
-@@ -3393,14 +4671,107 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+@@ -3393,14 +4551,97 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                      realloc(priv->eimg,
                              priv->eimg_size * sizeof(EventImages));
              }
 -            if (ass_render_event(&priv->state, event, priv->eimg + cnt))
 -                cnt++;
-+            if (cnt > 0 && event->ReadOrder <= last_read_order)
-+                readorder_sorted = false;
-+            last_read_order = event->ReadOrder;
-+            if (event->Layer < min_layer)
-+                min_layer = event->Layer;
-+            if (event->Layer > max_layer)
-+                max_layer = event->Layer;
 +            priv->eimg[cnt++] = (EventImages){
 +                .event = event,
 +            };
@@ -3816,10 +3569,7 @@ index b80ed87..4d18271 100644
 +                break;
 +            }
 +        }
-+        if (!sorted &&
-+                (!readorder_sorted ||
-+                 !stable_sort_events_by_layer(priv, priv->eimg, cnt,
-+                                              min_layer, max_layer)))
++        if (!sorted)
 +            qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
 +    }
  
@@ -3918,7 +3668,7 @@ index e1eb7d2..23291b2 100644
  
      ASS_Event *event;
      ASS_Style *style;
-@@ -303,11 +342,92 @@ typedef struct {
+@@ -303,11 +342,106 @@ typedef struct {
      Cache *composite_cache;
      Cache *face_size_metrics_cache;
      Cache *metrics_cache;
@@ -3929,8 +3679,7 @@ index e1eb7d2..23291b2 100644
  } CacheStore;
  
 +// One fully laid-out static event, cached across consecutive active frames.
-+// ASS_FEATURE_CACHE_LAYOUT additionally retains inactive snapshots for seeks and
-+// replays. Built once (on a layout-cache miss for an eligible event) right before
++// Built once (on a layout-cache miss for an eligible event) right before
 +// render_and_combine_glyphs, restored on later frames to skip the whole
 +// parse/shape/layout pipeline. Owns deep copies of the laid-out glyphs (including
 +// cluster next-chains) and holds an inc_ref on each
@@ -4008,17 +3757,32 @@ index e1eb7d2..23291b2 100644
 +    struct render_priv *back;   // event->render_priv, to null ->layout on flush
 +} LayoutSnapshot;
 +
++// Track-side layout inputs that have no setter funnel. ass_start_frame compares
++// them as a whole against the previous frame's values (renderer-config setters
++// bump layout_gen directly), so a new input needs a field here plus one line
++// there, not a third place in a hand-written change detector.
++typedef struct {
++    ASS_Track *track;
++    int play_res_x, play_res_y;
++    int layout_res_x, layout_res_y;
++    int wrap_style;
++    int kerning;
++    int scaled_border_and_shadow;
++    uint32_t feature_flags;
++    size_t num_emfonts;
++} LayoutSeen;
++
  struct ass_renderer {
      ASS_Library *library;
      FT_Library ftlibrary;
-@@ -316,11 +436,40 @@ struct ass_renderer {
+@@ -316,11 +450,28 @@ struct ass_renderer {
      ASS_Settings settings;
      int render_id;
  
 +    // Static-event layout cache. layout_gen is bumped on any layout-affecting
 +    // change; snapshots store the gen they were built under and are invalidated
-+    // on mismatch. layout_frame bounds the default cache to recently active
-+    // events; ASS_FEATURE_CACHE_LAYOUT retains snapshots across inactive gaps.
++    // on mismatch. layout_frame bounds the cache to events that were active on
++    // the immediately preceding frame; older snapshots are pruned every frame.
 +    // layout_cache is the head of an intrusive registry of all live snapshots
 +    // (so they can be freed/dec_ref'd while the caches are alive). layout_seen
 +    // caches the track-side layout inputs that have no setter funnel, so
@@ -4031,29 +3795,17 @@ index e1eb7d2..23291b2 100644
 +    pthread_mutex_t layout_cache_mutex;
 +    int layout_cache_mutex_inited;
 +#endif
-+    struct {
-+        bool valid;
-+        ASS_Track *track;
-+        int play_res_x, play_res_y;
-+        int layout_res_x, layout_res_y;
-+        int wrap_style;
-+        int kerning;
-+        int scaled_border_and_shadow;
-+        uint32_t feature_flags;
-+        size_t num_emfonts;
-+    } layout_seen;
++    LayoutSeen layout_seen;
 +
      ASS_Image *images_root;     // rendering result is stored here
      ASS_Image *prev_images_root;
 -
      EventImages *eimg;          // temporary buffer for sorting rendered events
      int eimg_size;              // allocated buffer size
-+    EventImages *eimg_sorted;   // temporary buffer for stable layer sorting
-+    int eimg_sorted_size;       // allocated buffer size
  
      // frame-global data
      int width, height;          // screen dimensions (the whole frame from ass_set_frame_size)
-@@ -338,11 +487,33 @@ struct ass_renderer {
+@@ -338,11 +489,33 @@ struct ass_renderer {
      BitmapEngine engine;
  
      ASS_Style user_override_style;
@@ -4087,7 +3839,7 @@ index e1eb7d2..23291b2 100644
  } RenderPriv;
  
  typedef struct {
-@@ -360,4 +531,8 @@ ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
+@@ -360,4 +533,8 @@ ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
  // XXX: this is actually in ass.c, includes should be fixed later on
  void ass_lazy_track_init(ASS_Library *lib, ASS_Track *track);
  
@@ -5024,26 +4776,20 @@ diff --git a/libass/ass_utils.h b/libass/ass_utils.h
 index 5b7cc7a..0f6b09c 100644
 --- a/libass/ass_utils.h
 +++ b/libass/ass_utils.h
-@@ -55,6 +55,18 @@
+@@ -55,6 +55,12 @@
  
  #define FEATURE_MASK(feat) (((uint32_t) 1) << (feat))
  
 +#if DEBUG_LEVEL >= 1
-+    #define ass_assert1(x) assert(x)
++    #define ass_assert(x) assert(x)
 +#else
-+    #define ass_assert1(x) (void)0
-+#endif
-+
-+#if DEBUG_LEVEL >= 2
-+    #define ass_assert2(x) assert(x)
-+#else
-+    #define ass_assert2(x) (void)0
++    #define ass_assert(x) (void)0
 +#endif
 +
  #if DEBUG_LEVEL >= 3
      #define ASSUME(x) assert(x)
  #elif __has_builtin(__builtin_assume)
-@@ -257,7 +269,93 @@ static inline int mystrtod(char **p, double *res)
+@@ -257,7 +263,93 @@ static inline int mystrtod(char **p, double *res)
  static inline int mystrtoi32(char **p, int base, int32_t *res)
  {
      char *start = *p;

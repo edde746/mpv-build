@@ -24,13 +24,34 @@ if [[ -z "$source_dir" ]]; then
     (cd "$root" && python3 scripts/patches.py fetch-pinned libass linux "$source_dir")
 fi
 
-# libass declares separate series for linux and windows, both empty: every
-# patch it carries is cross-platform and lives in series.common. Fail loudly if
-# that stops being true rather than silently applying a platform series here.
-if [[ -s "$root/patches/libass/series.linux" ]]; then
-    echo "FAIL: patches/libass/series.linux is no longer empty; this harness applies series.common only" >&2
-    exit 1
-fi
+# This harness builds libass for the HOST, so it applies series.common and
+# nothing else. libass also declares series.linux and series.windows; if either
+# ever gains an entry, the host build here would silently stop matching what the
+# linux or windows driver applies, so refuse rather than diverge.
+#
+# The guard compares the resolved series against series.common, so it can only
+# say anything if the resolution is real. patches.py resolves patches/ against
+# the cwd, so a call from anywhere but the repo root reads no series at all and
+# returns an empty list for every platform -- which compares equal to an empty
+# platform series and passes without checking anything. Resolve from $root, and
+# refuse an empty or truncated resolution instead of comparing empty to empty.
+common="$(grep -v '^#' "$root/patches/libass/series.common" | grep . || true)"
+for platform in linux windows; do
+    (cd "$root" && python3 scripts/patches.py resolve libass "$platform") >"$workdir/series.$platform"
+    resolved="$(cat "$workdir/series.$platform")"
+    if [[ -z "$resolved" ]] \
+        || [[ -n "$(comm -23 <(printf '%s\n' "$common" | sort) <(printf '%s\n' "$resolved" | sort))" ]]; then
+        echo "FAIL: resolving libass/$platform did not return series.common's entries;" >&2
+        echo "      patches.py resolves patches/ against the cwd, so this must run" >&2
+        echo "      from $root, and the resolution is series.common plus series.$platform." >&2
+        exit 1
+    fi
+    if [[ -n "$(comm -13 <(printf '%s\n' "$common" | sort) <(printf '%s\n' "$resolved" | sort))" ]]; then
+        echo "FAIL: patches/libass/series.$platform is no longer empty; this harness applies" >&2
+        echo "      series.common only, so it must learn about that patch first." >&2
+        exit 1
+    fi
+done
 
 build="$workdir/build"
 mkdir -p "$build"
