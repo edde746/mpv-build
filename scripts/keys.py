@@ -89,7 +89,7 @@ artifact (schema 2), one line per field, `\n`-terminated, in this order:
                                       #   component, pool-file sha256
 
 There are no gpl=/debug= lines: every build is GPL (there is no LGPL variant to
-key) and group.json builds have no flag matrix, so --debug does not move these
+key) and group.json builds have no flag matrix, so neither flag moves these
 keys. The asset one artifact publishes per variant is assetPattern with
 {key} and {variant} substituted; the pattern, including its extension, is
 authoritative. record-platform renames the unkeyed `<artifact>-<variant><ext>`

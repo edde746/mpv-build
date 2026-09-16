@@ -16,7 +16,6 @@
 #define AV_INPUT_BUFFER_PADDING_SIZE 64
 #define AVERROR(e) (-(e))
 #define AVERROR_INVALIDDATA (-0x41444E49)
-#define AVERROR_ENOMEM (-(12))
 #define AV_LOG_WARNING 24
 #define FFMAX(a, b) ((a) > (b) ? (a) : (b))
 #define FFMIN(a, b) ((a) > (b) ? (b) : (a))

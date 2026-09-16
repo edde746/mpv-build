@@ -104,15 +104,36 @@ jobs:
               components[component]['version'] = latest
               print(f'{component}: -> {latest}')
 
-          path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-
           # README.md renders the same pins as shields badges, so it is the
           # other half of the bump: without this it silently drifts from
-          # versions.json. Only the components whose pin moved are rewritten.
+          # versions.json. Only the components whose pin moved are rewritten,
+          # and anything but exactly one badge for a component is a failure
+          # rather than a no-op: re.sub() returns its input unchanged when it
+          # matches nothing, so a renamed or reformatted badge would leave the
+          # README stale behind a green step and a `changed=true` PR. Both
+          # files are written only after every badge has been substituted, so a
+          # failure here leaves the tree untouched rather than half-bumped.
           for component, latest in sorted(found.items()):
+              # Count before substituting: `re.sub(..., count=1)` returns at
+              # most one replacement, so testing its return value can only ever
+              # catch a badge that is missing. A README that grew a second
+              # badge would get its first rewritten and the step would pass,
+              # leaving the rest stale.
+              found_badges = len(re.findall(rf'badge/{component}-.*-blue', readme_text))
+              if found_badges != 1:
+                  raise SystemExit(
+                      f'README.md: expected exactly one {component} badge, found {found_badges}'
+                  )
               readme_text = re.sub(
-                  rf'{component}-.*-blue', rf'{component}-{latest}-blue', readme_text, count=1
+                  rf'badge/{component}-.*-blue', rf'badge/{component}-{latest}-blue',
+                  readme_text, count=1,
               )
+
+          # No sort_keys: versions.json's field order is deliberate (kind,
+          # version, url, ref, commit, provenance, platforms, overrides) and a
+          # sorted dump rewrites all 790 lines of the file, burying the one-line
+          # pin change this PR exists to show.
+          path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
           readme.write_text(readme_text, encoding='utf-8')
 
           Path('/tmp/BUMPED.txt').write_text(
@@ -268,8 +289,9 @@ jobs:
           # As with the upstream job, only the version fields move here: the
           # url, ref, commit and provenance fields must be re-derived and
           # audited per versions.json's refreshContract before the pins are
-          # usable.
-          path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          # usable. No sort_keys, for the same reason as the upstream job: a
+          # sorted dump reformats the whole file.
+          path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
           PY
         env:
           LATEST_TAG: ${{ steps.latest.outputs.tag }}

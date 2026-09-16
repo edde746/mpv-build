@@ -49,8 +49,6 @@ jobs:
       - name: Apply every series against its pinned source
         run: |
           python3 - <<'PY'
-          import hashlib
-          import json
           import shutil
           import subprocess
           import sys
@@ -64,7 +62,6 @@ jobs:
           if not GROUPS:
               raise SystemExit('keys.py groups reported no platform groups')
 
-          components = json.loads(Path('versions.json').read_text(encoding='utf-8'))['components']
           # A fresh directory per run, deliberately outside the checkout: the
           # gate below has to acquire and apply every series itself, so nothing
           # may survive from an earlier run into this one. A persisted or

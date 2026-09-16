@@ -9,11 +9,14 @@ name: Publish binaries
 # Binaries are sharded per platform group. Each group builds independently,
 # uploads to its own `binaries-<group>` rolling prerelease and contributes only
 # its own `platforms.<group>` section of artifacts.json; one final job splices
-# the sections together and commits the manifest. The group list comes from
-# `scripts/keys.py groups` (which discovers platforms/*/group.json), the
-# per-group publish recipe is one matrix job, and the android/linux/windows
-# groups need no job of their own: a new group is a group.json plus the build
-# job it needs.
+# the sections together and commits the manifest. The plan job's group list
+# comes from `scripts/keys.py groups` (which discovers platforms/*/group.json),
+# and the recording step is one matrix job shared by every group.json group --
+# only apple, whose build is defined in the Swift driver, has a job of its own.
+# Those two are not derived from the group list: the matrix row names the group
+# and the uploaded-artifact prefix its build job uploads, and the build job
+# itself is per platform, so a new group is a group.json, its build job, and a
+# row in the record matrix below.
 on:
   push:
     branches:
@@ -364,8 +367,10 @@ jobs:
       - name: Build libmpv-android (${{ matrix.abi }})
         run: bash platforms/android/build.sh --arch ${{ matrix.arch }}
 
-      # package.sh names the tarball by content key itself, so the build leg
-      # uploads it as-is; publish records every variant at once.
+      # package.sh emits the unkeyed name (libmpv-android-<abi>.tar.gz): the
+      # content key covers the published driver, which this leg cannot know is
+      # final yet. The build leg uploads it as-is and record-platform renames
+      # it to the group.json assetPattern's content-addressed spelling below.
       - name: Package per-ABI tarball (${{ matrix.abi }})
         run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
 
@@ -592,7 +597,18 @@ jobs:
       - name: Record variants in the manifest
         if: steps.stale.outputs.stale == 'true'
         run: |
-          for variant in $(python3 scripts/keys.py variants --platform-group ${{ matrix.group }}); do
+          # Capture the substitution instead of inlining it: a command
+          # substitution in a `for` word list does not propagate its exit
+          # status, even under `set -eo pipefail` -- the failed substitution
+          # expands to an empty list and the loop body never runs, which
+          # reports success. A keys.py traceback would then record zero
+          # variants and look like a group with nothing to record.
+          variants="$(python3 scripts/keys.py variants --platform-group ${{ matrix.group }})"
+          if [ -z "${variants}" ]; then
+            echo "FAIL: no variants for ${{ matrix.group }}" >&2
+            exit 1
+          fi
+          for variant in ${variants}; do
             python3 scripts/keys.py record-platform \
               --platform-group ${{ matrix.group }} \
               --platform "${variant}" \
