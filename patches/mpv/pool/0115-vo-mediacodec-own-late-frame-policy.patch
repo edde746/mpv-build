@@ -1,0 +1,20 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index e0db578..f82ba38 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -3928,6 +3928,15 @@ static void uninit(struct vo *vo)
+ const struct vo_driver video_out_mediacodec = {
+     .description = "Android (Timed MediaCodec Surface with OSD plane)",
+     .name = "mediacodec",
++    // This VO never drops: a late frame is released untimed and shown at
++    // the next vsync, and present_feedback counts what the viewer lost.
++    // Declaring the cap keeps the core's own late-frame drop (vo.c
++    // render_frame, "degrade to 10 FPS") off this path: the frames it
++    // would discard are already decoded, so on a plane whose flip is one
++    // release call the drop buys no throughput and only empties the
++    // screen. A burst of late frames still collapses at the compositor,
++    // which shows the newest queued buffer per vsync.
++    .caps = VO_CAP_FRAMEDROP,
+     .preinit = preinit,
+     .query_format = query_format,
+     .prepare_frame = prepare_frame,

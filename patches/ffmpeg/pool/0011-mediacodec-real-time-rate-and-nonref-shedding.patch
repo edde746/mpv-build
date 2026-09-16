@@ -1,0 +1,1066 @@
+diff --git a/configure b/configure
+index 539747c..f40b86e 100755
+--- a/configure
++++ b/configure
+@@ -3399,6 +3399,7 @@ av1_amf_encoder_deps="amf"
+ av1_amf_decoder_deps="amf"
+ av1_cuvid_decoder_deps="cuvid CUVIDAV1PICPARAMS"
+ av1_mediacodec_decoder_deps="mediacodec"
++av1_mediacodec_decoder_select="cbs_av1"
+ av1_mediacodec_encoder_deps="mediacodec"
+ av1_mediacodec_encoder_select="extract_extradata_bsf"
+ av1_mf_encoder_deps="mediafoundation"
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index fb22541..9d032e7 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -135,7 +135,7 @@ OBJS-$(CONFIG_LPC)                     += lpc.o
+ OBJS-$(CONFIG_LSP)                     += lsp.o
+ OBJS-$(CONFIG_LZF)                     += lzf.o
+ OBJS-$(CONFIG_ME_CMP)                  += me_cmp.o
+-OBJS-$(CONFIG_MEDIACODEC)              += mediacodecdec_common.o mediacodec_surface.o mediacodec_wrapper.o mediacodec_sw_buffer.o
++OBJS-$(CONFIG_MEDIACODEC)              += mediacodecdec_common.o mediacodec_surface.o mediacodec_wrapper.o mediacodec_sw_buffer.o mediacodec_shed.o
+ OBJS-$(CONFIG_MPEG_ER)                 += mpeg_er.o
+ OBJS-$(CONFIG_MPEGAUDIO)               += mpegaudio.o mpegaudiodec_common.o \
+                                           mpegaudiodata.o
+@@ -1322,7 +1322,7 @@ SKIPHEADERS-$(CONFIG_LIBAOM)           += libaom.h
+ SKIPHEADERS-$(CONFIG_LIBJXL)           += libjxl.h
+ SKIPHEADERS-$(CONFIG_LIBVPX)           += libvpx.h
+ SKIPHEADERS-$(CONFIG_LIBWEBP_ENCODER)  += libwebpenc_common.h
+-SKIPHEADERS-$(CONFIG_MEDIACODEC)       += mediacodecdec_common.h mediacodec_surface.h mediacodec_wrapper.h mediacodec_sw_buffer.h
++SKIPHEADERS-$(CONFIG_MEDIACODEC)       += mediacodecdec_common.h mediacodec_surface.h mediacodec_wrapper.h mediacodec_sw_buffer.h mediacodec_shed.h
+ SKIPHEADERS-$(CONFIG_MEDIAFOUNDATION)  += mf_utils.h
+ SKIPHEADERS-$(CONFIG_NVDEC)            += nvdec.h
+ SKIPHEADERS-$(CONFIG_NVENC)            += nvenc.h
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index 8083d6f..4d42af7 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -203,6 +203,38 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+     return s->async_mode ? 1 : 0;
+ }
+ 
++int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
++{
++    MediaCodecDecContext *s = ff_mediacodec_dec_from_avctx(avctx);
++    FFAMediaFormat *params;
++    int ret;
++
++    if (!s || !s->codec)
++        return AVERROR(ENOSYS);
++    if (rate <= 0)
++        return AVERROR(EINVAL);
++    params = ff_AMediaFormat_new(s->use_ndk_codec);
++    if (!params)
++        return AVERROR(ENOMEM);
++    ff_AMediaFormat_setInt32(params, "operating-rate", rate);
++    ret = ff_AMediaCodec_setParameters(s->codec, params);
++    ff_AMediaFormat_delete(params);
++    if (ret >= 0)
++        av_log(avctx, AV_LOG_VERBOSE, "Operating rate set to %d\n", rate);
++    return ret;
++}
++
++int av_mediacodec_input_drop_stats(AVCodecContext *avctx,
++                                   int64_t *performed, int *pending)
++{
++    MediaCodecDecContext *s = ff_mediacodec_dec_from_avctx(avctx);
++
++    if (!s)
++        return AVERROR(ENOSYS);
++    ff_mediacodec_dec_drop_stats(s, performed, pending);
++    return 0;
++}
++
+ int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
+ {
+     AVHWDeviceContext *device = device_ref ? (AVHWDeviceContext *)device_ref->data : NULL;
+@@ -278,6 +310,17 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+     return AVERROR(ENOSYS);
+ }
+ 
++int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
++{
++    return AVERROR(ENOSYS);
++}
++
++int av_mediacodec_input_drop_stats(AVCodecContext *avctx,
++                                   int64_t *performed, int *pending)
++{
++    return AVERROR(ENOSYS);
++}
++
+ int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
+ {
+     return AVERROR(ENOSYS);
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 8cf6056..326b111 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -153,6 +153,32 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+                                       void (*wakeup)(void *opaque), void *opaque);
+ 
++/**
++ * Re-declare the operating rate (MediaFormat "operating-rate", in frames
++ * per second) of a running MediaCodec decoder without reconfiguring it.
++ * Vendors use the rate to pick the codec's clock; whether a running
++ * component takes a new value is vendor-defined, and a component that
++ * ignores it reports no error, so the effect is only ever confirmed by
++ * measuring decode time.
++ *
++ * @return 0 when the platform accepted the parameter, AVERROR(ENOSYS) when
++ * `avctx` is not an opened MediaCodec decoder or the platform predates
++ * runtime parameters (NDK below API 26), another negative value otherwise.
++ */
++int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate);
++
++/**
++ * Frames a MediaCodec decoder shed before decoding them, on the host's
++ * AVDISCARD_NONREF request (avctx->skip_frame): `performed` is the lifetime
++ * count, `pending` how many of them the codec has not yet shown to be
++ * past — an output at or after a shed frame's time retires it. A host
++ * pacing its requests subtracts `pending` from how far behind it is.
++ *
++ * @return 0, or AVERROR(ENOSYS) when `avctx` is not a MediaCodec decoder.
++ */
++int av_mediacodec_input_drop_stats(AVCodecContext *avctx,
++                                   int64_t *performed, int *pending);
++
+ /**
+  * Repoint every decoder opened from the MediaCodec hardware device `device_ref`
+  * at `surface` (an android.view.Surface jobject) without recreating it, and
+diff --git a/libavcodec/mediacodec_shed.c b/libavcodec/mediacodec_shed.c
+new file mode 100644
+index 0000000..a269df4
+--- /dev/null
++++ b/libavcodec/mediacodec_shed.c
+@@ -0,0 +1,495 @@
++/*
++ * Android MediaCodec pre-decode frame shedding
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config_components.h"
++
++#include <stdint.h>
++#include <string.h>
++
++#include "libavutil/log.h"
++#include "libavutil/mem.h"
++
++#include "avcodec.h"
++#if CONFIG_AV1_MEDIACODEC_DECODER
++#include "av1.h"
++#include "cbs.h"
++#include "cbs_av1.h"
++#endif
++#include "h264.h"
++#include "hevc/hevc.h"
++#include "mediacodec_shed.h"
++#include "packet.h"
++
++// --- H.264 / HEVC ------------------------------------------------------------
++//
++// The packets a MediaCodec decoder is fed are Annex B (the wrapper's bitstream
++// filter converts length-prefixed streams). Only the NAL headers are read, and
++// those bytes can never hold an emulation prevention byte, so no unescaping.
++
++// The offset of the NAL unit that starts at or after *pos, with *pos moved
++// past it; -1 when there is none.
++static int annexb_next_nal(const uint8_t *data, int size, int *pos)
++{
++    int i = *pos;
++    while (i + 3 <= size) {
++        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
++            *pos = i + 3;
++            return i + 3;
++        }
++        i++;
++    }
++    *pos = size;
++    return -1;
++}
++
++int ff_mediacodec_shed_h264_droppable(const uint8_t *data, int size)
++{
++    int pos = 0, nal, slices = 0;
++
++    while ((nal = annexb_next_nal(data, size, &pos)) >= 0) {
++        int ref_idc, type;
++        if (nal >= size)
++            return 0;
++        ref_idc = (data[nal] >> 5) & 3;
++        type    =  data[nal] & 0x1f;
++        switch (type) {
++        case H264_NAL_SLICE:
++        case H264_NAL_DPA:
++        case H264_NAL_DPB:
++        case H264_NAL_DPC:
++        case H264_NAL_IDR_SLICE:
++            if (ref_idc)
++                return 0;
++            slices++;
++            break;
++        // Parameter sets and the SVC/MVC extension carriers ride along
++        // with pictures: never lose them, and never reason about layered
++        // streams from the base layer's ref_idc alone.
++        case H264_NAL_SPS:
++        case H264_NAL_PPS:
++        case H264_NAL_SPS_EXT:
++        case H264_NAL_PREFIX:
++        case H264_NAL_SUB_SPS:
++        case H264_NAL_DPS:
++        case H264_NAL_AUXILIARY_SLICE:
++        case H264_NAL_EXTEN_SLICE:
++        case H264_NAL_DEPTH_EXTEN_SLICE:
++            return 0;
++        default:
++            break;
++        }
++    }
++    return slices > 0;
++}
++
++// Table 7-1's sub-layer non-reference types: samples of these pictures are
++// never used for inter prediction by later pictures of the same sub-layer.
++// (Mirrors ff_hevc_nal_is_nonref; kept local so the classifier stays free
++// of the decoder's headers.)
++static int hevc_nal_is_sub_layer_nonref(int type)
++{
++    switch (type) {
++    case HEVC_NAL_TRAIL_N:
++    case HEVC_NAL_TSA_N:
++    case HEVC_NAL_STSA_N:
++    case HEVC_NAL_RADL_N:
++    case HEVC_NAL_RASL_N:
++    case HEVC_NAL_VCL_N10:
++    case HEVC_NAL_VCL_N12:
++    case HEVC_NAL_VCL_N14:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++// A sub-layer non-reference picture may still be referenced by pictures of
++// a *higher* sub-layer, so only pictures of the highest sub-layer the SPS
++// declares are safe to shed. *max_sub_layers_minus1 follows any SPS in the
++// access unit (and an access unit carrying parameter sets is always kept).
++int ff_mediacodec_shed_hevc_droppable(const uint8_t *data, int size,
++                                      int *max_sub_layers_minus1)
++{
++    int pos = 0, nal, slices = 0;
++
++    while ((nal = annexb_next_nal(data, size, &pos)) >= 0) {
++        int type, layer_id, temporal_id;
++        if (nal + 2 > size)
++            return 0;
++        type        = (data[nal] >> 1) & 0x3f;
++        layer_id    = ((data[nal] & 1) << 5) | (data[nal + 1] >> 3);
++        temporal_id = (data[nal + 1] & 7) - 1;
++        if (temporal_id < 0)
++            return 0;
++        if (type == HEVC_NAL_SPS) {
++            // sps_video_parameter_set_id(4) sps_max_sub_layers_minus1(3) ...
++            if (nal + 3 <= size && layer_id == 0)
++                *max_sub_layers_minus1 = (data[nal + 2] >> 1) & 7;
++            return 0;
++        }
++        if (type == HEVC_NAL_VPS || type == HEVC_NAL_PPS)
++            return 0;
++        if (type <= HEVC_NAL_RSV_VCL31) {
++            if (layer_id != 0)
++                return 0;
++            if (!hevc_nal_is_sub_layer_nonref(type))
++                return 0;
++            if (*max_sub_layers_minus1 < 0 || temporal_id != *max_sub_layers_minus1)
++                return 0;
++            slices++;
++        }
++    }
++    return slices > 0;
++}
++
++// --- VP9 -----------------------------------------------------------------------
++
++typedef struct ShedBits {
++    const uint8_t *data;
++    int size;
++    int pos; // in bits
++} ShedBits;
++
++static unsigned shed_bits_read(ShedBits *b, int n, int *ok)
++{
++    unsigned v = 0;
++    while (n-- > 0) {
++        if (b->pos >= b->size * 8) {
++            *ok = 0;
++            return 0;
++        }
++        v = (v << 1) | ((b->data[b->pos >> 3] >> (7 - (b->pos & 7))) & 1);
++        b->pos++;
++    }
++    return v;
++}
++
++// Whether the frame starting at data is a shown inter frame that refreshes
++// no reference slot: uncompressed_header() up to refresh_frame_flags, which
++// for a shown non-intra frame follows reset_frame_context directly.
++int ff_mediacodec_shed_vp9_frame_droppable(const uint8_t *data, int size)
++{
++    ShedBits b = { data, size, 0 };
++    int ok = 1, profile, frame_type, show_frame, error_resilient;
++    unsigned refresh;
++
++    if (shed_bits_read(&b, 2, &ok) != 2 || !ok)  // frame_marker
++        return 0;
++    profile  = shed_bits_read(&b, 1, &ok);
++    profile |= shed_bits_read(&b, 1, &ok) << 1;
++    if (profile == 3 && shed_bits_read(&b, 1, &ok)) // reserved_zero
++        return 0;
++    if (shed_bits_read(&b, 1, &ok))                 // show_existing_frame
++        return 0;
++    frame_type      = shed_bits_read(&b, 1, &ok);
++    show_frame      = shed_bits_read(&b, 1, &ok);
++    error_resilient = shed_bits_read(&b, 1, &ok);
++    if (!ok || frame_type == 0 || !show_frame)      // key frame; hidden frame
++        return 0;
++    // intra_only is only signalled for hidden frames, so this shown inter
++    // frame reads reset_frame_context (unless error resilient) and then
++    // refresh_frame_flags.
++    if (!error_resilient)
++        shed_bits_read(&b, 2, &ok);
++    refresh = shed_bits_read(&b, 8, &ok);
++    return ok && refresh == 0;
++}
++
++// A superframe index (Annex B of the VP9 spec) trails the frames it lists:
++// marker byte, N sizes of M bytes each (little endian), the same marker.
++static int vp9_superframe_index(const uint8_t *data, int size,
++                                int *frames, int *mag, int *index_size)
++{
++    uint8_t marker;
++    if (size < 1)
++        return 0;
++    marker = data[size - 1];
++    if ((marker & 0xe0) != 0xc0)
++        return 0;
++    *frames = (marker & 7) + 1;
++    *mag = ((marker >> 3) & 3) + 1;
++    *index_size = 2 + *mag * *frames;
++    if (size < *index_size || data[size - *index_size] != marker)
++        return 0;
++    return 1;
++}
++
++// Shed the shown frame of a VP9 packet. A superframe keeps its leading
++// (hidden reference) frames and gets its index rewritten in place for one
++// frame fewer; a plain frame packet is emptied.
++int ff_mediacodec_shed_vp9_packet(AVPacket *pkt)
++{
++    int frames = 1, mag = 0, index_size = 0;
++    int i, kept = 0, last_offset, last_size;
++    uint32_t sizes[8];
++
++    if (pkt->size <= 0)
++        return 0;
++    if (vp9_superframe_index(pkt->data, pkt->size, &frames, &mag, &index_size)) {
++        const uint8_t *idx = pkt->data + pkt->size - index_size + 1;
++        int total = 0;
++        for (i = 0; i < frames; i++) {
++            uint32_t sz = 0;
++            for (int j = 0; j < mag; j++)
++                sz |= (uint32_t)idx[i * mag + j] << (8 * j);
++            sizes[i] = sz;
++            total += sz;
++            if (sz == 0 || total > pkt->size - index_size)
++                return 0;
++        }
++        if (total != pkt->size - index_size)
++            return 0;
++        for (i = 0; i < frames - 1; i++)
++            kept += sizes[i];
++        last_offset = kept;
++        last_size = sizes[frames - 1];
++    } else {
++        last_offset = 0;
++        last_size = pkt->size;
++    }
++
++    if (!ff_mediacodec_shed_vp9_frame_droppable(pkt->data + last_offset, last_size))
++        return 0;
++
++    if (frames == 1) {
++        pkt->size = 0;
++        return 1;
++    }
++    if (frames == 2) {
++        // The packet's buffer may be shared with the demuxer: shorten the
++        // view, never touch the bytes past it.
++        pkt->size = kept;
++        return 1;
++    }
++    // Rebuild the index for frames - 1 entries behind the kept frames. It is
++    // shorter than the old one and the removed frame freed at least a byte,
++    // so it fits in place.
++    if (av_packet_make_writable(pkt) < 0)
++        return AVERROR(ENOMEM);
++    {
++        int n = frames - 1;
++        uint8_t marker = 0xc0 | ((mag - 1) << 3) | (n - 1);
++        uint8_t *w = pkt->data + kept;
++        *w++ = marker;
++        for (i = 0; i < n; i++)
++            for (int j = 0; j < mag; j++)
++                *w++ = (sizes[i] >> (8 * j)) & 0xff;
++        *w++ = marker;
++        pkt->size = (int)(w - pkt->data);
++    }
++    return 1;
++}
++
++#if CONFIG_AV1_MEDIACODEC_DECODER
++// --- AV1 -----------------------------------------------------------------------
++//
++// The coded-bitstream reader decomposes every OBU of a temporal unit and
++// keeps the sequence header and reference state the frame headers of later
++// units need, so it must see every packet, not only the ones being judged.
++
++static const AV1RawFrameHeader *av1_unit_frame_header(const CodedBitstreamUnit *unit)
++{
++    const AV1RawOBU *obu = unit->content;
++    if (!obu)
++        return NULL;
++    if (unit->type == AV1_OBU_FRAME)
++        return &obu->obu.frame.header;
++    if (unit->type == AV1_OBU_FRAME_HEADER)
++        return &obu->obu.frame_header;
++    return NULL;
++}
++
++// A stream the reader keeps failing on is one it will never shed; stop
++// asking after this many consecutive units rather than log every one.
++#define AV1_READ_FAILURES_TO_GIVE_UP 8
++
++// Decompose pkt into sh->frag. 0 on success; the fragment is reset on failure.
++static int av1_read(MediaCodecShedContext *sh, AVCodecContext *avctx,
++                    const AVPacket *pkt)
++{
++    int err;
++    if (!sh->cbs)
++        return AVERROR(ENOSYS);
++    err = ff_cbs_read_packet(sh->cbs, sh->frag, pkt);
++    if (err < 0) {
++        ff_cbs_fragment_reset(sh->frag);
++        if (++sh->cbs_failures >= AV1_READ_FAILURES_TO_GIVE_UP) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "AV1 temporal units not decomposed (%d); frame shedding "
++                   "is off for this stream\n", err);
++            ff_cbs_close(&sh->cbs);
++        }
++        return err;
++    }
++    sh->cbs_failures = 0;
++    return 0;
++}
++
++// Shed the temporal unit's last frame when it is shown and refreshes no
++// reference slot. Earlier OBUs -- the temporal delimiter, hidden reference
++// frames, a sequence header -- are kept, so the decoder still consumes a
++// valid (if now frame-less) temporal unit; a unit that held nothing but the
++// shed frame is emptied instead.
++static int av1_shed(MediaCodecShedContext *sh, AVCodecContext *avctx, AVPacket *pkt)
++{
++    CodedBitstreamFragment *frag = sh->frag;
++    const AV1RawFrameHeader *hdr = NULL;
++    int last = -1, keep_units = 0, offset;
++
++    if (av1_read(sh, avctx, pkt) < 0)
++        return 0;
++
++    for (int i = frag->nb_units - 1; i >= 0; i--) {
++        CodedBitstreamUnitType type = frag->units[i].type;
++        if (type == AV1_OBU_FRAME || type == AV1_OBU_FRAME_HEADER) {
++            last = i;
++            break;
++        }
++        if (type == AV1_OBU_TILE_GROUP || type == AV1_OBU_METADATA ||
++            type == AV1_OBU_PADDING || type == AV1_OBU_REDUNDANT_FRAME_HEADER)
++            continue;
++        break; // a tile list or something newer than this reader: keep
++    }
++    if (last >= 0)
++        hdr = av1_unit_frame_header(&frag->units[last]);
++    if (!hdr || hdr->show_existing_frame || !hdr->show_frame ||
++        hdr->refresh_frame_flags != 0 ||
++        hdr->frame_type == AV1_FRAME_KEY || hdr->frame_type == AV1_FRAME_SWITCH)
++        goto keep;
++
++    offset = (int)(frag->units[last].data - frag->data);
++    if (offset < 0 || offset > pkt->size)
++        goto keep;
++    for (int i = 0; i < last; i++) {
++        CodedBitstreamUnitType type = frag->units[i].type;
++        if (type == AV1_OBU_FRAME || type == AV1_OBU_FRAME_HEADER ||
++            type == AV1_OBU_TILE_GROUP || type == AV1_OBU_TILE_LIST ||
++            type == AV1_OBU_SEQUENCE_HEADER)
++            keep_units = 1;
++    }
++    ff_cbs_fragment_reset(frag);
++    // The buffer may be shared with the demuxer's cache: shorten the view,
++    // never write past it.
++    pkt->size = keep_units ? offset : 0;
++    return 1;
++
++keep:
++    ff_cbs_fragment_reset(frag);
++    return 0;
++}
++
++#endif /* CONFIG_AV1_MEDIACODEC_DECODER */
++
++// --- Entry points --------------------------------------------------------------
++
++int ff_mediacodec_shed_init(MediaCodecShedContext *sh, AVCodecContext *avctx)
++{
++    memset(sh, 0, sizeof(*sh));
++    sh->codec_id = avctx->codec_id;
++    sh->hevc_max_sub_layers_minus1 = -1;
++
++#if CONFIG_AV1_MEDIACODEC_DECODER
++    if (avctx->codec_id == AV_CODEC_ID_AV1) {
++        int err;
++        sh->frag = av_mallocz(sizeof(*sh->frag));
++        if (!sh->frag)
++            return AVERROR(ENOMEM);
++        err = ff_cbs_init(&sh->cbs, AV_CODEC_ID_AV1, avctx);
++        if (err < 0) {
++            av_freep(&sh->frag);
++            return 0;
++        }
++        if (avctx->extradata && avctx->extradata_size > 0) {
++            // The av1C sequence header, when the container carries one; the
++            // first temporal unit repeats it anyway.
++            if (ff_cbs_read_extradata_from_codec(sh->cbs, sh->frag, avctx) < 0)
++                av_log(avctx, AV_LOG_VERBOSE, "AV1 extradata not decomposed\n");
++            ff_cbs_fragment_reset(sh->frag);
++        }
++    }
++#endif
++    return 0;
++}
++
++void ff_mediacodec_shed_flush(MediaCodecShedContext *sh)
++{
++#if CONFIG_AV1_MEDIACODEC_DECODER
++    if (sh->cbs)
++        ff_cbs_flush(sh->cbs);
++#endif
++}
++
++void ff_mediacodec_shed_uninit(MediaCodecShedContext *sh)
++{
++#if CONFIG_AV1_MEDIACODEC_DECODER
++    if (sh->frag) {
++        ff_cbs_fragment_free(sh->frag);
++        av_freep(&sh->frag);
++    }
++    ff_cbs_close(&sh->cbs);
++#endif
++}
++
++void ff_mediacodec_shed_observe(MediaCodecShedContext *sh, AVCodecContext *avctx,
++                                const AVPacket *pkt)
++{
++#if CONFIG_AV1_MEDIACODEC_DECODER
++    if (sh->codec_id == AV_CODEC_ID_AV1 && sh->cbs && pkt->size > 0) {
++        if (av1_read(sh, avctx, pkt) >= 0)
++            ff_cbs_fragment_reset(sh->frag);
++    }
++#endif
++}
++
++int ff_mediacodec_shed_packet(MediaCodecShedContext *sh, AVCodecContext *avctx,
++                              AVPacket *pkt)
++{
++    if (pkt->size <= 0)
++        return 0;
++
++#if CONFIG_AV1_MEDIACODEC_DECODER
++    // The AV1 reader must see every unit, key frames first of all: that is
++    // where the sequence header it needs for everything after arrives.
++    if (sh->codec_id == AV_CODEC_ID_AV1)
++        return av1_shed(sh, avctx, pkt);
++#endif
++
++    // A key frame is a reference by construction, and the cheapest test.
++    if (pkt->flags & AV_PKT_FLAG_KEY)
++        return 0;
++
++    switch (sh->codec_id) {
++    case AV_CODEC_ID_H264:
++        if (!ff_mediacodec_shed_h264_droppable(pkt->data, pkt->size))
++            return 0;
++        pkt->size = 0;
++        return 1;
++    case AV_CODEC_ID_HEVC:
++        if (!ff_mediacodec_shed_hevc_droppable(pkt->data, pkt->size,
++                                               &sh->hevc_max_sub_layers_minus1))
++            return 0;
++        pkt->size = 0;
++        return 1;
++    case AV_CODEC_ID_VP9:
++        return ff_mediacodec_shed_vp9_packet(pkt);
++    default:
++        return 0;
++    }
++}
+diff --git a/libavcodec/mediacodec_shed.h b/libavcodec/mediacodec_shed.h
+new file mode 100644
+index 0000000..41ceb2a
+--- /dev/null
++++ b/libavcodec/mediacodec_shed.h
+@@ -0,0 +1,89 @@
++/*
++ * Android MediaCodec pre-decode frame shedding
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_MEDIACODEC_SHED_H
++#define AVCODEC_MEDIACODEC_SHED_H
++
++#include <stdint.h>
++
++#include "avcodec.h"
++#include "packet.h"
++
++/*
++ * A hardware decoder cannot skip frames the way a software one honours
++ * AVDiscard: MediaCodec decodes everything it is handed. The only way to
++ * spend less decoder time is to hand it less. These helpers remove, from an
++ * access unit about to be queued, the one shown frame that no later frame
++ * can reference -- a frame that refreshes no reference slot (AV1, VP9), a
++ * nal_ref_idc == 0 picture (H.264), or a sub-layer non-reference picture of
++ * the highest temporal sub-layer (HEVC). Not decoding such a frame cannot
++ * corrupt anything that follows; that is the whole safety argument, so
++ * every helper fails open: anything it does not fully understand is kept.
++ *
++ * Reference frames that share an access unit with the shed frame (an AV1
++ * hidden alt-ref, a VP9 superframe's hidden frames) stay in the packet; the
++ * packet is truncated to them, never reordered.
++ */
++
++typedef struct MediaCodecShedContext {
++    enum AVCodecID codec_id;
++
++    // AV1: a coded-bitstream reader that follows the stream (sequence header
++    // and reference state) so every frame header decomposes; NULL when the
++    // parser is unavailable for this stream.
++    struct CodedBitstreamContext *cbs;
++    struct CodedBitstreamFragment *frag;
++    int cbs_failures;   // consecutive units the reader refused
++
++    // HEVC: sps_max_sub_layers_minus1 of the last SPS seen, -1 until one has.
++    int hevc_max_sub_layers_minus1;
++} MediaCodecShedContext;
++
++int ff_mediacodec_shed_init(MediaCodecShedContext *sh, AVCodecContext *avctx);
++void ff_mediacodec_shed_flush(MediaCodecShedContext *sh);
++void ff_mediacodec_shed_uninit(MediaCodecShedContext *sh);
++
++/**
++ * Follow the stream for the parsers that keep state (AV1). Cheap; call for
++ * every packet that will be queued, whether or not shedding is wanted.
++ */
++void ff_mediacodec_shed_observe(MediaCodecShedContext *sh, AVCodecContext *avctx,
++                                const AVPacket *pkt);
++
++/**
++ * Remove the shown non-reference frame from pkt when there is one. On
++ * return pkt->size is 0 when the whole access unit was that frame, smaller
++ * when reference frames sharing it were kept, unchanged when nothing could
++ * be shed.
++ *
++ * @return 1 when a frame was shed, 0 when the packet is untouched, < 0 on an
++ *         allocation failure (pkt untouched).
++ */
++int ff_mediacodec_shed_packet(MediaCodecShedContext *sh, AVCodecContext *avctx,
++                              AVPacket *pkt);
++
++// Bitstream classifiers, exported for the host regression.
++int ff_mediacodec_shed_h264_droppable(const uint8_t *data, int size);
++int ff_mediacodec_shed_hevc_droppable(const uint8_t *data, int size,
++                                      int *max_sub_layers_minus1);
++int ff_mediacodec_shed_vp9_frame_droppable(const uint8_t *data, int size);
++int ff_mediacodec_shed_vp9_packet(AVPacket *pkt);
++
++#endif /* AVCODEC_MEDIACODEC_SHED_H */
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index fa54396..035a8e2 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -1919,6 +1919,7 @@ typedef struct FFAMediaCodecNdk {
+     media_status_t (*signalEndOfInputStream)(AMediaCodec *);
+     media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
+             struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
++    media_status_t (*setParameters)(AMediaCodec *, const AMediaFormat *);
+ 
+     // Available since API level 33. Declared locally: the NDK typedef is
+     // guarded by __ANDROID_API__, and the symbol is resolved at run time.
+@@ -2165,6 +2166,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+     GET_SYMBOL(signalEndOfInputStream)
+     GET_SYMBOL(setAsyncNotifyCallback)
+     GET_SYMBOL(setOnFrameRenderedCallback)
++    GET_SYMBOL(setParameters)
+ 
+ #undef GET_SYMBOL
+ 
+@@ -2612,6 +2614,28 @@ static int mediacodec_ndk_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *
+     return 0;
+ }
+ 
++// A parameter update for a running codec (API 26). The platform answers
++// only for keys it refuses outright; a component that ignores a key
++// answers OK, so a caller that cares has to measure.
++static int mediacodec_ndk_setParameters(FFAMediaCodec *ctx, const FFAMediaFormat *params)
++{
++    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
++    const FFAMediaFormatNdk *format = (const FFAMediaFormatNdk *)params;
++    media_status_t status;
++
++    if (!codec->setParameters)
++        return AVERROR(ENOSYS);
++    if (!format || !format->impl)
++        return AVERROR(EINVAL);
++
++    status = codec->setParameters(codec->impl, format->impl);
++    if (status != AMEDIA_OK) {
++        av_log(codec, AV_LOG_WARNING, "setParameters failed, %d\n", status);
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
+ static const FFAMediaFormat media_format_ndk = {
+     .class = &amediaformat_ndk_class,
+ 
+@@ -2676,6 +2700,7 @@ static const FFAMediaCodec media_codec_ndk = {
+     .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
+     .setOnFrameRenderedCallback = mediacodec_ndk_setOnFrameRenderedCallback,
+     .setOutputSurface = mediacodec_ndk_setOutputSurface,
++    .setParameters = mediacodec_ndk_setParameters,
+ };
+ 
+ FFAMediaFormat *ff_AMediaFormat_new(int ndk)
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+index 911069e..1cdf601 100644
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -255,6 +255,11 @@ struct FFAMediaCodec {
+     // Java API 23 / NDK API 26: repoint a running surface-configured decoder
+     // at another Surface. NULL when the platform lacks the entry point.
+     int (*setOutputSurface)(FFAMediaCodec *codec, FFANativeWindow *window);
++
++    // NDK API 26: hand a running codec a parameter update (an AMediaFormat
++    // of the keys to change). NULL where the platform lacks the entry point
++    // and on the Java wrapper, which carries no Bundle bridge.
++    int (*setParameters)(FFAMediaCodec *codec, const FFAMediaFormat *params);
+ };
+ 
+ static inline char *ff_AMediaCodec_getName(FFAMediaCodec *codec)
+@@ -407,6 +412,15 @@ static inline int ff_AMediaCodec_setOutputSurface(FFAMediaCodec *codec,
+     return codec->setOutputSurface(codec, window);
+ }
+ 
++// ENOSYS on the Java wrapper and on an NDK below API 26.
++static inline int ff_AMediaCodec_setParameters(FFAMediaCodec *codec,
++                                               const FFAMediaFormat *params)
++{
++    if (!codec->setParameters)
++        return AVERROR(ENOSYS);
++    return codec->setParameters(codec, params);
++}
++
+ int ff_Build_SDK_INT(AVCodecContext *avctx);
+ 
+ enum FFAMediaFormatColorRange {
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 83fdf52..c213261 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -47,6 +47,7 @@
+ #include "hwconfig.h"
+ #include "internal.h"
+ #include "jni.h"
++#include "mediacodec_shed.h"
+ #include "mediacodec_wrapper.h"
+ #include "mediacodecdec_common.h"
+ 
+@@ -63,8 +64,10 @@ typedef struct MediaCodecH264DecContext {
+ 
+     int use_ndk_codec;
+     int use_async;
+-    // Ref. MediaFormat KEY_OPERATING_RATE
++    // Ref. MediaFormat KEY_OPERATING_RATE, KEY_FRAME_RATE, KEY_PRIORITY
+     int operating_rate;
++    float frame_rate;
++    int priority;
+     int dolby_vision;
+     int dv_p7_mode;
+     int dv_filter; // DV_FILTER_*
+@@ -77,6 +80,11 @@ typedef struct MediaCodecH264DecContext {
+     AVBufferRef *dv_out;
+     uint8_t *dv_sei_scratch;
+     unsigned dv_sei_scratch_size;
++    // Pre-decode frame shedding for avctx->skip_frame >= AVDISCARD_NONREF,
++    // see mediacodec_shed.h. Hardware decodes everything it is handed, so
++    // the only way to honour a discard request is to hand it less.
++    MediaCodecShedContext shed;
++    int shed_inited;
+ } MediaCodecH264DecContext;
+ 
+ // convert: rewrite UNSPEC62 to profile 8.1 and drop UNSPEC63; strip: drop both
+@@ -99,6 +107,10 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+     av_packet_unref(&s->buffered_pkt);
+     av_buffer_unref(&s->dv_out);
+     av_freep(&s->dv_sei_scratch);
++    if (s->shed_inited) {
++        ff_mediacodec_shed_uninit(&s->shed);
++        s->shed_inited = 0;
++    }
+ 
+     return 0;
+ }
+@@ -275,6 +287,9 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+ 
+         avctx->profile = sps->ptl.general_ptl.profile_idc;
+         avctx->level   = sps->ptl.general_ptl.level_idc;
++        // The highest temporal sub-layer, for the shedding classifier.
++        ((MediaCodecH264DecContext *)avctx->priv_data)->shed.hevc_max_sub_layers_minus1 =
++            sps->max_sub_layers - 1;
+ 
+         if ((ret = h2645_ps_to_nalu(vps->data, vps->data_size, &vps_data, &vps_data_size)) < 0 ||
+             (ret = h2645_ps_to_nalu(sps->data, sps->data_size, &sps_data, &sps_data_size)) < 0 ||
+@@ -821,6 +836,15 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     if (s->use_ndk_codec < 0)
+         s->use_ndk_codec = !av_jni_get_java_vm(avctx);
+ 
++    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
++        // Before the extradata parse below, which records what it learns
++        // (the HEVC sub-layer count) into this context.
++        ret = ff_mediacodec_shed_init(&s->shed, avctx);
++        if (ret < 0)
++            goto done;
++        s->shed_inited = 1;
++    }
++
+     format = ff_AMediaFormat_new(s->use_ndk_codec);
+     if (!format) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
+@@ -954,6 +978,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     }
+     if (s->operating_rate > 0)
+         ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
++    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
++        // The stream's rate is informational; the operating rate is what
++        // sizes the codec's resources, and a realtime priority is what
++        // some vendors require beside it (a decoder on s5e8835/SA8155P
++        // refuses to configure with a rate and no priority).
++        if (s->frame_rate > 0)
++            ff_AMediaFormat_setFloat(format, "frame-rate", s->frame_rate);
++        if (s->priority >= 0)
++            ff_AMediaFormat_setInt32(format, "priority", s->priority);
++    }
+ 
+     s->ctx = av_mallocz(sizeof(*s->ctx));
+     if (!s->ctx) {
+@@ -1096,6 +1130,33 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+             }
+         }
+ #endif
++        if (ret >= 0 && s->shed_inited && !s->ctx->draining) {
++            // Frame dropping the hardware way: the caller asked for
++            // AVDISCARD_NONREF or stricter, so the shown frame no later
++            // frame references is taken out before it costs decode time.
++            // The parser follows every packet regardless so its stream
++            // state is right when a request does arrive.
++            if (avctx->skip_frame >= AVDISCARD_NONREF) {
++                int64_t pts = s->buffered_pkt.pts;
++                ret = ff_mediacodec_shed_packet(&s->shed, avctx, &s->buffered_pkt);
++                if (ret < 0) {
++                    av_packet_unref(&s->buffered_pkt);
++                    return ret;
++                }
++                if (ret > 0) {
++                    ff_mediacodec_dec_input_dropped(avctx, s->ctx, pts);
++                    av_log(avctx, AV_LOG_TRACE, "Shed frame pts=%"PRId64" (%s)\n",
++                           pts, s->buffered_pkt.size ? "references kept" : "whole unit");
++                }
++                if (!s->buffered_pkt.size) {
++                    av_packet_unref(&s->buffered_pkt);
++                    continue;
++                }
++            } else {
++                ff_mediacodec_shed_observe(&s->shed, avctx, &s->buffered_pkt);
++            }
++            ret = 0;
++        }
+         if (ret == AVERROR_EOF) {
+             AVPacket null_pkt = { 0 };
+             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
+@@ -1117,6 +1178,8 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
+     MediaCodecH264DecContext *s = avctx->priv_data;
+ 
+     av_packet_unref(&s->buffered_pkt);
++    if (s->shed_inited)
++        ff_mediacodec_shed_flush(&s->shed);
+ 
+     ff_mediacodec_dec_flush(avctx, s->ctx);
+ }
+@@ -1156,6 +1219,10 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+                    OFFSET(use_async), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
+             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
++    { "frame_rate", "The stream's frame rate, informational to the codec (MediaFormat frame-rate), zero for unspecified",
++            OFFSET(frame_rate), AV_OPT_TYPE_FLOAT, {.dbl = 0}, 0, 1000, VD },
++    { "priority", "Codec priority: 0 realtime, 1 best effort (MediaFormat priority), -1 for the platform default",
++            OFFSET(priority), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 1, VD },
+     { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
+                       OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+     { "dv_p7_mode", "Dolby Vision profile 7 handling",
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 1dce8c7..9fda6ba 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -1057,6 +1057,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+     atomic_fetch_add(&s->serial, 1);
+     atomic_init(&s->hw_buffer_count, 0);
+     s->current_input_buffer = -1;
++    // Every shed frame the codec had yet to pass is moot after a flush.
++    s->pending_drops = 0;
+ 
+     status = ff_AMediaCodec_flush(codec);
+     if (status < 0) {
+@@ -1466,6 +1468,18 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+                 " flags=%" PRIu32 "\n", index, info.offset, info.size,
+                 info.presentationTimeUs, info.flags);
+ 
++        // An output at or past a shed frame's time proves the codec has
++        // moved past it: that drop is no longer in flight.
++        if (s->pending_drops) {
++            int64_t pts = mediacodec_dec_untag_pts(s, info.presentationTimeUs);
++            int kept = 0;
++            for (int i = 0; i < s->pending_drops; i++) {
++                if (s->pending_drop_pts[i] > pts)
++                    s->pending_drop_pts[kept++] = s->pending_drop_pts[i];
++            }
++            s->pending_drops = kept;
++        }
++
+         if (info.flags & ff_AMediaCodec_getBufferFlagEndOfStream(codec)) {
+             s->eos = 1;
+         }
+@@ -1601,3 +1615,30 @@ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx, MediaCodecDecContext *s
+ {
+     return s->flushing;
+ }
++
++// A shown frame was taken out of the input (mediacodec_shed.h). Its time
++// stays on the pending list until an output proves the codec has moved past
++// it; that list is what lets a host tell "behind by N frames" from "behind
++// by N frames, M of which are already being made up".
++void ff_mediacodec_dec_input_dropped(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                     int64_t pkt_pts)
++{
++    int64_t pts = pkt_pts;
++
++    s->input_drops++;
++    if (pts == AV_NOPTS_VALUE) {
++        // Retired by the very next output, whatever its time.
++        pts = INT64_MIN;
++    } else if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
++        pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
++    }
++    if (s->pending_drops < FF_MEDIACODEC_PENDING_DROPS)
++        s->pending_drop_pts[s->pending_drops++] = pts;
++}
++
++void ff_mediacodec_dec_drop_stats(const MediaCodecDecContext *s,
++                                  int64_t *performed, int *pending)
++{
++    *performed = s->input_drops;
++    *pending = s->pending_drops;
++}
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index f150e9f..d932d2c 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -43,6 +43,10 @@
+ // a few seconds of batched delivery at any frame rate a surface shows.
+ #define FF_MEDIACODEC_RENDERED_RING 64
+ 
++// Shed frames whose effect the codec has yet to show; more than this many
++// in flight is not a state a sane shedding policy reaches.
++#define FF_MEDIACODEC_PENDING_DROPS 32
++
+ typedef struct MediaCodecDecContext {
+ 
+     AVCodecContext *avctx;
+@@ -115,6 +119,13 @@ typedef struct MediaCodecDecContext {
+     atomic_uint rendered_head;        // consumer
+     atomic_uint rendered_tail;        // producer
+     atomic_uint rendered_dropped;     // producer: ring full
++
++    // Input frames shed before decode (mediacodec_shed.h): the lifetime
++    // total, and the times of those no output has passed yet. Decoding
++    // thread only.
++    int64_t input_drops;
++    int64_t pending_drop_pts[FF_MEDIACODEC_PENDING_DROPS];
++    int pending_drops;
+ } MediaCodecDecContext;
+ 
+ int ff_mediacodec_dec_init(AVCodecContext *avctx,
+@@ -141,6 +152,12 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
+ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
+                                   MediaCodecDecContext *s);
+ 
++// Record a frame shed before decode, and read the counters back.
++void ff_mediacodec_dec_input_dropped(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                     int64_t pkt_pts);
++void ff_mediacodec_dec_drop_stats(const MediaCodecDecContext *s,
++                                  int64_t *performed, int *pending);
++
+ // A free input slot: the index, AVERROR(EAGAIN) when none is available within
+ // timeout_us, another negative value on a codec error.
+ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout_us);

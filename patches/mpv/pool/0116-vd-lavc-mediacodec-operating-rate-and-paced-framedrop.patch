@@ -1,0 +1,230 @@
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 7c6e365..b6526d1 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -189,6 +189,9 @@ struct priv {
+     int has_broken_decoded_pts;
+ 
+     int packets_without_output; // number packets sent without frame received
++    // Drops a decoder counts itself (VDCTRL_GET_FRAMEDROP_STATS); -1 while
++    // the decoder has not answered, which keeps the packet heuristic.
++    int64_t decoder_drops_seen;
+ 
+     // Final PTS of previously decoded frame
+     double pts;
+@@ -231,7 +234,8 @@ struct priv {
+     bool attached_picture;
+     bool pts_reset;
+     int attempt_framedrops; // try dropping this many frames
+-    int dropped_frames; // total frames _probably_ dropped
++    int dropped_frames; // total frames dropped: exact from a decoder that
++                        // counts its own, else probably
+ };
+ 
+ static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
+@@ -331,6 +335,7 @@ static void decf_reset(struct mp_filter *f)
+     p->pts_reset = false;
+     p->attempt_framedrops = 0;
+     p->dropped_frames = 0;
++    p->decoder_drops_seen = -1;
+     mp_mutex_unlock(&p->cache_lock);
+ 
+     p->coverart_returned = 0;
+@@ -922,10 +927,23 @@ static void feed_packet(struct priv *p)
+         int framedrop_type = 0;
+ 
+         mp_mutex_lock(&p->cache_lock);
+-        if (p->attempt_framedrops)
+-            framedrop_type = 1;
++        int wanted = p->attempt_framedrops;
+         mp_mutex_unlock(&p->cache_lock);
+ 
++        if (wanted) {
++            // A decoder with a deep pipeline (a hardware decoder holding
++            // a dozen frames) shows a drop's effect only that many frames
++            // later; the A/V difference that sized the request does not
++            // move meanwhile. Requesting against the drops it has already
++            // made but not yet shown would drop the same deficit again.
++            struct vd_framedrop_stats stats = {0};
++            if (p->decoder->control(p->decoder->f, VDCTRL_GET_FRAMEDROP_STATS,
++                                    &stats) == CONTROL_TRUE)
++                wanted -= stats.pending;
++            if (wanted > 0)
++                framedrop_type = 1;
++        }
++
+         if (start_pts != MP_NOPTS_VALUE && packet && p->play_dir > 0 &&
+             packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
+             framedrop_type = 2;
+@@ -1026,7 +1044,20 @@ static void read_frame(struct priv *p)
+     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
+         p->decoded_coverart = frame;
+     if (p->attempt_framedrops) {
+-        int dropped = MPMAX(0, p->packets_without_output - 1);
++        int dropped;
++        struct vd_framedrop_stats stats = {0};
++        if (p->decoder->control &&
++            p->decoder->control(p->decoder->f, VDCTRL_GET_FRAMEDROP_STATS,
++                                &stats) == CONTROL_TRUE)
++        {
++            // The decoder knows exactly which packets it dropped.
++            if (p->decoder_drops_seen < 0)
++                p->decoder_drops_seen = stats.performed;
++            dropped = MPMAX(0, (int)(stats.performed - p->decoder_drops_seen));
++            p->decoder_drops_seen = stats.performed;
++        } else {
++            dropped = MPMAX(0, p->packets_without_output - 1);
++        }
+         p->attempt_framedrops = MPMAX(0, p->attempt_framedrops - dropped);
+         p->dropped_frames += dropped;
+     }
+diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
+index 04b40c9..f93993c 100644
+--- a/filters/f_decoder_wrapper.h
++++ b/filters/f_decoder_wrapper.h
+@@ -19,6 +19,7 @@
+ 
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #include "filter.h"
+ 
+@@ -67,6 +68,15 @@ struct mp_decoder_list *audio_decoder_list(void);
+ // This is automatically unset if the target is reached, or on reset.
+ void mp_decoder_wrapper_set_start_pts(struct mp_decoder_wrapper *d, double pts);
+ 
++// What a decoder that drops frames before decoding them (a hardware
++// decoder shedding non-reference input) reports about its own drops.
++struct vd_framedrop_stats {
++    int64_t performed;  // frames dropped so far, lifetime
++    int pending;        // of those, the ones whose effect has not reached
++                        // the output yet: the decoder is still "behind" by
++                        // them, but they are already being made up
++};
++
+ enum dec_ctrl {
+     VDCTRL_FORCE_HWDEC_FALLBACK, // force software decoding fallback
+     VDCTRL_GET_HWDEC,
+@@ -75,6 +85,10 @@ enum dec_ctrl {
+     // framedrop mode: 0=none, 1=standard, 2=hrseek
+     VDCTRL_SET_FRAMEDROP,
+     VDCTRL_CHECK_FORCED_EOF,
++    // arg: struct vd_framedrop_stats*. CONTROL_TRUE only from a decoder that
++    // counts its own drops; everything else keeps the packet-counting
++    // heuristic in the wrapper.
++    VDCTRL_GET_FRAMEDROP_STATS,
+ };
+ 
+ int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 69c9c34..f837a28 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -143,6 +143,7 @@ struct hwdec_opts {
+     int hwdec_image_format;
+     int hwdec_extra_frames;
+     int hwdec_threads;
++    int mediacodec_operating_rate;
+ };
+ 
+ const struct m_sub_options hwdec_conf = {
+@@ -160,6 +161,13 @@ const struct m_sub_options hwdec_conf = {
+             {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX),
+             .flags = UPDATE_HWDEC},
+         {"hwdec-threads", OPT_INT(hwdec_threads), M_RANGE(0, DBL_MAX)},
++        // The frame rate a MediaCodec decoder is told to be ready for
++        // (MediaFormat "operating-rate"), which vendors use to pick the
++        // codec's clock. 0 leaves the platform default. Applied when the
++        // decoder is created and, as a runtime parameter, whenever it
++        // changes on a running decoder; no reinit.
++        {"hwdec-mediacodec-operating-rate", OPT_INT(mediacodec_operating_rate),
++            M_RANGE(0, 65535)},
+         {"vd-lavc-software-fallback", OPT_REPLACED("hwdec-software-fallback")},
+         {0}
+     },
+@@ -219,6 +227,8 @@ typedef struct lavc_ctx {
+ 
+     bool intra_only;
+     int framedrop_flags;
++    // --hwdec-mediacodec-operating-rate as last handed to the decoder.
++    int applied_operating_rate;
+ 
+     bool hw_probing;
+     struct demux_packet **sent_packets;
+@@ -839,6 +849,19 @@ static void init_avctx(struct mp_filter *vd)
+ 
+     mp_set_avopts(vd->log, avctx, lavc_param->avopts);
+ 
++    // The MediaCodec operating rate, on a decoder that has the option; it
++    // wins over a vd-lavc-o entry because it is the value the player keeps
++    // current at runtime (see update_operating_rate).
++    m_config_cache_update(ctx->hwdec_opts_cache);
++    ctx->applied_operating_rate = 0;
++    if (ctx->hwdec_opts->mediacodec_operating_rate > 0 && avctx->priv_data &&
++        av_opt_set_int(avctx->priv_data, "operating_rate",
++                       ctx->hwdec_opts->mediacodec_operating_rate, 0) >= 0)
++    {
++        ctx->applied_operating_rate = ctx->hwdec_opts->mediacodec_operating_rate;
++        MP_VERBOSE(vd, "Decoder operating rate: %d\n", ctx->applied_operating_rate);
++    }
++
+     // Do this after the above avopt handling in case it changes values
+     ctx->skip_frame = avctx->skip_frame;
+ 
+@@ -1155,6 +1178,27 @@ fallback:
+     return avcodec_default_get_buffer2(avctx, pic, flags);
+ }
+ 
++// Hand a changed --hwdec-mediacodec-operating-rate to the running decoder.
++// The platform reports only outright refusal; a component may take the
++// parameter and change nothing, so the caller confirms by measurement.
++static void update_operating_rate(struct mp_filter *vd)
++{
++    vd_ffmpeg_ctx *ctx = vd->priv;
++    int rate = ctx->hwdec_opts->mediacodec_operating_rate;
++
++    if (!ctx->avctx || rate <= 0 || rate == ctx->applied_operating_rate)
++        return;
++    int ret = av_mediacodec_set_operating_rate(ctx->avctx, rate);
++    if (ret == AVERROR(ENOSYS))
++        return; // not a MediaCodec decoder, or a platform without the call
++    ctx->applied_operating_rate = rate;
++    if (ret < 0) {
++        MP_WARN(vd, "Decoder refused operating rate %d.\n", rate);
++    } else {
++        MP_VERBOSE(vd, "Decoder operating rate: %d\n", rate);
++    }
++}
++
+ static void prepare_decoding(struct mp_filter *vd)
+ {
+     vd_ffmpeg_ctx *ctx = vd->priv;
+@@ -1164,6 +1208,9 @@ static void prepare_decoding(struct mp_filter *vd)
+     if (!avctx)
+         return;
+ 
++    if (m_config_cache_update(ctx->hwdec_opts_cache))
++        update_operating_rate(vd);
++
+     int drop = ctx->framedrop_flags;
+     if (drop == 1) {
+         avctx->skip_frame = opts->framedrop;    // normal framedrop
+@@ -1411,6 +1458,17 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+         *(bool *)arg = ctx->force_eof;
+         return CONTROL_TRUE;
+     }
++    case VDCTRL_GET_FRAMEDROP_STATS: {
++        struct vd_framedrop_stats *stats = arg;
++        int64_t performed = 0;
++        int pending = 0;
++        if (!ctx->avctx ||
++            av_mediacodec_input_drop_stats(ctx->avctx, &performed, &pending) < 0)
++            break;
++        stats->performed = performed;
++        stats->pending = pending;
++        return CONTROL_TRUE;
++    }
+     case VDCTRL_GET_BFRAMES: {
+         AVCodecContext *avctx = ctx->avctx;
+         if (!avctx)

@@ -94,6 +94,9 @@ jobs:
       - name: Test MediaCodec rendered-frame feedback ring
         run: bash ./scripts/test_mediacodec_rendered.sh
 
+      - name: Test MediaCodec pre-decode frame shedding
+        run: bash ./scripts/test_mediacodec_shed.sh
+
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 

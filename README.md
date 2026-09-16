@@ -235,6 +235,20 @@ intended vsync matched to the codec's report, the vsync histogram and the
 `video-present` line - is covered by `test_mediacodec_timing.sh`. Pass an
 already-patched source directory as the first argument to run offline.
 
+Run the pre-decode frame shedding regression with
+`bash scripts/test_mediacodec_shed.sh`. It fetches the pinned ffmpeg
+revision, applies the Android series, does a minimal host configure of the
+tree (the AV1 path needs FFmpeg's coded-bitstream reader) and exercises the
+production classifiers a MediaCodec decoder runs when the host asks for
+`AVDISCARD_NONREF`: H.264 by `nal_ref_idc`, HEVC by sub-layer non-reference
+type at the highest temporal sub-layer, VP9 and AV1 by `refresh_frame_flags`,
+with a VP9 superframe's hidden frames and an AV1 temporal unit's hidden
+alt-ref kept and the packet truncated in place. The AV1 corpus is a real
+SVT-AV1 stream (`--regenerate` re-encodes it with a host ffmpeg); the reader
+is the oracle for every unit's last frame, and a stream the reader keeps
+refusing switches shedding off rather than logging per unit. Pass an
+already-patched source directory as the first argument to run offline.
+
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers
 exactly the render's margins in surface pixels, rounds a scaled plane outward,

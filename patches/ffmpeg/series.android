@@ -8,3 +8,4 @@
 0008-mediacodec-frame-rendered-feedback.patch
 0009-mediacodec-async-decode-with-host-wakeup.patch
 0010-mediacodec-live-output-surface.patch
+0011-mediacodec-real-time-rate-and-nonref-shedding.patch
