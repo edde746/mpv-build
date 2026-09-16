@@ -19,7 +19,6 @@ enum Build {
         if !FileManager.default.fileExists(atPath: path.path) {
             try? FileManager.default.createDirectory(at: path, withIntermediateDirectories: false, attributes: nil)
         }
-        try? Utility.removeFiles(extensions: [".swift"], currentDirectoryURL: URL.currentDirectory + ["dist", "release"])
         FileManager.default.changeCurrentDirectoryPath(path.path)
         BaseBuild.options = options
         if !options.platforms.isEmpty {
@@ -30,30 +29,15 @@ enum Build {
 
 
 class ArgumentOptions {
-    private let arguments: [String]
     var enableDebug: Bool = false
-    var enableSplitPlatform: Bool = false
     var platforms : [PlatformType] = []
-    var releaseVersion: String = "0.0.0"
     /// Libraries that must be compiled from source. Empty means "no restriction".
     var libs: [Library] = []
     /// Restore every self-built library that is not in `libs` from its published prebuilt zips.
     var usePrebuilt: Bool = false
 
-    init() {
-        self.arguments = []
-    }
-
-    init(arguments: [String]) {
-        self.arguments = arguments
-    }
-
-    func contains(_ argument: String) -> Bool {  
-        return self.arguments.firstIndex(of: argument) != nil
-    }
-
     static func parse(_ arguments: [String]) throws -> ArgumentOptions {
-        let options = ArgumentOptions(arguments: Array(arguments.dropFirst()))
+        let options = ArgumentOptions()
         func appendPlatform(_ platform: PlatformType) {
             if !options.platforms.contains(platform) {
                 options.platforms += [platform]
@@ -64,15 +48,9 @@ class ArgumentOptions {
             switch argument {
             case "enable-debug":
                 options.enableDebug = true
-            case "enable-split-platform":
-                options.enableSplitPlatform = true
             case "use-prebuilt":
                 options.usePrebuilt = true
             default:
-                if argument.hasPrefix("version=") {
-                    let version = String(argument.suffix(argument.count - "version=".count))
-                    options.releaseVersion = version
-                }
                 if argument.hasPrefix("platform=") {
                     let values = String(argument.suffix(argument.count - "platform=".count))
                     for val in values.split(separator: ",") {
@@ -126,15 +104,14 @@ class ArgumentOptions {
 /// missing library entry is a soft miss so that a fresh checkout can still
 /// build everything from source.
 final class BinaryManifest {
-    struct Framework {
-        let asset: String
-        let checksum: String
-    }
-
     struct Entry {
         let key: String
         let prebuilt: [PlatformType: String]
-        let frameworks: [String: Framework]
+        /// Names of the frameworks this library publishes. The manifest on disk
+        /// nests an `{asset, checksum}` record per framework, but a prebuilt
+        /// restore only needs to know which names the entry carries (the zips
+        /// already contain the binary), so only the names are kept here.
+        let frameworks: Set<String>
     }
 
     let assetBase: String
@@ -174,15 +151,18 @@ final class BinaryManifest {
                 }
                 prebuilt[platform] = asset
             }
-            var frameworks: [String: Framework] = [:]
+            var frameworks: Set<String> = []
             for (frameworkName, value) in library["frameworks"] as? [String: Any] ?? [:] {
+                // The published shape is validated even though only the name is
+                // kept: an incomplete entry must still read as missing so the
+                // library falls back to a source build.
                 guard let framework = value as? [String: Any],
-                      let asset = framework["asset"] as? String,
-                      let checksum = framework["checksum"] as? String
+                      framework["asset"] is String,
+                      framework["checksum"] is String
                 else {
                     continue
                 }
-                frameworks[frameworkName] = Framework(asset: asset, checksum: checksum)
+                frameworks.insert(frameworkName)
             }
             entries[name] = Entry(key: key, prebuilt: prebuilt, frameworks: frameworks)
         }
@@ -202,18 +182,9 @@ class BaseBuild {
     static let defaultPath = "/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     static var platforms = PlatformType.allCases.filter { $0 != .xros && $0 != .xrsimulator }
     static var options = ArgumentOptions()
-    static let splitPlatformGroups = [
-        PlatformType.macos.rawValue: [PlatformType.macos, PlatformType.maccatalyst],
-        PlatformType.ios.rawValue: [PlatformType.ios, PlatformType.isimulator],
-        PlatformType.tvos.rawValue: [PlatformType.tvos, PlatformType.tvsimulator],
-    ]
     let library: Library
     let directoryURL: URL
     let xcframeworkDirectoryURL: URL
-    var pullLatestVersion = false;
-    /// Set when `buildALL()` restored this library from published prebuilt zips
-    /// instead of compiling it, which also means no local xcframework exists.
-    private(set) var restoredFromPrebuilt = false
     init(library: Library) {
         self.library = library
         directoryURL = URL.currentDirectory + "\(library.rawValue)-\(library.version)"
@@ -241,11 +212,7 @@ class BaseBuild {
         }
 
         // pull code from git
-        if pullLatestVersion {
-            try! Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", library.url, directoryURL.path])
-        } else {
-            try! Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
-        }
+        try! Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
 
         for patchFile in patchFiles {
             try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
@@ -294,7 +261,6 @@ class BaseBuild {
         state += "library=\(library.rawValue)\n"
         state += "version=\(library.version)\n"
         state += "url=\(library.url)\n"
-        state += "pullLatestVersion=\(pullLatestVersion)\n"
 
         for patchFile in patchFiles {
             let data = try Data(contentsOf: patchFile)
@@ -323,7 +289,6 @@ class BaseBuild {
         }
         try createXCFramework()
         try packageRelease()
-        try afterBuild()
     }
 
     /// Manifest entry to restore this library from, or nil when it has to be compiled.
@@ -346,7 +311,7 @@ class BaseBuild {
             print("Prebuilt \(library.rawValue) is missing platforms \(missingPlatforms.map(\.rawValue).joined(separator: ",")); building from source")
             return nil
         }
-        let missingFrameworks = library.targets.map(\.name).filter { entry.frameworks[$0] == nil }
+        let missingFrameworks = library.frameworks.filter { !entry.frameworks.contains($0) }
         if !missingFrameworks.isEmpty {
             print("Prebuilt \(library.rawValue) is missing frameworks \(missingFrameworks.joined(separator: ",")); building from source")
             return nil
@@ -356,7 +321,7 @@ class BaseBuild {
 
     /// Unpack the per-platform prebuilt zips of this library and lay them out under
     /// `dist/<library>/` as if they had just been compiled. No xcframework is produced
-    /// locally: `generatePackageManagerFile()` uses the manifest's asset and checksum.
+    /// locally: the published xcframeworks are what `Package.swift` links against.
     private func restoreFromPrebuilt(entry: BinaryManifest.Entry, manifest: BinaryManifest) throws {
         print("Restore \(library.rawValue) from prebuilt binaries (key \(entry.key))")
         let unpackedURL = URL.currentDirectory + "\(library.rawValue)-prebuilt-\(entry.key)"
@@ -386,20 +351,26 @@ class BaseBuild {
             }
         }
 
-        restoredFromPrebuilt = true
         try? FileManager.default.removeItem(at: URL.currentDirectory + library.rawValue)
         try? FileManager.default.createDirectory(atPath: (URL.currentDirectory + library.rawValue).path, withIntermediateDirectories: true, attributes: nil)
         restorePackagedArtifacts(from: unpackedURL)
-        try afterBuild()
+    }
+
+    /// The `lib` directory holding one platform/arch slice inside an unpacked
+    /// `-all.zip` tree. Most prebuilt releases use `ZipBaseBuild`'s
+    /// `<root>/lib/<platform>/thin/<arch>/lib` layout; MoltenVK nests the slices
+    /// inside its xcframework instead.
+    func unpackedThinLib(root: URL, platform: PlatformType, arch: ArchType) -> URL {
+        root + ["lib"] + [platform.rawValue, "thin", arch.rawValue, "lib"]
     }
 
     /// Copy an unpacked `<library>-all*.zip` tree into `dist/<library>/<platform>/thin/<arch>/`.
-    /// Shared by prebuilt restores of self-built libraries and by `ZipBaseBuild`.
+    /// Shared by prebuilt restores of self-built libraries, `ZipBaseBuild` and `BuildVulkan`.
     func restorePackagedArtifacts(from unpackedURL: URL) {
         for platform in BaseBuild.platforms {
             for arch in architectures(platform) {
                 // restore lib
-                let srcThinLibPath = unpackedURL + ["lib"] + [platform.rawValue, "thin", arch.rawValue, "lib"]
+                let srcThinLibPath = unpackedThinLib(root: unpackedURL, platform: platform, arch: arch)
                 // ignore if platform not support
                 if !FileManager.default.fileExists(atPath: srcThinLibPath.path) {
                     continue
@@ -426,10 +397,6 @@ class BaseBuild {
                 }
             }
         }
-    }
-
-    func afterBuild() throws {
-        try generatePackageManagerFile()
     }
 
     func architectures(_ platform: PlatformType) -> [ArchType] {
@@ -459,11 +426,6 @@ class BaseBuild {
             try Utility.launch(path: meson, arguments: ["compile", "--clean"], currentDirectoryURL: buildURL, environment: environ)
             try Utility.launch(path: meson, arguments: ["compile", "--verbose"], currentDirectoryURL: buildURL, environment: environ)
             try Utility.launch(path: meson, arguments: ["install"], currentDirectoryURL: buildURL, environment: environ)
-        } else if FileManager.default.fileExists(atPath: (directoryURL + wafPath()).path) {
-            let waf = (directoryURL + wafPath()).path
-            try Utility.launch(path: waf, arguments: ["configure"] + arguments(platform: platform, arch: arch), currentDirectoryURL: directoryURL, environment: environ)
-            try Utility.launch(path: waf, arguments: wafBuildArg(), currentDirectoryURL: directoryURL, environment: environ)
-            try Utility.launch(path: waf, arguments: ["install"] + wafInstallArg(), currentDirectoryURL: directoryURL, environment: environ)
         } else {
             try configure(buildURL: buildURL, environ: environ, platform: platform, arch: arch)
             try Utility.launch(path: "/usr/bin/make", arguments: ["-j8"], currentDirectoryURL: buildURL, environment: environ)
@@ -471,63 +433,14 @@ class BaseBuild {
         }
     }
 
-    func wafPath() -> String {
-        "./waf"
-    }
-
-    func wafBuildArg() -> [String] {
-        ["build"]
-    }
-
-    func wafInstallArg() -> [String] {
-        []
-    }
-
+    /// FFmpeg is the only source build without a `meson.build`: it ships an
+    /// in-tree `configure` and is installed with make.
     func configure(buildURL: URL, environ: [String: String], platform: PlatformType, arch: ArchType) throws {
-        let autogen = directoryURL + "autogen.sh"
-        if FileManager.default.fileExists(atPath: autogen.path) {
-            var environ = environ
-            environ["NOCONFIGURE"] = "1"
-            try Utility.launch(executableURL: autogen, arguments: [], currentDirectoryURL: directoryURL, environment: environ)
-        }
-        let makeLists = directoryURL + "CMakeLists.txt"
-        if FileManager.default.fileExists(atPath: makeLists.path) {
-            if Utility.shell("which cmake") == nil {
-                Utility.shell("brew install cmake")
-            }
-            let cmake = Utility.shell("which cmake", isOutput: true)!
-            let thinDirPath = thinDir(platform: platform, arch: arch).path
-            var arguments = [
-                makeLists.path,
-                "-DCMAKE_VERBOSE_MAKEFILE=0",
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-DCMAKE_OSX_SYSROOT=\(platform.sdk.lowercased())",
-                "-DCMAKE_OSX_ARCHITECTURES=\(arch.rawValue)",
-                "-DCMAKE_SYSTEM_NAME=\(platform.cmakeSystemName)",
-                "-DCMAKE_SYSTEM_PROCESSOR=\(arch.rawValue)",
-                "-DCMAKE_INSTALL_PREFIX=\(thinDirPath)",
-                "-DBUILD_SHARED_LIBS=0",
-                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-            ]
-            arguments.append(contentsOf: self.arguments(platform: platform, arch: arch))
-            try Utility.launch(path: cmake, arguments: arguments, currentDirectoryURL: buildURL, environment: environ)
-        } else {
-            let configure = directoryURL + "configure"
-            if !FileManager.default.fileExists(atPath: configure.path) {
-                var bootstrap = directoryURL + "bootstrap"
-                if !FileManager.default.fileExists(atPath: bootstrap.path) {
-                    bootstrap = directoryURL + ".bootstrap"
-                }
-                if FileManager.default.fileExists(atPath: bootstrap.path) {
-                    try Utility.launch(executableURL: bootstrap, arguments: [], currentDirectoryURL: directoryURL, environment: environ)
-                }
-            }
-            var arguments = [
-                "--prefix=\(thinDir(platform: platform, arch: arch).path)",
-            ]
-            arguments.append(contentsOf: self.arguments(platform: platform, arch: arch))
-            try Utility.launch(executableURL: configure, arguments: arguments, currentDirectoryURL: buildURL, environment: environ)
-        }
+        var arguments = [
+            "--prefix=\(thinDir(platform: platform, arch: arch).path)",
+        ]
+        arguments.append(contentsOf: self.arguments(platform: platform, arch: arch))
+        try Utility.launch(executableURL: directoryURL + "configure", arguments: arguments, currentDirectoryURL: buildURL, environment: environ)
     }
 
     func environment(platform: PlatformType, arch: ArchType) -> [String: String] {
@@ -595,20 +508,17 @@ class BaseBuild {
         [library.rawValue]
     }
 
+    /// Framework display names (`libfoo` becomes `Libfoo`); the same spelling
+    /// `scripts/keys.py` records in artifacts.json and `Package.swift` links.
+    func frameworkNames() throws -> [String] {
+        try frameworks().map { $0.hasPrefix("lib") ? "Lib" + $0.dropFirst(3) : $0 }
+    }
+
     func createXCFramework() throws {
         // clean all old xcframework
         try? Utility.removeFiles(extensions: [".xcframework"], currentDirectoryURL: self.xcframeworkDirectoryURL)
 
-        var frameworks: [String] = []
-        let libNames = try self.frameworks()
-        for libName in libNames {
-            if libName.hasPrefix("lib") {
-                frameworks.append("Lib" + libName.dropFirst(3))
-            } else {
-                frameworks.append(libName)
-            }
-        }
-        for framework in frameworks {
+        for framework in try frameworkNames() {
             var frameworkGenerated = [PlatformType: String]()
             for platform in BaseBuild.platforms {
                 if let frameworkPath = try createFramework(framework: framework, platform: platform) {
@@ -616,19 +526,6 @@ class BaseBuild {
                 }
             }
             try buildXCFramework(name: framework, paths: Array(frameworkGenerated.values))
-
-            // Generate xcframework for different platforms
-            if BaseBuild.options.enableSplitPlatform {
-                for (group, platforms) in BaseBuild.splitPlatformGroups {
-                    var frameworkPaths: [String] = []
-                    for platform in platforms {
-                        if let frameworkPath = frameworkGenerated[platform] {
-                            frameworkPaths.append(frameworkPath)
-                        }
-                    }
-                    try buildXCFramework(name: "\(framework)-\(group)", paths: frameworkPaths)
-                }
-            }
         }
     }
 
@@ -916,8 +813,10 @@ class BaseBuild {
         // copy pkg-config file example
         try packagePkgConfigRelease()
 
+        let names = try frameworkNames()
+
         // zip build artifacts when there are frameworks to generate
-        if try self.frameworks().count > 0 {
+        if !names.isEmpty {
             let sourceLib = releaseDirPath + [library.rawValue]
             let destZipLibPath = releaseDirPath + [library.rawValue + "-all.zip"]
             try? FileManager.default.removeItem(at: destZipLibPath)
@@ -925,16 +824,7 @@ class BaseBuild {
         }
 
         // zip xcframeworks
-        var frameworks: [String] = []
-        let libNames = try self.frameworks()
-        for libName in libNames {
-            if libName.hasPrefix("lib") {
-                frameworks.append("Lib" + libName.dropFirst(3))
-            } else {
-                frameworks.append(libName)
-            }
-        }
-        for framework in frameworks {
+        for framework in names {
             // clean old zip files
             try? FileManager.default.removeItem(at: releaseDirPath + [framework + ".xcframework.zip"])
             try? FileManager.default.removeItem(at: releaseDirPath + [framework + ".xcframework.checksum.txt"])
@@ -944,25 +834,6 @@ class BaseBuild {
             let checksumFile = releaseDirPath + [framework + ".xcframework.checksum.txt"]
             try Self.deterministicZip(entry: XCFrameworkFile, zipFile: zipFile, currentDirectoryURL: self.xcframeworkDirectoryURL)
             Utility.shell("swift package compute-checksum \(zipFile.path) > \(checksumFile.path)")
-
-            if BaseBuild.options.enableSplitPlatform {
-                for group in BaseBuild.splitPlatformGroups.keys {
-                    let XCFrameworkName =  "\(framework)-\(group)"
-                    
-                    // clean old zip files
-                    try? FileManager.default.removeItem(at: releaseDirPath + [XCFrameworkName + ".xcframework.zip"])
-                    try? FileManager.default.removeItem(at: releaseDirPath + [XCFrameworkName + ".xcframework.checksum.txt"])
-                    
-                    let XCFrameworkFile =  XCFrameworkName + ".xcframework"
-                    let XCFrameworkPath = self.xcframeworkDirectoryURL + ["\(framework)-\(group).xcframework"]
-                    if FileManager.default.fileExists(atPath: XCFrameworkPath.path) {
-                        let zipFile = releaseDirPath + [XCFrameworkName + ".xcframework.zip"]
-                        let checksumFile = releaseDirPath + [XCFrameworkName + ".xcframework.checksum.txt"]
-                        try Self.deterministicZip(entry: XCFrameworkFile, zipFile: zipFile, currentDirectoryURL: self.xcframeworkDirectoryURL)
-                        Utility.shell("swift package compute-checksum \(zipFile.path) > \(checksumFile.path)")
-                    }
-                }
-            }
         }
     }
 
@@ -1008,83 +879,6 @@ class BaseBuild {
         }
     }
 
-    func generatePackageManagerFile() throws {
-        let releaseDirPath = URL.currentDirectory + ["release"]
-        let template = URL.currentDirectory + ["../docs/Package.template.swift"]
-        let packageFile = releaseDirPath + "Package.swift"
-
-        if !FileManager.default.fileExists(atPath: packageFile.path) {
-            try! FileManager.default.createDirectory(at: releaseDirPath, withIntermediateDirectories: true, attributes: nil)
-            try! FileManager.default.copyItem(at: template, to: packageFile)
-        }
-
-        var dependencyTargetContent = ""
-        if self is ZipBaseBuild {
-            for target in library.targets {
-                let tmpChecksum = FileManager.default.temporaryDirectory + "\(library.rawValue)_checksum.txt"
-                if FileManager.default.fileExists(atPath: tmpChecksum.path) {
-                    try? FileManager.default.removeItem(at: tmpChecksum)
-                }
-                try! Utility.launch(path: "wget", arguments: ["-q", "-O", tmpChecksum.path, target.checksum], currentDirectoryURL: FileManager.default.temporaryDirectory)
-                let checksum = try String(contentsOf: tmpChecksum, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-                dependencyTargetContent += """
-                
-                        .binaryTarget(
-                            name: "\(target.name)",
-                            url: "\(target.url)",
-                            checksum: "\(checksum)"
-                        ),
-                """
-                try? FileManager.default.removeItem(at: tmpChecksum)
-            }
-        } else {
-            // Self-built library (libass, FFmpeg, libmpv). The published binary is
-            // content-addressed, so its URL and checksum come from artifacts.json whenever
-            // this run did not compile the library itself. A locally compiled library keeps
-            // the locally computed checksum: the manifest still describes the previous bytes
-            // until `keys.py record-frameworks` refreshes it.
-            let manifest = BinaryManifest.shared
-            let entry = manifest?.entry(for: library)
-            for target in library.targets {
-                let checksumFile = releaseDirPath + [target.name + ".xcframework.checksum.txt"]
-                let hasLocalChecksum = !restoredFromPrebuilt && FileManager.default.fileExists(atPath: checksumFile.path)
-                var url = target.url
-                var checksum: String
-                if let manifest, let framework = entry?.frameworks[target.name], !hasLocalChecksum {
-                    url = manifest.url(ofAsset: framework.asset)
-                    checksum = framework.checksum
-                } else {
-                    checksum = try String(contentsOf: checksumFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                dependencyTargetContent += """
-
-                        .binaryTarget(
-                            name: "\(target.name)",
-                            url: "\(url)",
-                            checksum: "\(checksum)"
-                        ),
-                """
-            }
-        }
-
-        if dependencyTargetContent.isEmpty {
-            return
-        }
-
-        if let data = FileManager.default.contents(atPath: packageFile.path), var str = String(data: data, encoding: .utf8) {
-            let placeholderChars = "//AUTO_GENERATE_TARGETS_END//"
-            str = str.replacingOccurrences(of: 
-            """
-                    \(placeholderChars)
-            """, with: 
-            """
-            \(dependencyTargetContent)
-                    \(placeholderChars)
-            """)
-            try! str.write(toFile: packageFile.path, atomically: true, encoding: .utf8)
-        }
-    }
-
     func getFirstSuccessPlatform() -> PlatformType? {
         for platform in BaseBuild.platforms {
             let firstArch = architectures(platform).first!
@@ -1096,112 +890,6 @@ class BaseBuild {
 
         return nil
     }
-}
-
-class CombineBaseBuild : BaseBuild {
-
-    func combineFrameworkName() -> String {
-        "\(library.rawValue)-combined.a"
-    }
-
-    func combineFrameworks(platform: PlatformType, arch: ArchType) -> [String] {
-        let thinLibPath = thinDir(platform: platform, arch: arch) + ["lib"]
-        let staticLibraries = try? FileManager.default.contentsOfDirectory(atPath: thinLibPath.path).filter { $0.hasSuffix(".a") } 
-        guard let staticLibraries = staticLibraries else {
-            return []
-        }
-        // order by create date descending
-        let sortedFrameworks = staticLibraries.sorted {
-            let file1Path = thinLibPath + [$0]
-            let file2Path = thinLibPath + [$1]
-            let attr1 = try? FileManager.default.attributesOfItem(atPath: file1Path.path)
-            let attr2 = try? FileManager.default.attributesOfItem(atPath: file2Path.path)
-            let date1 = attr1?[FileAttributeKey.creationDate] as? Date ?? Date.distantPast
-            let date2 = attr2?[FileAttributeKey.creationDate] as? Date ?? Date.distantPast
-            return date1 < date2
-        }
-        return sortedFrameworks
-    }
-
-    override func frameworks() throws -> [String] {
-        ["\(library.rawValue)-combined"]
-    }
-
-    override func build(platform: PlatformType, arch: ArchType) throws {
-        try super.build(platform: platform, arch: arch)
-
-        try combineStaticLibraries(platform: platform, arch: arch)
-    }
-
-    func combineStaticLibraries(platform: PlatformType, arch: ArchType) throws {
-        let frameworks = self.combineFrameworks(platform: platform, arch: arch)
-        if frameworks.isEmpty {
-            return
-        }
-
-        print("Create combine static libraries...")
-        let thinLibPath = thinDir(platform: platform, arch: arch) + ["lib"]
-        var combinedLibName = combineFrameworkName()
-        if !combinedLibName.hasSuffix(".a") {
-            combinedLibName += ".a"
-        }
-        var paths: [String] = []
-        let prefix = thinDir(platform: platform, arch: arch)
-        if !FileManager.default.fileExists(atPath: prefix.path) {
-            throw NSError(domain: "no build for \(platform.rawValue) \(arch.rawValue)", code: 1)
-        }
-        for framework in frameworks {
-                let libname = framework.hasPrefix("lib") || framework.hasPrefix("Lib") ? framework : "lib" + framework
-                let libPath = prefix + ["lib", libname]
-                if !FileManager.default.fileExists(atPath: libPath.path) {
-                    throw NSError(domain: "no library \(libPath.path) for \(platform.rawValue) \(arch.rawValue)", code: 1)
-                }
-                paths.append(libPath.path)
-        }
-
-        let outputPath = prefix + ["lib", combinedLibName]
-        var arguments = ["-static"]
-        arguments.append(contentsOf: ["-o", outputPath.path])
-        for frameworkPath in paths {
-            arguments.append(frameworkPath)
-        }
-        if FileManager.default.fileExists(atPath: outputPath.path) {
-            try? FileManager.default.removeItem(at: outputPath)
-        }
-        try Utility.launch(path: "/usr/bin/libtool", arguments: arguments)
-
-        // move old static libraries to origin directory
-        let backupDirectory = thinLibPath + ["bak"]
-        try? FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true, attributes: nil)
-        for framework in frameworks {
-            let libname = framework.hasPrefix("lib") || framework.hasPrefix("Lib") ? framework : "lib" + framework
-            let libPath = prefix + ["lib", libname]
-            let backupLibPath = backupDirectory + [libname]
-            try? FileManager.default.moveItem(at: libPath, to: backupLibPath)
-        }
-
-        // create combine pkgconfig
-        let pkgconfigPath = thinLibPath + ["pkgconfig", "\(library.rawValue).pc"]
-        if !FileManager.default.fileExists(atPath: pkgconfigPath.path) {
-            throw NSError(domain: "no pkgconfig \(pkgconfigPath.path) for \(platform.rawValue) \(arch.rawValue)", code: 1)
-        }
-
-        var content = try String(contentsOf: pkgconfigPath)
-        let combinedLibname = combinedLibName.hasPrefix("lib") ? String(combinedLibName.dropFirst(3).dropLast(2)) : String(combinedLibName.dropLast(2))
-        content = content.replacingOccurrences(
-            of: "-L\\$\\{libdir\\}((\\s+-l\\S+)+)",
-            with: "-L${libdir} -l\(combinedLibname)",
-            options: .regularExpression
-        )
-
-        // move old pkgconfig to origin directory
-        let backupPkgconfigPath = backupDirectory + [pkgconfigPath.lastPathComponent]
-        try? FileManager.default.moveItem(at: pkgconfigPath, to: backupPkgconfigPath)
-
-        // replace with combined pkgconfig
-        FileManager.default.createFile(atPath: pkgconfigPath.path, contents: content.data(using: .utf8), attributes: nil)
-    }
-
 }
 
 class ZipBaseBuild : BaseBuild {
@@ -1229,35 +917,8 @@ class ZipBaseBuild : BaseBuild {
         try? FileManager.default.removeItem(at: directoryURL.appendingPathExtension("log"))
         try? FileManager.default.createDirectory(atPath: (URL.currentDirectory + library.rawValue).path, withIntermediateDirectories: true, attributes: nil)
         restorePackagedArtifacts(from: directoryURL)
-
-        try afterBuild()
-    }
-
-    override func afterBuild() throws {
-        try super.afterBuild()
     }
 }
-
-class PackageTarget {
-    let name: String
-    let url : String
-    let checksum: String
-
-    init(name: String, url : String, checksum: String) {
-        self.name = name
-        self.url = url
-        self.checksum = checksum
-    }
-
-    static func target(
-        name: String,
-        url : String,
-        checksum: String
-    ) -> PackageTarget {
-        return PackageTarget(name: name, url: url, checksum: checksum)
-    }
-}
-
 
 enum PlatformType: String, CaseIterable {
     case xros, xrsimulator, maccatalyst, macos, isimulator, tvsimulator, tvos, ios
@@ -1274,23 +935,6 @@ enum PlatformType: String, CaseIterable {
             return ""
         case .xros, .xrsimulator:
             return "1.0"
-        }
-    }
-
-    var name: String {
-        switch self {
-        case .ios, .tvos, .macos:
-            return rawValue
-        case .tvsimulator:
-            return "tvossim"
-        case .isimulator:
-            return "iossim"
-        case .maccatalyst:
-            return "maccat"
-        case .xros:
-            return "visionos"
-        case .xrsimulator:
-            return "visionossim"
         }
     }
 
@@ -1409,32 +1053,6 @@ enum PlatformType: String, CaseIterable {
         }
     }
 
-    var cmakeSystemName: String {
-        switch self {
-        case .ios, .isimulator:
-            return "iOS"
-        case .tvos, .tvsimulator:
-            return "tvOS"
-        case .macos, .maccatalyst:
-            return "Darwin"
-        case .xros, .xrsimulator:
-            return "visionOS"
-        }
-    }
-
-    func host(arch: ArchType) -> String {
-        switch self {
-        case .ios, .isimulator, .maccatalyst:
-            return "\(arch == .x86_64 ? "x86_64" : "arm64")-ios-darwin"
-        case .tvos, .tvsimulator:
-            return "\(arch == .x86_64 ? "x86_64" : "arm64")-tvos-darwin"
-        case .xros, .xrsimulator:
-            return "\(arch == .x86_64 ? "x86_64" : "arm64")-xros-darwin"
-        case .macos:
-            return "\(arch == .x86_64 ? "x86_64" : "arm64")-apple-darwin"
-        }
-    }
-
     func ldFlags(arch: ArchType) -> [String] {
         // ldFlags的关键参数要跟cFlags保持一致，不然会在ld的时候不通过。
         var flags = ["-lc++", "-arch", arch.rawValue, "-isysroot", isysroot, "-target", deploymentTarget(arch), osVersionMin]
@@ -1511,14 +1129,6 @@ enum ArchType: String, CaseIterable {
         case .x86_64:
             return "x86_64"
         }
-    }
-
-    static var hostArch : ArchType {
-        #if arch(arm64)
-        return .arm64
-        #else
-        return .x86_64
-        #endif
     }
 }
 
@@ -1676,6 +1286,8 @@ enum Utility {
         }
     }
 
+    /// Every regular file in `directory`, recursively. `FileManager`'s enumerator
+    /// already walks subdirectories, so each yielded path is only classified here.
     @discardableResult
     static func listAllFiles(in directory: URL) -> [URL] {
         var allFiles: [URL] = []
@@ -1686,10 +1298,7 @@ enum Utility {
             var isDirectory: ObjCBool = false
 
             if FileManager.default.fileExists(atPath: filePath.path, isDirectory: &isDirectory) {
-                if isDirectory.boolValue {
-                    // 如果是目录，则递归遍历该目录
-                    listAllFiles(in: filePath)
-                } else {
+                if !isDirectory.boolValue {
                     allFiles.append(filePath)
                 }
             }

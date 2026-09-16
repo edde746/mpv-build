@@ -2,20 +2,18 @@
 # Zip the mpv-dev tree a build.sh run assembled under its content-addressed
 # asset name.
 #
-# usage: platforms/windows/package.sh <x86_64|aarch64> [--key <key>] [--out <dir>]
+# usage: platforms/windows/package.sh <x86_64|aarch64>
 #
 # The archive layout matches the sourceforge mpv-dev 7z packages plezy already
 # consumes: libmpv-2.dll, libmpv.dll.a and include/mpv/*.h at the archive ROOT
 # (no wrapping directory), so the plezy windows/CMakeLists.txt swap is a
 # URL + hash change only -- FetchContent and the raw-extraction ARM64 path
-# both keep working unchanged.
-#
-# --key defaults to `scripts/keys.py keys --platform-group windows`; pass it
-# explicitly to package before/without group support in a checkout.
+# both keep working unchanged. The name's content key comes from
+# `scripts/keys.py keys --platform-group windows`.
 set -euo pipefail
 
 usage() {
-  echo "usage: platforms/windows/package.sh <x86_64|aarch64> [--key <key>] [--out <dir>]" >&2
+  echo "usage: platforms/windows/package.sh <x86_64|aarch64>" >&2
   exit 2
 }
 
@@ -24,25 +22,11 @@ case "$ARCH" in
   x86_64 | aarch64) ;;
   *) usage ;;
 esac
-shift
+[[ $# -le 1 ]] || usage
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-KEY=""
 OUT="$ROOT/dist/release"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --key)
-      KEY="${2:?--key needs a value}"
-      shift 2
-      ;;
-    --out)
-      OUT="${2:?--out needs a value}"
-      shift 2
-      ;;
-    *) usage ;;
-  esac
-done
 
 BUILD="$ROOT/build/windows/$ARCH"
 shopt -s nullglob
@@ -54,10 +38,8 @@ if [[ "${#DEV_DIRS[@]}" -ne 1 ]]; then
 fi
 DEV_DIR="${DEV_DIRS[0]%/}"
 
-if [[ -z "$KEY" ]]; then
-  KEY="$(python3 "$ROOT/scripts/keys.py" keys --platform-group windows |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["libmpv-windows"])')"
-fi
+KEY="$(python3 "$ROOT/scripts/keys.py" keys --platform-group windows |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["libmpv-windows"])')"
 
 mkdir -p "$OUT"
 ASSET="$OUT/libmpv-windows-$KEY-$ARCH.zip"

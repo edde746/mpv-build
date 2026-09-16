@@ -46,6 +46,11 @@ and the pinned winbuild commit ships no packages/<c>-*.patch for these
 components (both facts are asserted by test_pin_packages.py against fixture
 copies in testdata/).
 
+This script is also the one place that resolves the windows pin: `--print-pins`
+emits the pinned-source inventory build.sh invalidates against, and
+`--print-winbuild-pin` the meta-build checkout's url and commit, which is the
+build-state cache key.
+
 The script also suppresses the check-git step in cmake/custom_steps.cmake.
 Upstream injects it at configure time whenever a package's source dir already
 exists, to mark an adopted source's download step as done -- but the step is
@@ -86,6 +91,9 @@ EXTRA_COMPONENTS = {
     "nv-codec-headers": "packages/nvcodec-headers.cmake",
 }
 GROUP = "windows"
+# The meta-build checkout build.sh fetches: its commit pins the whole
+# dependency graph, so it is also the build-state cache key.
+WINBUILD_COMPONENT = "mpv-winbuild-cmake"
 
 # Keywords this script owns inside the three package files. Stripped before
 # every injection so re-runs converge.
@@ -100,8 +108,10 @@ def fail(message):
 def resolved_pins(versions, component):
     """The component's git pins with overrides.windows folded in.
 
-    Mirrors scripts/keys.py resolved_pins(); duplicated here (it is four
-    lines of folding) so this helper does not depend on the caller's cwd.
+    The windows-side resolver: build.sh fetches the commit and invalidates the
+    sources this returns, so the fold exists once instead of once per caller.
+    Stricter than scripts/keys.py resolved_pins(), which needs only
+    version/url: GIT_TAG/GIT_RESET pinning needs the whole git pin.
     """
     entry = versions.get("components", {}).get(component)
     if entry is None:
@@ -117,6 +127,30 @@ def resolved_pins(versions, component):
                 "GIT_RESET pinning needs a fully resolved git pin"
             )
     return pins
+
+
+def load_versions(repo):
+    versions_path = repo / "versions.json"
+    if not versions_path.is_file():
+        fail(f"{versions_path}: missing")
+    return json.loads(versions_path.read_text(encoding="utf-8"))
+
+
+def pinned_sources(versions):
+    """(component, source dir, pins) for every source the driver checks out.
+
+    build.sh invalidates stale pins by walking this, so a component added to
+    COMPONENTS/EXTRA_COMPONENTS is pinned and invalidated by the same edit: a
+    missed entry would leave the old source and its stamps in place while the
+    content key moved, and ExternalProject never re-examines a completed
+    download (see build.sh). The source dir is the name winbuild checks the
+    clone out under, which is the package file's own name.
+    """
+    rows = [(component, component, resolved_pins(versions, component))
+            for component in COMPONENTS]
+    rows += [(component, Path(relpath).stem, resolved_pins(versions, component))
+             for component, relpath in EXTRA_COMPONENTS.items()]
+    return rows
 
 
 def read_series(path):
@@ -320,24 +354,45 @@ def gate_ffmpeg_cuda(text):
 
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--winbuild", required=True, help="mpv-winbuild-cmake checkout to rewrite")
+    parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
     parser.add_argument(
         "--repo",
         default=str(Path(__file__).resolve().parent.parent.parent),
         help="unified repo root holding versions.json and patches/ (default: this file's repo)",
     )
+    parser.add_argument(
+        "--print-pins",
+        action="store_true",
+        help="print the pinned-source inventory (component, source dir, commit, url) and exit",
+    )
+    parser.add_argument(
+        "--print-winbuild-pin",
+        action="store_true",
+        help="print the winbuild checkout's url and commit and exit",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo)
+    versions = load_versions(repo)
+
+    # build.sh derives both the checkout it fetches (and, in CI, the cache
+    # key) and the sources it invalidates from these two, so the pin has one
+    # reachable resolver instead of an in-shell copy per consumer.
+    if args.print_pins:
+        for component, source_dir, pins in pinned_sources(versions):
+            print(f"{component}\t{source_dir}\t{pins['commit']}\t{pins['url']}")
+        return 0
+    if args.print_winbuild_pin:
+        pins = resolved_pins(versions, WINBUILD_COMPONENT)
+        print(f"{pins['url']}\t{pins['commit']}")
+        return 0
+    if not args.winbuild:
+        parser.error("--winbuild is required")
+
     winbuild = Path(args.winbuild)
     packages_dir = winbuild / "packages"
     if not packages_dir.is_dir():
         fail(f"{winbuild}: not a mpv-winbuild-cmake checkout (no packages/ directory)")
-
-    versions_path = repo / "versions.json"
-    if not versions_path.is_file():
-        fail(f"{versions_path}: missing")
-    versions = json.loads(versions_path.read_text(encoding="utf-8"))
 
     for component in COMPONENTS:
         pins = resolved_pins(versions, component)

@@ -9,7 +9,7 @@
 /* Begin PBXBuildFile section */
 		F4850CAA2BEE59C900ABB79A /* MPVProperty.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4850CA82BEE59C900ABB79A /* MPVProperty.swift */; };
 		F4850CAB2BEE59C900ABB79A /* MPVPlayerDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4850CA92BEE59C900ABB79A /* MPVPlayerDelegate.swift */; };
-		F4D866A02CBCAFF6009CC9F8 /* MPVKit-GPL in Frameworks */ = {isa = PBXBuildFile; productRef = F4D8669F2CBCAFF6009CC9F8 /* MPVKit-GPL */; };
+		F4D866A02CBCAFF6009CC9F8 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = F4D8669F2CBCAFF6009CC9F8 /* MPVKit */; };
 		F4D8D7962BD7553E00246C75 /* MPVMetalPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4D8D7952BD7553E00246C75 /* MPVMetalPlayerView.swift */; };
 		F4D8D7982BD7559700246C75 /* MetalLayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4D8D7972BD7559700246C75 /* MetalLayer.swift */; };
 		F4EB5D162B61E45000486E3F /* Demo_tvOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4EB5D152B61E45000486E3F /* Demo_tvOSApp.swift */; };
@@ -17,14 +17,11 @@
 		F4EB5D1A2B61E45200486E3F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F4EB5D192B61E45200486E3F /* Assets.xcassets */; };
 		F4EB5D1D2B61E45200486E3F /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F4EB5D1C2B61E45200486E3F /* Preview Assets.xcassets */; };
 		F4EB5D292B61E48A00486E3F /* MPVMetalViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4EB5D242B61E48A00486E3F /* MPVMetalViewController.swift */; };
-		F4EB5D2A2B61E48A00486E3F /* MPVViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4EB5D252B61E48A00486E3F /* MPVViewController.swift */; };
-		F4EB5D2C2B61E48A00486E3F /* MPVPlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4EB5D272B61E48A00486E3F /* MPVPlayerView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		F4850CA82BEE59C900ABB79A /* MPVProperty.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVProperty.swift; sourceTree = "<group>"; };
 		F4850CA92BEE59C900ABB79A /* MPVPlayerDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVPlayerDelegate.swift; sourceTree = "<group>"; };
-		F4D8669E2CBCAFD1009CC9F8 /* MPVKit */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = MPVKit; path = ../..; sourceTree = "<group>"; };
 		F4D8D7952BD7553E00246C75 /* MPVMetalPlayerView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVMetalPlayerView.swift; sourceTree = "<group>"; };
 		F4D8D7972BD7559700246C75 /* MetalLayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalLayer.swift; sourceTree = "<group>"; };
 		F4EB5D122B61E45000486E3F /* Demo-tvOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Demo-tvOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -33,8 +30,6 @@
 		F4EB5D192B61E45200486E3F /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F4EB5D1C2B61E45200486E3F /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		F4EB5D242B61E48A00486E3F /* MPVMetalViewController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVMetalViewController.swift; sourceTree = "<group>"; };
-		F4EB5D252B61E48A00486E3F /* MPVViewController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVViewController.swift; sourceTree = "<group>"; };
-		F4EB5D272B61E48A00486E3F /* MPVPlayerView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = MPVPlayerView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -42,22 +37,13 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F4D866A02CBCAFF6009CC9F8 /* MPVKit-GPL in Frameworks */,
+				F4D866A02CBCAFF6009CC9F8 /* MPVKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		F4BA11AB2BCCFD9C00B472DE /* OpenGL */ = {
-			isa = PBXGroup;
-			children = (
-				F4EB5D272B61E48A00486E3F /* MPVPlayerView.swift */,
-				F4EB5D252B61E48A00486E3F /* MPVViewController.swift */,
-			);
-			path = OpenGL;
-			sourceTree = "<group>";
-		};
 		F4BA11AC2BCCFE3A00B472DE /* Metal */ = {
 			isa = PBXGroup;
 			children = (
@@ -68,19 +54,10 @@
 			path = Metal;
 			sourceTree = "<group>";
 		};
-		F4D8669D2CBCAFD1009CC9F8 /* Frameworks */ = {
-			isa = PBXGroup;
-			children = (
-				F4D8669E2CBCAFD1009CC9F8 /* MPVKit */,
-			);
-			name = Frameworks;
-			sourceTree = "<group>";
-		};
 		F4EB5D092B61E45000486E3F = {
 			isa = PBXGroup;
 			children = (
 				F4EB5D142B61E45000486E3F /* Demo-tvOS */,
-				F4D8669D2CBCAFD1009CC9F8 /* Frameworks */,
 				F4EB5D132B61E45000486E3F /* Products */,
 			);
 			sourceTree = "<group>";
@@ -118,7 +95,6 @@
 			children = (
 				F4850CA92BEE59C900ABB79A /* MPVPlayerDelegate.swift */,
 				F4850CA82BEE59C900ABB79A /* MPVProperty.swift */,
-				F4BA11AB2BCCFD9C00B472DE /* OpenGL */,
 				F4BA11AC2BCCFE3A00B472DE /* Metal */,
 			);
 			path = Player;
@@ -141,7 +117,7 @@
 			);
 			name = "Demo-tvOS";
 			packageProductDependencies = (
-				F4D8669F2CBCAFF6009CC9F8 /* MPVKit-GPL */,
+				F4D8669F2CBCAFF6009CC9F8 /* MPVKit */,
 			);
 			productName = "Demo-tvOS";
 			productReference = F4EB5D122B61E45000486E3F /* Demo-tvOS.app */;
@@ -172,6 +148,7 @@
 			);
 			mainGroup = F4EB5D092B61E45000486E3F;
 			packageReferences = (
+				F4D866B12CBCAFF6009CC9F8 /* XCLocalSwiftPackageReference "../.." */,
 			);
 			productRefGroup = F4EB5D132B61E45000486E3F /* Products */;
 			projectDirPath = "";
@@ -199,14 +176,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				F4EB5D2A2B61E48A00486E3F /* MPVViewController.swift in Sources */,
 				F4D8D7962BD7553E00246C75 /* MPVMetalPlayerView.swift in Sources */,
 				F4EB5D292B61E48A00486E3F /* MPVMetalViewController.swift in Sources */,
 				F4D8D7982BD7559700246C75 /* MetalLayer.swift in Sources */,
 				F4EB5D182B61E45000486E3F /* ContentView.swift in Sources */,
 				F4850CAA2BEE59C900ABB79A /* MPVProperty.swift in Sources */,
 				F4EB5D162B61E45000486E3F /* Demo_tvOSApp.swift in Sources */,
-				F4EB5D2C2B61E48A00486E3F /* MPVPlayerView.swift in Sources */,
 				F4850CAB2BEE59C900ABB79A /* MPVPlayerDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -405,10 +380,18 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		F4D866B12CBCAFF6009CC9F8 /* XCLocalSwiftPackageReference "../.." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
-		F4D8669F2CBCAFF6009CC9F8 /* MPVKit-GPL */ = {
+		F4D8669F2CBCAFF6009CC9F8 /* MPVKit */ = {
 			isa = XCSwiftPackageProductDependency;
-			productName = "MPVKit-GPL";
+			package = F4D866B12CBCAFF6009CC9F8 /* XCLocalSwiftPackageReference "../.." */;
+			productName = MPVKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

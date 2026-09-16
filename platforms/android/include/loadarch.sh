@@ -1,6 +1,12 @@
 # ABI selection and per-ABI prefix setup, sourced by build.sh and package.sh
 # (both run with platforms/android as the working directory).
 
+# The ABIs one publish covers, in the order build.sh and package.sh walk them;
+# android_arch_list spells the same set for the usage messages.
+android_arches=(armv7l arm64 x86 x86_64)
+android_arch_list="${android_arches[*]}"
+android_arch_list="${android_arch_list// /, }"
+
 loadarch () {
 	unset CC CXX CPATH LIBRARY_PATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
 	unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
@@ -35,7 +41,7 @@ loadarch () {
 		cc_triple=$ndk_triple$apilvl
 		prefix_name=x86_64
 	else
-		echo >&2 "Invalid architecture: $1 (supported: armv7l, arm64, x86, x86_64)"
+		echo >&2 "Invalid architecture: $1 (supported: $android_arch_list)"
 		exit 1
 	fi
 	export prefix_name

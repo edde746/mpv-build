@@ -10,18 +10,12 @@
     "platforms/android/include/libdovi/rpu_parser.h",
     "platforms/android/include/loadarch.sh",
     "platforms/android/include/path.sh",
-    "platforms/android/scripts/dav1d.sh",
+    "platforms/android/scripts/configure.sh",
     "platforms/android/scripts/ffmpeg.sh",
-    "platforms/android/scripts/freetype.sh",
-    "platforms/android/scripts/fribidi.sh",
-    "platforms/android/scripts/harfbuzz.sh",
-    "platforms/android/scripts/libass.sh",
     "platforms/android/scripts/libdovi.sh",
-    "platforms/android/scripts/libplacebo.sh",
-    "platforms/android/scripts/libunibreak.sh",
     "platforms/android/scripts/lua.sh",
     "platforms/android/scripts/mbedtls.sh",
-    "platforms/android/scripts/mpv.sh"
+    "platforms/android/scripts/meson.sh"
   ],
   "artifacts": {
     "libmpv-android": {

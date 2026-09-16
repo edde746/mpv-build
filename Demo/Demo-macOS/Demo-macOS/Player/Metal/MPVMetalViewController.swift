@@ -10,7 +10,6 @@ final class MPVMetalViewController: NSViewController {
     var metalLayer = MetalLayer()
     var mpv: OpaquePointer!
     var playDelegate: MPVPlayerDelegate?
-    var edrRange: CGFloat?
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     
     var playUrl: URL?
@@ -79,7 +78,7 @@ final class MPVMetalViewController: NSViewController {
         }
     }
     
-    func setupMpv(hdrPass : Bool = false) {
+    func setupMpv() {
         mpv = mpv_create()
         if mpv == nil {
             print("failed creating context\n")
@@ -150,21 +149,6 @@ final class MPVMetalViewController: NSViewController {
     
     func seek(relative time: TimeInterval) {
         command("seek", args: [String(time), "relative"])
-    }
-    
-    private func getDouble(_ name: String) -> Double {
-        guard mpv != nil else { return 0.0 }
-        var data = Double()
-        mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
-        return data
-    }
-    
-    private func getString(_ name: String) -> String? {
-        guard mpv != nil else { return nil }
-        let cstr = mpv_get_property_string(mpv, name)
-        let str: String? = cstr == nil ? nil : String(cString: cstr!)
-        mpv_free(cstr)
-        return str
     }
     
     func setFlag(_ name: String, _ flag: Bool) {

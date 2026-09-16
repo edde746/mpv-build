@@ -8,14 +8,15 @@ struct MPVMetalPlayerView: NSViewControllerRepresentable {
         let mpv =  MPVMetalViewController()
         mpv.playDelegate = coordinator
         mpv.playUrl = coordinator.playUrl
-        
-        context.coordinator.player = mpv
+        coordinator.player = mpv
         return mpv
     }
     
     func updateNSViewController(_ nsViewController: NSViewControllerType, context: Context) {
     }
     
+    // Protocol requirement: the view already owns the coordinator, so return that
+    // instance and context.coordinator stays identical to it.
     public func makeCoordinator() -> Coordinator {
         coordinator
     }

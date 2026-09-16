@@ -11,14 +11,35 @@ set -euo pipefail
 
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 root="$( cd ../.. && pwd )"
+. ./include/depinfo.sh
+
+# Every pin the run needs, from the resolver the android content key uses
+# (keys.py, override-aware). One interpreter for the lot, not one startup per
+# field; the function prints shell assignments that pin() reads back, with the
+# optional fields versions.json may not carry (ref and commit on archives,
+# sha256 on git pins) coming back empty.
+pin_block () {
+	python3 - "$root" "$components" <<'PY'
+import shlex, sys
+
+sys.path.insert(0, sys.argv[1] + "/scripts")
+import keys
+
+versions = keys.load_versions(keys.repo_root())
+for component in sys.argv[2].split():
+    pins = keys.resolved_pins(versions, component, "android")
+    kind = keys.resolved_kind(versions, component, "android")
+    print(f"pin_{component}_kind={shlex.quote(kind)}")
+    print(f"pin_{component}_url={shlex.quote(pins['url'])}")
+    for field in ("ref", "sha256", "commit"):
+        print(f"pin_{component}_{field}={shlex.quote(pins.get(field, ''))}")
+PY
+}
+
+eval "$( pin_block )"
 
 pin () {
-	python3 - "$root/versions.json" "$1" "$2" <<'PY'
-import json, sys
-entry = json.load(open(sys.argv[1]))["components"][sys.argv[2]]
-override = (entry.get("overrides") or {}).get("android") or {}
-print(override.get(sys.argv[3], entry.get(sys.argv[3], "")))
-PY
+	table "pin_${1}_$2"
 }
 
 apply_patches () {
@@ -78,15 +99,23 @@ fi
 
 mkdir -p deps
 
-fetch_git mbedtls --recurse-submodules
-fetch_git dav1d
-fetch_git libdovi
-fetch_git ffmpeg
-fetch_git freetype
-fetch_git fribidi
-fetch_git harfbuzz
-fetch_archive libunibreak
-fetch_git libass
-fetch_archive lua
-fetch_git libplacebo --recurse-submodules
-fetch_git mpv
+# How a component is acquired is a pin (versions.json kind, override-aware), so
+# a kind change cannot leave a stale copy of this dispatch behind. Only two
+# git pins vendor code in submodules.
+for component in $components; do
+	case "$(pin "$component" kind)" in
+		git)
+			case "$component" in
+				mbedtls|libplacebo) fetch_git "$component" --recurse-submodules ;;
+				*) fetch_git "$component" ;;
+			esac
+			;;
+		archive)
+			fetch_archive "$component"
+			;;
+		*)
+			echo >&2 "$component: versions.json pins kind '$(pin "$component" kind)', no fetcher for it"
+			exit 1
+			;;
+	esac
+done

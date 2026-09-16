@@ -12,19 +12,6 @@ final class MPVMetalViewController: UIViewController {
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     
     var playUrl: URL?
-    var hdrAvailable : Bool = false
-    var hdrEnabled = false {
-        didSet {
-            // FIXME: target-colorspace-hint does not support being changed at runtime.
-            // this option should be set as early as possible otherwise can cause issues
-            // not recommended to use this way.
-            if hdrEnabled {
-                checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
-            } else {
-                checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "no"))
-            }
-        }
-    }
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -81,7 +68,6 @@ final class MPVMetalViewController: UIViewController {
         
         checkError(mpv_initialize(mpv))
         
-        mpv_observe_property(mpv, 0, MPVProperty.videoParamsSigPeak, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.pausedForCache, MPV_FORMAT_FLAG)
         mpv_set_wakeup_callback(self.mpv, { (ctx) in
             let client = unsafeBitCast(ctx, to: MPVMetalViewController.self)
@@ -110,16 +96,7 @@ final class MPVMetalViewController: UIViewController {
     func loadFile(
         _ url: URL
     ) {
-        var args = [url.absoluteString]
-        var options = [String]()
-        
-        args.append("replace")
-        
-        if !options.isEmpty {
-            args.append(options.joined(separator: ","))
-        }
-        
-        command("loadfile", args: args)
+        command("loadfile", args: [url.absoluteString, "replace"])
     }
     
     func togglePause() {
@@ -132,21 +109,6 @@ final class MPVMetalViewController: UIViewController {
     
     func pause() {
         setFlag(MPVProperty.pause, true)
-    }
-    
-    private func getDouble(_ name: String) -> Double {
-        guard mpv != nil else { return 0.0 }
-        var data = Double()
-        mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
-        return data
-    }
-    
-    private func getString(_ name: String) -> String? {
-        guard mpv != nil else { return nil }
-        let cstr = mpv_get_property_string(mpv, name)
-        let str: String? = cstr == nil ? nil : String(cString: cstr!)
-        mpv_free(cstr)
-        return str
     }
     
     private func getFlag(_ name: String) -> Bool {
@@ -215,15 +177,6 @@ final class MPVMetalViewController: UIViewController {
                     if let property = UnsafePointer<mpv_event_property>(dataOpaquePtr)?.pointee {
                         let propertyName = String(cString: property.name)
                         switch propertyName {
-                        case MPVProperty.videoParamsSigPeak:
-                            if let sigPeak = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
-                                DispatchQueue.main.async {
-                                    let maxEDRRange = self.view.window?.screen.potentialEDRHeadroom ?? 1.0
-                                    // display screen support HDR and current playing HDR video
-                                    self.hdrAvailable = maxEDRRange > 1.0 && sigPeak > 1.0
-                                    self.playDelegate?.propertyChange(mpv: self.mpv, propertyName: propertyName, data: sigPeak)
-                                }
-                            }
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
                             DispatchQueue.main.async {

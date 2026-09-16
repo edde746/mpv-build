@@ -2,8 +2,6 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var coordinator = MPVMetalPlayerView.Coordinator()
-    @State var hdrAvailable = false
-    @State var tonemappingVisualizeEnabled = false
     @State var showControlOverlay = false
     @State var loading = false
     

@@ -37,4 +37,5 @@
 # tests assert the audited idiom still matches and that the rewrite converges.
 #
 # When bumping the mpv-winbuild-cmake pin in versions.json, refresh these
-# nine fixtures from the new commit and update the hashes above.
+# nine fixtures from the new commit and update the hashes above;
+# test_pin_packages.py asserts them, so a stale fixture fails the suite.

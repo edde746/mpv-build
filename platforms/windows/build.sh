@@ -6,9 +6,11 @@
 # Stages:
 #   1. shallow-fetch shinchiro/mpv-winbuild-cmake at the commit pinned by the
 #      versions.json component `mpv-winbuild-cmake`
-#   2. pin packages/{mpv,ffmpeg,libass}.cmake and toolchain/mingw-w64.cmake
-#      to versions.json, stage the resolved windows patch series and
-#      neutralize the check-git cache cascade (pin_packages.py)
+#   2. pin every source winbuild builds to versions.json (pin_packages.py):
+#      the payload packages, its live-fetch toolchain packages (mingw-w64,
+#      llvm) and the ffmpeg-side packages whose upstream tip cannot build
+#      against the pinned release ffmpeg, then stage the resolved windows
+#      patch series and neutralize the check-git cache cascade
 #   3. cmake configure with the clang toolchain (aarch64 REQUIRES clang:
 #      gcc + aarch64 is a configure-time FATAL_ERROR upstream) and ccache
 #      baked into the cross-compiler wrappers. winbuild's
@@ -60,16 +62,9 @@ export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-# The winbuild pin, override-aware for the windows group.
-read -r WINBUILD_URL WINBUILD_COMMIT < <(python3 - "$ROOT/versions.json" <<'PY'
-import json, sys
-entry = json.load(open(sys.argv[1]))["components"]["mpv-winbuild-cmake"]
-pins = {f: entry[f] for f in ("url", "commit") if f in entry}
-pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
-             if f in ("url", "commit")})
-print(pins["url"], pins["commit"])
-PY
-)
+# The winbuild pin, resolved by the one place that folds overrides.windows in.
+winbuild_pin="$(python3 "$HERE/pin_packages.py" --print-winbuild-pin)"
+read -r WINBUILD_URL WINBUILD_COMMIT <<< "$winbuild_pin"
 
 WORK="$ROOT/build/windows"
 SRC="$WORK/mpv-winbuild-cmake"
@@ -96,7 +91,7 @@ git -C "$SRC" -c advice.detachedHead=false checkout -q --detach "$WINBUILD_COMMI
 git -C "$SRC" reset --hard -q "$WINBUILD_COMMIT"
 
 echo "==> pinning packages to versions.json"
-python3 "$HERE/pin_packages.py" --winbuild "$SRC" --repo "$ROOT"
+python3 "$HERE/pin_packages.py" --winbuild "$SRC"
 
 echo "==> configuring for $ARCH-w64-mingw32 (clang toolchain)"
 # SINGLE_SOURCE_LOCATION and RUSTUP_LOCATION sit outside the per-arch build
@@ -194,19 +189,13 @@ purge_sysroot_world() {
   done
 }
 invalidate_stale_pins() {
-  python3 - "$ROOT/versions.json" <<'PY' | while read -r component source_name pinned; do
-import json, sys
-components = json.load(open(sys.argv[1]))["components"]
-for component, source_name in (("mpv", "mpv"), ("ffmpeg", "ffmpeg"),
-                               ("libass", "libass"), ("svt-av1", "svtav1"),
-                               ("nv-codec-headers", "nvcodec-headers"),
-                               ("llvm", "llvm"), ("mingw-w64", "mingw-w64")):
-    entry = components[component]
-    pins = {"commit": entry["commit"]}
-    pins.update({f: v for f, v in (entry.get("overrides", {}).get("windows") or {}).items()
-                 if f == "commit"})
-    print(component, source_name, pins["commit"])
-PY
+  # The inventory is pin_packages.py's (same tables that pin the sources), so
+  # a component added there is invalidated here without a second edit: a
+  # missed entry would leave its source and stamps stale while the artifact
+  # key moved, and the download step above never re-examines a source it
+  # already completed.
+  python3 "$HERE/pin_packages.py" --print-pins \
+    | while read -r component source_name pinned _; do
     local src="$WORK/src/$source_name" family
     case "$component" in
       mingw-w64) family="__sysroot_world__" ;;
@@ -254,7 +243,6 @@ if [[ ! -x "$WORK/rustup/.cargo/bin/cargo" ]]; then
   ninja -C "$BUILD" rustup-fullclean 2> /dev/null || true
 fi
 echo "==> toolchain targets (llvm, rustup, llvm-clang; no-ops when clean)"
-rm -f "$BUILD/.toolchain-bootstrapped"
 ninja -C "$BUILD" llvm
 ninja -C "$BUILD" rustup
 ninja -C "$BUILD" llvm-clang

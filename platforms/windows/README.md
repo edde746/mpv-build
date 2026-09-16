@@ -8,10 +8,13 @@ pinned as the versions.json component `mpv-winbuild-cmake`.
     platforms/windows/package.sh <x86_64|aarch64>   # -> libmpv-windows-<key>-<arch>.zip
 
 `build.sh` shallow-fetches the pinned winbuild commit, runs `pin_packages.py`
-to rewrite `packages/{mpv,ffmpeg,libass}.cmake` onto the versions.json pins
-(upstream tracks master for all three; the rewrite uses upstream's own
-`GIT_REMOTE_NAME origin` / `GIT_TAG` / `GIT_RESET` idiom from
-`packages/mbedtls.cmake`), then
+to rewrite every source winbuild builds onto the versions.json pins -- the
+payload packages (`packages/{mpv,ffmpeg,libass}.cmake`, whose upstream tracks
+master) plus winbuild's live-fetch toolchain and ffmpeg-side packages
+(`toolchain/mingw-w64.cmake`, `toolchain/llvm/llvm.cmake`,
+`packages/svtav1.cmake`, `packages/nvcodec-headers.cmake`) -- using upstream's
+own `GIT_REMOTE_NAME origin` / `GIT_TAG` / `GIT_RESET` idiom from
+`packages/mbedtls.cmake`, then
 configures with `-DCOMPILER_TOOLCHAIN=clang` (mandatory for aarch64),
 bootstraps the toolchain (`ninja llvm`, `ninja rustup`, `ninja llvm-clang`)
 and runs `ninja mpv`. Full builds need a Linux host with the winbuild README
@@ -26,8 +29,10 @@ sets `-Dgl=disabled -Degl-angle=disabled` for that target.
 
 ## Key coarseness
 
-`group.json` lists components `mpv`, `ffmpeg`, `libass`, `mpv-winbuild-cmake`
-and `mingw-w64`. The winbuild graph builds ~60 more dependencies (freetype,
+`group.json` lists components `mpv`, `ffmpeg`, `libass`,
+`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1` and `nv-codec-headers`
+(the last four being the live-fetch packages `pin_packages.EXTRA_COMPONENTS`
+pins). The winbuild graph builds ~60 more dependencies (freetype,
 harfbuzz, x264, dav1d, ...). Those are deliberately NOT individual
 versions.json components: they track whatever `GIT_RESET`/URL pins the
 winbuild commit carries, so they are keyed -- coarsely but honestly --
@@ -64,11 +69,12 @@ Why reusing a restored tree is sound:
   the pin-free last restore tier reuses a tree across winbuild bumps, and
   recipe changes still land because changed step command lines dirty their
   packages;
-- the packages `pin_packages.py` rewrites (mpv, ffmpeg, libass) get new step
-  command lines whenever their pins or patch series change, which dirties
-  exactly those packages and their dependents, and the injected
-  PATCH_COMMAND resets to the pin before applying so a re-run converges
-  instead of double-applying;
+- the packages `pin_packages.py` pins get new step command lines whenever
+  their pins or patch series change, which dirties exactly those packages and
+  their dependents, and the injected PATCH_COMMAND resets to the pin before
+  applying so a re-run converges instead of double-applying; `build.sh`
+  invalidates stale sources from the same pin table, so a package added to
+  the pinning side cannot slip past invalidation;
 - `pin_packages.py` suppresses upstream's check-git step. Upstream injects
   it at configure time whenever a source dir already exists, so the step is
   absent from a cold build's graph; its first warm appearance has no
@@ -138,8 +144,12 @@ the winbuild checkout itself pristine.
 
     python3 platforms/windows/test_pin_packages.py
 
-runs `pin_packages.py` against byte-exact fixture copies of the real package
-files (`testdata/`, provenance in `testdata/PROVENANCE`) and asserts the
-injected block matches the mbedtls idiom, idempotency, that GIT_REPOSITORY
-follows the pinned url, and that a PATCH_COMMAND is only injected for a
-non-empty resolved windows series.
+runs the real `main()` over a synthetic winbuild checkout planted from the
+byte-exact fixture copies in `testdata/` (provenance and digests in
+`testdata/PROVENANCE`), against this repo's versions.json and patch series,
+and asserts what it leaves behind: every pinned package carrying its resolved
+commit, the staged series and its PATCH_COMMAND (injected exactly when the
+resolved series is non-empty), the neutralized check-git step, and a second
+run converging. The remaining tests pin the pure rewrites -- the injected
+block matches the mbedtls idiom, the aarch64 cuda gate, and the mpv option
+gate.

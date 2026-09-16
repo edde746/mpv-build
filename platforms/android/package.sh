@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Per-ABI release tarballs for the libmpv-android artifact.
 #
-# For each ABI this produces dist/release/libmpv-android-<key>-<abi>.tar.gz
-# (the group.json assetPattern; the key comes from keys.py, so the name is
-# content-addressed and immutable) containing:
+# For each ABI this produces dist/release/libmpv-android-<abi>.tar.gz, the
+# unkeyed spelling keys.py record-platform renames to the group.json
+# assetPattern's content-addressed name (the key covers the published driver,
+# which the leg that builds a tarball cannot know is final yet). Contents:
 #
 #   lib/          libmpv.so, the ffmpeg shared libraries (libav*, libsw*,
 #                 libpostproc) and the pinned NDK's libc++_shared.so (built
@@ -15,11 +16,14 @@
 # This replaces the fork's Gradle AAR assembly (scripts/mpv-android.sh): the
 # consumer unpacks these trees directly.
 #
-# Usage: package.sh [--arch <armv7l|arm64|x86|x86_64>]   (default: all four)
+# Usage: package.sh [--arch <arch>]   (default: all four)
 set -euo pipefail
 
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 root="$( cd ../.. && pwd )"
+
+. ./include/loadarch.sh
+. ./include/path.sh
 
 arch=
 while [ $# -gt 0 ]; do
@@ -29,23 +33,17 @@ while [ $# -gt 0 ]; do
 		arch=$1
 		;;
 		*)
-		echo >&2 "usage: package.sh [--arch <armv7l|arm64|x86|x86_64>]"
+		echo >&2 "usage: package.sh [--arch <${android_arch_list//, /|}>]"
 		exit 1
 		;;
 	esac
 	shift
 done
 
-archs=(armv7l arm64 x86 x86_64)
+archs=("${android_arches[@]}")
 if [ -n "$arch" ]; then
 	archs=("$arch")
 fi
-
-key="$( cd "$root" && python3 scripts/keys.py keys --platform-group android \
-	| python3 -c 'import json, sys; print(json.load(sys.stdin)["libmpv-android"])' )"
-
-. ./include/loadarch.sh
-. ./include/path.sh
 
 release_dir="$root/dist/release"
 mkdir -p "$release_dir"
@@ -67,7 +65,7 @@ for arch in "${archs[@]}"; do
 	for header in "${headers[@]}"; do
 		cp "prefix/$prefix_name/include/mpv/$header" "$staging/include/mpv/"
 	done
-	asset="libmpv-android-$key-$prefix_name.tar.gz"
+	asset="libmpv-android-$prefix_name.tar.gz"
 	# Reproducible bytes: the release skips re-uploading an existing
 	# content-addressed name, so a rebuild of the same key MUST produce the
 	# identical archive or the recorded checksum drifts from the published

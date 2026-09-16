@@ -45,6 +45,6 @@ fi
 
 sdk_root="${MPV_ANDROID_SDK:-$DIR/sdk/android-sdk-$os}"
 toolchain=$(echo "$sdk_root/ndk/$v_ndk/toolchains/llvm/prebuilt/"*)
-export PATH="$toolchain/bin:$sdk_root/ndk/$v_ndk:$PATH"
+export PATH="$toolchain/bin:$PATH"
 export ANDROID_HOME="$sdk_root"
 unset ANDROID_SDK_ROOT ANDROID_NDK_ROOT

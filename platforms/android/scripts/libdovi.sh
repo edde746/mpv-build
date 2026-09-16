@@ -12,11 +12,7 @@ else
 	exit 255
 fi
 
-# Build the patched parser from the pinned source, never the old prebuilts.
-if [ ! -f dolby_vision/Cargo.toml ]; then
-	echo >&2 "libdovi source missing; move obsolete deps/libdovi aside and rerun download.sh"
-	exit 1
-fi
+# The obsolete prebuilt layout is refused earlier, by download.sh.
 if ! command -v rustup >/dev/null; then
 	echo >&2 "rustup is required to build libdovi (https://rustup.rs)"
 	exit 1

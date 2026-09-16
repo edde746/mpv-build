@@ -53,7 +53,7 @@ init_repository "$repository"
 printf 'first\n' >"$repository/input.txt"
 git -C "$repository" add input.txt
 git -C "$repository" commit --quiet -m first
-git -C "$repository" tag release
+git -C "$repository" -c tag.gpgsign=false tag release
 approved_commit="$(git -C "$repository" rev-parse HEAD)"
 checkout_verified_ref "file://$repository" release "$approved_commit" "$checkout"
 [ "$(git -C "$checkout" rev-parse HEAD)" = "$approved_commit" ] ||
@@ -74,7 +74,7 @@ init_repository "$mirror_repository"
 printf 'substituted\n' >"$mirror_repository/input.txt"
 git -C "$mirror_repository" add input.txt
 git -C "$mirror_repository" commit --quiet -m substituted
-git -C "$mirror_repository" tag release
+git -C "$mirror_repository" -c tag.gpgsign=false tag release
 if checkout_verified_ref "$unreachable" release "$approved_commit" "$checkout" "file://$mirror_repository"; then
   fail "mirror serving another commit was accepted"
 fi
@@ -82,7 +82,7 @@ assert_absent "$checkout"
 
 printf 'second\n' >"$repository/input.txt"
 git -C "$repository" commit --quiet -am second
-git -C "$repository" tag --force release >/dev/null
+git -C "$repository" -c tag.gpgsign=false tag --force release >/dev/null
 if checkout_verified_ref "file://$repository" release "$approved_commit" "$checkout"; then
   fail "moved tag was accepted"
 fi
@@ -178,7 +178,7 @@ git -C "$shaderc_repository" add utils/git-sync-deps
 # Windows checkouts do not track the mode bit, and the build plan executes it.
 git -C "$shaderc_repository" update-index --chmod=+x utils/git-sync-deps
 git -C "$shaderc_repository" commit --quiet -m shaderc
-git -C "$shaderc_repository" tag release
+git -C "$shaderc_repository" -c tag.gpgsign=false tag release
 shaderc_commit="$(git -C "$shaderc_repository" rev-parse HEAD)"
 
 dav1d_repository="$temporary/dav1d-source"
@@ -186,7 +186,7 @@ init_repository "$dav1d_repository"
 printf 'stub dav1d\n' >"$dav1d_repository/meson.build"
 git -C "$dav1d_repository" add meson.build
 git -C "$dav1d_repository" commit --quiet -m dav1d
-git -C "$dav1d_repository" tag release
+git -C "$dav1d_repository" -c tag.gpgsign=false tag release
 dav1d_commit="$(git -C "$dav1d_repository" rev-parse HEAD)"
 
 libplacebo_repository="$temporary/libplacebo-source"
@@ -194,7 +194,7 @@ init_repository "$libplacebo_repository"
 printf 'stub libplacebo\n' >"$libplacebo_repository/meson.build"
 git -C "$libplacebo_repository" add meson.build
 git -C "$libplacebo_repository" commit --quiet -m libplacebo
-git -C "$libplacebo_repository" tag release
+git -C "$libplacebo_repository" -c tag.gpgsign=false tag release
 libplacebo_commit="$(git -C "$libplacebo_repository" rev-parse HEAD)"
 
 # libass builds autotools-style out of its fork checkout: the committed
@@ -211,7 +211,7 @@ chmod +x "$libass_repository/autogen.sh"
 git -C "$libass_repository" add autogen.sh
 git -C "$libass_repository" update-index --chmod=+x autogen.sh
 git -C "$libass_repository" commit --quiet -m libass
-git -C "$libass_repository" tag release
+git -C "$libass_repository" -c tag.gpgsign=false tag release
 libass_commit="$(git -C "$libass_repository" rev-parse HEAD)"
 
 # The stub manifest mirrors versions.json: linux pins live in overrides.linux
@@ -304,25 +304,25 @@ patches_root="$temporary/patches-root"
 mkdir -p "$patches_root"
 
 # JOBS keeps nproc out of it; TMPDIR keeps main()'s own mktemp -d inside the
-# directory this test already cleans up.
+# directory this test already cleans up. Both runs below come through here so
+# their environment cannot drift apart.
+run_build() {
+  VERSIONS_MANIFEST="$1" PATCHES_ROOT="$patches_root" PATH="$stub_bin:$PATH" \
+    TMPDIR="$temporary/tmp" PREFIX="$temporary/prefix" JOBS=1 \
+    bash "$SCRIPT_DIR/build.sh"
+}
+
 build_log="$temporary/build.log"
-if ! (
-  export VERSIONS_MANIFEST="$manifest"
-  export PATCHES_ROOT="$patches_root"
-  export PATH="$stub_bin:$PATH"
-  export TMPDIR="$temporary/tmp"
-  export PREFIX="$temporary/prefix"
-  export JOBS=1
-  bash "$SCRIPT_DIR/build.sh"
-) >"$build_log" 2>&1; then
+if ! run_build "$manifest" >"$build_log" 2>&1; then
   cat "$build_log" >&2
   fail "the stubbed build plan did not run to completion"
 fi
 
 # A pin whose kind stopped matching its acquisition step must fail at parse
 # time, before anything downloads - the acquisition steps are written per
-# kind, and a silently retargeted step is exactly what require_kind exists
-# to catch. Strip mpv's override so the folded kind degrades to git.
+# kind, and a silently retargeted step is exactly what resolve_pins' kind
+# check exists to catch. Strip mpv's override so the folded kind degrades to
+# git.
 kind_manifest="$temporary/versions-kind-drift.json"
 python3 - "$manifest" "$kind_manifest" <<'PY'
 import json
@@ -334,18 +334,11 @@ del manifest["components"]["mpv"]["overrides"]
 with open(sys.argv[2], "w", encoding="utf-8") as sink:
     json.dump(manifest, sink)
 PY
-if (
-  export VERSIONS_MANIFEST="$kind_manifest"
-  export PATCHES_ROOT="$patches_root"
-  export PATH="$stub_bin:$PATH"
-  export TMPDIR="$temporary/tmp"
-  export JOBS=1
-  bash "$SCRIPT_DIR/build.sh"
-) >"$temporary/kind-drift.log" 2>&1; then
+if run_build "$kind_manifest" >"$temporary/kind-drift.log" 2>&1; then
   fail "a kind drifted away from its acquisition step and was accepted"
 fi
 grep -q "kind 'git'" "$temporary/kind-drift.log" ||
-  fail "kind drift did not fail through require_kind"
+  fail "kind drift was not reported"
 
 recorded_call() {
   local program="$1" directory="$2" candidate

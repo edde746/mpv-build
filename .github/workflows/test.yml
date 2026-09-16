@@ -6,10 +6,6 @@ on:
       - ci
       - test
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release tag name (default mpv version)'
-        default: ''
 
 jobs:
   build:
@@ -24,15 +20,6 @@ jobs:
         with:
           script: |
             import json
-            import re
-
-            def normalize_version(version_string):
-              version_string = re.sub(r'[^.0-9]+|-.+', '', version_string)
-              parts = re.split(r'\.', version_string)
-              major = int(parts[0])
-              minor = int(parts[1]) if len(parts) > 1 else 0
-              patch = int(parts[2]) if len(parts) > 2 else 0
-              return f"{major}.{minor}.{patch}"
 
             # Pins live in versions.json; the Swift driver reads them from there
             # too, so nothing here parses Swift source.
@@ -46,10 +33,7 @@ jobs:
 
             print(f'mpv version: {mpvVersion}')
             print(f'ffmpeg version: {ffmpegVersion}')
-            releaseVersion = '${{ github.event.inputs.version }}' or normalize_version(mpvVersion)
-            print(f'release version: {releaseVersion}')
             set_env('BUILD_VERSION', mpvVersion)
-            set_env('RELEASE_VERSION', releaseVersion)
 
             with open('/tmp/RELEASE_NOTE.txt', 'w', encoding='utf-8') as file:
               file.write(f'''
@@ -83,7 +67,7 @@ jobs:
 
       - name: Build GPL version
         run: |
-          make build version=${{ env.RELEASE_VERSION }} platform=maccatalyst,ios,macos
+          make build platform=maccatalyst,ios,macos
 
           cd ./dist/release
           rename 's/-all\.zip/-GPL-all\.zip/' *-all.zip

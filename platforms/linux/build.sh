@@ -23,93 +23,90 @@ VERSIONS_MANIFEST="${VERSIONS_MANIFEST:-$REPO_ROOT/versions.json}"
 # directory so the stubbed build plan never depends on the real patch pools.
 PATCHES_ROOT="${PATCHES_ROOT:-$REPO_ROOT}"
 
-pin_value() {
-  python3 - "$VERSIONS_MANIFEST" "$1" "$2" <<'PY'
+# Every pin this driver reads, resolved in one manifest pass with
+# overrides.linux folded in: one python3 invocation instead of one per scalar
+# (30 spawns, each re-parsing versions.json for a single value), and one place
+# that decides what a missing pin means. A table row is
+# <variable> <component> <key> [optional]; `optional` marks a key whose
+# absence means "not offered" (a mirror URL) rather than a broken manifest.
+# Pinned values are never optional: a missing checksum or commit stays fatal.
+#
+# The arguments name the acquisition each step below is written for. When a
+# pin's kind changes (say mpv's linux override is retired and the shared git
+# pin takes over), the step has to be rewritten with it -- the check fails
+# loudly at parse time instead of downloading a tag archive that no longer
+# exists.
+resolve_pins() {
+  local dump line
+  dump="$(python3 - "$VERSIONS_MANIFEST" "$@" <<'PY'
 import json
 import sys
 
+SPECS = """
+FFMPEG_VERSION ffmpeg version
+FFMPEG_URL ffmpeg url
+FFMPEG_SHA256 ffmpeg sha256
+DAV1D_VERSION dav1d version
+DAV1D_URL dav1d url
+DAV1D_MIRROR dav1d mirror optional
+DAV1D_REF dav1d ref
+DAV1D_COMMIT dav1d commit
+SHADERC_VERSION shaderc version
+SHADERC_URL shaderc url
+SHADERC_REF shaderc ref
+SHADERC_COMMIT shaderc commit
+LIBPLACEBO_VERSION libplacebo version
+LIBPLACEBO_URL libplacebo url
+LIBPLACEBO_MIRROR libplacebo mirror optional
+LIBPLACEBO_REF libplacebo ref
+LIBPLACEBO_COMMIT libplacebo commit
+LIBASS_VERSION libass version
+LIBASS_URL libass url
+LIBASS_REF libass ref
+LIBASS_COMMIT libass commit
+MPV_VERSION mpv version
+MPV_URL mpv url
+MPV_SHA256 mpv sha256
+""".strip().splitlines()
+
 with open(sys.argv[1], encoding="utf-8") as source:
-    manifest = json.load(source)
-component = manifest["components"][sys.argv[2]]
-override = (component.get("overrides") or {}).get("linux") or {}
-value = override.get(sys.argv[3], component.get(sys.argv[3]))
-if not isinstance(value, str) or not value:
-    raise SystemExit(f"invalid versions.json pin: {sys.argv[2]}.{sys.argv[3]}")
-print(value)
+    components = json.load(source)["components"]
+
+
+def component(name):
+    if name not in components:
+        raise SystemExit(f"versions.json: no component {name!r}")
+    return components[name]
+
+
+for expectation in sys.argv[2:]:
+    name, expected = expectation.split(":", 1)
+    entry = component(name)
+    actual = (entry.get("overrides") or {}).get("linux", {}).get("kind", entry.get("kind"))
+    if actual != expected:
+        raise SystemExit(f"versions.json pins {name} as kind '{actual}',"
+                         f" but this build acquires it as '{expected}'")
+
+for spec in SPECS:
+    variable, name, key, *flags = spec.split()
+    entry = component(name)
+    override = (entry.get("overrides") or {}).get("linux") or {}
+    value = override.get(key, entry.get(key, ""))
+    if not isinstance(value, str) or (not value and "optional" not in flags):
+        raise SystemExit(f"invalid versions.json pin: {name}.{key}")
+    print(f"{variable}={value}")
 PY
+)" || exit 1
+
+  while read -r line; do
+    printf -v "${line%%=*}" '%s' "${line#*=}"
+  done <<< "$dump"
 }
 
-# For keys that are genuinely optional, where absence means "not offered"
-# rather than a broken manifest. Pinned values never come through here: a
-# missing checksum or commit has to stay fatal.
-pin_optional() {
-  python3 - "$VERSIONS_MANIFEST" "$1" "$2" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as source:
-    manifest = json.load(source)
-component = manifest["components"][sys.argv[2]]
-override = (component.get("overrides") or {}).get("linux") or {}
-value = override.get(sys.argv[3], component.get(sys.argv[3], ""))
-if not isinstance(value, str):
-    raise SystemExit(f"invalid versions.json pin: {sys.argv[2]}.{sys.argv[3]}")
-print(value)
-PY
-}
-
-# Each acquisition step below is written for one kind. When a pin's kind
-# changes (say mpv's linux override is retired and the shared git pin takes
-# over), the step must be rewritten with it -- fail loudly instead of
-# downloading a tag archive that no longer exists.
-require_kind() {
-  local component="$1" expected="$2" actual
-  actual="$(pin_value "$component" kind)"
-  if [ "$actual" != "$expected" ]; then
-    echo "versions.json pins $component as kind '$actual'," \
-      "but this build acquires it as '$expected'" >&2
-    return 1
-  fi
-}
-
-require_kind dav1d git
-require_kind ffmpeg archive
-require_kind shaderc git
-require_kind libplacebo git
-require_kind libass git
-require_kind mpv archive
-
-FFMPEG_VERSION="$(pin_value ffmpeg version)"
-FFMPEG_URL="$(pin_value ffmpeg url)"
-FFMPEG_SHA256="$(pin_value ffmpeg sha256)"
-DAV1D_VERSION="$(pin_value dav1d version)"
-DAV1D_URL="$(pin_value dav1d url)"
-DAV1D_MIRROR="$(pin_optional dav1d mirror)"
-DAV1D_REF="$(pin_value dav1d ref)"
-DAV1D_COMMIT="$(pin_value dav1d commit)"
-SHADERC_VERSION="$(pin_value shaderc version)"
-SHADERC_URL="$(pin_value shaderc url)"
-SHADERC_REF="$(pin_value shaderc ref)"
-SHADERC_COMMIT="$(pin_value shaderc commit)"
-LIBPLACEBO_VERSION="$(pin_value libplacebo version)"
-LIBPLACEBO_URL="$(pin_value libplacebo url)"
-LIBPLACEBO_MIRROR="$(pin_optional libplacebo mirror)"
-LIBPLACEBO_REF="$(pin_value libplacebo ref)"
-LIBPLACEBO_COMMIT="$(pin_value libplacebo commit)"
-LIBASS_VERSION="$(pin_value libass version)"
-LIBASS_URL="$(pin_value libass url)"
-LIBASS_REF="$(pin_value libass ref)"
-LIBASS_COMMIT="$(pin_value libass commit)"
-MPV_VERSION="$(pin_value mpv version)"
-MPV_URL="$(pin_value mpv url)"
-MPV_SHA256="$(pin_value mpv sha256)"
+resolve_pins dav1d:git ffmpeg:archive shaderc:git libplacebo:git libass:git mpv:archive
 
 sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d ' ' -f 1
-  else
-    shasum -a 256 "$1" | cut -d ' ' -f 1
-  fi
+  sha256sum "$1" | cut -d ' ' -f 1
 }
 
 download_verified() {
@@ -221,6 +218,13 @@ apply_patch_series() {
   (cd "$PATCHES_ROOT" && python3 "$REPO_ROOT/scripts/patches.py" apply "$component" linux "$tree")
 }
 
+# The epilogue every step shares: back to the source root, where the next step
+# resolves its own tree from, then the step name so a long log stays scannable.
+finish_step() {
+  cd "$srcdir"
+  printf '\n==> %s done.\n\n' "$1"
+}
+
 cleanup_srcdir=""
 
 cleanup() {
@@ -273,10 +277,7 @@ main() {
 
   ninja -C build -j"$jobs"
   ninja -C build install
-  cd "$srcdir"
-  echo ""
-  echo "==> dav1d done."
-  echo ""
+  finish_step dav1d
 
   # ─── Step 2: ffmpeg (static libraries) ─────────────────────────────────────
   echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoder-only)..."
@@ -311,10 +312,7 @@ main() {
 
   make -j"$jobs"
   make install
-  cd "$srcdir"
-  echo ""
-  echo "==> ffmpeg done."
-  echo ""
+  finish_step ffmpeg
 
   # ─── Step 3: shaderc (static library) ───────────────────────────────────────
   echo "==> Building shaderc $SHADERC_VERSION (static)..."
@@ -336,10 +334,7 @@ main() {
 
   cmake --build build -j"$jobs"
   cmake --install build
-  cd "$srcdir"
-  echo ""
-  echo "==> shaderc done."
-  echo ""
+  finish_step shaderc
 
   # ─── Step 4: libplacebo (static library) ───────────────────────────────────
   echo "==> Building libplacebo $LIBPLACEBO_VERSION (static)..."
@@ -360,10 +355,7 @@ main() {
 
   ninja -C build -j"$jobs"
   ninja -C build install
-  cd "$srcdir"
-  echo ""
-  echo "==> libplacebo done."
-  echo ""
+  finish_step libplacebo
 
   # ─── Step 5: libass (static library, our fork) ─────────────────────────────
   # mpv would happily take the distro's libass, but the whole point of the
@@ -395,10 +387,7 @@ main() {
 
   make -j"$jobs"
   make install
-  cd "$srcdir"
-  echo ""
-  echo "==> libass done."
-  echo ""
+  finish_step libass
 
   # ─── Step 6: mpv (shared libmpv) ───────────────────────────────────────────
   echo "==> Building mpv $MPV_VERSION (shared libmpv only)..."
@@ -446,9 +435,7 @@ main() {
 
   ninja -C build -j"$jobs"
   ninja -C build install
-  echo ""
-  echo "==> mpv done."
-  echo ""
+  finish_step mpv
   echo "==> libmpv build complete. Output in $prefix"
 }
 

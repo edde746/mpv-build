@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Unit tests for pin_packages.py against fixture copies of the real
-mpv-winbuild-cmake package files (testdata/, see testdata/PROVENANCE).
+"""Tests for pin_packages.py.
+
+testdata/ holds byte-exact copies of the files the pinned mpv-winbuild-cmake
+commit ships (see testdata/PROVENANCE). The end-to-end test runs the real
+main() over a synthetic winbuild checkout planted from them, against this
+repo's versions.json and patch series; the rest pin the pure rewrites.
 
 Run: python3 platforms/windows/test_pin_packages.py
 """
 
+import hashlib
+import json
 import shutil
 import sys
 import tempfile
@@ -12,55 +18,22 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent.parent
 TESTDATA = HERE / "testdata"
 sys.path.insert(0, str(HERE))
 
 import pin_packages  # noqa: E402
 
-PINS = {
-    "mpv": {
-        "version": "v0.41.0",
-        "url": "https://github.com/mpv-player/mpv",
-        "ref": "v0.41.0",
-        "commit": "41f6a645068483470267271e1d09966ca3b9f413",
-    },
-    "ffmpeg": {
-        "version": "n8.0.1",
-        "url": "https://github.com/FFmpeg/FFmpeg",
-        "ref": "n8.0.1",
-        "commit": "894da5ca7d742e4429ffb2af534fcda0103ef593",
-    },
-    "libass": {
-        "version": "0.17.5",
-        "url": "https://github.com/libass/libass",
-        "ref": "0.17.5",
-        "commit": "4a05d8127f525943ebf45fdc6497c9e665947f0d",
-    },
-    "mingw-w64": {
-        "version": "master-2026-08-29",
-        "url": "https://github.com/mingw-w64/mingw-w64",
-        "ref": "master",
-        "commit": "ca4cc40bdcda1aa3e9df68d5443c7ceaf1f212f9",
-    },
-    "llvm": {
-        "version": "release-22.x-2026-06-15",
-        "url": "https://github.com/llvm/llvm-project",
-        "ref": "release/22.x",
-        "commit": "ca7933e47d3a3451d81e72ac174dcb5aa28b59d1",
-    },
-    "svt-av1": {
-        "version": "v3.1.2",
-        "url": "https://gitlab.com/AOMediaCodec/SVT-AV1",
-        "ref": "v3.1.2",
-        "commit": "b33dcc56cc64fcb3b3569094af8ab1d0d81ab4c1",
-    },
-    "nv-codec-headers": {
-        "version": "n13.0.19.1",
-        "url": "https://github.com/FFmpeg/nv-codec-headers",
-        "ref": "n13.0.19.1",
-        "commit": "88fee5c37318c991a8762d423530f91681e32e3a",
-    },
-}
+# Where each fixture lives inside a winbuild checkout, and which component it
+# carries, both derived from the driver's own tables so a new pinned package
+# cannot leave the test covering a stale subset. mbedtls.cmake is upstream's
+# own pinned+patched idiom: the tests read it, nothing rewrites it.
+CHECKOUT_FILES = {f"{c}.cmake": f"packages/{c}.cmake" for c in pin_packages.COMPONENTS}
+CHECKOUT_FILES.update({Path(r).name: r for r in pin_packages.EXTRA_COMPONENTS.values()})
+CHECKOUT_FILES["custom_steps.cmake"] = "cmake/custom_steps.cmake"
+COMPONENT_FILES = {c: f"{c}.cmake" for c in pin_packages.COMPONENTS}
+COMPONENT_FILES.update({c: Path(r).name for c, r in pin_packages.EXTRA_COMPONENTS.items()})
+IDIOM_FIXTURE = "mbedtls.cmake"
 
 PATCH = """diff --git a/a.c b/a.c
 index 0000000..1111111 100644
@@ -72,217 +45,190 @@ index 0000000..1111111 100644
 """
 
 
+def first_word(line):
+    return line.strip().split(" ", 1)[0] if line.strip() else ""
+
+
 def keyword_sequence(text, keywords):
     """The keyword of each line whose first word is in `keywords`, in order."""
-    out = []
-    for line in text.splitlines():
-        word = line.strip().split(" ", 1)[0] if line.strip() else ""
-        if word in keywords:
-            out.append(word)
-    return out
+    return [word for word in map(first_word, text.splitlines()) if word in keywords]
+
+
+def passthrough(text):
+    """The lines the rewrite must leave alone: everything but the keywords it
+    owns and the single GIT_REPOSITORY it retargets."""
+    owned = set(pin_packages.INJECTED_KEYWORDS) | {"GIT_REPOSITORY"}
+    return [line for line in text.splitlines() if first_word(line) not in owned]
+
+
+def series_entries(component):
+    """The repo's resolved windows series, read independently of the driver:
+    series.common first, then series.<group>, comments and blanks ignored."""
+    entries = []
+    for name in ("series.common", f"series.{pin_packages.GROUP}"):
+        path = REPO / "patches" / component / name
+        if path.is_file():
+            entries += [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+                        if line.strip() and not line.startswith("#")]
+    return entries
+
+
+def read_tree(root):
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
+            if path.is_file()}
 
 
 class PinPackagesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="pin-packages-test-"))
         self.addCleanup(shutil.rmtree, self.tmp)
-        self.packages = self.tmp / "winbuild" / "packages"
-        self.packages.mkdir(parents=True)
-        for name in ("mpv", "ffmpeg", "libass"):
-            shutil.copyfile(TESTDATA / f"{name}.cmake", self.packages / f"{name}.cmake")
+        versions = json.loads((REPO / "versions.json").read_text(encoding="utf-8"))
+        self.pins = {component: pin_packages.resolved_pins(versions, component)
+                     for component in COMPONENT_FILES}
+        self.winbuild = self.tmp / "mpv-winbuild-cmake"
+        for fixture, relative in CHECKOUT_FILES.items():
+            path = self.winbuild / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(TESTDATA / fixture, path)
 
-        # Synthetic repo root: mpv has a two-entry windows series, ffmpeg and
-        # libass have empty series (matching the real repo today).
-        self.repo = self.tmp / "repo"
-        pool = self.repo / "patches" / "mpv" / "pool"
-        pool.mkdir(parents=True)
-        (pool / "0001-first.patch").write_text(PATCH)
-        (pool / "0002-second.patch").write_text(PATCH)
-        (self.repo / "patches" / "mpv" / "series.common").write_text("0001-first.patch\n")
-        (self.repo / "patches" / "mpv" / "series.windows").write_text(
-            "# windows-only entry\n0002-second.patch\n"
-        )
-        (self.repo / "patches" / "ffmpeg").mkdir(parents=True)
-        (self.repo / "patches" / "ffmpeg" / "series.windows").write_text("# empty\n")
+    def package_text(self, component):
+        return (self.winbuild / CHECKOUT_FILES[COMPONENT_FILES[component]]).read_text(
+            encoding="utf-8")
 
-    def run_pin(self, component):
-        staged = pin_packages.stage_patches(self.repo, component, self.packages)
-        path = self.packages / f"{component}.cmake"
-        text = path.read_text()
-        pinned = pin_packages.rewrite(text, component, PINS[component], bool(staged))
-        path.write_text(pinned)
-        return pinned, staged
+    def run_main(self):
+        return pin_packages.main(["--winbuild", str(self.winbuild), "--repo", str(REPO)])
 
-    def run_all(self):
-        return {c: self.run_pin(c) for c in ("mpv", "ffmpeg", "libass")}
+    def test_fixtures_are_the_audited_upstream_bytes(self):
+        # The strip-before-inject idempotency contract rests on these being
+        # upstream's own bytes, so the PROVENANCE digests are enforced rather
+        # than decorative.
+        recorded = {}
+        for line in (TESTDATA / "PROVENANCE").read_text(encoding="utf-8").splitlines():
+            fields = line.strip().lstrip("#").split()
+            if len(fields) == 2 and len(fields[0]) == 64:
+                recorded[fields[1]] = fields[0]
+        self.assertEqual(sorted(recorded), sorted([*CHECKOUT_FILES, IDIOM_FIXTURE]))
+        for name, digest in recorded.items():
+            with self.subTest(fixture=name):
+                blob = (TESTDATA / name).read_bytes()
+                self.assertEqual(hashlib.sha256(blob).hexdigest(), digest)
+        for name in CHECKOUT_FILES:
+            # Nothing this script injects is already in the file: a GIT_RESET
+            # or PATCH_COMMAND would survive a strip and skew the rewrite
+            # (llvm carries only upstream's own GIT_REMOTE_NAME/GIT_TAG, which
+            # the strip removes; mbedtls is the idiom, not a rewritten file).
+            words = keyword_sequence((TESTDATA / name).read_text(encoding="utf-8"),
+                                     set(pin_packages.INJECTED_KEYWORDS))
+            self.assertNotIn("GIT_RESET", words)
+            self.assertNotIn("PATCH_COMMAND", words)
 
-    def test_fixtures_are_pristine(self):
-        # The strip-before-inject idempotency contract is only safe because the
-        # upstream files carry none of the keywords this script owns.
-        for name in ("mpv", "ffmpeg", "libass"):
-            text = (TESTDATA / f"{name}.cmake").read_text()
-            self.assertEqual(
-                keyword_sequence(text, set(pin_packages.INJECTED_KEYWORDS)), [],
-                f"{name}.cmake fixture unexpectedly carries injected keywords",
-            )
+    def test_rewrite_pins_every_component_to_its_resolved_commit(self):
+        for component, fixture in COMPONENT_FILES.items():
+            with self.subTest(component=component):
+                pins = self.pins[component]
+                text = (TESTDATA / fixture).read_text(encoding="utf-8")
+                pinned = pin_packages.rewrite(text, component, pins, False)
+                # GIT_TAG is the resolved commit, not the human ref: the tag
+                # value is what lands in <pkg>-gitinfo.txt, the only graph
+                # input that dirties the download step on a warm tree.
+                self.assertIn(
+                    '    UPDATE_COMMAND ""\n'
+                    "    GIT_REMOTE_NAME origin\n"
+                    f"    GIT_TAG {pins['commit']}\n"
+                    f"    GIT_RESET {pins['commit']} #",
+                    pinned,
+                )
+                self.assertNotIn("PATCH_COMMAND", pinned)
+                repository = [line for line in pinned.splitlines() if "GIT_REPOSITORY" in line]
+                self.assertEqual(len(repository), 1)
+                self.assertIn(pins["url"], repository[0])
+                self.assertTrue(repository[0].rstrip().endswith(".git"))
+                # Everything but the pin block and GIT_REPOSITORY survives,
+                # and a re-run over the output converges.
+                self.assertEqual(passthrough(text), passthrough(pinned))
+                self.assertEqual(pin_packages.rewrite(pinned, component, pins, False), pinned)
 
-    def test_injected_block_matches_mbedtls_idiom(self):
-        pinned, _ = self.run_pin("mpv")
+    def test_patched_block_follows_the_mbedtls_idiom(self):
         # The keyword shape upstream itself uses for a pinned+patched package,
         # taken from the mbedtls fixture rather than hardcoded here.
-        idiom = ("PATCH_COMMAND", "UPDATE_COMMAND", "GIT_REMOTE_NAME", "GIT_TAG", "GIT_RESET")
-        mbedtls = (TESTDATA / "mbedtls.cmake").read_text()
+        idiom = {"PATCH_COMMAND", "UPDATE_COMMAND", "GIT_REMOTE_NAME", "GIT_TAG", "GIT_RESET"}
+        pins = self.pins["mpv"]
+        pinned = pin_packages.rewrite(
+            (TESTDATA / "mpv.cmake").read_text(encoding="utf-8"), "mpv", pins, True)
         self.assertEqual(
-            keyword_sequence(pinned, set(idiom)),
-            keyword_sequence(mbedtls, set(idiom)),
-            "injected block does not follow the mbedtls.cmake keyword order",
+            keyword_sequence(pinned, idiom),
+            keyword_sequence((TESTDATA / IDIOM_FIXTURE).read_text(encoding="utf-8"), idiom),
         )
-        # And the exact injected lines, contiguous, mbedtls-style 4-space indent.
-        # GIT_TAG is the resolved commit, not the tag name: the tag value is
-        # what lands in <pkg>-gitinfo.txt, the only graph input that dirties
-        # the download step on a warm tree. A textually stable ref whose
-        # target moved must invalidate.
-        expected = (
-            "    PATCH_COMMAND ${EXEC} "
-            '"git reset --hard 41f6a645068483470267271e1d09966ca3b9f413 -q '
-            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch"\n'
-            '    UPDATE_COMMAND ""\n'
-            "    GIT_REMOTE_NAME origin\n"
-            "    GIT_TAG 41f6a645068483470267271e1d09966ca3b9f413\n"
-            "    GIT_RESET 41f6a645068483470267271e1d09966ca3b9f413 # v0.41.0\n"
-        )
-        self.assertIn(expected, pinned)
-
-    def test_patch_command_only_for_nonempty_series(self):
-        results = self.run_all()
-        self.assertIn("PATCH_COMMAND", results["mpv"][0])
-        self.assertNotIn("PATCH_COMMAND", results["ffmpeg"][0])
-        self.assertNotIn("PATCH_COMMAND", results["libass"][0])
-        # ffmpeg/libass still get the pin block.
-        for component in ("ffmpeg", "libass"):
-            pins = PINS[component]
-            self.assertIn(f"    GIT_RESET {pins['commit']} # {pins['version']}\n", results[component][0])
-            self.assertIn("    GIT_REMOTE_NAME origin\n", results[component][0])
-
-    def test_staged_patches_glob_in_series_order(self):
-        _, staged = self.run_pin("mpv")
-        self.assertEqual(staged, ["mpv-0001-0001-first.patch", "mpv-0002-0002-second.patch"])
-        self.assertEqual(sorted(staged), staged, "glob order must equal series order")
-        for name in staged:
-            self.assertTrue((self.packages / name).is_file())
-
-    def test_git_repository_follows_the_pinned_url(self):
-        pinned, _ = self.run_pin("libass")
-        self.assertIn("    GIT_REPOSITORY https://github.com/libass/libass.git\n", pinned)
-
-    def test_ffmpeg_sparse_checkout_preserved(self):
-        pinned, _ = self.run_pin("ffmpeg")
-        self.assertIn('GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !tests/ref/fate"', pinned)
-        self.assertIn('GIT_CLONE_FLAGS "--sparse --filter=tree:0"', pinned)
-
-    def test_idempotent_rerun(self):
-        first = {c: (self.packages / f"{c}.cmake").read_text() for c in self.run_all()}
-        second = {c: (self.packages / f"{c}.cmake").read_text() for c in self.run_all()}
-        self.assertEqual(first, second)
-        # Staged patch set converges too (stale files removed, same names).
-        staged = sorted(p.name for p in self.packages.glob("*-*.patch"))
-        self.assertEqual(staged, ["mpv-0001-0001-first.patch", "mpv-0002-0002-second.patch"])
-
-    def test_patch_command_resets_to_the_pinned_commit(self):
-        # A patch step re-run alone (series-only change, or a warm-cache step
-        # cascade) must converge instead of double-applying onto a patched
-        # tree, so the injected command resets to the pin before applying.
-        pinned, _ = self.run_pin("mpv")
-        self.assertIn(f'"git reset --hard {PINS["mpv"]["commit"]} -q && git apply ', pinned)
-
-    def test_mingw_fixture_is_pristine_and_pin_matches_idiom(self):
-        # The toolchain source package pins through the same machinery; its
-        # pristine upstream file has no GIT_TAG at all (implicit master tip).
-        text = (TESTDATA / "mingw-w64.cmake").read_text()
-        self.assertEqual(
-            keyword_sequence(text, set(pin_packages.INJECTED_KEYWORDS)), [],
-            "mingw-w64.cmake fixture unexpectedly carries injected keywords",
-        )
-        pins = PINS["mingw-w64"]
-        pinned = pin_packages.rewrite(text, "mingw-w64", pins, False)
+        # The patch step resets to the pin before applying: a step re-run on
+        # its own (series-only change, or a warm-cache step cascade) must
+        # converge instead of double-applying onto a patched tree.
         self.assertIn(
+            "    PATCH_COMMAND ${EXEC} "
+            f'"git reset --hard {pins["commit"]} -q '
+            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/mpv-*.patch"\n'
             '    UPDATE_COMMAND ""\n'
             "    GIT_REMOTE_NAME origin\n"
             f"    GIT_TAG {pins['commit']}\n"
             f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
             pinned,
         )
-        self.assertNotIn("PATCH_COMMAND", pinned)
-        # Idempotent like the payload rewrites.
-        self.assertEqual(pin_packages.rewrite(pinned, "mingw-w64", pins, False), pinned)
 
-    def test_llvm_branch_tag_is_replaced_by_the_pin(self):
-        # llvm's pristine file carries upstream's own GIT_REMOTE_NAME and a
-        # moving-branch GIT_TAG (release/22.x); the strip-before-inject
-        # rewrite must replace them with the resolved commit, not stack a
-        # second block next to them.
-        text = (TESTDATA / "llvm.cmake").read_text()
-        self.assertIn("    GIT_TAG release/22.x\n", text)
-        pins = PINS["llvm"]
-        pinned = pin_packages.rewrite(text, "llvm", pins, False)
-        self.assertNotIn("GIT_TAG release/22.x", pinned)
-        self.assertEqual(pinned.count("GIT_TAG "), 1)
-        self.assertEqual(pinned.count("GIT_REMOTE_NAME "), 1)
-        self.assertIn(
-            '    UPDATE_COMMAND ""\n'
-            "    GIT_REMOTE_NAME origin\n"
-            f"    GIT_TAG {pins['commit']}\n"
-            f"    GIT_RESET {pins['commit']} # {pins['ref']} {pins['version']}\n",
-            pinned,
-        )
-        # The sparse-checkout clone flags must survive the rewrite.
-        self.assertIn('GIT_CLONE_FLAGS "--sparse --filter=tree:0"', pinned)
-        self.assertEqual(pin_packages.rewrite(pinned, "llvm", pins, False), pinned)
+    def test_main_rewrites_the_checkout_end_to_end(self):
+        # main() is what CI runs: drive it instead of re-composing its stages,
+        # so a dropped gate, a skipped EXTRA_COMPONENTS loop or an
+        # unconditional write fails here.
+        self.assertEqual(self.run_main(), 0)
+        for component in COMPONENT_FILES:
+            with self.subTest(component=component):
+                pinned = self.package_text(component)
+                self.assertIn(f"    GIT_TAG {self.pins[component]['commit']}\n", pinned)
+                self.assertEqual(pinned.count("GIT_TAG"), 1)
+        for component in pin_packages.COMPONENTS:
+            with self.subTest(staged=component):
+                entries = series_entries(component)
+                staged = sorted(path.name for path
+                                in (self.winbuild / "packages").glob(f"{component}-*.patch"))
+                self.assertEqual(
+                    staged,
+                    sorted(f"{component}-{index:04d}-{name}"
+                           for index, name in enumerate(entries, start=1)),
+                )
+                self.assertEqual("PATCH_COMMAND" in self.package_text(component), bool(entries))
+        for component in pin_packages.EXTRA_COMPONENTS:
+            self.assertNotIn("PATCH_COMMAND", self.package_text(component))
+        # The two gates main() applies on top of the rewrite: dropping either
+        # call ships a configure failure (ffmpeg aarch64 cuda) or a silently
+        # disabled feature (vapoursynth).
+        self.assertNotIn("-Dsubrandr=enabled", self.package_text("mpv"))
+        self.assertIn("-Dvapoursynth=disabled", self.package_text("mpv"))
+        self.assertNotIn(pin_packages.FFMPEG_CUDA_ORIGINAL, self.package_text("ffmpeg"))
+        self.assertTrue(self.package_text("ffmpeg").startswith(pin_packages.FFMPEG_CUDA_GUARD))
+        steps = (self.winbuild / "cmake/custom_steps.cmake").read_text(encoding="utf-8")
+        self.assertNotIn(pin_packages.CHECK_GIT_ORIGINAL, steps)
+        self.assertIn(pin_packages.CHECK_GIT_NEUTRALIZED, steps)
+
+    def test_main_converges_on_a_second_run(self):
+        self.run_main()
+        first = read_tree(self.winbuild)
+        # A patch left behind by a longer series must not survive the re-run:
+        # the staged-patch glob is what makes the rewrite idempotent.
+        (self.winbuild / "packages" / "mpv-9999-stale.patch").write_text(PATCH)
+        self.assertEqual(self.run_main(), 0)
+        self.assertEqual(first, read_tree(self.winbuild))
 
     def test_check_git_fixture_matches_audited_idiom(self):
         # neutralize_check_git string-matches the exact upstream injection
         # guard; a winbuild bump that reshapes it must fail loud, not
         # silently skip.
-        text = (TESTDATA / "custom_steps.cmake").read_text()
+        text = (TESTDATA / "custom_steps.cmake").read_text(encoding="utf-8")
         self.assertEqual(text.count(pin_packages.CHECK_GIT_ORIGINAL), 1)
         self.assertNotIn(pin_packages.CHECK_GIT_NEUTRALIZED, text)
-
-    def test_svtav1_pin_matches_idiom(self):
-        # svt-av1 pins to a 3.x release: SVT-AV1 4.0 removed a field the
-        # pinned release ffmpeg still sets unguarded.
-        text = (TESTDATA / "svtav1.cmake").read_text()
-        pins = PINS["svt-av1"]
-        pinned = pin_packages.rewrite(text, "svt-av1", pins, False)
-        self.assertIn(
-            '    UPDATE_COMMAND ""\n'
-            "    GIT_REMOTE_NAME origin\n"
-            f"    GIT_TAG {pins['commit']}\n"
-            f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
-            pinned,
-        )
-        self.assertEqual(pin_packages.rewrite(pinned, "svt-av1", pins, False), pinned)
-
-    def test_nvcodec_pin_matches_idiom(self):
-        # nv-codec-headers pins to the 13.0 series: the 13.1 in-dev tip
-        # reshapes NV_ENC_CLOCK_TIMESTAMP_SET, which n8.0.1's nvenc wrapper
-        # still uses.
-        text = (TESTDATA / "nvcodec-headers.cmake").read_text()
-        pins = PINS["nv-codec-headers"]
-        pinned = pin_packages.rewrite(text, "nv-codec-headers", pins, False)
-        self.assertIn(
-            '    UPDATE_COMMAND ""\n'
-            "    GIT_REMOTE_NAME origin\n"
-            f"    GIT_TAG {pins['commit']}\n"
-            f"    GIT_RESET {pins['commit']} # {pins['version']}\n",
-            pinned,
-        )
-        self.assertEqual(pin_packages.rewrite(pinned, "nv-codec-headers", pins, False), pinned)
 
     def test_ffmpeg_cuda_is_arch_gated(self):
         # The pinned release ffmpeg's ffnvcodec probe fails on
         # aarch64-w64-mingw32; the unconditional cuda enables become a
         # variable that is only set off-aarch64.
-        text = (TESTDATA / "ffmpeg.cmake").read_text()
+        text = (TESTDATA / "ffmpeg.cmake").read_text(encoding="utf-8")
         self.assertIn(pin_packages.FFMPEG_CUDA_ORIGINAL, text)
         gated = pin_packages.gate_ffmpeg_cuda(text)
         self.assertNotIn(pin_packages.FFMPEG_CUDA_ORIGINAL, gated)
@@ -296,7 +242,7 @@ class PinPackagesTest(unittest.TestCase):
     def test_mpv_master_only_options_are_stripped(self):
         # meson hard-errors on unknown options; subrandr and libcurl landed
         # after v0.41.0.
-        text = (TESTDATA / "mpv.cmake").read_text()
+        text = (TESTDATA / "mpv.cmake").read_text(encoding="utf-8")
         self.assertIn("-Dsubrandr=enabled", text)
         self.assertIn("-Dlibcurl=enabled", text)
         self.assertIn("-Dvapoursynth=enabled", text)
@@ -313,17 +259,8 @@ class PinPackagesTest(unittest.TestCase):
         self.assertEqual(len(text.splitlines()) - 2, len(gated.splitlines()))
         self.assertEqual(pin_packages.gate_mpv_options(gated), gated)
 
-    def test_ffmpeg_cuda_gate_survives_full_rewrite_cycle(self):
-        # main() applies rewrite() then gate_ffmpeg_cuda() on every run; a
-        # second full cycle must converge byte-identically.
-        text = (TESTDATA / "ffmpeg.cmake").read_text()
-        pins = PINS["ffmpeg"]
-        once = pin_packages.gate_ffmpeg_cuda(pin_packages.rewrite(text, "ffmpeg", pins, False))
-        twice = pin_packages.gate_ffmpeg_cuda(pin_packages.rewrite(once, "ffmpeg", pins, False))
-        self.assertEqual(once, twice)
-
     def test_neutralize_check_git_suppresses_and_converges(self):
-        text = (TESTDATA / "custom_steps.cmake").read_text()
+        text = (TESTDATA / "custom_steps.cmake").read_text(encoding="utf-8")
         fixed = pin_packages.neutralize_check_git(text)
         self.assertNotIn(pin_packages.CHECK_GIT_ORIGINAL, fixed)
         self.assertIn(pin_packages.CHECK_GIT_NEUTRALIZED, fixed)
