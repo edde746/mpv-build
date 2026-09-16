@@ -27,7 +27,7 @@ Development history up to the unification lives in those repositories.
 | `versions.json` | Single source of truth for component pins: upstream version, URL and hash/ref per component, with per-platform overrides. |
 | `patches/<component>/` | Patch pool plus `series.common` and `series.<platform>` files; line order is the application order. |
 | `toolchain/` | Per-group toolchain generation stamps (`toolchain/apple.txt`); bump one to force a full rebuild of that group without a source change. |
-| `scripts/` | `patches.py` (series resolution/validation/application), `keys.py` (content-addressed binary keys and the publish gate), and their regression tests. |
+| `scripts/` | `patches.py` (series resolution/validation/application, and `fetch-pinned`), `keys.py` (content-addressed binary keys and the publish gate), `extract.py` (the shared extractor the host regression harnesses slice production code with), and their regression tests. |
 | `artifacts.json` | Committed manifest of the published binaries, one section per platform group. |
 | `Package.swift` | SwiftPM manifest, rendered from the apple section of `artifacts.json`. |
 | `Sources/BuildScripts/` | The Apple build driver (SwiftPM package that compiles and packages the XCFrameworks). |
@@ -96,16 +96,31 @@ patches/<component>/series.<platform>   applied after series.common
 ```
 
 ```bash
-# validate every pool and series file
+# validate every pool and series file, and that versions.json's `platforms`
+# arrays agree with the groups that actually build each component
 python3 scripts/patches.py check
 # the ordered series one platform applies
 python3 scripts/patches.py resolve mpv apple
 # prove the series still applies to a source tree
 python3 scripts/patches.py apply mpv apple <srcdir> --check
+# acquire the exact source this repository pins and apply its series
+python3 scripts/patches.py fetch-pinned mpv apple <srcdir>
 ```
 
 CI applies every nonempty series against the exact sources `versions.json`
 pins, so a version bump that breaks a patch fails before anything builds.
+
+`fetch-pinned` is the one implementation of the pin contract, and the host
+regression harnesses below call it instead of each carrying their own copy: it
+resolves the override-aware pin, acquires the source the way the pin's `kind`
+says -- a `git` pin is shallow-cloned at its `ref` and `HEAD` is proven against
+the pinned `commit`; an `archive` pin is downloaded, checked against the pinned
+`sha256` and unpacked with its single top directory stripped -- and then applies
+the resolved series. The harnesses that build against a source tree also accept
+an already-patched source directory as their first argument, which is how they
+run offline. The harnesses that slice the patch files directly need no source
+tree at all, and `test_patches.sh` and `test_keys.sh` are regression tests of
+the Python tools themselves rather than of a source tree.
 
 ## How to build
 
