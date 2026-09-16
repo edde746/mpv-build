@@ -12,8 +12,9 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 python3 - "$root" <<'PY'
-import hashlib
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -86,19 +87,7 @@ with tempfile.TemporaryDirectory() as tmp:
     run(tmp, "resolve", "widget", "macos", expect=1)
     print("resolve honors series order")
 
-# 2. resolve --hashes: `name<TAB>sha256hex` of the pool bytes.
-with tempfile.TemporaryDirectory() as tmp:
-    component = make_tree(tmp)
-    result = run(tmp, "resolve", "widget", "apple", "--hashes")
-    lines = result.stdout.splitlines()
-    check(len(lines) == 3, f"--hashes must emit one line per resolved patch; got {len(lines)}")
-    for line in lines:
-        name, _, digest = line.partition("\t")
-        expected = hashlib.sha256((component / "pool" / name).read_bytes()).hexdigest()
-        check(digest == expected, f"--hashes digest for {name} must be sha256 of the pool bytes")
-    print("--hashes emits name<TAB>sha256hex")
-
-# 3. check: pass on a clean tree, fail on each contract violation.
+# 2. check: pass on a clean tree, fail on each contract violation.
 with tempfile.TemporaryDirectory() as tmp:
     component = make_tree(tmp)
     run(tmp, "check")
@@ -210,27 +199,30 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     print("apply --check is sound for stacked series and unwinds on failure")
 
-# 5. This repository's own tree is valid, and the apple series are nonempty.
-# series.common resolves first; behind it, the migrated apple series keeps
-# the old lexicographic apply order and its patch count.
-def series_entries(path):
-    if not path.is_file():
-        return []
-    lines = (line.strip() for line in path.read_text(encoding="utf-8").splitlines())
-    return [line for line in lines if line and not line.startswith("#")]
+# 5. This repository's own tree is valid, and every group is declared where
+# versions.json says it is.
+run(root, "check")
+# Every real component resolves for every platform, and every entry it names
+# exists: `check` above is what enforces the latter, this proves the former.
+for component in sorted(p.name for p in (root / "patches").iterdir() if p.is_dir()):
+    for platform in ("apple", "android", "linux", "windows"):
+        run(root, "resolve", component, platform)
 
-
-result = run(root, "check")
-for component, migrated_count in (("mpv", 24), ("ffmpeg", 13)):
-    common = series_entries(root / "patches" / component / "series.common")
-    resolved = run(root, "resolve", component, "apple").stdout.split()
-    check(resolved[: len(common)] == common, f"the real {component} apple series must start with series.common")
-    migrated = resolved[len(common):]
+# A component a group's build consumes must declare that group in versions.json;
+# check enforces it, so prove the enforcement fires on a real tree.
+with tempfile.TemporaryDirectory() as tmp:
+    sandbox = Path(tmp)
+    shutil.copytree(root / "patches", sandbox / "patches")
+    shutil.copytree(root / "platforms", sandbox / "platforms")
+    shutil.copy2(root / "versions.json", sandbox / "versions.json")
+    versions = json.loads((sandbox / "versions.json").read_text(encoding="utf-8"))
+    versions["components"]["ffmpeg"]["platforms"] = ["apple"]
+    (sandbox / "versions.json").write_text(json.dumps(versions), encoding="utf-8")
+    result = run(sandbox, "check", expect=1)
     check(
-        len(migrated) == migrated_count,
-        f"the real {component} apple series must resolve {migrated_count} apple patches, got {len(migrated)}",
+        "ffmpeg" in result.stderr and "android" in result.stderr,
+        "check must fail when a built component does not declare its group",
     )
-    check(migrated == sorted(migrated), f"the migrated {component} series must preserve the old lexicographic order")
 print("the repository's own patch tree passes check")
 
 if failures:

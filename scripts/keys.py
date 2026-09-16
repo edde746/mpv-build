@@ -130,6 +130,10 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+# scripts/patches.py owns the series format; keys.py reads series through it so
+# the rule has one implementation.
+import patches
+
 SCHEMA = 2
 
 MANIFEST_PATH = Path("artifacts.json")
@@ -286,11 +290,31 @@ def load_versions(root: Path) -> dict:
     return versions
 
 
-def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
-    """The component's pin fields with the group's overrides folded in."""
+def _component_entry(versions: dict, component: str) -> dict:
     entry = versions.get("components", {}).get(component)
     if entry is None:
         raise SystemExit(f"{VERSIONS_PATH}: no component {component!r}")
+    return entry
+
+
+def resolved_kind(versions: dict, component: str, group: str) -> str:
+    """The component's acquisition kind with the group's overrides folded in.
+
+    The drivers dispatch on this (`git` clones, everything else fetches a
+    file), so it must agree with resolved_pins: a per-platform override that
+    switches a prebuilt pin to a git one has to reach both.
+    """
+    entry = _component_entry(versions, component)
+    override = (entry.get("overrides") or {}).get(group) or {}
+    kind = override.get("kind", entry.get("kind"))
+    if not kind:
+        raise SystemExit(f"{VERSIONS_PATH}: {component} has no kind")
+    return kind
+
+
+def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
+    """The component's pin fields with the group's overrides folded in."""
+    entry = _component_entry(versions, component)
     fields = ("version", "url", "ref", "sha256", "commit")
     pins = {field: entry[field] for field in fields if field in entry}
     for field, value in (entry.get("overrides", {}).get(group) or {}).items():
@@ -306,14 +330,23 @@ def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
 
 
 def _series_entries(path: Path) -> list[str]:
-    # A missing series file is an empty series. Order is authoritative.
-    if not path.is_file():
-        return []
+    # The series format lives in scripts/patches.py; this is the same reader so
+    # a rule change cannot land in one and miss the other.
+    return patches.read_series(path)
+
+
+def patch_entries(root: Path, component: str, group: str) -> list[tuple[str, str]]:
+    """(name, sha256) of every patch in the component's resolved series, in order."""
+    directory = root / PATCHES_ROOT / component
+    names = _series_entries(directory / "series.common") + _series_entries(
+        directory / f"series.{group}"
+    )
     entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            entries.append(line)
+    for name in names:
+        pool_file = directory / "pool" / name
+        if not pool_file.is_file():
+            raise SystemExit(f"{directory / 'pool' / name}: named by a series file but missing")
+        entries.append((name, _sha256_file(pool_file)))
     return entries
 
 
@@ -399,7 +432,7 @@ def _artifact_key_inputs(root: Path, group: Group, artifact: str) -> str:
     return "\n".join(text) + "\n"
 
 
-def key_inputs(root: Path, group: Group, artifact: str, *, gpl: bool, debug: bool) -> str:
+def key_inputs(root: Path, group: Group, artifact: str) -> str:
     if group.artifacts is not None:
         return _artifact_key_inputs(root, group, artifact)
 
@@ -414,8 +447,12 @@ def key_inputs(root: Path, group: Group, artifact: str, *, gpl: bool, debug: boo
     ]
     text.extend(_pin_lines(pins))
     text += [
-        f"gpl={int(gpl)}",
-        f"debug={int(debug)}",
+        # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true
+        # and the group.json builds have no flag matrix, so these two lines are
+        # constants. They stay because the published apple keys were derived
+        # from them; there is no LGPL build and no debug build to key.
+        "gpl=1",
+        "debug=0",
         f"platforms={','.join(group.platforms)}",
         f"driver={driver_digest(root, group)}",
         f"toolchain={_sha256_bytes(toolchain_path.read_bytes())}",
@@ -425,15 +462,12 @@ def key_inputs(root: Path, group: Group, artifact: str, *, gpl: bool, debug: boo
     return "\n".join(text) + "\n"
 
 
-def library_key(root: Path, group: Group, artifact: str, *, gpl: bool, debug: bool) -> str:
-    return _sha256_bytes(key_inputs(root, group, artifact, gpl=gpl, debug=debug).encode())[:12]
+def library_key(root: Path, group: Group, artifact: str) -> str:
+    return _sha256_bytes(key_inputs(root, group, artifact).encode())[:12]
 
 
-def all_keys(root: Path, group: Group, *, gpl: bool, debug: bool) -> dict[str, str]:
-    return {
-        artifact: library_key(root, group, artifact, gpl=gpl, debug=debug)
-        for artifact in group.self_built
-    }
+def all_keys(root: Path, group: Group) -> dict[str, str]:
+    return {artifact: library_key(root, group, artifact) for artifact in group.self_built}
 
 
 # ---- manifest -------------------------------------------------------------
@@ -582,7 +616,7 @@ def _record_variant(args, root: Path, group: Group) -> int:
     hide under a fresh key.
     """
     release = root / args.release_dir
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
     manifest = load_manifest(root)
     section = group_section(manifest, group)
 
@@ -634,7 +668,7 @@ def cmd_record_platform(args, root: Path, group: Group) -> int:
         return _record_variant(args, root, group)
 
     release = root / args.release_dir
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
 
     renamed = 0
     for library in group.self_built:
@@ -660,7 +694,7 @@ def cmd_record_frameworks(args, root: Path, group: Group) -> int:
             "record-platform per variant is its only record verb"
         )
     release = root / args.release_dir
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
     manifest = load_manifest(root)
     section = group_section(manifest, group)
 
@@ -735,37 +769,51 @@ def _has_local_path_target(text: str, name: str) -> bool:
     return bool(pattern.search(text))
 
 
+def framework_expectations(root: Path, group: Group) -> list[tuple[str, str, str]]:
+    """(framework, expected url, expected checksum) for every rendered target.
+
+    The one authority for what `render` writes and what `verify` demands: both
+    walk this list, so they cannot disagree about a layout the manifest
+    describes.
+    """
+    if group.package is None:
+        return []
+    manifest = load_manifest(root)
+    section = group_section(manifest, group)
+    asset_base = section["assetBase"]
+
+    expected = []
+    for library in group.self_built:
+        entry = section["libraries"].get(library)
+        if not entry:
+            continue
+        for name, framework in sorted((entry.get("frameworks") or {}).items()):
+            expected.append(
+                (name, f"{asset_base}/{framework['asset']}", framework["checksum"])
+            )
+    return expected
+
+
 def cmd_render(args, root: Path, group: Group) -> int:
     if group.package is None:
         # group.json groups render nothing; a no-op keeps the publish recipe
         # uniform across groups.
         print(f"the {group.name} group renders no package manifest")
         return 0
-    manifest = load_manifest(root)
-    section = group_section(manifest, group)
-    asset_base = section["assetBase"]
     path = root / group.package
     text = path.read_text(encoding="utf-8")
     original = text
     skipped = []
 
-    for library in group.self_built:
-        entry = section["libraries"].get(library)
-        if not entry:
-            continue
-        for name, framework in sorted((entry.get("frameworks") or {}).items()):
-            url = f"{asset_base}/{framework['asset']}"
-            checksum = framework["checksum"]
-            match = _target_block(text, name)
-            if not match:
-                if _has_local_path_target(text, name):
-                    skipped.append(name)
-                    continue
-                raise SystemExit(f"{group.package}: no url/checksum target named {name}")
-            replacement = (
-                f'{match.group(1)}url: "{url}",{match.group(3)}checksum: "{checksum}"'
-            )
-            text = text[: match.start()] + replacement + text[match.end() :]
+    for name, url, checksum in framework_expectations(root, group):
+        match = _target_block(text, name)
+        if not match:
+            if _has_local_path_target(text, name):
+                skipped.append(name)
+                continue
+            raise SystemExit(f"{group.package}: no url/checksum target named {name}")
+        replacement = f'{match.group(1)}url: "{url}",{match.group(3)}checksum: "{checksum}"'
+        text = text[: match.start()] + replacement + text[match.end() :]
 
     if text != original:
         path.write_text(text, encoding="utf-8")
@@ -782,18 +830,47 @@ def cmd_render(args, root: Path, group: Group) -> int:
 
 
 def cmd_keys(args, root: Path, group: Group) -> int:
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
     if args.show_inputs:
         for library in group.self_built:
             print(f"# {library} -> {keys[library]}")
-            print(key_inputs(root, group, library, gpl=args.gpl, debug=args.debug), end="")
+            print(key_inputs(root, group, library), end="")
         return 0
     print(json.dumps(keys, indent=2, sort_keys=True))
     return 0
 
 
+def cmd_versions(args, root: Path, group: Group | None) -> int:
+    """Print `<component><TAB><version>` for every component, sorted.
+
+    The base pin, not a platform override: this is what release notes and
+    release tags want. It replaces the workflows' regex reads of the Swift
+    driver, which stopped carrying versions when pins moved to versions.json.
+    """
+    for component, entry in sorted(load_versions(root)["components"].items()):
+        print(f"{component}\t{entry['version']}")
+    return 0
+
+
+def cmd_groups(args, root: Path, group: Group | None) -> int:
+    """Print every group's name, space-separated.
+
+    The workflow matrices and the plan job consume this instead of keeping
+    their own copies of the list.
+    """
+    print(" ".join(sorted(GROUPS)))
+    return 0
+
+
+def cmd_variants(args, root: Path, group: Group) -> int:
+    """Print the group's variants (ABIs/arches) in group.json order."""
+    for variant in group.platforms:
+        print(variant)
+    return 0
+
+
 def cmd_stale(args, root: Path, group: Group) -> int:
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
     manifest = load_manifest(root)
     section = group_section(manifest, group)
     for library in group.self_built:
@@ -803,8 +880,124 @@ def cmd_stale(args, root: Path, group: Group) -> int:
     return 0
 
 
+def _wanted_assets(section: dict) -> list[tuple[str, str]]:
+    """(library, asset) for every asset the manifest pins, deduplicated in order.
+
+    Two entry shapes reach here: the apple group records `prebuilt` as a
+    platform -> asset-name map, while a group.json group records a
+    variant -> {asset, checksum} map.
+    """
+    wanted = []
+    seen = set()
+    for library, entry in sorted(section["libraries"].items()):
+        assets = []
+        for value in sorted((entry.get("prebuilt") or {}).items()):
+            recorded = value[1]
+            assets.append(recorded["asset"] if isinstance(recorded, dict) else recorded)
+        assets += [
+            framework["asset"]
+            for _, framework in sorted((entry.get("frameworks") or {}).items())
+        ]
+        for asset in assets:
+            if asset not in seen:
+                seen.add(asset)
+                wanted.append((library, asset))
+    return wanted
+
+
+def _published_digests(root: Path, group: Group) -> dict[str, str]:
+    """Asset name -> remote sha256 for the group's rolling prerelease."""
+    release = f"binaries-{group.name}"
+    listing = root / "dist" / "published-assets.txt"
+    listing.parent.mkdir(parents=True, exist_ok=True)
+    with listing.open("w", encoding="utf-8") as handle:
+        subprocess.run(
+            ["gh", "release", "view", release, "--json", "assets",
+             "--jq", '.assets[] | "\\(.name) \\(.digest // "")"'],
+            stdout=handle,
+            check=True,
+        )
+    digests = {}
+    for line in listing.read_text(encoding="utf-8").splitlines():
+        name, _, digest = line.strip().partition(" ")
+        if name:
+            digests[name] = digest.removeprefix("sha256:")
+    return digests
+
+
+def cmd_publish_assets(args, root: Path, group: Group) -> int:
+    """Upload every manifest asset this run built that is not published yet.
+
+    One implementation for every group, so the verify-on-skip rule below
+    cannot drift between them.
+    """
+    release = f"binaries-{group.name}"
+    notes = (
+        f"Content-addressed {group.name} build artifacts for the commits on main. "
+        "Asset names encode the sources they were built from, so every asset is "
+        "immutable and is never replaced. The committed manifest pins these URLs; "
+        "deleting an asset breaks every commit and tag that references it."
+    )
+    if subprocess.run(["gh", "release", "view", release], capture_output=True).returncode != 0:
+        subprocess.run(
+            ["gh", "release", "create", release,
+             "--prerelease", "--title", f"Rolling binaries ({group.name})", "--notes", notes],
+            check=True,
+        )
+
+    digests = _published_digests(root, group)
+    section = group_section(load_manifest(root), group)
+    release_dir = root / args.release_dir
+
+    uploads = []
+    missing = []
+    for library, asset in _wanted_assets(section):
+        path = release_dir / asset
+        if asset in digests:
+            # Verify-on-skip: an existing content-addressed name must hold
+            # exactly the bytes this run rebuilt, or the checksum recorded in
+            # artifacts.json drifts from what consumers download (this happened
+            # when the archives were not byte-reproducible).
+            remote = digests[asset]
+            if path.is_file() and remote:
+                local = _sha256_file(path)
+                if local != remote:
+                    raise SystemExit(
+                        f"{asset}: rebuilt bytes {local} != published digest {remote}; "
+                        "a content-addressed asset must never change bytes -- the "
+                        "archive packaging has lost reproducibility"
+                    )
+                print(f"published {asset} (bytes verified)")
+            else:
+                print(f"published {asset}")
+            continue
+        if path.is_file():
+            uploads.append(path)
+        else:
+            missing.append(f"{library}: {asset}")
+
+    # A manifest asset that is neither published nor built would leave a dead
+    # URL in the rendered package manifest, so refuse to commit that manifest.
+    if missing:
+        raise SystemExit(
+            "manifest references assets that were neither published nor built:\n  "
+            + "\n  ".join(missing)
+        )
+
+    if not uploads:
+        print("every manifest asset is already published")
+        return 0
+    for path in uploads:
+        print(f"upload    {path.name}")
+    # No --clobber: an existing name is the same bytes by construction.
+    subprocess.run(
+        ["gh", "release", "upload", release, *(str(path) for path in uploads)], check=True
+    )
+    return 0
+
+
 def cmd_verify(args, root: Path, group: Group) -> int:
-    keys = all_keys(root, group, gpl=args.gpl, debug=args.debug)
+    keys = all_keys(root, group)
     failures: list[str] = []
 
     if not (root / MANIFEST_PATH).is_file():
@@ -813,7 +1006,6 @@ def cmd_verify(args, root: Path, group: Group) -> int:
 
     manifest = load_manifest(root)
     section = group_section(manifest, group)
-    asset_base = section["assetBase"]
     text = (root / group.package).read_text(encoding="utf-8") if group.package else ""
     allow_local = os.environ.get("MPVKIT_ALLOW_LOCAL_PATH") == "1"
 
@@ -821,33 +1013,30 @@ def cmd_verify(args, root: Path, group: Group) -> int:
         entry = section["libraries"].get(library)
         for problem in entry_problems(entry, keys[library], library, group):
             failures.append(f"{library}: {problem}")
-        if not entry or group.package is None:
-            continue
 
-        for name, framework in sorted((entry.get("frameworks") or {}).items()):
-            expected_url = f"{asset_base}/{framework['asset']}"
-            match = _target_block(text, name)
-            if not match:
-                if _has_local_path_target(text, name):
-                    message = (
-                        f"{name}: {group.package} pins a local path instead of {expected_url}"
-                    )
-                    if allow_local:
-                        print(f"warning: {message} (MPVKIT_ALLOW_LOCAL_PATH=1)")
-                    else:
-                        failures.append(message)
+    for name, expected_url, expected_checksum in framework_expectations(root, group):
+        match = _target_block(text, name)
+        if not match:
+            if _has_local_path_target(text, name):
+                message = (
+                    f"{name}: {group.package} pins a local path instead of {expected_url}"
+                )
+                if allow_local:
+                    print(f"warning: {message} (MPVKIT_ALLOW_LOCAL_PATH=1)")
                 else:
-                    failures.append(f"{name}: no url/checksum target in {group.package}")
-                continue
-            if match.group("url") != expected_url:
-                failures.append(
-                    f"{name}: {group.package} url {match.group('url')} != {expected_url}"
-                )
-            if match.group("checksum") != framework["checksum"]:
-                failures.append(
-                    f"{name}: {group.package} checksum {match.group('checksum')} "
-                    f"!= {framework['checksum']}"
-                )
+                    failures.append(message)
+            else:
+                failures.append(f"{name}: no url/checksum target in {group.package}")
+            continue
+        if match.group("url") != expected_url:
+            failures.append(
+                f"{name}: {group.package} url {match.group('url')} != {expected_url}"
+            )
+        if match.group("checksum") != expected_checksum:
+            failures.append(
+                f"{name}: {group.package} checksum {match.group('checksum')} "
+                f"!= {expected_checksum}"
+            )
 
     if failures:
         print(f"FAIL: the published {group.name} binaries do not describe this commit")
@@ -863,29 +1052,16 @@ def cmd_verify(args, root: Path, group: Group) -> int:
 
 
 def main(argv: list[str]) -> int:
-    # The globals are registered on the main parser and every subparser, with
-    # SUPPRESS defaults on the actions, so they work both before and after the
-    # verb without the subparser's copy clobbering a value parsed earlier.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--platform-group",
         dest="group",
         choices=sorted(GROUPS),
-        default=argparse.SUPPRESS,
+        default="apple",
         help="platform group to operate on (default: apple)",
     )
-    # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true and
-    # the group.json builds have no flag matrix. The key text keeps its gpl=1
-    # line for apple so published keys stay stable; there is no LGPL build to key.
-    common.add_argument(
-        "--debug",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="key a debug build",
-    )
 
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], parents=[common])
-    parser.set_defaults(group="apple", gpl=True, debug=False)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     keys = subparsers.add_parser(
@@ -898,6 +1074,33 @@ def main(argv: list[str]) -> int:
         "stale", parents=[common], help="list libraries whose binaries need building"
     )
     stale.set_defaults(func=cmd_stale)
+
+    # No --platform-group: this verb is what enumerates the groups.
+    groups = subparsers.add_parser(
+        "groups", help="print every platform group's name, space-separated"
+    )
+    groups.set_defaults(func=cmd_groups)
+
+    # No --platform-group either: base pins, not a platform's overrides.
+    versions = subparsers.add_parser(
+        "versions", help="print every component's pinned upstream version"
+    )
+    versions.set_defaults(func=cmd_versions)
+
+    variants = subparsers.add_parser(
+        "variants",
+        parents=[common],
+        help="print the group's variants (ABIs/arches) in group.json order",
+    )
+    variants.set_defaults(func=cmd_variants)
+
+    publish_assets = subparsers.add_parser(
+        "publish-assets",
+        parents=[common],
+        help="upload the manifest's assets that this run built and nothing published yet",
+    )
+    publish_assets.add_argument("--release-dir", default="dist/release")
+    publish_assets.set_defaults(func=cmd_publish_assets)
 
     record_platform = subparsers.add_parser(
         "record-platform",
@@ -929,7 +1132,8 @@ def main(argv: list[str]) -> int:
     verify.set_defaults(func=cmd_verify)
 
     args = parser.parse_args(argv)
-    return args.func(args, repo_root(), GROUPS[args.group])
+    group = GROUPS[args.group] if getattr(args, "group", None) else None
+    return args.func(args, repo_root(), group)
 
 
 if __name__ == "__main__":

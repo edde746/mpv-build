@@ -37,6 +37,7 @@ jobs:
           REQUESTED_RELEASE_VERSION: ${{ github.event.inputs.version }}
         run: |
           python3 - <<'PY'
+          import json
           import os
           import re
           import textwrap
@@ -50,13 +51,14 @@ jobs:
             patch = int(parts[2]) if len(parts) > 2 else 0
             return f"{major}.{minor}.{patch}"
 
-          file_path = Path('./Sources/BuildScripts/XCFrameworkBuild/main.swift')
-          content = file_path.read_text(encoding='utf-8')
-
-          mpv_version = re.search(r'(case .libmpv[^"]+?)"(.+?)"', content).group(2)
-          ffmpeg_version = re.search(r'(case .FFmpeg[^"]+?)"(.+?)"', content).group(2)
-          libplacebo_version = re.search(r'(case .libplacebo[^"]+?)"(.+?)"', content).group(2)
-          vulkan_version = re.search(r'(case .vulkan[^"]+?)"(.+?)"', content).group(2)
+          file_path = Path('versions.json')
+          components = json.loads(file_path.read_text(encoding='utf-8'))['components']
+          # Pins live in versions.json; the Swift driver reads them from there
+          # too, so nothing in this workflow parses Swift source.
+          mpv_version = components['mpv']['version']
+          ffmpeg_version = components['ffmpeg']['version']
+          libplacebo_version = components['libplacebo']['version']
+          vulkan_version = components['vulkan']['version']
 
           release_version = os.environ.get('REQUESTED_RELEASE_VERSION') or normalize_version(mpv_version)
           print(f'mpv version: {mpv_version}')

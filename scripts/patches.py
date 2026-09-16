@@ -15,10 +15,9 @@ windows.
 
 Commands:
 
-    patches.py resolve <component> <platform> [--hashes]
+    patches.py resolve <component> <platform>
         Print the resolved series (series.common then series.<platform>) as
-        pool-relative filenames, one per line. With --hashes each line is
-        `name<TAB>sha256hex` of the pool file's bytes.
+        pool-relative filenames, one per line.
 
     patches.py check
         Validate every component: each series entry names an existing pool
@@ -34,15 +33,27 @@ Commands:
         --check` against the pristine tree would report false failures --
         and then unwound with `git apply -R` in reverse order, leaving the
         tree byte-identical to how it was found.
+
+    patches.py fetch-pinned <component> <platform> <srcdir>
+        Clone the exact source `<component>` is pinned to for `<platform>`
+        in versions.json (override-aware), prove HEAD is the pinned commit,
+        and apply the resolved series. This is the one implementation of
+        the pin contract; the host regression harnesses call it instead of
+        each carrying their own copy.
+
+`check` also enforces versions.json's `platforms` arrays: a component a
+group's build consumes must declare that group.
 """
 
 import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 PLATFORMS = ("apple", "android", "linux", "windows")
 PATCHES_DIR = Path("patches")
+VERSIONS_PATH = Path("versions.json")
 
 
 def fail(message):
@@ -90,26 +101,117 @@ def require_platform(platform):
         fail(f"unknown platform {platform!r}; expected one of {', '.join(PLATFORMS)}")
 
 
-def cmd_resolve(component, platform, hashes):
+def cmd_resolve(component, platform):
     require_platform(platform)
-    pool = PATCHES_DIR / component / "pool"
     for name in resolve(component, platform):
-        if hashes:
-            path = pool / name
-            if not path.is_file():
-                fail(f"{component}: series entry {name!r} has no pool file {path}")
-            print(f"{name}\t{sha256_file(path)}")
-        else:
-            print(name)
+        print(name)
     return 0
+
+
+def component_pins(component, platform):
+    """The component's pins for one platform, with overrides.<platform> folded."""
+    if not VERSIONS_PATH.is_file():
+        fail(f"{VERSIONS_PATH}: missing; component pins live there now")
+    components = json.loads(VERSIONS_PATH.read_text(encoding="utf-8")).get("components", {})
+    entry = components.get(component)
+    if entry is None:
+        fail(f"{VERSIONS_PATH}: no component {component!r}")
+    pins = dict(entry)
+    pins.update((entry.get("overrides") or {}).get(platform) or {})
+    return pins
+
+
+def cmd_fetch(component, platform, srcdir):
+    """Clone the component's pinned source for this platform and patch it.
+
+    The single implementation of the pin contract: resolve the override-aware
+    pin, shallow-clone the ref, prove HEAD is the pinned commit, then apply the
+    resolved series.
+    """
+    require_platform(platform)
+    pins = component_pins(component, platform)
+    if pins.get("kind") != "git":
+        fail(f"{component}: {platform} pins kind {pins.get('kind')!r}, not a git checkout")
+    url, ref, commit = pins.get("url"), pins.get("ref"), pins.get("commit")
+    if not url or not ref:
+        fail(f"{VERSIONS_PATH}: {component} has no {platform} url/ref to clone")
+    if not commit:
+        fail(f"{VERSIONS_PATH}: {component} has no {platform} commit to verify against")
+
+    destination = Path(srcdir)
+    if destination.exists():
+        fail(f"{srcdir!r} already exists; refusing to clone into it")
+    result = subprocess.run(
+        ["git", "clone", "--quiet", "--depth", "1", "--branch", ref, url, str(destination)]
+    )
+    if result.returncode != 0:
+        fail(f"{component}: could not clone {url} at {ref}")
+    head = subprocess.run(
+        ["git", "-C", str(destination), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if head != commit:
+        fail(f"{component}: {ref} is {head}, {VERSIONS_PATH} pins {commit}")
+    return cmd_apply(component, platform, srcdir, False)
+
+
+def group_components():
+    """group -> the versions.json components that group's build consumes."""
+    consumed = {}
+    for path in sorted(Path("platforms").glob("*/group.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        names = set()
+        for spec in (data.get("artifacts") or {}).values():
+            names.update(spec.get("components") or ())
+        consumed[path.parent.name] = names
+    # The apple group is defined in the Swift driver rather than a group.json:
+    # the components it builds are the ones its own patch series touch.
+    apple = consumed.setdefault("apple", set())
+    if PATCHES_DIR.is_dir():
+        for component_dir in sorted(PATCHES_DIR.iterdir()):
+            if component_dir.is_dir() and read_series(component_dir / "series.apple"):
+                apple.add(component_dir.name)
+    return consumed
+
+
+def check_platform_declarations(components, problems):
+    """Every component a group builds must declare that group in versions.json.
+
+    The `platforms` arrays are the only place that records which platforms a
+    component participates in; without this they are unread decoration that can
+    silently disagree with the drivers.
+    """
+    for group, names in sorted(group_components().items()):
+        for component in sorted(names):
+            entry = components.get(component)
+            if entry is None:
+                problems.append(
+                    f"{group} builds {component!r}, which {VERSIONS_PATH} does not pin"
+                )
+                continue
+            declared = entry.get("platforms") or []
+            if group not in declared:
+                problems.append(
+                    f"{group} builds {component!r}, but its {VERSIONS_PATH} "
+                    f"platforms {declared} do not list {group}"
+                )
 
 
 def cmd_check():
     problems = []
+    if VERSIONS_PATH.is_file():
+        components = json.loads(VERSIONS_PATH.read_text(encoding="utf-8")).get("components", {})
+        check_platform_declarations(components, problems)
 
     if not PATCHES_DIR.is_dir():
         # A tree with no patches at all is valid.
-        return 0
+        if not problems:
+            return 0
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        return 1
 
     for component_dir in sorted(PATCHES_DIR.iterdir()):
         if not component_dir.is_dir():
@@ -141,7 +243,7 @@ def cmd_check():
         referenced = set()
         for series in known_series:
             for name in read_series(component_dir / series):
-                if "/" in name or name != name.strip():
+                if "/" in name:
                     problems.append(f"{component}/{series}: invalid entry {name!r}")
                     continue
                 referenced.add(name)
@@ -203,14 +305,12 @@ def cmd_apply(component, platform, srcdir, check_only):
 
 
 def main(argv):
-    if len(argv) >= 3 and argv[0] == "resolve":
-        hashes = "--hashes" in argv[3:]
-        extra = [a for a in argv[3:] if a != "--hashes"]
-        if len(argv) < 3 or extra:
-            fail("usage: patches.py resolve <component> <platform> [--hashes]")
-        return cmd_resolve(argv[1], argv[2], hashes)
+    if len(argv) == 3 and argv[0] == "resolve":
+        return cmd_resolve(argv[1], argv[2])
     if argv == ["check"]:
         return cmd_check()
+    if len(argv) == 4 and argv[0] == "fetch-pinned":
+        return cmd_fetch(argv[1], argv[2], argv[3])
     if len(argv) >= 4 and argv[0] == "apply":
         check_only = "--check" in argv[4:]
         extra = [a for a in argv[4:] if a != "--check"]
@@ -218,8 +318,9 @@ def main(argv):
             fail("usage: patches.py apply <component> <platform> <srcdir> [--check]")
         return cmd_apply(argv[1], argv[2], argv[3], check_only)
     fail(
-        "usage: patches.py resolve <component> <platform> [--hashes] | "
-        "patches.py check | patches.py apply <component> <platform> <srcdir> [--check]"
+        "usage: patches.py resolve <component> <platform> | "
+        "patches.py check | patches.py apply <component> <platform> <srcdir> [--check] | "
+        "patches.py fetch-pinned <component> <platform> <srcdir>"
     )
 
 

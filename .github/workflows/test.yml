@@ -23,6 +23,7 @@ jobs:
         uses: jannekem/run-python-script-action@v1
         with:
           script: |
+            import json
             import re
 
             def normalize_version(version_string):
@@ -33,14 +34,15 @@ jobs:
               patch = int(parts[2]) if len(parts) > 2 else 0
               return f"{major}.{minor}.{patch}"
 
-            file_path = './Sources/BuildScripts/XCFrameworkBuild/main.swift'
-            with open(file_path, 'r', encoding='utf-8') as file:
-              content = file.read()
+            # Pins live in versions.json; the Swift driver reads them from there
+            # too, so nothing here parses Swift source.
+            with open('./versions.json', 'r', encoding='utf-8') as file:
+              components = json.load(file)['components']
 
-            mpvVersion = re.search(r'(case .libmpv[^"]+?)"(.+?)"', content).group(2)
-            ffmpegVersion = re.search(r'(case .FFmpeg[^"]+?)"(.+?)"', content).group(2)
-            libplaceboVersion = re.search(r'(case .libplacebo[^"]+?)"(.+?)"', content).group(2)
-            vulkanVersion = re.search(r'(case .vulkan[^"]+?)"(.+?)"', content).group(2)
+            mpvVersion = components['mpv']['version']
+            ffmpegVersion = components['ffmpeg']['version']
+            libplaceboVersion = components['libplacebo']['version']
+            vulkanVersion = components['vulkan']['version']
 
             print(f'mpv version: {mpvVersion}')
             print(f'ffmpeg version: {ffmpegVersion}')

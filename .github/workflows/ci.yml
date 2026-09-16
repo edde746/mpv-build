@@ -32,6 +32,13 @@ jobs:
       - name: Test windows package pinning
         run: python3 platforms/windows/test_pin_packages.py
 
+      # The linux driver has no other runner. The harness needs only bash, git
+      # and python3 (every build tool is stubbed and JOBS=1 keeps nproc out of
+      # it), and it is the only gate on the mpv/ffmpeg configure flags whose
+      # loss still compiles, links and plays -- just degraded.
+      - name: Test linux build plan
+        run: bash platforms/linux/test.sh
+
       # Every nonempty (component, group) series must still apply cleanly to
       # the exact source tree versions.json pins for it, otherwise the next
       # publish run breaks. `apply --check` lands the whole stack and unwinds
@@ -43,10 +50,14 @@ jobs:
           import json
           import subprocess
           import sys
-          import urllib.request
           from pathlib import Path
 
-          GROUPS = ['apple', 'android', 'linux', 'windows']
+          # The group list is discovered from platforms/*/group.json by keys.py,
+          # not restated here, so a new group cannot be silently unchecked.
+          GROUPS = subprocess.run([sys.executable, 'scripts/keys.py', 'groups'],
+                                  capture_output=True, text=True, check=True).stdout.split()
+          if not GROUPS:
+              raise SystemExit('keys.py groups reported no platform groups')
 
           components = json.loads(Path('versions.json').read_text(encoding='utf-8'))['components']
           work = Path('.ci-sources')
@@ -59,30 +70,13 @@ jobs:
             return [line for line in result.stdout.splitlines() if line.strip()]
 
           def fetch(component, group, dest):
-            entry = components[component]
-            override = (entry.get('overrides') or {}).get(group) or {}
-            kind = override.get('kind', entry['kind'])
-            url = override.get('url', entry.get('url'))
-            if kind == 'git':
-              ref = override.get('ref', entry.get('ref'))
-              subprocess.run(['git', 'clone', '--depth', '1', '--branch', ref, url, str(dest)], check=True)
-              commit = override.get('commit', entry.get('commit'))
-              if commit:
-                head = subprocess.run(['git', '-C', str(dest), 'rev-parse', 'HEAD'],
-                                      capture_output=True, text=True, check=True).stdout.strip()
-                if head != commit:
-                  raise SystemExit(f'{component}: {ref} is {head}, versions.json pins {commit}')
-            elif kind == 'archive':
-              archive = work / f'{component}-{group}.archive'
-              urllib.request.urlretrieve(url, archive)
-              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-              expected = override.get('sha256', entry.get('sha256'))
-              if expected and digest != expected:
-                raise SystemExit(f'{component}: archive sha256 {digest}, versions.json pins {expected}')
-              dest.mkdir()
-              subprocess.run(['tar', '-xf', str(archive), '--strip-components=1', '-C', str(dest)], check=True)
-            else:
-              raise SystemExit(f'{component}: cannot fetch kind {kind!r} to check patches against')
+            # The pin contract lives in scripts/patches.py fetch-pinned: it
+            # resolves the override-aware pin, clones the ref, proves HEAD is
+            # the pinned commit and applies the series. --check unwinds the
+            # tree again, so the clone stays pristine.
+            subprocess.run(
+              [sys.executable, 'scripts/patches.py', 'fetch-pinned', component, group, str(dest)],
+              check=True)
 
           checked = 0
           for component_dir in sorted(Path('patches').iterdir()):
@@ -94,25 +88,19 @@ jobs:
               if not series:
                 continue
               dest = work / f'{component}-{group}'
-              if not dest.exists():
-                fetch(component, group, dest)
               print(f'{component}/{group}: checking {len(series)} patch(es)')
-              subprocess.run(
-                [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest), '--check'],
-                check=True)
+              if not dest.exists():
+                # fetch-pinned lands the series for real: applied is what the
+                # harnesses below need, and a patch that does not apply aborts
+                # the step.
+                fetch(component, group, dest)
               checked += 1
               if component == 'mpv' and group == 'android':
-                subprocess.run(
-                  [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest)],
-                  check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_rebind.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_letterbox.sh', str(dest)], check=True)
               if component == 'ffmpeg' and group == 'android':
-                subprocess.run(
-                  [sys.executable, 'scripts/patches.py', 'apply', component, group, str(dest)],
-                  check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_input.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_crop.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_rendered.sh', str(dest)], check=True)

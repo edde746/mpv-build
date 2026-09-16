@@ -9,11 +9,11 @@ name: Publish binaries
 # Binaries are sharded per platform group. Each group builds independently,
 # uploads to its own `binaries-<group>` rolling prerelease and contributes only
 # its own `platforms.<group>` section of artifacts.json; one final job splices
-# the sections together and commits the manifest. Enabling a new group touches:
-#   1. env.PLATFORM_GROUPS (append the group name),
-#   2. the plan job's outputs block (stale_<group> / any_<group>),
-#   3. a build-<group> + publish-<group> job pair modeled on the apple ones,
-#   4. the manifest job's needs list and its all-or-nothing gate.
+# the sections together and commits the manifest. The group list comes from
+# `scripts/keys.py groups` (which discovers platforms/*/group.json), the
+# per-group publish recipe is one matrix job, and the android/linux/windows
+# groups need no job of their own: a new group is a group.json plus the build
+# job it needs.
 on:
   push:
     branches:
@@ -28,12 +28,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  # Active platform groups, space-separated. Every group here needs its
-  # plan outputs, a build-<group>/publish-<group> job pair and a manifest
-  # needs entry (see the header comment).
-  PLATFORM_GROUPS: apple android linux windows
 
 jobs:
   tests:
@@ -121,15 +115,13 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     outputs:
-      # One stale_<group>/any_<group> pair per active platform group.
+      # The stale libraries of the apple group, comma-separated: the `libs=`
+      # argument the apple build legs need.
       stale_apple: ${{ steps.stale.outputs.stale_apple }}
-      any_apple: ${{ steps.stale.outputs.any_apple }}
-      stale_android: ${{ steps.stale.outputs.stale_android }}
-      any_android: ${{ steps.stale.outputs.any_android }}
-      stale_linux: ${{ steps.stale.outputs.stale_linux }}
-      any_linux: ${{ steps.stale.outputs.any_linux }}
-      stale_windows: ${{ steps.stale.outputs.stale_windows }}
-      any_windows: ${{ steps.stale.outputs.any_windows }}
+      # JSON arrays. `stale_groups` is empty when every group is published,
+      # which is what skips the build/publish jobs and the manifest commit.
+      stale_groups: ${{ steps.stale.outputs.stale_groups }}
+      groups: ${{ steps.stale.outputs.groups }}
     steps:
       - uses: actions/checkout@v4
 
@@ -142,26 +134,35 @@ jobs:
         # crash in keys.py is not swallowed by the pipe into paste.
         shell: bash
         run: |
-          for group in ${PLATFORM_GROUPS}; do
+          # The group list and the per-group platform variants are discovered,
+          # not restated here: keys.py reads them out of platforms/*/group.json.
+          groups="$(python3 scripts/keys.py groups)"
+          echo "groups=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "${groups}")" >> "$GITHUB_OUTPUT"
+          echo "groups=${groups}" >> "$GITHUB_STEP_SUMMARY"
+
+          stale_groups=""
+          for group in ${groups}; do
             stale="$(python3 scripts/keys.py stale --platform-group "${group}" | paste -sd, -)"
-            echo "stale_${group}=${stale}" >> "$GITHUB_OUTPUT"
             if [ -n "${stale}" ]; then
-              echo "any_${group}=true" >> "$GITHUB_OUTPUT"
+              stale_groups="${stale_groups} ${group}"
               echo "${group}: rebuilding ${stale}" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "any_${group}=false" >> "$GITHUB_OUTPUT"
               echo "${group}: binaries already published for this tree" >> "$GITHUB_STEP_SUMMARY"
               # Nothing to build means the committed manifest must already
               # describe this tree exactly, otherwise the commit is not
               # pinnable and no later job would notice.
               python3 scripts/keys.py verify --platform-group "${group}"
             fi
+            if [ "${group}" = "apple" ]; then
+              echo "stale_apple=${stale}" >> "$GITHUB_OUTPUT"
+            fi
           done
+          echo "stale_groups=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split()))' "${stale_groups}")" >> "$GITHUB_OUTPUT"
 
   build-apple:
     name: Build apple ${{ matrix.name }}
     needs: plan
-    if: needs.plan.outputs.any_apple == 'true'
+    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'apple')
     permissions:
       contents: read
     runs-on: macos-26
@@ -217,7 +218,6 @@ jobs:
           path: |
             ./dist/release/*.zip
             ./dist/release/*.checksum.txt
-            ./dist/release/Package.swift
           if-no-files-found: error
 
   publish-apple:
@@ -234,6 +234,11 @@ jobs:
         with:
           pattern: apple-*
           path: ./dist/partials
+
+      - name: Collect release assets
+        run: |
+          mkdir -p dist/release
+          find dist/partials -type f -exec cp -v {} dist/release/ \;
 
       - name: Merge platform XCFrameworks
         run: |
@@ -305,85 +310,7 @@ jobs:
       - name: Upload binaries that are not published yet
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          if ! gh release view binaries-apple >/dev/null 2>&1; then
-            gh release create binaries-apple \
-              --prerelease \
-              --title "Rolling binaries (apple)" \
-              --notes "Content-addressed apple build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. Package.swift pins these URLs; deleting an asset breaks every commit and tag that references it."
-          fi
-
-          gh release view binaries-apple --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
-
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
-          section = manifest['platforms']['apple']
-          import hashlib
-          digests = {}
-          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-              continue
-            name, _, digest = line.partition(' ')
-            digests[name] = digest.removeprefix('sha256:')
-          published = set(digests)
-          release_dir = Path('dist/release')
-
-          wanted = []
-          for library, entry in sorted(section['libraries'].items()):
-            for asset in entry.get('prebuilt', {}).values():
-              wanted.append((library, asset))
-            for framework in entry.get('frameworks', {}).values():
-              wanted.append((library, framework['asset']))
-
-          uploads = []
-          seen = set()
-          missing = []
-          for library, asset in wanted:
-            if asset in seen:
-              continue
-            seen.add(asset)
-            if asset in published:
-              # Verify-on-skip: an existing content-addressed name must hold
-              # exactly the bytes this run rebuilt, or the checksum recorded
-              # in artifacts.json drifts from what consumers download (this
-              # happened when the archives were not byte-reproducible).
-              local_path = release_dir / asset
-              remote = digests.get(asset, '')
-              if local_path.is_file() and remote:
-                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
-                if local != remote:
-                  raise SystemExit(
-                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
-                    'a content-addressed asset must never change bytes -- the '
-                    'archive packaging has lost reproducibility')
-                print(f'published {asset} (bytes verified)')
-              else:
-                print(f'published {asset}')
-              continue
-            path = release_dir / asset
-            if path.is_file():
-              uploads.append(path)
-            else:
-              missing.append(f'{library}: {asset}')
-
-          # A manifest asset that is neither published nor built would leave a
-          # dead URL in Package.swift, so refuse to commit that manifest.
-          if missing:
-            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
-
-          if not uploads:
-            print('every manifest asset is already published')
-          else:
-            for path in uploads:
-              print(f'upload    {path.name}')
-            # No --clobber: an existing name is the same bytes by construction.
-            subprocess.run(['gh', 'release', 'upload', 'binaries-apple', *(str(path) for path in uploads)], check=True)
-          PY
+        run: python3 scripts/keys.py publish-assets --platform-group apple
 
       - name: Upload manifest for the commit job
         uses: actions/upload-artifact@v4
@@ -397,7 +324,7 @@ jobs:
   build-android:
     name: Build android ${{ matrix.abi }}
     needs: plan
-    if: needs.plan.outputs.any_android == 'true'
+    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'android')
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -433,7 +360,7 @@ jobs:
         run: bash platforms/android/build.sh --arch ${{ matrix.arch }}
 
       # package.sh names the tarball by content key itself, so the build leg
-      # uploads it as-is; publish-android records every variant at once.
+      # uploads it as-is; publish records every variant at once.
       - name: Package per-ABI tarball (${{ matrix.abi }})
         run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
 
@@ -444,135 +371,10 @@ jobs:
           path: ./dist/release/*.tar.gz
           if-no-files-found: error
 
-  publish-android:
-    name: Publish android
-    needs: build-android
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download platform builds
-        uses: actions/download-artifact@v4
-        with:
-          pattern: android-*
-          path: ./dist/partials
-
-      - name: Collect release assets
-        run: |
-          mkdir -p dist/release
-          find dist/partials -type f -exec cp -v {} dist/release/ \;
-
-      # For group.json groups record-platform is the verb that writes the
-      # manifest section, so it runs here -- once per variant against the
-      # merged release dir -- not in the build legs, whose partial manifests
-      # would each carry a single variant.
-      - name: Record variants in the manifest
-        run: |
-          for variant in arm64-v8a armeabi-v7a x86 x86_64; do
-            python3 scripts/keys.py record-platform \
-              --platform-group android \
-              --platform "${variant}" \
-              --release-dir dist/release
-          done
-
-      - name: Verify manifest matches this commit
-        run: python3 scripts/keys.py verify --platform-group android
-
-      - name: Upload binaries that are not published yet
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if ! gh release view binaries-android >/dev/null 2>&1; then
-            gh release create binaries-android \
-              --prerelease \
-              --title "Rolling binaries (android)" \
-              --notes "Content-addressed android build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
-          fi
-
-          gh release view binaries-android --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
-
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          group = 'android'
-          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
-          section = manifest['platforms'][group]
-          import hashlib
-          digests = {}
-          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-              continue
-            name, _, digest = line.partition(' ')
-            digests[name] = digest.removeprefix('sha256:')
-          published = set(digests)
-          release_dir = Path('dist/release')
-
-          wanted = []
-          for library, entry in sorted(section['libraries'].items()):
-            for variant in sorted(entry.get('prebuilt', {})):
-              wanted.append((library, entry['prebuilt'][variant]['asset']))
-
-          uploads = []
-          seen = set()
-          missing = []
-          for library, asset in wanted:
-            if asset in seen:
-              continue
-            seen.add(asset)
-            if asset in published:
-              # Verify-on-skip: an existing content-addressed name must hold
-              # exactly the bytes this run rebuilt, or the checksum recorded
-              # in artifacts.json drifts from what consumers download (this
-              # happened when the archives were not byte-reproducible).
-              local_path = release_dir / asset
-              remote = digests.get(asset, '')
-              if local_path.is_file() and remote:
-                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
-                if local != remote:
-                  raise SystemExit(
-                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
-                    'a content-addressed asset must never change bytes -- the '
-                    'archive packaging has lost reproducibility')
-                print(f'published {asset} (bytes verified)')
-              else:
-                print(f'published {asset}')
-              continue
-            path = release_dir / asset
-            if path.is_file():
-              uploads.append(path)
-            else:
-              missing.append(f'{library}: {asset}')
-
-          # A manifest asset that is neither published nor built would leave a
-          # dead URL in artifacts.json, so refuse to commit that manifest.
-          if missing:
-            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
-
-          if not uploads:
-            print('every manifest asset is already published')
-          else:
-            for path in uploads:
-              print(f'upload    {path.name}')
-            # No --clobber: an existing name is the same bytes by construction.
-            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
-          PY
-
-      - name: Upload manifest for the commit job
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-android
-          path: ./artifacts.json
-          if-no-files-found: error
-
   build-linux:
     name: Build linux ${{ matrix.arch }}
     needs: plan
-    if: needs.plan.outputs.any_linux == 'true'
+    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'linux')
     permissions:
       contents: read
     # The aarch64 leg runs on GitHub's native arm runner: toolchain/linux.txt
@@ -607,131 +409,10 @@ jobs:
           path: ./dist/release/*.tar.zst
           if-no-files-found: error
 
-  publish-linux:
-    name: Publish linux
-    needs: build-linux
-    permissions:
-      contents: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download platform builds
-        uses: actions/download-artifact@v4
-        with:
-          pattern: linux-*
-          path: ./dist/partials
-
-      - name: Collect release assets
-        run: |
-          mkdir -p dist/release
-          find dist/partials -type f -exec cp -v {} dist/release/ \;
-
-      - name: Record variants in the manifest
-        run: |
-          for variant in x86_64 aarch64; do
-            python3 scripts/keys.py record-platform \
-              --platform-group linux \
-              --platform "${variant}" \
-              --release-dir dist/release
-          done
-
-      - name: Verify manifest matches this commit
-        run: python3 scripts/keys.py verify --platform-group linux
-
-      - name: Upload binaries that are not published yet
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if ! gh release view binaries-linux >/dev/null 2>&1; then
-            gh release create binaries-linux \
-              --prerelease \
-              --title "Rolling binaries (linux)" \
-              --notes "Content-addressed linux build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
-          fi
-
-          gh release view binaries-linux --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
-
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          group = 'linux'
-          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
-          section = manifest['platforms'][group]
-          import hashlib
-          digests = {}
-          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-              continue
-            name, _, digest = line.partition(' ')
-            digests[name] = digest.removeprefix('sha256:')
-          published = set(digests)
-          release_dir = Path('dist/release')
-
-          wanted = []
-          for library, entry in sorted(section['libraries'].items()):
-            for variant in sorted(entry.get('prebuilt', {})):
-              wanted.append((library, entry['prebuilt'][variant]['asset']))
-
-          uploads = []
-          seen = set()
-          missing = []
-          for library, asset in wanted:
-            if asset in seen:
-              continue
-            seen.add(asset)
-            if asset in published:
-              # Verify-on-skip: an existing content-addressed name must hold
-              # exactly the bytes this run rebuilt, or the checksum recorded
-              # in artifacts.json drifts from what consumers download (this
-              # happened when the archives were not byte-reproducible).
-              local_path = release_dir / asset
-              remote = digests.get(asset, '')
-              if local_path.is_file() and remote:
-                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
-                if local != remote:
-                  raise SystemExit(
-                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
-                    'a content-addressed asset must never change bytes -- the '
-                    'archive packaging has lost reproducibility')
-                print(f'published {asset} (bytes verified)')
-              else:
-                print(f'published {asset}')
-              continue
-            path = release_dir / asset
-            if path.is_file():
-              uploads.append(path)
-            else:
-              missing.append(f'{library}: {asset}')
-
-          # A manifest asset that is neither published nor built would leave a
-          # dead URL in artifacts.json, so refuse to commit that manifest.
-          if missing:
-            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
-
-          if not uploads:
-            print('every manifest asset is already published')
-          else:
-            for path in uploads:
-              print(f'upload    {path.name}')
-            # No --clobber: an existing name is the same bytes by construction.
-            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
-          PY
-
-      - name: Upload manifest for the commit job
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-linux
-          path: ./artifacts.json
-          if-no-files-found: error
-
   build-windows:
     name: Build windows ${{ matrix.arch }}
     needs: plan
-    if: needs.plan.outputs.any_windows == 'true'
+    if: contains(fromJSON(needs.plan.outputs.stale_groups), 'windows')
     permissions:
       contents: read
     # Both target arches cross-compile from an x86_64 host: winbuild's
@@ -771,16 +452,13 @@ jobs:
           python3 -m pip install --break-system-packages meson
           meson --version
 
+      # pin_packages.py is the one place that resolves the windows pin, so the
+      # cache key below cannot describe a different commit than build.sh
+      # fetches.
       - name: Resolve the winbuild pin
         id: winbuild
         run: |
-          commit="$(python3 - <<'PY'
-          import json
-          entry = json.load(open('versions.json'))['components']['mpv-winbuild-cmake']
-          override = (entry.get('overrides') or {}).get('windows') or {}
-          print(override.get('commit', entry['commit']))
-          PY
-          )"
+          read -r _ commit < <(python3 platforms/windows/pin_packages.py --print-winbuild-pin)
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
       # The llvm/rust bootstrap takes hours and the dependency graph builds
@@ -822,7 +500,7 @@ jobs:
         run: bash platforms/windows/build.sh ${{ matrix.arch }}
 
       # package.sh names the zip by content key itself, so the build leg
-      # uploads it as-is; publish-windows records every variant at once.
+      # uploads it as-is; publish records every variant at once.
       - name: Package dev zip (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
 
@@ -843,145 +521,102 @@ jobs:
           path: ./dist/release/*.zip
           if-no-files-found: error
 
-  publish-windows:
-    name: Publish windows
-    needs: build-windows
+  publish:
+    name: Publish ${{ matrix.group }}
+    # One recipe for every group.json group. The only per-group inputs are data:
+    # the group name and its artifact glob, both of which come from the group's
+    # own group.json (via `keys.py groups`/`variants`) rather than being
+    # restated here.
+    needs: [plan, build-android, build-linux, build-windows]
+    if: needs.plan.outputs.stale_groups != '[]'
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: android
+            artifacts: android-*
+            pattern: ./*.tar.gz
+          - group: linux
+            artifacts: linux-*
+            pattern: ./*.tar.zst
+          - group: windows
+            artifacts: windows-*
+            pattern: ./*.zip
     steps:
       - uses: actions/checkout@v4
 
+      # A group with nothing stale keeps its committed section and is skipped
+      # rather than published; the manifest job's gate below is what proves
+      # every stale group got here.
+      - name: Skip groups with nothing stale
+        id: stale
+        run: |
+          if python3 -c 'import json,sys; sys.exit(0 if sys.argv[2] in json.loads(sys.argv[1]) else 1)' \
+              '${{ needs.plan.outputs.stale_groups }}' '${{ matrix.group }}'; then
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "${{ matrix.group }}: nothing stale, keeping the committed section"
+          fi
+
       - name: Download platform builds
+        if: steps.stale.outputs.stale == 'true'
         uses: actions/download-artifact@v4
         with:
-          pattern: windows-*
+          pattern: ${{ matrix.artifacts }}
           path: ./dist/partials
 
       - name: Collect release assets
+        if: steps.stale.outputs.stale == 'true'
         run: |
           mkdir -p dist/release
           find dist/partials -type f -exec cp -v {} dist/release/ \;
 
+      # For group.json groups record-platform is the verb that writes the
+      # manifest section, so it runs here -- once per variant against the
+      # merged release dir -- not in the build legs, whose partial manifests
+      # would each carry a single variant.
       - name: Record variants in the manifest
+        if: steps.stale.outputs.stale == 'true'
         run: |
-          for variant in x86_64 aarch64; do
+          for variant in $(python3 scripts/keys.py variants --platform-group ${{ matrix.group }}); do
             python3 scripts/keys.py record-platform \
-              --platform-group windows \
+              --platform-group ${{ matrix.group }} \
               --platform "${variant}" \
               --release-dir dist/release
           done
 
       - name: Verify manifest matches this commit
-        run: python3 scripts/keys.py verify --platform-group windows
+        if: steps.stale.outputs.stale == 'true'
+        run: python3 scripts/keys.py verify --platform-group ${{ matrix.group }}
 
       - name: Upload binaries that are not published yet
+        if: steps.stale.outputs.stale == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          if ! gh release view binaries-windows >/dev/null 2>&1; then
-            gh release create binaries-windows \
-              --prerelease \
-              --title "Rolling binaries (windows)" \
-              --notes "Content-addressed windows build artifacts for the commits on main. Asset names encode the sources they were built from, so every asset is immutable and is never replaced. artifacts.json pins these URLs; deleting an asset breaks every commit and tag that references it."
-          fi
-
-          gh release view binaries-windows --json assets --jq '.assets[] | "\(.name) \(.digest // "")"' > ./dist/published-assets.txt
-
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          group = 'windows'
-          manifest = json.loads(Path('artifacts.json').read_text(encoding='utf-8'))
-          section = manifest['platforms'][group]
-          import hashlib
-          digests = {}
-          for line in Path('dist/published-assets.txt').read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-              continue
-            name, _, digest = line.partition(' ')
-            digests[name] = digest.removeprefix('sha256:')
-          published = set(digests)
-          release_dir = Path('dist/release')
-
-          wanted = []
-          for library, entry in sorted(section['libraries'].items()):
-            for variant in sorted(entry.get('prebuilt', {})):
-              wanted.append((library, entry['prebuilt'][variant]['asset']))
-
-          uploads = []
-          seen = set()
-          missing = []
-          for library, asset in wanted:
-            if asset in seen:
-              continue
-            seen.add(asset)
-            if asset in published:
-              # Verify-on-skip: an existing content-addressed name must hold
-              # exactly the bytes this run rebuilt, or the checksum recorded
-              # in artifacts.json drifts from what consumers download (this
-              # happened when the archives were not byte-reproducible).
-              local_path = release_dir / asset
-              remote = digests.get(asset, '')
-              if local_path.is_file() and remote:
-                local = hashlib.sha256(local_path.read_bytes()).hexdigest()
-                if local != remote:
-                  raise SystemExit(
-                    f'{asset}: rebuilt bytes {local} != published digest {remote}; '
-                    'a content-addressed asset must never change bytes -- the '
-                    'archive packaging has lost reproducibility')
-                print(f'published {asset} (bytes verified)')
-              else:
-                print(f'published {asset}')
-              continue
-            path = release_dir / asset
-            if path.is_file():
-              uploads.append(path)
-            else:
-              missing.append(f'{library}: {asset}')
-
-          # A manifest asset that is neither published nor built would leave a
-          # dead URL in artifacts.json, so refuse to commit that manifest.
-          if missing:
-            raise SystemExit('manifest references assets that were neither published nor built:\n  ' + '\n  '.join(missing))
-
-          if not uploads:
-            print('every manifest asset is already published')
-          else:
-            for path in uploads:
-              print(f'upload    {path.name}')
-            # No --clobber: an existing name is the same bytes by construction.
-            subprocess.run(['gh', 'release', 'upload', f'binaries-{group}', *(str(path) for path in uploads)], check=True)
-          PY
+        run: python3 scripts/keys.py publish-assets --platform-group ${{ matrix.group }}
 
       - name: Upload manifest for the commit job
+        if: steps.stale.outputs.stale == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: manifest-windows
+          name: manifest-${{ matrix.group }}
           path: ./artifacts.json
           if-no-files-found: error
 
   manifest:
     name: Commit manifest
     # All-or-nothing composition: every group the plan job marked stale must
-    # have published successfully, and at least one group must have published
-    # (all-clean runs have nothing to splice and are fully verified by the
-    # plan job). A group with nothing stale keeps its committed section; the
-    # splice below composes however many manifest-* artifacts arrive.
-    needs: [plan, publish-apple, publish-android, publish-linux, publish-windows]
-    if: >-
-      !cancelled() &&
-      (needs.publish-apple.result == 'success' ||
-       needs.publish-android.result == 'success' ||
-       needs.publish-linux.result == 'success' ||
-       needs.publish-windows.result == 'success') &&
-      (needs.plan.outputs.any_apple == 'false' || needs.publish-apple.result == 'success') &&
-      (needs.plan.outputs.any_android == 'false' || needs.publish-android.result == 'success') &&
-      (needs.plan.outputs.any_linux == 'false' || needs.publish-linux.result == 'success') &&
-      (needs.plan.outputs.any_windows == 'false' || needs.publish-windows.result == 'success')
+    # have published a manifest, and at least one group must have published
+    # (all-clean runs have nothing to splice and are fully verified by the plan
+    # job). The gate reads the plan's stale list and the downloaded manifests
+    # rather than restating per-group job names, so a group added to
+    # platforms/*/group.json cannot be silently skipped.
+    needs: [plan, publish-apple, publish]
+    if: always() && !cancelled() && needs.plan.outputs.stale_groups != '[]'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -993,6 +628,25 @@ jobs:
         with:
           pattern: manifest-*
           path: ./dist/manifests
+
+      - name: Check every stale group published
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          stale = json.loads(os.environ['STALE_GROUPS'])
+          present = {p.name[len('manifest-'):] for p in Path('dist/manifests').glob('manifest-*')}
+          missing = [group for group in stale if group not in present]
+          if missing:
+              print(f'FAIL: {", ".join(missing)} was stale but published no manifest')
+              raise SystemExit(1)
+          print(f'every stale group published: {", ".join(stale)}')
+          PY
+        env:
+          STALE_GROUPS: ${{ needs.plan.outputs.stale_groups }}
 
       # Each group's publish job rewrote only its own platforms.<group> section
       # of artifacts.json (keys.py re-serializes the rest untouched), so

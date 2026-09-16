@@ -1,5 +1,10 @@
 name: Check new version
 
+# Proposes a dependency bump by rewriting the pins in versions.json -- the single
+# source of truth every driver reads -- and opening a PR. The PR is deliberately
+# not a merge: versions.json's refreshContract requires auditing each new
+# upstream release (tag record, dereferenced commit, dependency lock) before its
+# pins change, which is a human step.
 on:
   workflow_dispatch:
   schedule:
@@ -14,213 +19,195 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout ffmpeg
-        uses: actions/checkout@v4
-        with:
-          repository: "FFmpeg/FFmpeg"
-          path: 'ffmpeg'
-          fetch-depth: 0
-
-      - name: Checkout mpv
-        uses: actions/checkout@v4
-        with:
-          repository: "mpv-player/mpv"
-          path: 'mpv'
-          fetch-depth: 0
-
-      - name: Get latest verion
-        id: version
+      - name: Resolve the latest upstream tags
+        id: latest
         run: |
-          cd ./ffmpeg
-          latest_tag=$(git tag | grep n | grep -v "-" | sort -r | head -n 1)
-          echo "ffmpeg latest tag: $latest_tag"
-          echo "FFMPEG_LATEST_VERSION=$latest_tag" >> $GITHUB_ENV
-          cd ..
+          mpv_latest="$(git ls-remote --tags --refs https://github.com/mpv-player/mpv \
+            | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          ffmpeg_latest="$(git ls-remote --tags --refs https://github.com/FFmpeg/FFmpeg \
+            | sed 's#.*refs/tags/##' | grep -E '^n[0-9]+(\.[0-9]+)*$' | sort -V | tail -n1)"
+          echo "mpv latest tag: ${mpv_latest}"
+          echo "ffmpeg latest tag: ${ffmpeg_latest}"
+          {
+            echo "mpv=${mpv_latest}"
+            echo "ffmpeg=${ffmpeg_latest}"
+          } >> "$GITHUB_OUTPUT"
 
-          cd ./mpv
-          latest_tag=$(git describe --tags `git rev-list --tags --max-count=1`)
-          echo "mpv latest tag: $latest_tag"
-          echo "MPV_LATEST_VERSION=$latest_tag" >> $GITHUB_ENV
-          cd ..
+      - name: Update versions.json pins
+        id: bump
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          rm -rf ./ffmpeg
-          rm -rf ./mpv
+          path = Path('versions.json')
+          document = json.loads(path.read_text(encoding='utf-8'))
+          components = document['components']
 
-      - name: update to new version
-        uses: jannekem/run-python-script-action@v1
-        with:
-          script: |
-            import re
+          found = {}
+          for component, env in (('mpv', 'MPV'), ('ffmpeg', 'FFMPEG')):
+              latest = os.environ[env]
+              if latest and latest != components[component]['version']:
+                  found[component] = latest
 
-            def parse_version(ver):
-              if '-' in ver or ver == '':
-                return 0
-              version_string = re.sub(r'[^.0-9]+', r'', ver)
-              parts = re.split(r'\.', version_string)
-              major = int(parts[0])
-              minor = int(parts[1]) if len(parts) > 1 else 0
-              patch = int(parts[2]) if len(parts) > 2 else 0
-              return int(f"{major}{minor}{patch}")
+          if not found:
+              print('both pins are already current')
+              Path(os.environ['GITHUB_OUTPUT']).open('a').write('changed=false\n')
+              raise SystemExit(0)
+          Path(os.environ['GITHUB_OUTPUT']).open('a').write('changed=true\n')
 
-            file_path = './Sources/BuildScripts/XCFrameworkBuild/main.swift'
-            with open(file_path, 'r', encoding='utf-8') as file:
-              content = file.read()
+          # versions.json is only half the pin: ref, commit and provenance must
+          # be re-derived and audited by a human, so this step records the new
+          # tag and leaves the rest to the PR review. The version field moving
+          # is what makes keys.py invalidate the affected libraries.
+          for component, latest in found.items():
+              components[component]['version'] = latest
+              print(f'{component}: -> {latest}')
 
-            mpvOldVersion = re.search(r'(case .libmpv[^"]+?)"(.+?)"', content).group(2)
-            print("mpv old version:", mpvOldVersion)
-            set_env('MPV_OLD_VERSION', mpvOldVersion)
-            mpvNewVersion = '${{ env.MPV_LATEST_VERSION }}'
-            if parse_version(mpvNewVersion) > parse_version(mpvOldVersion) and not mpvOldVersion.startswith(mpvNewVersion):
-              content = re.sub(r'(case .libmpv[^"]+?)"(.+?)"', r'\1"${{ env.MPV_LATEST_VERSION }}"', content, count=1)
-              set_env('FOUND_NEW_MPV_VERSION', '1')
+          path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          Path('/tmp/BUMPED.txt').write_text(
+              '\n'.join(f'{component} -> {latest}' for component, latest in sorted(found.items())),
+              encoding='utf-8',
+          )
+          PY
+        env:
+          MPV: ${{ steps.latest.outputs.mpv }}
+          FFMPEG: ${{ steps.latest.outputs.ffmpeg }}
 
-            ffmpegOldVersion = re.search(r'(case .FFmpeg[^"]+?)"(.+?)"', content).group(2)
-            print("ffmpeg old version:", ffmpegOldVersion)
-            set_env('FFMPEG_OLD_VERSION', ffmpegOldVersion)
-            ffmpegNewVersion = '${{ env.FFMPEG_LATEST_VERSION }}'
-            if parse_version(ffmpegNewVersion) > parse_version(ffmpegOldVersion) and not ffmpegOldVersion.startswith(ffmpegNewVersion):
-              content = re.sub(r'(case .FFmpeg[^"]+?)"(.+?)"', r'\1"${{ env.FFMPEG_LATEST_VERSION }}"', content, count=1)
-              set_env('FOUND_NEW_FFMPEG_VERSION', '1')
-
-            with open(file_path, 'w', encoding='utf-8') as file:
-              file.write(content)
-            
-
-            file_path = './README.md'
-            with open(file_path, 'r', encoding='utf-8') as file:
-              content = file.read()
-            if parse_version(mpvNewVersion) > parse_version(mpvOldVersion):
-              content = re.sub(r'mpv-.*-blue', r'mpv-${{ env.MPV_LATEST_VERSION }}-blue', content, count=1)
-            if parse_version(ffmpegNewVersion) > parse_version(ffmpegOldVersion):
-              content = re.sub(r'ffmpeg-.*-blue', r'ffmpeg-${{ env.FFMPEG_LATEST_VERSION }}-blue', content, count=1)
-            with open(file_path, 'w', encoding='utf-8') as file:
-              file.write(content)
-
+      - name: Summarize the bump
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          {
+            echo "### Proposed pin bump"
+            echo
+            cat /tmp/BUMPED.txt
+            echo
+            echo "Audit each upstream release before merging (versions.json refreshContract):"
+            echo "the version field alone does not move \`ref\`, \`commit\` or \`provenance\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create Pull Request
-        if: env.FOUND_NEW_MPV_VERSION && !env.FOUND_NEW_FFMPEG_VERSION
+        if: steps.bump.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           add-paths: |
-            ./Sources/BuildScripts/XCFrameworkBuild/main.swift
-            ./README.md
-          title: "mpv bump version to ${{ env.MPV_LATEST_VERSION }}"
+            ./versions.json
+          branch: "create-pull-request/pin-bump"
+          delete-branch: true
+          title: "bump pins: ${{ steps.latest.outputs.mpv != '' && format('mpv {0}', steps.latest.outputs.mpv) || '' }}${{ steps.latest.outputs.mpv != '' && steps.latest.outputs.ffmpeg != '' && ' && ' || '' }}${{ steps.latest.outputs.ffmpeg != '' && format('ffmpeg {0}', steps.latest.outputs.ffmpeg) || '' }}"
           body: |
-            https://github.com/mpv-player/mpv/releases/tag/${{ env.MPV_LATEST_VERSION }}
-            https://github.com/mpv-player/mpv/compare/${{ env.MPV_OLD_VERSION }}...${{ env.MPV_LATEST_VERSION }}
-          commit-message: "chore: mpv bump version to ${{ env.MPV_LATEST_VERSION }}"
+            Latest upstream tags:
 
-      - name: Create Pull Request
-        if: env.FOUND_NEW_FFMPEG_VERSION && !env.FOUND_NEW_MPV_VERSION
-        uses: peter-evans/create-pull-request@v6
-        with:
-          add-paths: |
-            ./Sources/BuildScripts/XCFrameworkBuild/main.swift
-            ./README.md
-          title: "FFmpeg bump version to ${{ env.FFMPEG_LATEST_VERSION }}"
-          body: |
-            https://github.com/FFmpeg/FFmpeg/blob/${{ env.FFMPEG_LATEST_VERSION }}/Changelog
-            https://github.com/FFmpeg/FFmpeg/compare/${{ env.FFMPEG_OLD_VERSION }}...${{ env.FFMPEG_LATEST_VERSION }}
-          commit-message: "chore: FFmpeg bump version to ${{ env.FFMPEG_LATEST_VERSION }}"
+            * mpv `${{ steps.latest.outputs.mpv }}`
+            * FFmpeg `${{ steps.latest.outputs.ffmpeg }}`
 
-      - name: Create Pull Request
-        if: env.FOUND_NEW_FFMPEG_VERSION && env.FOUND_NEW_MPV_VERSION
-        uses: peter-evans/create-pull-request@v6
-        with:
-          add-paths: |
-            ./Sources/BuildScripts/XCFrameworkBuild/main.swift
-            ./README.md
-          title: "mpv ${{ env.MPV_LATEST_VERSION }} && FFmpeg ${{ env.FFMPEG_LATEST_VERSION }}"
-          body: |
-            https://github.com/mpv-player/mpv/releases/tag/${{ env.MPV_LATEST_VERSION }}
-            https://github.com/mpv-player/mpv/compare/${{ env.MPV_OLD_VERSION }}...${{ env.MPV_LATEST_VERSION }}
-
-            https://github.com/FFmpeg/FFmpeg/blob/${{ env.FFMPEG_LATEST_VERSION }}/Changelog
-            https://github.com/FFmpeg/FFmpeg/compare/${{ env.FFMPEG_OLD_VERSION }}...${{ env.FFMPEG_LATEST_VERSION }}
-          commit-message: "chore: mpv ${{ env.MPV_LATEST_VERSION }} && FFmpeg ${{ env.FFMPEG_LATEST_VERSION }}"
+            `versions.json` has been updated with the new `version` fields only. Per its
+            `refreshContract`, the `ref`, `commit` and `provenance` fields still need to be
+            re-derived and audited against the upstream tag records, and
+            `python3 scripts/patches.py check` plus a full CI run prove the series still
+            applies to the new sources.
+          commit-message: "chore: bump pins to mpv ${{ steps.latest.outputs.mpv }} / ffmpeg ${{ steps.latest.outputs.ffmpeg }}"
 
   check-deps:
+    # The prebuilt dependency pins track third-party release tags of their build
+    # repositories rather than upstream's own tags, so they are checked against
+    # those repositories. Each row names every versions.json component that one
+    # repository's release produces: libass-build ships its four dependencies at
+    # the same tag, which is why they move together.
     permissions:
       contents: write
       pull-requests: write
     strategy:
+      fail-fast: false
       matrix:
-        library:
-          - name: libass
-            repository: "mpvkit/libass-build"
-          - name: vulkan
-            repository: "mpvkit/moltenvk-build"
-          - name: libplacebo
-            repository: "mpvkit/libplacebo-build"
-          - name: libshaderc
-            repository: "mpvkit/libshaderc-build"
-          - name: libdovi
-            repository: "mpvkit/libdovi-build"
+        include:
+          - repository: "libass/libass"
+            branch: libass
+            components: "libass"
+          - repository: "mpvkit/libass-build"
+            branch: libass-build
+            components: "libunibreak libfreetype libfribidi libharfbuzz"
+          - repository: "mpvkit/moltenvk-build"
+            branch: moltenvk-build
+            components: "vulkan"
+          - repository: "mpvkit/libplacebo-build"
+            branch: libplacebo-build
+            components: "libplacebo"
+          - repository: "mpvkit/libshaderc-build"
+            branch: libshaderc-build
+            components: "libshaderc"
+          - repository: "mpvkit/libdovi-build"
+            branch: libdovi-build
+            components: "libdovi"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout latest code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ matrix.library.repository }}
-          path: 'latest_code'
-          fetch-depth: 0
-
-      - name: Get latest verion
-        id: version
+      - name: Resolve the latest release tag
+        id: latest
         run: |
-          cd ./latest_code
-          latest_tag=$(git tag --sort=-v:refname | grep -v "-" | head -n 1)
-          echo "latest tag: $latest_tag"
-          echo "LATEST_VERSION=$latest_tag" >> $GITHUB_ENV
-          rm -rf ../latest_code
+          latest="$(git ls-remote --tags --refs https://github.com/${{ matrix.repository }} \
+            | sed 's#.*refs/tags/##' | grep -Ev '\^\{\}$' | sort -V | tail -n1)"
+          echo "latest tag: ${latest}"
+          echo "tag=${latest}" >> "$GITHUB_OUTPUT"
 
-      - name: update to new version
-        uses: jannekem/run-python-script-action@v1
-        with:
-          script: |
-            import re
+      - name: Update versions.json pins
+        id: bump
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-            def parse_version(ver):
-              if '-' in ver or ver == '':
-                return 0
-              version_string = re.sub(r'[^.0-9]+', r'', ver)
-              parts = re.split(r'\.', version_string)
-              major = int(parts[0])
-              minor = int(parts[1]) if len(parts) > 1 else 0
-              patch = int(parts[2]) if len(parts) > 2 else 0
-              return int(f"{major}{minor}{patch}")
+          latest = os.environ['LATEST_TAG']
+          wanted = os.environ['COMPONENTS'].split()
+          path = Path('versions.json')
+          document = json.loads(path.read_text(encoding='utf-8'))
+          components = document['components']
 
-            file_path = './Sources/BuildScripts/XCFrameworkBuild/main.swift'
-            with open(file_path, 'r', encoding='utf-8') as file:
-              content = file.read()
-            oldVersion = re.search(r'(case .${{ matrix.library.name }}[^"]+?)"(.+?)"', content).group(2)
-            print("old version:", oldVersion)
-            newVersion = '${{ env.LATEST_VERSION }}'
-            print("new version:", newVersion)
-            if parse_version(newVersion) > parse_version(oldVersion) and not oldVersion.startswith(newVersion):
-              content = re.sub(r'(case .${{ matrix.library.name }}[^"]+?)"(.+?)"', r'\1"${{ env.LATEST_VERSION }}"', content, count=1)
-              set_env('FOUND_NEW_VERSION', '1')
-              # If libass is being updated, also update its dependencies
-              if '${{ matrix.library.name }}' == 'libass':
-                deps = ['libunibreak', 'libfreetype', 'libfribidi', 'libharfbuzz']
-                for dep in deps:
-                  content = re.sub(r'(case .' + dep + r'[^"]+?)"(.+?)"', r'\1"${{ env.LATEST_VERSION }}"', content, count=1)
-              with open(file_path, 'w', encoding='utf-8') as file:
-                file.write(content)
+          changed = []
+          for component in wanted:
+              current = components[component]['version']
+              if current != latest:
+                  components[component]['version'] = latest
+                  changed.append(f'{component}: {current} -> {latest}')
 
+          outputs = Path(os.environ['GITHUB_OUTPUT'])
+          if not changed:
+              print(f'every pin already at {latest}')
+              outputs.open('a').write('changed=false\n')
+              raise SystemExit(0)
+          outputs.open('a').write('changed=true\n')
+          changed_path = Path('/tmp/BUMPED.txt')
+          changed_path.write_text('\n'.join(changed) + '\n', encoding='utf-8')
+          print(changed_path.read_text(), end='')
+
+          # As with the upstream job, only the version fields move here: the
+          # url, ref, commit and provenance fields must be re-derived and
+          # audited per versions.json's refreshContract before the pins are
+          # usable.
+          path.write_text(json.dumps(document, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+        env:
+          LATEST_TAG: ${{ steps.latest.outputs.tag }}
+          COMPONENTS: ${{ matrix.components }}
 
       - name: Create Pull Request
-        if: env.FOUND_NEW_VERSION
+        if: steps.bump.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           add-paths: |
-            ./Sources/BuildScripts/XCFrameworkBuild/main.swift
-          branch: "create-pull-request/${{ matrix.library.name }}"
+            ./versions.json
+          branch: "create-pull-request/${{ matrix.branch }}"
           delete-branch: true
-          title: "${{ matrix.library.name }} bump version to ${{ env.LATEST_VERSION }}"
+          title: "${{ matrix.repository }} release ${{ steps.latest.outputs.tag }}"
           body: |
-            https://github.com/${{ matrix.library.repository }}/releases/tag/${{ env.LATEST_VERSION }}
-          commit-message: "chore: ${{ matrix.library.name }} bump version to ${{ env.LATEST_VERSION }}"
-          
+            https://github.com/${{ matrix.repository }}/releases/tag/${{ steps.latest.outputs.tag }}
+
+            Updated `versions.json` components: `${{ matrix.components }}`.
+
+            Per `versions.json`'s `refreshContract`, audit the release before merging: the
+            `url`, `ref`, `commit` and `provenance` fields must be re-derived from the new
+            tag and verified, and a full CI run must prove the patch series still applies.
+          commit-message: "chore: bump ${{ matrix.components }} to ${{ steps.latest.outputs.tag }}"
