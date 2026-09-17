@@ -1,0 +1,90 @@
+From c5d391adba7bd024954d0df1e0405f5749f4d4ca Mon Sep 17 00:00:00 2001
+From: Dudemanguy <random342@airmail.cc>
+Date: Tue, 18 Aug 2026 10:27:43 -0500
+Subject: [PATCH] ao_coreaudio: cleanup ao on init failure
+
+Upstream mpv-player/mpv#18383, merged into mpv master as c5d391ad plus
+the uninit hardening from the same PR; carried here because v0.41.0
+predates it and no mpv release contains it yet.
+
+On macOS 27, ao_coreaudio's init() fails with paramErr (-50) when the
+negotiated format is planar or mono (mpv-player/mpv#18384). init()
+registered the CoreAudio hotplug listener before the failing step and
+never unregistered it on the error path, so the freed ao kept receiving
+HAL notifications; the next audio device change (Bluetooth, USB audio,
+display endpoints) called hotplug_cb on dead memory and crashed in
+mp_msg_va (mpv-player/mpv#18274, plezy #2046/#2171).
+
+Register the hotplug listener only after the last failable init step,
+call uninit() on the error path, and make uninit() tolerate the
+partially-initialized state (NULL queue/audio_unit).
+---
+ audio/out/ao_coreaudio.c | 25 ++++++++++++++++---------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git forkSrcPrefix/audio/out/ao_coreaudio.c forkDstPrefix/audio/out/ao_coreaudio.c
+index 4b4bf1d48c0d6..7d421390e9dc3 100644
+--- forkSrcPrefix/audio/out/ao_coreaudio.c
++++ forkDstPrefix/audio/out/ao_coreaudio.c
+@@ -141,6 +141,7 @@ static void init_physical_format(struct ao *ao);
+ static void reinit_latency(struct ao *ao);
+ static bool register_hotplug_cb(struct ao *ao);
+ static void unregister_hotplug_cb(struct ao *ao);
++static void uninit(struct ao *ao);
+ 
+ static bool reinit_device(struct ao *ao) {
+     struct priv *p = ao->priv;
+@@ -167,9 +168,6 @@ static int init(struct ao *ao)
+     if (!reinit_device(ao))
+         goto coreaudio_error;
+ 
+-    if (!register_hotplug_cb(ao))
+-        goto coreaudio_error;
+-
+     if (p->change_physical_format)
+         init_physical_format(ao);
+ 
+@@ -187,6 +185,9 @@ static int init(struct ao *ao)
+     if (!r)
+         goto coreaudio_error;
+ 
++    if (!register_hotplug_cb(ao))
++        goto coreaudio_error;
++
+     reinit_latency(ao);
+     ao->device_buffer = av_rescale(p->hw_latency_ns, ao->samplerate, 1000000000) * 2;
+ 
+@@ -196,6 +197,7 @@ static int init(struct ao *ao)
+     return CONTROL_OK;
+ 
+ coreaudio_error:
++    uninit(ao);
+     return CONTROL_ERROR;
+ }
+ 
+@@ -436,14 +438,18 @@ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+ 
+-    dispatch_sync(p->queue, ^{
+-        cancel_and_release_idle_work(p);
+-    });
+-    dispatch_release(p->queue);
++    if (p->queue) {
++        dispatch_sync(p->queue, ^{
++            cancel_and_release_idle_work(p);
++        });
++        dispatch_release(p->queue);
++    }
+ 
+-    AudioOutputUnitStop(p->audio_unit);
+-    AudioUnitUninitialize(p->audio_unit);
+-    AudioComponentInstanceDispose(p->audio_unit);
++    if (p->audio_unit) {
++        AudioOutputUnitStop(p->audio_unit);
++        AudioUnitUninitialize(p->audio_unit);
++        AudioComponentInstanceDispose(p->audio_unit);
++    }
+ 
+     if (p->original_asbd.mFormatID) {
+         OSStatus err = CA_SET(p->original_asbd_stream,

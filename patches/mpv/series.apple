@@ -24,3 +24,4 @@
 0023-avfoundation-refuse-reads-past-the-write-head.patch
 0024-avfoundation-frame-space-osd-in-pip.patch
 0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch
+0028-ao-coreaudio-uninit-on-init-failure.patch
