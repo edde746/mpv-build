@@ -26,6 +26,7 @@ E="$root/scripts/extract.py"
 python3 "$E" type "$src" "$workdir/audiotrack_clock.inc" --name priv
 python3 "$E" symbol "$src" "$workdir/audiotrack_clock.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_smoothPlayhead \
+    --fn head_rate --fn head_jump_is_wrap \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_getLatency
 python3 "$E" range "$src" "$workdir/audiotrack_read.inc" \
     --first "            int read_samples =" --last "ao_read_data(" --last-inclusive
@@ -43,6 +44,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
+    --fn head_rate --fn head_jump_is_wrap \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_getLatency \
     --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
     --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \

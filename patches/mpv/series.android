@@ -29,3 +29,4 @@
 0115-vo-mediacodec-own-late-frame-policy.patch
 0116-vd-lavc-mediacodec-operating-rate-and-paced-framedrop.patch
 0117-ao-audiotrack-raw-dts-hd.patch
+0118-ao-audiotrack-position-reanchor.patch

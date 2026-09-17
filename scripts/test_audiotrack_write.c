@@ -19,6 +19,7 @@
 #define MP_TIME_NS_TO_S(v) ((v) / 1000000000.0)
 #define MP_ARRAY_SIZE(v) ((int)(sizeof(v) / sizeof((v)[0])))
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
+#define MPMAX(a, b) ((a) > (b) ? (a) : (b))
 #define MPCLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 #define MP_THREAD_VOID void *
 #define MP_THREAD_RETURN() return NULL
@@ -35,6 +36,15 @@ struct object {
     uint8_t *data;
     uint8_t sink[256];
     int sink_size;
+    // Simulated HAL counters. head is what getPlaybackHeadPosition reports;
+    // head_resets models whether flush() zeroes it (false = the Xiaomi-style
+    // HAL that keeps the render position across a flush). ts_fpos/ts_nanos
+    // are what getTimestamp publishes while timestamp_ok.
+    uint32_t head;
+    bool head_resets;
+    uint32_t ts_fpos;
+    int64_t ts_nanos;
+    bool timestamp_ok;
 };
 typedef struct object *jobject, *jbyteArray, *jshortArray, *jfloatArray;
 struct jni;
@@ -177,8 +187,9 @@ static jint jni_int(JNIEnv *env, jobject track, int method, ...)
             head_queries++;
             pthread_cond_broadcast(&changed);
         }
+        int head = method == AudioTrack.getPlaybackHeadPosition ? track->head : 0;
         mp_mutex_unlock(&gate);
-        return 0;
+        return head;
     }
     va_list args;
     va_start(args, method);
@@ -234,6 +245,11 @@ static void jni_void(JNIEnv *env, jobject track, int method)
         track->state = AudioTrack.PLAYSTATE_PLAYING;
     } else {
         assert(method == AudioTrack.flush);
+        // A healthy HAL zeroes its counters on flush; a broken one keeps them.
+        if (track->head_resets) {
+            track->head = 0;
+            track->ts_fpos = 0;
+        }
     }
     // pause/flush deliberately do not complete the outstanding write.
     pthread_cond_broadcast(&changed);
@@ -247,9 +263,27 @@ static void jni_void(JNIEnv *env, jobject track, int method)
 #define MP_JNI_LOCAL_FREEP(obj) drop_ref(env, obj)
 #define MP_JNI_GLOBAL_FREEP(obj) drop_ref(env, obj)
 #define MP_JNI_EXCEPTION_LOG(ao) ((void)(ao), 0)
-#define MP_JNI_CALL_BOOL(obj, method, stamp) ((void)env, false)
-#define MP_JNI_GET_LONG(obj, field) ((void)AudioTimestamp, (int64_t)0)
+#define MP_JNI_CALL_BOOL(obj, method, stamp) jni_bool(env, obj, method, stamp)
+#define MP_JNI_GET_LONG(obj, field) jni_long(env, obj, field)
 
+static bool jni_bool(JNIEnv *env, jobject track, int method, jobject stamp)
+{
+    (void)env;
+    assert(method == AudioTrack.getTimestamp);
+    mp_mutex_lock(&gate);
+    assert(track && track->track && stamp);
+    stamp->ts_fpos = track->ts_fpos;
+    stamp->ts_nanos = track->ts_nanos;
+    bool ok = track->timestamp_ok;
+    mp_mutex_unlock(&gate);
+    return ok;
+}
+
+static int64_t jni_long(JNIEnv *env, jobject stamp, int field)
+{
+    (void)env;
+    return field == AudioTimestamp.framePosition ? stamp->ts_fpos : stamp->ts_nanos;
+}
 static int AudioTrack_New(struct ao *ao);
 static void AudioTrack_recreateOrFail(struct ao *ao);
 static void AudioTrack_checkRouteChange(struct ao *ao) { (void)ao; }
@@ -264,7 +298,8 @@ static int AudioTrack_New(struct ao *ao)
     assert(track_count < (int)MP_ARRAY_SIZE(tracks));
     jobject track = &tracks[track_count++];
     *track = (struct object){.track = true, .refs = 1,
-                             .state = AudioTrack.PLAYSTATE_PAUSED};
+                             .state = AudioTrack.PLAYSTATE_PAUSED,
+                             .head_resets = true};
     p->audiotrack = track;
     mp_mutex_unlock(&gate);
     return 0;
@@ -286,7 +321,7 @@ static int ao_read_data(struct ao *ao, void **data, int samples, int64_t end,
 struct fixture {
     struct ao ao;
     struct priv p;
-    struct object buffer;
+    struct object buffer, stamp;
     uint8_t chunk[256], backing[264];
 };
 
@@ -297,17 +332,20 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
     response = input_bytes = track_count = underrun_queries = 0;
     pause_after_write = true;
     atomic_store(&now_ns, MP_TIME_S_TO_NS(1));
-    AudioTrack.writeBufferV21 = direct ? 1 : 0;
-    f->ao = (struct ao){.priv = &f->p, .samplerate = 48000, .sstride = 2};
     f->buffer = (struct object){.refs = 1,
         .data = direct && !raw ? f->chunk : f->backing};
+    AudioTrack.writeBufferV21 = direct ? 1 : 0;
+    f->ao = (struct ao){.priv = &f->p, .samplerate = 48000, .sstride = 2};
     f->p.raw_passthrough = raw;
     f->p.raw_rate_mult = 1;
     f->p.format = format;
     f->p.chunksize = sizeof(f->chunk);
+    f->p.size = sizeof(f->chunk);
     f->p.chunk = f->chunk;
     f->p.rawbuf = f->backing;
     f->p.bbuf = f->p.shortarray = f->p.floatarray = f->p.bytearray = &f->buffer;
+    f->stamp = (struct object){.refs = 1};
+    f->p.timestamp = &f->stamp;
     pthread_mutex_init(&f->p.lock, NULL);
     pthread_mutex_init(&f->p.track_lock, NULL);
     pthread_mutex_init(&f->p.monitor_lock, NULL);
@@ -338,6 +376,20 @@ static void begin_write(struct fixture *f, const uint8_t *bytes, int len)
     wait_counter(&entered, target);
 }
 
+// A track left PLAYING parks the worker inside a zero-length JNI write that
+// teardown cannot reach; pause it and release the blocked call first.
+static void park_worker(struct fixture *f)
+{
+    mp_mutex_lock(&gate);
+    for (int n = 0; n < track_count; n++)
+        tracks[n].state = AudioTrack.PLAYSTATE_PAUSED;
+    permitted = entered;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    mp_mutex_lock(&f->p.lock);
+    mp_mutex_unlock(&f->p.lock);
+}
+
 static void finish_write(struct fixture *f, int result)
 {
     mp_mutex_lock(&gate);
@@ -352,14 +404,20 @@ static void finish_write(struct fixture *f, int result)
     mp_mutex_unlock(&f->p.lock);
 }
 
-static void expect_delay(struct fixture *f, uint32_t frames)
+static void expect_delay_played(struct fixture *f, uint32_t written,
+                                uint32_t played)
 {
     mp_mutex_lock(&f->p.lock);
     int64_t sample_time = 0;
     double delay = AudioTrack_getLatency(&f->ao, &sample_time);
-    assert(f->p.written_frames == frames);
-    assert(fabs(delay - frames / 48000.0) < 1e-12);
+    assert(f->p.written_frames == written);
+    assert(fabs(delay - (written - played) / 48000.0) < 1e-12);
     mp_mutex_unlock(&f->p.lock);
+}
+
+static void expect_delay(struct fixture *f, uint32_t frames)
+{
+    expect_delay_played(f, frames, 0);
 }
 
 static void teardown(struct fixture *f)
@@ -669,6 +727,277 @@ static void check_watchdog_after_reset(void)
     puts("PASS: restart keeps an old blocked write visible to the existing watchdog");
 }
 
+// The reported bug: on a Xiaomi Pad 8 Pro, flush() leaves the render
+// position untouched, so the head keeps its pre-seek value. Unanchored,
+// written - head wraps to ~2^32 frames and the delay collapses to 0; the
+// epoch anchor must absorb the stale counter instead.
+static void check_pcm_stale_head_after_flush(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    expect_delay(&f, 4);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 1000; // stale render position survives the flush
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    expect_delay(&f, 4); // anchored: the delay is the new buffer, not 0
+    assert(f.p.head_offset == 1000);
+    assert(!warnings);
+    teardown(&f);
+    puts("PASS: a head that survives flush() anchors instead of wrapping the delay");
+}
+
+// The other half of the quirk: the counter resets to 0 only after the first
+// post-flush read already anchored a stale value. The backward jump drops the
+// anchor but keeps written_frames, which is real buffered audio.
+static void check_pcm_delayed_head_reset(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 1000;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    expect_delay(&f, 0); // anchors at the stale 1000
+    assert(f.p.head_offset == 1000);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head = 5; // the HAL resets late, already partway into the epoch
+    mp_mutex_unlock(&gate);
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    expect_delay_played(&f, 4, 4); // head 5 vs written 4: clamped, not wrapped
+    assert(!f.p.head_offset);
+    teardown(&f);
+    puts("PASS: a delayed post-flush head reset drops the anchor, keeps the writes");
+}
+
+// A backward jump at the uint32 boundary is a wrap, not a reset: the anchor
+// must survive or the position collapses.
+static void check_pcm_head_wrap(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 1000;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    expect_delay(&f, 0); // anchored at 1000
+
+    mp_mutex_lock(&gate);
+    tracks[0].head = UINT32_MAX - 100;
+    mp_mutex_unlock(&gate);
+    expect_delay_played(&f, 0, UINT32_MAX - 100 - 1000);
+    mp_mutex_lock(&gate);
+    tracks[0].head = 50; // wraps past UINT32_MAX
+    mp_mutex_unlock(&gate);
+    expect_delay_played(&f, 0, (uint32_t)(50 - 1000));
+    assert(f.p.head_offset == 1000); // the anchor rode the wrap
+    assert(!warnings);
+    teardown(&f);
+    puts("PASS: a head wrap keeps the epoch anchor and the delay arithmetic");
+}
+
+// A write stop() could not wait for lands in the track after the flush; the
+// generation guard drops its written_frames credit, but the frames still
+// play. The anchor plus the bounded overshoot clamp keep the delay at 0
+// instead of wrapping it.
+static void check_pcm_late_write_after_flush(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    mp_mutex_unlock(&gate);
+    begin_write(&f, data, sizeof(data)); // blocked inside the JNI write
+    mp_mutex_lock(&gate);
+    tracks[0].head = 1000; // the counter goes stale only once flush() runs
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    finish_write(&f, 8); // the late write completes post-flush, uncredited
+    mp_mutex_lock(&gate);
+    tracks[0].head = 1004; // and its frames actually play
+    mp_mutex_unlock(&gate);
+    expect_delay(&f, 0); // head 4 over written 0: absorbed, not wrapped
+    teardown(&f);
+    puts("PASS: a write landing after flush() is bounded by the epoch anchor");
+}
+
+// Same broken HAL through the timestamp source: framePosition survives the
+// flush and keeps advancing. The pending anchor locks it to the head's
+// epoch (ts_offset = fpos - head_played), so the timestamp path engages
+// with the stale bias absorbed instead of being rejected or flapping.
+static void check_pcm_stale_timestamp_after_flush(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 700;
+    tracks[0].timestamp_ok = true;
+    tracks[0].ts_fpos = 700; // stale framePosition, still advancing
+    tracks[0].ts_nanos = atomic_load(&now_ns);
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    mp_mutex_lock(&gate);
+    response = 0; // a parked zero-write must not credit stale frames
+    mp_mutex_unlock(&gate);
+
+    // Both counters advance together; the timestamp anchors to the head's
+    // epoch on the first fetch and is trusted from the second.
+    for (int n = 0; n < 4; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        mp_mutex_lock(&gate);
+        tracks[0].head += 1;
+        tracks[0].ts_fpos += 1;
+        tracks[0].ts_nanos = atomic_load(&now_ns);
+        tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(&f, 4, n + 1);
+    }
+    assert(f.p.timestamp_set);
+    assert(!f.p.ts_reset_pending);
+    assert(f.p.ts_offset == 700); // the stale bias, not the played frames
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a framePosition that survives flush() re-anchors to the head epoch");
+}
+
+static void check_pcm_healthy_counters_after_flush(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].timestamp_ok = true;
+    tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao); // head_resets: head and ts_fpos return to 0
+    mp_mutex_lock(&gate);
+    tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+    mp_mutex_unlock(&gate);
+
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    mp_mutex_lock(&gate);
+    response = 0; // a parked zero-write must not credit stale frames
+    mp_mutex_unlock(&gate);
+    for (int n = 0; n < 4; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        mp_mutex_lock(&gate);
+        tracks[0].head += 1;
+        tracks[0].ts_fpos += 1;
+        tracks[0].ts_nanos = atomic_load(&now_ns);
+        tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+        mp_mutex_unlock(&gate);
+        // The timestamp path must report the same delay the head does:
+        // an anchor biased by pre-fetch playback would skew it permanently.
+        expect_delay_played(&f, 4, n + 1);
+    }
+    assert(f.p.timestamp_set); // trusted again by the second fetch
+    assert(!f.p.head_offset); // a reset counter anchors at zero
+    assert(f.p.ts_offset <= 4); // anchored against the head, not the fpos
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: counters that reset on flush() keep exact delays and timestamps");
+}
+
+// Passthrough through the smoother: a delayed head reset must reset the
+// (head - clock) ring too, or the estimate crawls toward truth at the 10%
+// drift limit instead of snapping to the new epoch.
+static void check_iec_delayed_reset_smoothing(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 4000;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = 10000; // post-flush writes
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, 10000); // anchored at 4000; head 0 reports nothing played
+
+    // Played frames track the clock (40 ms at 48 kHz per step) so the
+    // smoother's (head - clock) ring holds a steady offset.
+    for (int n = 0; n < 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 4000 + 1920 * (n + 1);
+        mp_mutex_unlock(&gate);
+        expect_delay_played(&f, 10000, 1920 * (n + 1));
+    }
+
+    // The HAL resets late; the smoother must not carry the pre-reset ring.
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+    mp_mutex_lock(&gate);
+    tracks[0].head = 3;
+    mp_mutex_unlock(&gate);
+    expect_delay_played(&f, 10000, 3);
+    teardown(&f);
+    puts("PASS: a delayed head reset re-anchors the passthrough smoother");
+}
+
+// A recreated track arms the same anchors: its first read cannot trip the
+// backward-jump path or warn.
+static void check_recreate_anchors_fresh_track(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 1000;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    expect_delay(&f, 0); // anchor held on the old track
+
+    mp_mutex_lock(&f.p.lock);
+    assert(!AudioTrack_Recreate(&f.ao));
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, 0); // fresh track, fresh anchor, no spurious warn
+    assert(!warnings);
+    teardown(&f);
+    puts("PASS: recreate re-anchors without tripping reset detection");
+}
+
 int main(void)
 {
     alarm(15); // fail a regression that holds the reset lock, rather than hang CI
@@ -685,5 +1014,13 @@ int main(void)
     check_dead_object();
     check_watchdog_after_reset();
     check_underrun_reporting();
+    check_pcm_stale_head_after_flush();
+    check_pcm_delayed_head_reset();
+    check_pcm_head_wrap();
+    check_pcm_late_write_after_flush();
+    check_pcm_stale_timestamp_after_flush();
+    check_pcm_healthy_counters_after_flush();
+    check_iec_delayed_reset_smoothing();
+    check_recreate_anchors_fresh_track();
     return 0;
 }

@@ -14,8 +14,10 @@
 #define MP_TIME_NS_TO_S(v) ((v) / 1000000000.0)
 #define MP_ARRAY_SIZE(v) ((int)(sizeof(v) / sizeof((v)[0])))
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
+#define MPMAX(a, b) ((a) > (b) ? (a) : (b))
 #define MPCLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 #define MP_VERBOSE(...) ((void)0)
+#define MP_WARN(...) ((void)0)
 
 typedef void *jobject, *jbyteArray, *jshortArray, *jfloatArray;
 typedef int jint, JNIEnv, mp_thread, mp_mutex, mp_cond;
