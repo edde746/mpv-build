@@ -79,6 +79,9 @@ jobs:
       - name: Test MediaCodec OSD-plane letterbox fill
         run: bash ./scripts/test_mediacodec_letterbox.sh
 
+      - name: Test decoder busy policy past end of stream
+        run: bash ./scripts/test_lavc_busy_policy.sh
+
       - name: Test MediaCodec Dolby Vision packet filter
         run: bash ./scripts/test_mediacodec_dv_filter.sh
 

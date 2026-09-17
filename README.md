@@ -283,6 +283,16 @@ paints nothing for cover/zoom or a full-frame picture, and leaves the scissor
 and clear color as the subtitle draw expects. Pass an already-patched source
 directory to run offline.
 
+Run the decoder busy-policy regression with `bash scripts/test_lavc_busy_policy.sh`.
+It compiles mpv's `lavc_process` against scripted send/receive callbacks and
+a recording filter graph, and drives the policy a MediaCodec decoder runs
+under: a polled decoder that still answers EAGAIN after the EOF packet was
+accepted is asked again until it delivers its last frames and EOF (nothing
+upstream will ever call it otherwise), is not spun while the demuxer starves
+it, and has a refused packet put back and retried; a decoder that wakes the
+filter itself and an ordinary libavcodec decoder are left alone. Pass an
+already-patched source directory to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer

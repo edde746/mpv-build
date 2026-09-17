@@ -107,6 +107,7 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_mediacodec_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_rebind.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_letterbox.sh', str(dest)], check=True)
+                subprocess.run(['bash', 'scripts/test_lavc_busy_policy.sh', str(dest)], check=True)
               if component == 'ffmpeg' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_mediacodec_input.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_eos.sh', str(dest)], check=True)
