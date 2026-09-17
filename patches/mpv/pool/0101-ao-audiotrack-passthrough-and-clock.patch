@@ -1,4 +1,5 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index f483ccc..fff2f3d 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,6 +21,9 @@
@@ -343,7 +344,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
      if (delay > 2.0) {
          //MP_WARN(ao, "getLatency: written=%u playhead=%u diff=%u delay=%f\n", p->written_frames, playhead, diff, delay);
-@@ -486,6 +642,195 @@ static double AudioTrack_getLatency(struct ao *ao)
+@@ -486,6 +642,218 @@ static double AudioTrack_getLatency(struct ao *ao)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
@@ -374,6 +375,29 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        return AudioFormat.ENCODING_E_AC3;
 +    case AF_FORMAT_S_DTS:
 +        return AudioFormat.ENCODING_DTS;
++    default:
++        return 0;
++    }
++}
++
++// Depth of the raw track in bitstream bytes. On a direct track this buffer
++// is the only slack between the writer and the HAL: mpv's soft buffer sits
++// behind the blocking write, so a late worker thread underruns the device
++// itself, and a direct-track underrun is invisible to the writer (AudioFlinger
++// disables the track and the client restarts it on the next write). Twice the
++// driver minimum is about two E-AC-3 frames (64 ms at 768 kb/s on a Fire TV);
++// media3 holds 250 ms of the stream rate and Kodi fixed per-codec budgets.
++// Eight frames at each codec's top rate stays under 1.3 s at its lowest
++// common rate, inside the 2 s delay clamp in AudioTrack_getLatency.
++static int raw_buffer_budget(int format)
++{
++    switch (format) {
++    case AF_FORMAT_S_AC3:
++        return 8 * 3840;  // 640 kb/s frame; 40 frames (1.28 s) at 192 kb/s
++    case AF_FORMAT_S_EAC3:
++        return 8 * 3072;  // 768 kb/s frame; 32 frames (1.02 s) at 192 kb/s
++    case AF_FORMAT_S_DTS:
++        return 16 * 2048; // 1536 kb/s 512-sample frame; 341 ms at 768 kb/s
 +    default:
 +        return 0;
 +    }
@@ -539,7 +563,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static int AudioTrack_write(struct ao *ao, int len)
  {
      struct priv *p = ao->priv;
-@@ -493,38 +838,80 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -493,38 +861,80 @@ static int AudioTrack_write(struct ao *ao, int len)
          return -1;
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      void *buf = p->chunk;
@@ -588,12 +612,12 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        method = AudioTrack.writeBufferV21;
      } else if (p->format == AudioFormat.ENCODING_PCM_FLOAT) {
 -        (*env)->SetFloatArrayRegion(env, p->floatarray, 0, len / sizeof(float), buf);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeFloat, p->floatarray, 0, len / sizeof(float), AudioTrack.WRITE_BLOCKING);
 +        sample_size = sizeof(float);
 +        count = len / sample_size;
 +        (*env)->SetFloatArrayRegion(env, p->floatarray, 0, count, buf);
          if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
--        ret = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.writeFloat, p->floatarray, 0, len / sizeof(float), AudioTrack.WRITE_BLOCKING);
--        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
 -        if (ret > 0) ret *= sizeof(float);
 -
 +        buffer = p->floatarray;
@@ -641,7 +665,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  }
  
  static void uninit_jni(struct ao *ao)
-@@ -566,6 +953,55 @@ error:
+@@ -566,6 +976,55 @@ error:
      return -1;
  }
  
@@ -697,7 +721,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -574,6 +1010,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -574,6 +1033,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
      while (!p->thread_terminate) {
@@ -705,7 +729,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
              state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
-@@ -581,10 +1018,17 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -581,10 +1041,17 @@ static MP_THREAD_VOID ao_thread(void *arg)
          if (state == AudioTrack.PLAYSTATE_PLAYING) {
              int read_samples = p->chunksize / ao->sstride;
              int64_t ts = mp_time_ns();
@@ -725,7 +749,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              if (ret >= 0) {
                  p->written_frames += ret / ao->sstride;
              } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
-@@ -657,9 +1101,32 @@ static int init(struct ao *ao)
+@@ -657,9 +1124,32 @@ static int init(struct ao *ao)
      if (init_jni(ao) < 0)
          return -1;
  
@@ -761,7 +785,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              MP_ERR(ao, "spdif passthrough not supported by API\n");
              return -1;
          }
-@@ -673,7 +1140,8 @@ static int init(struct ao *ao)
+@@ -673,7 +1163,8 @@ static int init(struct ao *ao)
          p->format = AudioFormat.ENCODING_PCM_16BIT;
      }
  
@@ -771,7 +795,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          jint samplerate = MP_JNI_CALL_STATIC_INT(
              AudioTrack.clazz,
              AudioTrack.getNativeOutputSampleRate,
-@@ -685,6 +1153,10 @@ static int init(struct ao *ao)
+@@ -685,6 +1176,10 @@ static int init(struct ao *ao)
          }
      }
      p->samplerate = ao->samplerate;
@@ -782,7 +806,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  
      /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
      static const struct mp_chmap layouts[] = {
-@@ -710,8 +1182,16 @@ static int init(struct ao *ao)
+@@ -710,8 +1205,16 @@ static int init(struct ao *ao)
          AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
      };
      static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
@@ -801,7 +825,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      } else {
          struct mp_chmap_sel sel = {0};
          for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
-@@ -731,20 +1211,47 @@ static int init(struct ao *ao)
+@@ -731,25 +1234,57 @@ static int init(struct ao *ao)
          p->channel_config,
          p->format
      );
@@ -839,9 +863,14 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 -    p->size = MPCLAMP(buffer_size * 2, min, max);
 -    MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
 +    if (p->raw_passthrough) {
-+        // getMinBufferSize answers in bitstream bytes for raw encodings.
-+        p->size = MP_ALIGN_UP(buffer_size * 2, bps);
-+        MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d)\n", p->size, buffer_size);
++        // getMinBufferSize answers in bitstream bytes for raw encodings. The
++        // budget is depth, not granularity: each write stays one doubled
++        // driver minimum of carrier data, as before.
++        const int budget = raw_buffer_budget(ao->format);
++        p->chunksize = MP_ALIGN_UP(buffer_size * 2, bps);
++        p->size = MP_ALIGN_UP(MPMAX(buffer_size * 2, budget), bps);
++        MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d, budget=%d, chunk=%d)\n",
++                   p->size, buffer_size, budget, p->chunksize);
 +    } else {
 +        // Double the driver minimum, clamped to 75-150 ms. AudioTrack rejects
 +        // a PCM buffer that is not a whole number of frames.
@@ -853,11 +882,18 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        p->size = MPCLAMP(buffer_size * 2, min, max);
 +        p->size = (p->size + frame - 1) / frame * frame;
 +        MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
++        p->chunksize = p->size;
 +    }
      mp_assert(p->size % bps == 0);
      ao->device_buffer = p->size / bps;
  
-@@ -760,7 +1267,14 @@ static int init(struct ao *ao)
+-    p->chunksize = p->size;
+-    p->chunk = talloc_size(ao, p->size);
++    p->chunk = talloc_size(ao, p->chunksize);
+ 
+     jobject timestamp = MP_JNI_NEW(AudioTimestamp.clazz, AudioTimestamp.ctor);
+     if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !timestamp) {
+@@ -760,7 +1295,14 @@ static int init(struct ao *ao)
      MP_JNI_LOCAL_FREEP(&timestamp);
  
      // decide and create buffer of right type
@@ -873,7 +909,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          jshortArray shortarray = (*env)->NewShortArray(env, p->chunksize / 2);
          p->shortarray = (*env)->NewGlobalRef(env, shortarray);
          MP_JNI_LOCAL_FREEP(&shortarray);
-@@ -812,11 +1326,22 @@ static void stop(struct ao *ao)
+@@ -812,11 +1354,22 @@ static void stop(struct ao *ao)
      MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.flush);
      MP_JNI_EXCEPTION_LOG(ao);
  
@@ -896,7 +932,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  }
  
  static void start(struct ao *ao)
-@@ -846,9 +1371,13 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -846,9 +1399,13 @@ const struct ao_driver audio_out_audiotrack = {
      .priv_size = sizeof(struct priv),
      .priv_defaults = &(const OPT_BASE_STRUCT) {
          .cfg_pcm_float = 1,

@@ -39,6 +39,7 @@ index ce044fd..fb697a5 100644
  
  struct ao_hotplug;
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index fff2f3d..e59bbdb 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -22,6 +22,8 @@
@@ -79,7 +80,15 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  struct priv {
      jobject audiotrack;
      jint samplerate;
-@@ -101,11 +125,33 @@ struct priv {
+@@ -72,6 +96,7 @@ struct priv {
+     int raw_input_len;    // IEC bytes credited when raw_pending drains
+     int raw_payload_left; // payload bytes still to emit for this burst
+     void *rawbuf;         // chunk plus space for a fragmented DTS header
++    bool raw_depth_logged;// first burst's Pd has sized the track in bursts
+ 
+     // Route polling for passthrough tracks (see AudioTrack_checkRouteChange)
+     jint routed_device;      // 0 = none observed yet
+@@ -101,11 +126,36 @@ struct priv {
      bool cfg_route_reload;
      int cfg_session_id;
  
@@ -105,6 +114,9 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    atomic_bool recreate_requested;
 +    atomic_bool failed;
 +    atomic_int recovery_attempts;
++    // Bumped under track_lock by every replacement; a new track restarts
++    // AudioTrack.getUnderrunCount at zero.
++    int track_generation;
 +
 +    atomic_bool monitor_terminate;
 +    bool monitor_created;
@@ -114,7 +126,23 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  };
  
  static struct JNIByteBuffer {
-@@ -433,20 +479,6 @@ static int AudioTrack_New(struct ao *ao)
+@@ -142,6 +192,7 @@ static struct JNIAudioTrack {
+     jmethodID getMinBufferSize;
+     jmethodID isDirectPlaybackSupported;
+     jmethodID getRoutedDevice;
++    jmethodID getUnderrunCount;
+     jmethodID getNativeOutputSampleRate;
+     jint STATE_INITIALIZED;
+     jint PLAYSTATE_STOPPED;
+@@ -178,6 +229,7 @@ static const struct MPJniField AudioTrack_mapping[] = {
+     {"isDirectPlaybackSupported", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z", MP_JNI_STATIC_METHOD, OFFSET(isDirectPlaybackSupported), 0},
+     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
+     {"getRoutedDevice", "()Landroid/media/AudioDeviceInfo;", MP_JNI_METHOD, OFFSET(getRoutedDevice), 0},
++    {"getUnderrunCount", "()I", MP_JNI_METHOD, OFFSET(getUnderrunCount), 0},
+     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
+     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
+     {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
+@@ -433,20 +485,6 @@ static int AudioTrack_New(struct ao *ao)
      return 0;
  }
  
@@ -135,7 +163,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
  {
      p->smooth_count = 0;
-@@ -458,6 +490,58 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+@@ -458,6 +496,59 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
      p->smooth_reported_ns = 0;
  }
  
@@ -178,6 +206,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        MP_JNI_GLOBAL_FREEP(&p->audiotrack);
 +    }
 +    p->routed_device = 0;
++    p->track_generation++;
 +    p->routing_lost = false;
 +    p->playhead_pos = 0;
 +    p->reset_pending = false;
@@ -194,7 +223,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  // A direct/offload track's playback head advances in HAL-period steps (8192
  // frames at 192 kHz), larger than a 24p frame. Like media3's
  // AudioTrackPositionTracker: average the last (head - clock) offsets, bound
-@@ -642,15 +726,6 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+@@ -642,15 +733,6 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
      return MPCLAMP(delay, 0.0, 2.0);
  }
  
@@ -210,7 +239,21 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  #define IEC61937_AC3  0x01
  #define IEC61937_DTS1 0x0b
  #define IEC61937_DTS2 0x0c
-@@ -1002,6 +1077,35 @@ static void AudioTrack_checkRouteChange(struct ao *ao)
+@@ -845,6 +927,13 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+                 break;
+             }
+             p->raw_state = p->raw_payload_left > 0 ? RAW_PAYLOAD : RAW_SYNC_PA;
++            if (p->raw_payload_left > 0 && !p->raw_depth_logged) {
++                // Pd is the whole burst, so the depth is in codec frames
++                // (AC-3/E-AC-3: one 32 ms frame per burst).
++                p->raw_depth_logged = true;
++                MP_VERBOSE(ao, "raw burst of %d bytes: the track holds %d bursts\n",
++                           p->raw_payload_left, p->size / p->raw_payload_left);
++            }
+             break;
+         }
+     }
+@@ -1025,6 +1114,35 @@ static void AudioTrack_checkRouteChange(struct ao *ao)
      }
  }
  
@@ -246,7 +289,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -1009,7 +1113,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -1032,7 +1150,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      mp_thread_set_name("ao/audiotrack");
      mp_mutex_lock(&p->lock);
@@ -264,7 +307,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
          AudioTrack_checkRouteChange(ao);
          int state = AudioTrack.PLAYSTATE_PAUSED;
          if (p->audiotrack) {
-@@ -1025,17 +1138,32 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -1048,17 +1175,32 @@ static MP_THREAD_VOID ao_thread(void *arg)
              ts += MP_TIME_S_TO_NS(delay);
              int samples = p->raw_pending ? 0 :
                  ao_read_data(ao, &p->chunk, read_samples, ts, NULL, false, false);
@@ -303,7 +346,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
              } else {
                  MP_ERR(ao, "AudioTrack.write failed with %d\n", ret);
              }
-@@ -1047,25 +1175,126 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -1070,25 +1212,153 @@ static MP_THREAD_VOID ao_thread(void *arg)
      MP_THREAD_RETURN();
  }
  
@@ -323,6 +366,13 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +    uint32_t last_head = 0;
 +    bool have_head = false;
 +    int64_t healthy_since = 0;
++    // AudioTrack.getUnderrunCount (API 24). A direct-track underrun never
++    // fails a write: AudioFlinger disables the track and the next write
++    // restarts it, so this counter is the only sign the HAL ran dry. Log,
++    // never charge the recovery budget: a dry HAL is not a dead one.
++    int underruns = 0;
++    int underrun_generation = -1;
++    int64_t underrun_logged_ns = 0;
 +    mp_mutex_lock(&p->monitor_lock);
 +    while (!atomic_load(&p->monitor_terminate)) {
 +        mp_cond_timedwait(&p->monitor_wakeup, &p->monitor_lock, STALL_POLL_NS);
@@ -336,11 +386,31 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 +        mp_mutex_lock(&p->track_lock);
 +        uint32_t head = 0;
 +        bool sampled = false;
++        int underrun_delta = 0;
 +        if (p->audiotrack) {
 +            head = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
 +            sampled = MP_JNI_EXCEPTION_LOG(ao) >= 0;
++            if (sampled && AudioTrack.getUnderrunCount) {
++                if (p->track_generation != underrun_generation) {
++                    underrun_generation = p->track_generation;
++                    underruns = 0;
++                }
++                int count = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getUnderrunCount);
++                if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++                    count = underruns;
++                underrun_delta = count - underruns;
++                underruns = count;
++            }
 +        }
 +        mp_mutex_unlock(&p->track_lock);
++        if (underrun_delta > 0) {
++            int64_t t = mp_time_ns();
++            if (t - underrun_logged_ns >= MP_TIME_S_TO_NS(1)) {
++                underrun_logged_ns = t;
++                MP_WARN(ao, "AudioTrack underrun (+%d, %d on this track); head=%u\n",
++                        underrun_delta, underruns, head);
++            }
++        }
 +        if (!sampled) {
 +            have_head = false;
 +            continue;
@@ -431,7 +501,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      if (p->audiotrack) {
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
          MP_JNI_EXCEPTION_LOG(ao);
-@@ -1082,6 +1311,9 @@ static void uninit(struct ao *ao)
+@@ -1105,6 +1375,9 @@ static void uninit(struct ao *ao)
  
      MP_JNI_GLOBAL_FREEP(&p->timestamp);
  
@@ -441,7 +511,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      mp_cond_destroy(&p->wakeup);
      mp_mutex_destroy(&p->lock);
  
-@@ -1097,6 +1329,10 @@ static int init(struct ao *ao)
+@@ -1120,6 +1393,10 @@ static int init(struct ao *ao)
  
      mp_mutex_init(&p->lock);
      mp_cond_init(&p->wakeup);
@@ -452,7 +522,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
  
      if (init_jni(ao) < 0)
          return -1;
-@@ -1305,6 +1541,12 @@ static int init(struct ao *ao)
+@@ -1333,6 +1610,12 @@ static int init(struct ao *ao)
      }
      p->thread_created = true;
  
@@ -465,7 +535,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
      return 1;
  
  error:
-@@ -1315,46 +1557,44 @@ error:
+@@ -1343,46 +1626,44 @@ error:
  static void stop(struct ao *ao)
  {
      struct priv *p = ao->priv;

@@ -30,7 +30,7 @@ typedef pthread_cond_t mp_cond;
 typedef int jint, jmethodID;
 struct object {
     bool track, released;
-    int refs, state, position;
+    int refs, state, position, underruns;
     uint8_t *data;
     uint8_t sink[256];
     int sink_size;
@@ -49,7 +49,9 @@ struct ao { void *priv; int samplerate, sstride, format; };
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static atomic_llong now_ns;
-static int entered, permitted, idle, head_queries, pauses, failures;
+static int entered, permitted, idle, head_queries, pauses, failures, warnings;
+static int underrun_queries;
+static char last_warning[256];
 static int response, input_bytes;
 static bool pause_after_write;
 static uint8_t input[256];
@@ -64,8 +66,19 @@ static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
 static void test_log(const char *fmt, ...) { (void)fmt; }
+static void warn_log(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    mp_mutex_lock(&gate);
+    vsnprintf(last_warning, sizeof(last_warning), fmt, args);
+    warnings++;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    va_end(args);
+}
 #define MP_VERBOSE(ao, ...) test_log(__VA_ARGS__)
-#define MP_WARN(ao, ...) test_log(__VA_ARGS__)
+#define MP_WARN(ao, ...) warn_log(__VA_ARGS__)
 #define MP_ERR(ao, ...) test_log(__VA_ARGS__)
 
 static void mp_cond_timedwait(mp_cond *c, mp_mutex *m, int64_t ns)
@@ -87,9 +100,9 @@ static void mp_cond_timedwait(mp_cond *c, mp_mutex *m, int64_t ns)
 static struct {
     int writeBufferV21, writeShortV23, writeFloat, write;
     int getPlayState, getPlaybackHeadPosition, getLatency, getTimestamp;
-    int release, pause, flush, play;
+    int release, pause, flush, play, getUnderrunCount;
     int PLAYSTATE_PLAYING, PLAYSTATE_PAUSED, WRITE_BLOCKING;
-} AudioTrack = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 3, 2, 0};
+} AudioTrack = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 3, 2, 0};
 static const struct { int ENCODING_IEC61937, ENCODING_PCM_FLOAT; }
     AudioFormat = {13, 4};
 static const struct { int ERROR_DEAD_OBJECT; } AudioManager = {-6};
@@ -150,6 +163,13 @@ static jint jni_int(JNIEnv *env, jobject track, int method, ...)
         int state = track->state;
         mp_mutex_unlock(&gate);
         return state;
+    }
+    if (method == AudioTrack.getUnderrunCount) {
+        int count = track->underruns;
+        underrun_queries++;
+        pthread_cond_broadcast(&changed);
+        mp_mutex_unlock(&gate);
+        return count;
     }
     if (method == AudioTrack.getPlaybackHeadPosition || method == AudioTrack.getLatency) {
         if (method == AudioTrack.getPlaybackHeadPosition) {
@@ -271,8 +291,8 @@ struct fixture {
 static void setup(struct fixture *f, bool raw, int format, bool direct)
 {
     memset(f, 0, sizeof(*f));
-    entered = permitted = idle = head_queries = pauses = failures = 0;
-    response = input_bytes = track_count = 0;
+    entered = permitted = idle = head_queries = pauses = failures = warnings = 0;
+    response = input_bytes = track_count = underrun_queries = 0;
     pause_after_write = true;
     atomic_store(&now_ns, MP_TIME_S_TO_NS(1));
     AudioTrack.writeBufferV21 = direct ? 1 : 0;
@@ -458,6 +478,77 @@ static void check_dead_object(void)
     puts("PASS: stale ERROR_DEAD_OBJECT is ignored; live errors retain recovery budget");
 }
 
+// One monitor sample, then the verdict it produced: the monitor logs after
+// the counter query that fed it, so the state after query N is settled once
+// query N+1 has been observed. Only the monitor reads the counter, so a
+// worker spinning on a playing track cannot satisfy the wait.
+static void sample_monitor(struct fixture *f)
+{
+    mp_mutex_lock(&gate);
+    int target = underrun_queries + 2;
+    mp_mutex_unlock(&gate);
+    mp_cond_signal(&f->p.monitor_wakeup);
+    wait_counter(&underrun_queries, target);
+}
+
+static void check_underrun_reporting(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    atomic_store(&f.p.play_requested, true); // the core wants audio; no write in flight
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+
+    sample_monitor(&f);
+    assert(warnings == 0);
+
+    mp_mutex_lock(&gate);
+    tracks[0].underruns = 2;
+    mp_mutex_unlock(&gate);
+    sample_monitor(&f);
+    assert(warnings == 1);
+    assert(strstr(last_warning, "+2, 2 on this track"));
+
+    // Within the same second: counted, not logged.
+    mp_mutex_lock(&gate);
+    tracks[0].underruns = 3;
+    mp_mutex_unlock(&gate);
+    sample_monitor(&f);
+    assert(warnings == 1);
+
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
+    mp_mutex_lock(&gate);
+    tracks[0].underruns = 4;
+    mp_mutex_unlock(&gate);
+    sample_monitor(&f);
+    assert(warnings == 2);
+    assert(strstr(last_warning, "+1, 4 on this track"));
+
+    // A replacement track counts from zero; its first sample is not a drop.
+    mp_mutex_lock(&f.p.lock);
+    assert(!AudioTrack_Recreate(&f.ao));
+    mp_mutex_unlock(&f.p.lock);
+    mp_mutex_lock(&gate);
+    tracks[1].state = AudioTrack.PLAYSTATE_PAUSED; // recreate resumed it; idle the worker
+    mp_mutex_unlock(&gate);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
+    sample_monitor(&f);
+    assert(warnings == 2);
+    mp_mutex_lock(&gate);
+    tracks[1].underruns = 1;
+    mp_mutex_unlock(&gate);
+    sample_monitor(&f);
+    assert(warnings == 3);
+    assert(strstr(last_warning, "+1, 1 on this track"));
+
+    // Dry, not dead: the recovery budget and the failure path are untouched.
+    assert(atomic_load(&f.p.recovery_attempts) == 0 && !failures);
+    assert(!atomic_load(&f.p.recreate_requested));
+    atomic_store(&f.p.play_requested, false);
+    teardown(&f);
+    puts("PASS: underruns are logged per track, rate-limited, and never charged as stalls");
+}
+
 static void check_watchdog_after_reset(void)
 {
     struct fixture f;
@@ -502,5 +593,6 @@ int main(void)
     puts("PASS: PCM direct/byte/float and IEC partial counts survive reset without stale credit");
     check_dead_object();
     check_watchdog_after_reset();
+    check_underrun_reporting();
     return 0;
 }
