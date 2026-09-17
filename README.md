@@ -298,8 +298,10 @@ Run the AudioTrack deadline regression with
 applies the Android series, and exercises the production clock and audio-buffer
 deadline code with deterministic JNI delays. Coverage includes passthrough,
 PCM timestamp/fallback paths, startup, E-AC3 counter wrap, partial writes
-across stop/reset/recreation, and stale write completions without clock credit.
-Pass an already-patched source directory as the first argument to run offline.
+across stop/reset/recreation, stale write completions without clock credit,
+and DTS-HD bursts unwrapping to bare packets with the raw track reopened at
+the core rate. Pass an already-patched source directory as the first argument
+to run offline.
 
 ## Make demo app using the local build version
 

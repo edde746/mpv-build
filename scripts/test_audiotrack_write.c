@@ -23,6 +23,7 @@
 #define MP_THREAD_VOID void *
 #define MP_THREAD_RETURN() return NULL
 #define AF_FORMAT_S_DTS 99
+#define AF_FORMAT_S_DTSHD 98
 
 typedef pthread_t mp_thread;
 typedef pthread_mutex_t mp_mutex;
@@ -250,6 +251,7 @@ static void jni_void(JNIEnv *env, jobject track, int method)
 #define MP_JNI_GET_LONG(obj, field) ((void)AudioTimestamp, (int64_t)0)
 
 static int AudioTrack_New(struct ao *ao);
+static void AudioTrack_recreateOrFail(struct ao *ao);
 static void AudioTrack_checkRouteChange(struct ao *ao) { (void)ao; }
 static void ao_request_failure(struct ao *ao) { (void)ao; failures++; }
 static int ao_read_data(struct ao *, void **, int, int64_t, void *, bool, bool);
@@ -434,6 +436,91 @@ static void check_raw_partial_reset(void)
     puts("PASS: partial raw writes survive stop/reset/recreate and late completion");
 }
 
+// One DTS type IV burst as libavformat's spdif muxer emits it: LE preamble
+// words, then the byte-swapped payload (10-byte start code, big-endian packet
+// size, the packet) padded to Pd, then carrier zeros up to the next burst.
+// The packet is a DTS core header whose SFREQ code is `sfreq`, plus a byte.
+static int dtshd_burst(uint8_t *out, int sfreq)
+{
+    static const uint8_t start_code[10] = {1, 0, 0, 0, 0, 0, 0, 0, 0xfe, 0xfe};
+    uint8_t packet[10] = {0x7f, 0xfe, 0x80, 0x01, 0x3f, 0xc0, 0x40, 0x00, sfreq << 2, 0xab};
+    uint8_t payload[24] = {0}; // 12 + 10 packet bytes, then 2 bytes of Pd padding
+    memcpy(payload, start_code, sizeof(start_code));
+    payload[10] = 0;
+    payload[11] = sizeof(packet);
+    memcpy(payload + 12, packet, sizeof(packet));
+    const uint16_t preamble[4] = {0xf872, 0x4e1f, 0x11, sizeof(payload)};
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        out[n++] = preamble[i] & 0xff;
+        out[n++] = preamble[i] >> 8;
+    }
+    for (int i = 0; i < (int)sizeof(payload); i += 2) {
+        out[n++] = payload[i + 1];
+        out[n++] = payload[i];
+    }
+    for (int i = 0; i < 6; i++)
+        out[n++] = 0;
+    return n;
+}
+
+static void check_raw_dtshd(int sfreq, int expected_rate, int expected_tracks)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    f.ao.format = AF_FORMAT_S_DTSHD;
+    f.ao.samplerate = 192000;
+    f.p.samplerate = 48000;
+    f.p.raw_rate_mult = 4;
+    uint8_t stream[64];
+    const int len = dtshd_burst(stream, sfreq);
+    const uint8_t packet[10] = {0x7f, 0xfe, 0x80, 0x01, 0x3f, 0xc0, 0x40, 0x00, sfreq << 2, 0xab};
+
+    begin_write(&f, stream, len);
+    finish_write(&f, sizeof(packet));
+    // The whole burst - preamble, header, packet and padding - is credited
+    // once the packet alone has drained, on the track the core rate chose.
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.written_frames == (uint32_t)(len / f.ao.sstride));
+    assert(f.p.raw_rate_verified);
+    assert(f.p.samplerate == expected_rate);
+    assert(f.p.raw_rate_mult == 192000 / expected_rate);
+    mp_mutex_unlock(&f.p.lock);
+    assert(track_count == expected_tracks && !failures);
+    struct object *track = &tracks[track_count - 1];
+    assert(track->sink_size == (int)sizeof(packet));
+    assert(!memcmp(track->sink, packet, sizeof(packet)));
+
+    // A later burst goes straight to the same track without another probe.
+    begin_write(&f, stream, len);
+    finish_write(&f, sizeof(packet));
+    assert(track_count == expected_tracks);
+    assert(track->sink_size == 2 * (int)sizeof(packet));
+    assert(!memcmp(track->sink + sizeof(packet), packet, sizeof(packet)));
+    teardown(&f);
+}
+
+// The parser keeps its place across arbitrarily fragmented chunks: fed one
+// byte at a time, two bursts still unwrap to exactly two bare packets.
+static void check_dtshd_unwrap_fragmented(void)
+{
+    struct priv p = {0};
+    struct ao ao = {.priv = &p, .samplerate = 192000, .sstride = 16,
+                    .format = AF_FORMAT_S_DTSHD};
+    uint8_t stream[128];
+    const int len = dtshd_burst(stream, 13);
+    memcpy(stream + len, stream, len);
+    uint8_t out[64];
+    int n = 0;
+    for (int i = 0; i < 2 * len; i++)
+        n += AudioTrack_unwrapIEC61937(&ao, out + n, stream + i, 1);
+    const uint8_t packet[10] = {0x7f, 0xfe, 0x80, 0x01, 0x3f, 0xc0, 0x40, 0x00, 13 << 2, 0xab};
+    assert(n == 2 * (int)sizeof(packet));
+    assert(!memcmp(out, packet, sizeof(packet)));
+    assert(!memcmp(out + sizeof(packet), packet, sizeof(packet)));
+    assert(p.raw_state == RAW_SYNC_PA && !warnings);
+}
+
 static void check_pcm_and_iec(int format, bool direct, int returned, int bytes)
 {
     struct fixture f;
@@ -586,6 +673,10 @@ int main(void)
 {
     alarm(15); // fail a regression that holds the reset lock, rather than hang CI
     check_raw_partial_reset();
+    check_raw_dtshd(13, 48000, 1);
+    check_raw_dtshd(14, 96000, 2);
+    check_dtshd_unwrap_fragmented();
+    puts("PASS: DTS-HD bursts unwrap to the bare packet and a 96 kHz core reopens the track");
     check_pcm_and_iec(1, true, 6, 6);
     check_pcm_and_iec(1, false, 6, 6);
     check_pcm_and_iec(AudioFormat.ENCODING_PCM_FLOAT, false, 2, 8);

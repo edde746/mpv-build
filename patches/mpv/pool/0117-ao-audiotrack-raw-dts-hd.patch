@@ -1,0 +1,366 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index e59bbdb..b828b5c 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -58,6 +58,7 @@ enum {
+     RAW_PD,
+     RAW_PAYLOAD,
+     RAW_DTS_HEADER,
++    RAW_DTSHD_HEADER,
+ };
+ 
+ struct priv {
+@@ -83,13 +84,13 @@ struct priv {
+     uint64_t write_generation;
+ 
+     // Raw passthrough: IEC 61937 bursts from ad_spdif unwrapped into a track
+-    // opened with the codec's own encoding (ENCODING_AC3/E_AC3/DTS).
++    // opened with the codec's own encoding (ENCODING_AC3/E_AC3/DTS/DTS_HD).
+     bool raw_passthrough;
+     int raw_rate_mult;    // IEC carrier rate / raw track rate (4 for E-AC3)
+     int raw_state;        // RAW_*
+     int raw_data_type;    // Pc data type of the burst being unwrapped
+     uint8_t raw_dts_header[8];
+-    int raw_dts_header_len;
++    int raw_dts_header_len; // bytes gathered (DTS core) or skipped (DTS-HD)
+     uint8_t raw_byte;
+     bool raw_have_byte;
+     int raw_pending;      // bytes left in the current Java ByteBuffer
+@@ -97,6 +98,7 @@ struct priv {
+     int raw_payload_left; // payload bytes still to emit for this burst
+     void *rawbuf;         // chunk plus space for a fragmented DTS header
+     bool raw_depth_logged;// first burst's Pd has sized the track in bursts
++    bool raw_rate_verified;// DTS-HD: the core header confirmed the track rate
+ 
+     // Route polling for passthrough tracks (see AudioTrack_checkRouteChange)
+     jint routed_device;      // 0 = none observed yet
+@@ -287,6 +289,7 @@ static struct JNIAudioFormat {
+     jint ENCODING_AC3;
+     jint ENCODING_E_AC3;
+     jint ENCODING_DTS;
++    jint ENCODING_DTS_HD;
+     jint CHANNEL_OUT_MONO;
+     jint CHANNEL_OUT_STEREO;
+     jint CHANNEL_OUT_FRONT_CENTER;
+@@ -305,6 +308,7 @@ static const struct MPJniField AudioFormat_mapping[] = {
+     {"ENCODING_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_AC3), 0},
+     {"ENCODING_E_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_E_AC3), 0},
+     {"ENCODING_DTS", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS), 0},
++    {"ENCODING_DTS_HD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS_HD), 0},
+     {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
+     {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
+     {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
+@@ -733,11 +737,16 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+     return MPCLAMP(delay, 0.0, 2.0);
+ }
+ 
+-#define IEC61937_AC3  0x01
+-#define IEC61937_DTS1 0x0b
+-#define IEC61937_DTS2 0x0c
+-#define IEC61937_DTS3 0x0d
+-#define IEC61937_EAC3 0x15
++#define IEC61937_AC3   0x01
++#define IEC61937_DTS1  0x0b
++#define IEC61937_DTS2  0x0c
++#define IEC61937_DTS3  0x0d
++#define IEC61937_DTSHD 0x11
++#define IEC61937_EAC3  0x15
++
++// The DTS type IV burst payload: libavformat's 10-byte start code, the
++// packet size (big-endian), then the whole core+substream packet.
++#define DTSHD_BURST_HEADER 12
+ 
+ static jint raw_encoding_for_format(int format, int *rate_mult)
+ {
+@@ -751,6 +760,12 @@ static jint raw_encoding_for_format(int format, int *rate_mult)
+         return AudioFormat.ENCODING_E_AC3;
+     case AF_FORMAT_S_DTS:
+         return AudioFormat.ENCODING_DTS;
++    case AF_FORMAT_S_DTSHD:
++        // ad_spdif clocks every DTS-HD burst at 192 kHz whatever the core
++        // rate; assume the common 48 kHz core and let the first frame's
++        // header correct it (AudioTrack_adoptDtsHdRate).
++        *rate_mult = 4;
++        return AudioFormat.ENCODING_DTS_HD;
+     default:
+         return 0;
+     }
+@@ -774,6 +789,10 @@ static int raw_buffer_budget(int format)
+         return 8 * 3072;  // 768 kb/s frame; 32 frames (1.02 s) at 192 kb/s
+     case AF_FORMAT_S_DTS:
+         return 16 * 2048; // 1536 kb/s 512-sample frame; 341 ms at 768 kb/s
++    case AF_FORMAT_S_DTSHD:
++        // The 8-channel 192 kHz carrier bounds a 512-sample MA frame at 32 KiB
++        // (spdifenc: pkt_offset - preamble); 1.4 s at HRA's 1.5 Mb/s floor.
++        return 8 * 32768;
+     default:
+         return 0;
+     }
+@@ -832,7 +851,9 @@ done:
+ 
+ // Unwraps IEC 61937 (LE words from libavformat's spdif muxer) back into the
+ // codec byte stream; parser state persists across calls. Full-carrier DTS
+-// arrives without a preamble, so the frame header supplies its length.
++// arrives without a preamble, so the frame header supplies its length. A
++// DTS-HD burst carries its own header (DTSHD_BURST_HEADER) inside Pd, and
++// Pd is padded past the packet, so the header's size field bounds the copy.
+ // dst needs len + sizeof(raw_dts_header) bytes.
+ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+                                      const uint8_t *src, int len)
+@@ -886,6 +907,25 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+             continue;
+         }
+ 
++        if (p->raw_state == RAW_DTSHD_HEADER) {
++            p->raw_dts_header_len += 2;
++            if (p->raw_dts_header_len < DTSHD_BURST_HEADER)
++                continue;
++            // The last word is the packet size, big-endian in the burst.
++            const int size = hi << 8 | lo;
++            p->raw_dts_header_len = 0;
++            if (size > 0 && size + DTSHD_BURST_HEADER <= p->raw_payload_left) {
++                p->raw_payload_left = size;
++                p->raw_state = RAW_PAYLOAD;
++            } else {
++                MP_WARN(ao, "DTS-HD burst header names %d bytes of a %d byte burst\n",
++                        size, p->raw_payload_left);
++                p->raw_payload_left = 0;
++                p->raw_state = RAW_SYNC_PA;
++            }
++            continue;
++        }
++
+         const uint16_t word = lo | (hi << 8);
+         switch (p->raw_state) {
+         case RAW_SYNC_PA:
+@@ -918,6 +958,7 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+                 p->raw_payload_left = word >> 3; // Pd in bits
+                 break;
+             case IEC61937_EAC3:
++            case IEC61937_DTSHD:
+                 p->raw_payload_left = word; // Pd in bytes
+                 break;
+             default:
+@@ -927,6 +968,10 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+                 break;
+             }
+             p->raw_state = p->raw_payload_left > 0 ? RAW_PAYLOAD : RAW_SYNC_PA;
++            if (p->raw_state == RAW_PAYLOAD && p->raw_data_type == IEC61937_DTSHD) {
++                p->raw_dts_header_len = 0;
++                p->raw_state = RAW_DTSHD_HEADER;
++            }
+             if (p->raw_payload_left > 0 && !p->raw_depth_logged) {
+                 // Pd is the whole burst, so the depth is in codec frames
+                 // (AC-3/E-AC-3: one 32 ms frame per burst).
+@@ -941,6 +986,67 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+     return out;
+ }
+ 
++// The core rate named by a DTS-HD packet's leading core frame, or 0.
++static int dtshd_core_rate(const uint8_t *pkt, int len)
++{
++    // DTS core SFREQ codes (libavcodec dca.h); 0 marks the reserved ones.
++    static const int rates[16] = {
++        0, 8000, 16000, 32000, 0, 0, 11025, 22050,
++        44100, 0, 0, 12000, 24000, 48000, 96000, 192000,
++    };
++    if (len < 9 || pkt[0] != 0x7f || pkt[1] != 0xfe || pkt[2] != 0x80 || pkt[3] != 0x01)
++        return 0;
++    return rates[(pkt[8] >> 2) & 0xf];
++}
++
++static void AudioTrack_recreateOrFail(struct ao *ao);
++
++// ad_spdif does not expose the codec rate, so a raw DTS-HD track opens at
++// 48 kHz and the first unwrapped packet's core header confirms it. Another
++// rate that still divides the carrier reopens the track at that rate. The
++// replacement resets the clock, as any replacement does, but keeps the
++// unwrapped packet and the parser position the reset would drop: the caller
++// returns without writing, and the worker re-enters under the new generation
++// with the packet still pending. A rate the carrier cannot clock keeps the
++// track as opened, with a warning. p->lock held.
++static void AudioTrack_adoptDtsHdRate(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    p->raw_rate_verified = true;
++    const int rate = dtshd_core_rate(p->rawbuf, p->raw_pending);
++    if (!rate) {
++        MP_WARN(ao, "DTS-HD packet has no core header; keeping the raw track at %d Hz\n",
++                p->samplerate);
++        return;
++    }
++    if (rate == p->samplerate)
++        return;
++    if (ao->samplerate % rate) {
++        MP_WARN(ao, "%d Hz DTS-HD core does not divide the %d Hz carrier; "
++                "keeping the raw track at %d Hz\n",
++                rate, ao->samplerate, p->samplerate);
++        return;
++    }
++    MP_VERBOSE(ao, "DTS-HD core is %d Hz; reopening the raw track at that rate\n",
++               rate);
++    const int state = p->raw_state, data_type = p->raw_data_type,
++              header_len = p->raw_dts_header_len, pending = p->raw_pending,
++              input_len = p->raw_input_len, payload_left = p->raw_payload_left;
++    const uint8_t byte = p->raw_byte;
++    const bool have_byte = p->raw_have_byte;
++    p->samplerate = rate;
++    p->raw_rate_mult = ao->samplerate / rate;
++    AudioTrack_recreateOrFail(ao);
++    p->raw_state = state;
++    p->raw_data_type = data_type;
++    p->raw_dts_header_len = header_len;
++    p->raw_pending = pending;
++    p->raw_input_len = input_len;
++    p->raw_payload_left = payload_left;
++    p->raw_byte = byte;
++    p->raw_have_byte = have_byte;
++}
++
+ // Enter and return with p->lock held. Preparation and completion mutate the
+ // parser/accounting; only the blocking JNI write runs outside that lock.
+ static int AudioTrack_write(struct ao *ao, int len)
+@@ -963,6 +1069,12 @@ static int AudioTrack_write(struct ao *ao, int len)
+             jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
+             if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+             MP_JNI_LOCAL_FREEP(&bbuf);
++            if (ao->format == AF_FORMAT_S_DTSHD && !p->raw_rate_verified) {
++                const uint64_t generation = p->write_generation;
++                AudioTrack_adoptDtsHdRate(ao);
++                if (generation != p->write_generation)
++                    return 0; // reopened: the worker writes the packet next
++            }
+         }
+         // A short write leaves ByteBuffer.position on the unwritten tail.
+         buffer = p->bbuf;
+@@ -1405,14 +1517,76 @@ static int init(struct ao *ao)
+ 
+     const bool spdif = af_fmt_is_spdif(ao->format);
+ 
++    /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
++    static const struct mp_chmap layouts[] = {
++        {0},                                        // empty
++        MP_CHMAP_INIT_MONO,                         // mono
++        MP_CHMAP_INIT_STEREO,                       // stereo
++        MP_CHMAP3(FL, FR, FC),                      // 3.0
++        MP_CHMAP4(FL, FR, BL, BR),                  // quad
++        MP_CHMAP5(FL, FR, FC, BL, BR),              // 5.0
++        MP_CHMAP6(FL, FR, FC, LFE, BL, BR),         // 5.1
++        MP_CHMAP7(FL, FR, FC, LFE, BL, BR, BC),     // 6.1
++        MP_CHMAP8(FL, FR, FC, LFE, BL, BR, SL, SR), // 7.1
++    };
++    const jint layout_map[] = {
++        0,
++        AudioFormat.CHANNEL_OUT_MONO,
++        AudioFormat.CHANNEL_OUT_STEREO,
++        AudioFormat.CHANNEL_OUT_STEREO | AudioFormat.CHANNEL_OUT_FRONT_CENTER,
++        AudioFormat.CHANNEL_OUT_QUAD,
++        AudioFormat.CHANNEL_OUT_QUAD | AudioFormat.CHANNEL_OUT_FRONT_CENTER,
++        AudioFormat.CHANNEL_OUT_5POINT1,
++        AudioFormat.CHANNEL_OUT_5POINT1 | AudioFormat.CHANNEL_OUT_BACK_CENTER,
++        AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
++    };
++    static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
++    if (spdif) {
++        // TrueHD and DTS-HD MA bursts are 8-channel; forcing stereo would
++        // open a track that cannot carry them. A raw track keeps the burst's
++        // mask too: 7.1 for DTS-HD MA, stereo for the rest.
++        p->channel_config = ao->channels.num < MP_ARRAY_SIZE(layout_map)
++                          ? layout_map[ao->channels.num] : 0;
++        if (!p->channel_config) {
++            MP_ERR(ao, "no channel mask for a %d channel IEC 61937 burst\n",
++                   ao->channels.num);
++            goto error;
++        }
++    } else {
++        struct mp_chmap_sel sel = {0};
++        for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
++            if (layout_map[i])
++                mp_chmap_sel_add_map(&sel, &layouts[i]);
++        }
++        if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels))
++            goto error;
++        p->channel_config = layout_map[ao->channels.num];
++        mp_assert(p->channel_config);
++    }
++
+     if (spdif) {
+         int rate_mult = 1;
+         jint raw_format = p->cfg_raw_passthrough
+                         ? raw_encoding_for_format(ao->format, &rate_mult) : 0;
++        if (raw_format && ao->format == AF_FORMAT_S_DTSHD &&
++            AudioFormat.ENCODING_IEC61937 &&
++            AudioTrack_rawRouteSupported(ao, AudioFormat.ENCODING_IEC61937,
++                                         ao->samplerate, p->channel_config)) {
++            // The reverse of the lossy codecs' order. A route that takes the
++            // 192 kHz carrier keeps it: Fire OS advertises ENCODING_DTS_HD,
++            // opens the raw track, and renders it as silence (its DTS-HD is
++            // the basic profile), while its carrier plays. Raw DTS-HD is for
++            // routes with no carrier at all - a TCL C8K's eARC port has only
++            // the native DTS-HD offload profile. With no route oracle (API
++            // < 29) the carrier is kept, as before.
++            MP_VERBOSE(ao, "route carries the IEC 61937 %s burst, keeping it\n",
++                       af_fmt_to_str(ao->format));
++            raw_format = 0;
++        }
+         if (raw_format &&
+             !AudioTrack_rawRouteSupported(ao, raw_format,
+                                           ao->samplerate / rate_mult,
+-                                          AudioFormat.CHANNEL_OUT_STEREO)) {
++                                          p->channel_config)) {
+             MP_VERBOSE(ao, "route rejects a raw %s track, using IEC 61937\n",
+                        af_fmt_to_str(ao->format));
+             raw_format = 0;
+@@ -1458,52 +1632,6 @@ static int init(struct ao *ao)
+         p->samplerate = ao->samplerate / p->raw_rate_mult;
+     }
+ 
+-    /* https://developer.android.com/reference/android/media/AudioFormat#channelPositionMask */
+-    static const struct mp_chmap layouts[] = {
+-        {0},                                        // empty
+-        MP_CHMAP_INIT_MONO,                         // mono
+-        MP_CHMAP_INIT_STEREO,                       // stereo
+-        MP_CHMAP3(FL, FR, FC),                      // 3.0
+-        MP_CHMAP4(FL, FR, BL, BR),                  // quad
+-        MP_CHMAP5(FL, FR, FC, BL, BR),              // 5.0
+-        MP_CHMAP6(FL, FR, FC, LFE, BL, BR),         // 5.1
+-        MP_CHMAP7(FL, FR, FC, LFE, BL, BR, BC),     // 6.1
+-        MP_CHMAP8(FL, FR, FC, LFE, BL, BR, SL, SR), // 7.1
+-    };
+-    const jint layout_map[] = {
+-        0,
+-        AudioFormat.CHANNEL_OUT_MONO,
+-        AudioFormat.CHANNEL_OUT_STEREO,
+-        AudioFormat.CHANNEL_OUT_STEREO | AudioFormat.CHANNEL_OUT_FRONT_CENTER,
+-        AudioFormat.CHANNEL_OUT_QUAD,
+-        AudioFormat.CHANNEL_OUT_QUAD | AudioFormat.CHANNEL_OUT_FRONT_CENTER,
+-        AudioFormat.CHANNEL_OUT_5POINT1,
+-        AudioFormat.CHANNEL_OUT_5POINT1 | AudioFormat.CHANNEL_OUT_BACK_CENTER,
+-        AudioFormat.CHANNEL_OUT_7POINT1_SURROUND,
+-    };
+-    static_assert(MP_ARRAY_SIZE(layout_map) == MP_ARRAY_SIZE(layouts), "");
+-    if (spdif) {
+-        // TrueHD and DTS-HD MA bursts are 8-channel; forcing stereo would
+-        // open a track that cannot carry them.
+-        p->channel_config = ao->channels.num < MP_ARRAY_SIZE(layout_map)
+-                          ? layout_map[ao->channels.num] : 0;
+-        if (!p->channel_config) {
+-            MP_ERR(ao, "no channel mask for a %d channel IEC 61937 burst\n",
+-                   ao->channels.num);
+-            goto error;
+-        }
+-    } else {
+-        struct mp_chmap_sel sel = {0};
+-        for (int i = 0; i < MP_ARRAY_SIZE(layouts); i++) {
+-            if (layout_map[i])
+-                mp_chmap_sel_add_map(&sel, &layouts[i]);
+-        }
+-        if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels))
+-            goto error;
+-        p->channel_config = layout_map[ao->channels.num];
+-        mp_assert(p->channel_config);
+-    }
+-
+     jint buffer_size = MP_JNI_CALL_STATIC_INT(
+         AudioTrack.clazz,
+         AudioTrack.getMinBufferSize,

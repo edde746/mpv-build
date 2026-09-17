@@ -37,13 +37,15 @@ python3 "$E" type "$src" "$workdir/audiotrack_write.inc" --member RAW_SYNC_PA
 python3 "$E" type "$src" "$workdir/audiotrack_write.inc" --append --name priv
 python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name IEC61937_AC3 --name IEC61937_DTS1 --name IEC61937_DTS2 \
-    --name IEC61937_DTS3 --name IEC61937_EAC3 \
+    --name IEC61937_DTS3 --name IEC61937_DTSHD --name IEC61937_EAC3 \
+    --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_getLatency \
-    --fn AudioTrack_unwrapIEC61937 --fn AudioTrack_write \
+    --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
+    --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
     --fn ao_thread --fn monitor_thread --fn stop --fn start
 
