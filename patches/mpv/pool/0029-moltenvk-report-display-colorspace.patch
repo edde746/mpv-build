@@ -1,0 +1,49 @@
+diff --git a/video/out/vulkan/context_moltenvk.m b/video/out/vulkan/context_moltenvk.m
+index 70c7cdc..b0974af 100644
+--- a/video/out/vulkan/context_moltenvk.m
++++ b/video/out/vulkan/context_moltenvk.m
+@@ -76,6 +76,36 @@ static bool moltenvk_check_visible(struct ra_ctx *ctx)
+     return !p->layer.hidden;
+ }
+ 
++// Display colorspace for --target-colorspace-hint=auto. Only the embedder
++// knows which screen shows the layer (a CALayer has no screen; NSScreen.main
++// follows the key window), so it publishes that screen's EDR headroom -
++// NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue - under
++// this key through CALayer's arbitrary-key KVC, and rewrites it whenever the
++// window changes screens. Read per frame, like the visibility gate above.
++//
++// Headroom above 1 reports a BT.2020 PQ display. With the hint on, libplacebo
++// then negotiates a 10-bit HDR10_ST2084 swapchain, and MoltenVK tags the
++// layer kCGColorSpaceITUR_2100_PQ with EDR on and forwards the HDR metadata
++// as CAEDRMetadata, leaving the mapping to the panel with WindowServer, as
++// AVFoundation does. No key, or headroom at 1 and below, reports an unknown
++// display: the hint stays off and mpv keeps tone-mapping into the sRGB
++// swapchain, which is what an SDR screen wants and what every screen got
++// before the key existed.
++static NSString *const kMpvEDRHeadroomKey = @"mpvEDRHeadroom";
++
++static struct pl_color_space moltenvk_preferred_csp(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    id headroom = [p->layer valueForKey:kMpvEDRHeadroomKey];
++    if (![headroom isKindOfClass:[NSNumber class]] || [headroom doubleValue] <= 1.0)
++        return (struct pl_color_space){0};
++
++    return (struct pl_color_space){
++        .primaries = PL_COLOR_PRIM_BT_2020,
++        .transfer  = PL_COLOR_TRC_PQ,
++    };
++}
++
+ static bool moltenvk_init(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+@@ -107,6 +137,7 @@ static bool moltenvk_init(struct ra_ctx *ctx)
+ 
+     struct ra_ctx_params params = {
+         .check_visible = moltenvk_check_visible,
++        .preferred_csp = moltenvk_preferred_csp,
+     };
+ 
+     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
