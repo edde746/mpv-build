@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index c338727..f6bde77 100644
+index f51d421..bc4f4d4 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -319,68 +319,102 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
@@ -146,35 +146,38 @@ index c338727..f6bde77 100644
          if (missed)
              s->missed++;
          return missed;
-@@ -414,9 +447,8 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
+@@ -414,10 +447,9 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
      return false;
  }
  
 -// What a video-present line exists to catch: a frame the display showed off
--// the vsync its siblings land on, a release the VO could not time, or a
--// report that never came.
+-// the vsync its siblings land on, a release the VO could not time, a report
+-// that never came, or -- on every source -- a release that was late or
+-// could not be snapped to a vsync.
 +// What a video-present line exists to catch: a frame held off its cadence, a
-+// release the VO could not time, or a report that never came.
++// release the VO could not time, a report that never came, or -- on every
++// source -- a release that was late or could not be snapped to a vsync.
  static uint64_t present_failures(const struct present_stats *s)
  {
-     return (uint64_t)s->untimed + s->overrun + s->missed;
-@@ -3216,14 +3248,11 @@ static void present_log_stats(struct vo *vo, const char *why)
+     return (uint64_t)s->untimed + s->overrun + s->missed + s->late +
+@@ -3228,15 +3260,12 @@ static void present_log_stats(struct vo *vo, const char *why)
  {
      struct priv *p = vo->priv;
      const struct present_stats *s = &p->present;
 -    int64_t ref = 0;
 -    bool have_ref = present_reference(s, &ref);
--    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s refMs=%s "
-+    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
+-    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s refMs=%s "
++    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
                 "measured=%u missed=%u untimed=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
-                why, s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
+                why, p->present_source,
+                s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
                 s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
                 s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
 -               have_ref ? mp_tprintf(16, "%d", (int)(ref / 1000000)) : "n/a",
                 s->measured, s->missed, s->untimed, s->late, s->unsnapped,
                 s->unmatched, s->overrun);
  }
-@@ -3677,8 +3706,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3690,8 +3719,8 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  // instead, and the core's own drop count (frame-drop-count) only moves for a
  // frame that is a whole duration late on admission, which preparation makes
  // rare. So the count the viewer can see in an overlay is kept here: a frame
@@ -185,13 +188,13 @@ index c338727..f6bde77 100644
  static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
                               struct release_target target)
  {
-@@ -3688,7 +3717,8 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
-         p->present_source = source;
-         MP_VERBOSE(vo, "video-present feedback: %s\n", source);
-     }
--    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync);
-+    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync,
-+                   p->cur_duration);
-     if (target.late)
-         p->present.late++;
-     else if (target.timestamp && !target.vsync)
+@@ -3707,7 +3736,8 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
+         p->present.unsnapped++;
+     int missed = target.late ? 1 : 0;
+     if (present_reports_on(p)) {
+-        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync);
++        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync,
++                       p->cur_duration);
+         AVMediaCodecRendered reports[16];
+         int n;
+         while ((n = av_mediacodec_drain_rendered(buffer, reports,

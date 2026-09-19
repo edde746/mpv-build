@@ -259,7 +259,9 @@ empties: delivery order across bounded drains, a full ring dropping and
 counting the newest report, a producer racing a consumer across many wraps,
 and a codec without feedback answering ENOSYS. The VO side - each release's
 intended vsync matched to the codec's report, the vsync histogram and the
-`video-present` line - is covered by `test_mediacodec_timing.sh`. Pass an
+`video-present` line, which names its source and on an `off:*` source
+records no intents and keeps only the submission-side `late`/`unsnapped`
+counters live - is covered by `test_mediacodec_timing.sh`. Pass an
 already-patched source directory as the first argument to run offline.
 
 Run the pre-decode frame shedding regression with
@@ -299,9 +301,10 @@ applies the Android series, and exercises the production clock and audio-buffer
 deadline code with deterministic JNI delays. Coverage includes passthrough,
 PCM timestamp/fallback paths, startup, E-AC3 counter wrap, partial writes
 across stop/reset/recreation, stale write completions without clock credit,
-and DTS-HD bursts unwrapping to bare packets with the raw track reopened at
-the core rate. Pass an already-patched source directory as the first argument
-to run offline.
+DTS-HD bursts unwrapping to bare packets with the raw track reopened at
+the core rate, and the passthrough clock's rate-limited `playhead step`
+diagnostic with its observe-only `getTimestamp` probe. Pass an
+already-patched source directory as the first argument to run offline.
 
 ## Make demo app using the local build version
 

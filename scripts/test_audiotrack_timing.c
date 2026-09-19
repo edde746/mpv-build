@@ -16,7 +16,9 @@
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
 #define MPMAX(a, b) ((a) > (b) ? (a) : (b))
 #define MPCLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
-#define MP_VERBOSE(...) ((void)0)
+// Verbose lines are evaluated and discarded, so their arguments count as used.
+static void sink_log(const char *fmt, ...) { (void)fmt; }
+#define MP_VERBOSE(ao, ...) sink_log(__VA_ARGS__)
 #define MP_WARN(...) ((void)0)
 
 typedef void *jobject, *jbyteArray, *jshortArray, *jfloatArray;

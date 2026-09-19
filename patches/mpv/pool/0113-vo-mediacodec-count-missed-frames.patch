@@ -1,5 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 47234a8..c338727 100644
+index bacdf38..f51d421 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -323,6 +323,13 @@ struct present_intent {
@@ -62,7 +62,7 @@ index 47234a8..c338727 100644
          }
          int64_t err = system_nano - e->vsync;
          s->measured++;
-@@ -373,17 +401,25 @@ static void present_observe(struct present_stats *s, int64_t media_us,
+@@ -373,17 +401,27 @@ static void present_observe(struct present_stats *s, int64_t media_us,
          double vsyncs = (double)err / period_ns;
          s->hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
                : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
@@ -82,27 +82,30 @@ index 47234a8..c338727 100644
  
  // What a video-present line exists to catch: a frame the display showed off
 -// its vsync, a release the VO could not time, or a report that never came.
-+// the vsync its siblings land on, a release the VO could not time, or a
-+// report that never came.
++// the vsync its siblings land on, a release the VO could not time, a report
++// that never came, or -- on every source -- a release that was late or
++// could not be snapped to a vsync.
  static uint64_t present_failures(const struct present_stats *s)
  {
 -    return (uint64_t)s->untimed + s->overrun + s->hist[0] + s->hist[1] +
 -           s->hist[3] + s->hist[4];
-+    return (uint64_t)s->untimed + s->overrun + s->missed;
++    return (uint64_t)s->untimed + s->overrun + s->missed + s->late +
++           s->unsnapped;
  }
  
  // --- end mediacodec stats core
-@@ -3180,12 +3216,16 @@ static void present_log_stats(struct vo *vo, const char *why)
+@@ -3190,13 +3228,17 @@ static void present_log_stats(struct vo *vo, const char *why)
  {
      struct priv *p = vo->priv;
      const struct present_stats *s = &p->present;
--    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
+-    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
 -               "measured=%u untimed=%u unmatched=%u overrun=%u\n",
 +    int64_t ref = 0;
 +    bool have_ref = present_reference(s, &ref);
-+    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s refMs=%s "
++    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s refMs=%s "
 +               "measured=%u missed=%u untimed=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
-                why, s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
+                why, p->present_source,
+                s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
                 s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
                 s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
 -               s->measured, s->untimed, s->unmatched, s->overrun);
@@ -112,7 +115,7 @@ index 47234a8..c338727 100644
  }
  
  // One tick per OSD_STATS_INTERVAL_FRAMES flips; each line decides its own
-@@ -3355,6 +3395,7 @@ static int64_t mediacodec_release_horizon(int64_t period_ns)
+@@ -3366,6 +3408,7 @@ static int64_t mediacodec_release_horizon(int64_t period_ns)
  struct release_target {
      int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
      int64_t vsync;     // the vsync the timestamp targets, 0 when not snapped
@@ -120,7 +123,7 @@ index 47234a8..c338727 100644
  };
  
  static int64_t read_vsync_sample(struct priv *p)
-@@ -3454,6 +3495,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
+@@ -3465,6 +3508,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
          sample, p->queue_period, mediacodec_release_horizon(p->queue_period));
      if (result.timestamp && sample && raw_target > mono_now)
          result.vsync = result.timestamp + p->queue_period * 8 / 10;
@@ -128,7 +131,7 @@ index 47234a8..c338727 100644
      return result;
  }
  
-@@ -3630,8 +3672,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3641,8 +3685,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
  // Record what this release aimed at, then take in what the codec has
  // rendered since the previous flip. A report for an intent that reset_video
  // dropped lands in unmatched, by design.
@@ -145,28 +148,30 @@ index 47234a8..c338727 100644
  {
      struct priv *p = vo->priv;
      const char *source = av_mediacodec_rendered_source(buffer);
-@@ -3639,17 +3688,25 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
+@@ -3650,19 +3701,27 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
          p->present_source = source;
          MP_VERBOSE(vo, "video-present feedback: %s\n", source);
      }
--    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), vsync);
-+    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync);
 +    if (target.late)
 +        p->present.late++;
 +    else if (target.timestamp && !target.vsync)
 +        p->present.unsnapped++;
 +    int missed = target.late ? 1 : 0;
-     AVMediaCodecRendered reports[16];
-     int n;
-     while ((n = av_mediacodec_drain_rendered(buffer, reports,
-                                              MP_ARRAY_SIZE(reports))) > 0)
-     {
-         for (int i = 0; i < n; i++) {
--            present_observe(&p->present, reports[i].media_time_us,
--                            reports[i].system_nano, p->queue_period);
-+            if (present_observe(&p->present, reports[i].media_time_us,
-+                                reports[i].system_nano, p->queue_period))
-+                missed++;
+     if (present_reports_on(p)) {
+-        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), vsync);
++        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync);
+         AVMediaCodecRendered reports[16];
+         int n;
+         while ((n = av_mediacodec_drain_rendered(buffer, reports,
+                                                  MP_ARRAY_SIZE(reports))) > 0)
+         {
+             for (int i = 0; i < n; i++) {
+-                present_observe(&p->present, reports[i].media_time_us,
+-                                reports[i].system_nano, p->queue_period);
++                if (present_observe(&p->present, reports[i].media_time_us,
++                                    reports[i].system_nano, p->queue_period))
++                    missed++;
+             }
          }
      }
 +    if (missed)
@@ -174,7 +179,7 @@ index 47234a8..c338727 100644
  }
  
  static void flip_page(struct vo *vo)
-@@ -3685,7 +3742,7 @@ static void flip_page(struct vo *vo)
+@@ -3698,7 +3757,7 @@ static void flip_page(struct vo *vo)
              : av_mediacodec_release_buffer(buffer, 1);
      if (ret >= 0)
          p->submitted_frame_id = p->cur_frame_id;

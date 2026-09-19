@@ -1,18 +1,35 @@
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index a5bb0f3..ec3ba29 100644
+index e6bd7c5..794dc7b 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -189,6 +189,9 @@ struct priv {
+@@ -148,6 +148,10 @@ const struct m_sub_options dec_wrapper_conf = {
+     },
+ };
+ 
++// Floor between two decoder-shed lines: a device shedding steadily writes
++// a bounded share of a diagnostic log.
++#define DECODER_SHED_LOG_NS MP_TIME_S_TO_NS(5)
++
+ struct priv {
+     struct mp_log *log;
+     struct sh_stream *header;
+@@ -189,6 +193,15 @@ struct priv {
      int has_broken_decoded_pts;
  
      int packets_without_output; // number packets sent without frame received
 +    // Drops a decoder counts itself (VDCTRL_GET_FRAMEDROP_STATS); -1 while
 +    // the decoder has not answered, which keeps the packet heuristic.
 +    int64_t decoder_drops_seen;
++    // A decoder shed logs at trace level under ffmpeg/video, which a
++    // diagnostic log holds at warn; this line is the only visible record of
++    // one. At most one line per DECODER_SHED_LOG_NS, carrying every shed
++    // since the previous line.
++    int shed_unlogged;
++    int64_t shed_logged_ns;
  
      // Final PTS of previously decoded frame
      double pts;
-@@ -231,7 +234,8 @@ struct priv {
+@@ -231,7 +244,8 @@ struct priv {
      bool attached_picture;
      bool pts_reset;
      int attempt_framedrops; // try dropping this many frames
@@ -22,7 +39,7 @@ index a5bb0f3..ec3ba29 100644
  };
  
  static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
-@@ -331,6 +335,7 @@ static void decf_reset(struct mp_filter *f)
+@@ -331,6 +345,7 @@ static void decf_reset(struct mp_filter *f)
      p->pts_reset = false;
      p->attempt_framedrops = 0;
      p->dropped_frames = 0;
@@ -30,7 +47,7 @@ index a5bb0f3..ec3ba29 100644
      mp_mutex_unlock(&p->cache_lock);
  
      p->coverart_returned = 0;
-@@ -922,10 +927,23 @@ static void feed_packet(struct priv *p)
+@@ -922,10 +937,23 @@ static void feed_packet(struct priv *p)
          int framedrop_type = 0;
  
          mp_mutex_lock(&p->cache_lock);
@@ -56,7 +73,7 @@ index a5bb0f3..ec3ba29 100644
          if (start_pts != MP_NOPTS_VALUE && packet && p->play_dir > 0 &&
              packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
              framedrop_type = 2;
-@@ -1026,7 +1044,20 @@ static void read_frame(struct priv *p)
+@@ -1026,7 +1054,29 @@ static void read_frame(struct priv *p)
      if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
          p->decoded_coverart = frame;
      if (p->attempt_framedrops) {
@@ -72,6 +89,15 @@ index a5bb0f3..ec3ba29 100644
 +                p->decoder_drops_seen = stats.performed;
 +            dropped = MPMAX(0, (int)(stats.performed - p->decoder_drops_seen));
 +            p->decoder_drops_seen = stats.performed;
++            p->shed_unlogged += dropped;
++            int64_t now = mp_time_ns();
++            if (dropped && now - p->shed_logged_ns >= DECODER_SHED_LOG_NS) {
++                MP_VERBOSE(p, "decoder shed %d frame(s) before decode, "
++                           "%d pending, %" PRId64 " over the session\n",
++                           p->shed_unlogged, stats.pending, stats.performed);
++                p->shed_unlogged = 0;
++                p->shed_logged_ns = now;
++            }
 +        } else {
 +            dropped = MPMAX(0, p->packets_without_output - 1);
 +        }
@@ -79,7 +105,7 @@ index a5bb0f3..ec3ba29 100644
          p->dropped_frames += dropped;
      }
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index 76862a1..0a59e06 100644
+index 9af0058..3b8f4b6 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
 @@ -19,6 +19,7 @@
@@ -118,7 +144,7 @@ index 76862a1..0a59e06 100644
  
  int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 34d2474..cc499f8 100644
+index 69c9c34..f837a28 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
 @@ -143,6 +143,7 @@ struct hwdec_opts {

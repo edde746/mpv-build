@@ -76,7 +76,22 @@ static void mp_thread_set_name(const char *name) { (void)name; }
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
-static void test_log(const char *fmt, ...) { (void)fmt; }
+// Verbose lines are discarded except the playhead-step diagnostic, which the
+// step check reads back.
+static int step_lines;
+static char last_step_line[512];
+static void test_log(const char *fmt, ...)
+{
+    if (strncmp(fmt, "playhead step:", 14))
+        return;
+    va_list args;
+    va_start(args, fmt);
+    mp_mutex_lock(&gate);
+    vsnprintf(last_step_line, sizeof(last_step_line), fmt, args);
+    step_lines++;
+    mp_mutex_unlock(&gate);
+    va_end(args);
+}
 static void warn_log(const char *fmt, ...)
 {
     va_list args;
@@ -329,7 +344,7 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
 {
     memset(f, 0, sizeof(*f));
     entered = permitted = idle = head_queries = pauses = failures = warnings = 0;
-    response = input_bytes = track_count = underrun_queries = 0;
+    response = input_bytes = track_count = underrun_queries = step_lines = 0;
     pause_after_write = true;
     atomic_store(&now_ns, MP_TIME_S_TO_NS(1));
     f->buffer = (struct object){.refs = 1,
@@ -972,6 +987,126 @@ static void check_iec_delayed_reset_smoothing(void)
     puts("PASS: a delayed head reset re-anchors the passthrough smoother");
 }
 
+// One passthrough clock poll.
+static void poll_clock(struct fixture *f)
+{
+    mp_mutex_lock(&f->p.lock);
+    int64_t sample_time = 0;
+    AudioTrack_getLatency(&f->ao, &sample_time);
+    mp_mutex_unlock(&f->p.lock);
+}
+
+static void stall_polls(struct fixture *f, int polls)
+{
+    for (int n = 0; n < polls; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(30));
+        poll_clock(f);
+    }
+}
+
+#define STEP_LINE_FORMAT "playhead step: est=%dms head=%dms over %dms; " \
+    "raw=%u written=%u smoothed=%u polls=%u limited=%u resets=%u " \
+    "ts=%d fpos=%u nano=%lld tsAgeMs=%d tsAdvancing=%d"
+
+// The passthrough clock's step diagnostic: a HAL head that stops advancing
+// moves the smoothed estimate against real time at the drift limiter's pace,
+// and the line fires once that movement passes 20 ms -- naming the raw head,
+// the written frames, the estimate, the limiter's share, and a getTimestamp
+// probe that feeds nothing. Two steps inside the 5 s window are one line.
+static void check_iec_playhead_step_line(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+
+    mp_mutex_lock(&gate);
+    tracks[0].head_resets = false;
+    tracks[0].head = 4000;
+    mp_mutex_unlock(&gate);
+    stop(&f.ao);
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = 50000;
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, 50000); // head 0: nothing to anchor on yet
+
+    // Steady: the head follows the clock (1920 frames per 40 ms poll).
+    for (int n = 0; n < 4; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 4000 + 1920 * (n + 1);
+        mp_mutex_unlock(&gate);
+        expect_delay_played(&f, 50000, 1920 * (n + 1));
+    }
+    assert(step_lines == 0);
+
+    // The head stalls. The limiter lets the estimate fall 144 frames (3 ms)
+    // behind the clock per 30 ms poll: 18 ms after six polls is not yet a
+    // step, 21 ms after the seventh is.
+    stall_polls(&f, 6);
+    assert(step_lines == 0);
+    stall_polls(&f, 1);
+    assert(step_lines == 1);
+    int est_ms, head_ms, over_ms, ts_ok, ts_age, ts_adv;
+    unsigned raw, written, smoothed, polls, limited, resets, fpos;
+    long long nano;
+    assert(sscanf(last_step_line, STEP_LINE_FORMAT, &est_ms, &head_ms, &over_ms,
+                  &raw, &written, &smoothed, &polls, &limited, &resets, &ts_ok,
+                  &fpos, &nano, &ts_age, &ts_adv) == 14);
+    assert(est_ms == -21);        // seven limited polls of 3 ms
+    assert(head_ms == -210);      // the raw head stood still for seven polls
+    assert(over_ms == 3 * 40 + 7 * 30); // three steady polls, then seven stalled
+    assert(raw == 4000 + 1920 * 4);
+    assert(written == 50000);
+    assert(smoothed == 7680 + 7 * (1440 - 144));
+    assert(polls == 10 && limited == 7 && resets == 0);
+    assert(ts_ok == 0 && ts_adv == -1 && ts_age == -1);
+
+    // The next poll re-anchors; another 21 ms of movement inside the 5 s
+    // window stays silent...
+    mp_mutex_lock(&gate);
+    tracks[0].timestamp_ok = true;
+    tracks[0].ts_fpos = 123;
+    tracks[0].ts_nanos = atomic_load(&now_ns) - MP_TIME_MS_TO_NS(7);
+    mp_mutex_unlock(&gate);
+    stall_polls(&f, 8);
+    assert(step_lines == 1);
+    // ...and the line after the window reports the whole movement since the
+    // previous one (the limiter's 10 % of a 5 s poll included), with the
+    // probe's first reading. Writes kept up meanwhile, so nothing overshoots.
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames += 5 * 48000;
+    mp_mutex_unlock(&f.p.lock);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(5));
+    poll_clock(&f);
+    assert(step_lines == 2);
+    assert(sscanf(last_step_line, STEP_LINE_FORMAT, &est_ms, &head_ms, &over_ms,
+                  &raw, &written, &smoothed, &polls, &limited, &resets, &ts_ok,
+                  &fpos, &nano, &ts_age, &ts_adv) == 14);
+    assert(est_ms == -(7 * 3 + 500) && head_ms == -(7 * 30 + 5000));
+    assert(over_ms == 7 * 30 + 5000 && polls == 8 && limited == 8 && resets == 0);
+    assert(ts_ok == 1 && fpos == 123 && ts_adv == -1);
+    assert(ts_age == 7 + 8 * 30 + 5000);
+    // The probe fed nothing: the clock is still the head, untouched.
+    assert(!f.p.timestamp_set && !f.p.timestamp_fetched && !f.p.timestamp_last_fpos);
+    assert(f.p.smooth_reported == (int64_t)smoothed);
+
+    // A probe that sees framePosition move reports it advancing.
+    mp_mutex_lock(&gate);
+    tracks[0].ts_fpos = 4567;
+    mp_mutex_unlock(&gate);
+    stall_polls(&f, 1); // re-anchors
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames += 5 * 48000;
+    mp_mutex_unlock(&f.p.lock);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(5));
+    poll_clock(&f);
+    assert(step_lines == 3);
+    assert(strstr(last_step_line, " fpos=4567 ") && strstr(last_step_line, "tsAdvancing=1"));
+
+    teardown(&f);
+    puts("PASS: a stalled passthrough head logs one rate-limited step line with a "
+         "getTimestamp probe that feeds nothing");
+}
+
 // A recreated track arms the same anchors: its first read cannot trip the
 // backward-jump path or warn.
 static void check_recreate_anchors_fresh_track(void)
@@ -1021,6 +1156,7 @@ int main(void)
     check_pcm_stale_timestamp_after_flush();
     check_pcm_healthy_counters_after_flush();
     check_iec_delayed_reset_smoothing();
+    check_iec_playhead_step_line();
     check_recreate_anchors_fresh_track();
     return 0;
 }

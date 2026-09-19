@@ -826,8 +826,10 @@ static void test_flip_records_intents_and_drains_reports(void)
     CHECK_EQ(p.present.ring[1].live, 0, "a seek forgets pending intents");
     CHECK_EQ(p.present.measured, 1, "a seek keeps the session counters");
 
-    // A codec without feedback: the flip still records, the drain is refused
-    // once per flip, and nothing is matched.
+    // A codec without feedback (Android 12: the NDK callback is API 33+):
+    // the flip learns the source, records no intent -- nothing could ever
+    // match it -- and does not drain. The submission-side counters are the
+    // live half of the line there, so they alone must move its failure sum.
     rendered_source = "off:java";
     p.present_source = NULL;
     rendered_drains = 0;
@@ -840,9 +842,27 @@ static void test_flip_records_intents_and_drains_reports(void)
     clock_ns = in.wakeup_pts;
     CHECK_EQ(present_queued(&vo), true, "released without feedback");
     CHECK_EQ(strcmp(p.present_source, "off:java"), 0, "the source names why feedback is off");
-    CHECK_EQ(rendered_drains, 1, "an ENOSYS drain is not retried within a flip");
+    CHECK_EQ(present_reports_on(&p), 0, "an off source has no reports to record against");
+    CHECK_EQ(rendered_drains, 0, "no drain is attempted without a report source");
+    CHECK_EQ(p.present.ring[0].live, 0, "no intent is recorded without a report source");
     CHECK_EQ(p.present.measured, 1, "nothing is measured without feedback");
     CHECK_EQ(image.refs, 1, "balanced image ownership");
+
+    uint64_t failures = present_failures(&p.present);
+    for (int n = 0; n < PRESENT_INTENTS + 4; n++)
+        present_feedback(&vo, &buffer, (struct release_target){.timestamp = EPOCH + n * MS});
+    CHECK_EQ(p.present.overrun, 0, "a stream of releases on an off source overruns nothing");
+    CHECK_EQ(p.present.unsnapped, PRESENT_INTENTS + 4, "unsnapped releases are still counted");
+    CHECK_EQ(present_failures(&p.present) - failures, PRESENT_INTENTS + 4,
+             "each unsnapped release is a failure the line reports as an event");
+    drops = 0;
+    present_feedback(&vo, &buffer, (struct release_target){.late = true});
+    CHECK_EQ(p.present.late, 1, "a late release is counted on an off source");
+    CHECK_EQ(drops, 1, "and still costs the viewer a slot");
+    CHECK_EQ(present_failures(&p.present) - failures, PRESENT_INTENTS + 5,
+             "a late release moves the failure sum too");
+    CHECK_EQ(p.present.measured + p.present.untimed + p.present.unmatched, 1,
+             "the display-side counters stay where the ndk session left them");
 }
 
 static void test_driver_refresh_and_cadence(void)

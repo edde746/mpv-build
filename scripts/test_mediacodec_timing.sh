@@ -33,7 +33,8 @@ python3 "$E" range "$src" "$workdir/mediacodec_timing_driver.inc" \
     --first "#define VSYNC_SAMPLE_MAX_AGE_NS" --last "static int64_t read_vsync_sample"
 for fn in read_vsync_sample read_vsync_period vsync_sample_is_fresh plausible_period \
           display_period update_queue_timing get_release_target prepare_osd \
-          submit_deadline prepare_frame draw_frame present_feedback flip_page reset_video; do
+          submit_deadline prepare_frame draw_frame present_reports_on present_feedback \
+          flip_page reset_video; do
     python3 "$E" symbol "$src" "$workdir/mediacodec_timing_driver.inc" --append --fn "$fn"
 done
 

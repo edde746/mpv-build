@@ -1,0 +1,165 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index c7d2d57..d57c17c 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -131,6 +131,22 @@ struct priv {
+     int64_t smooth_reported;  // last returned estimate, unwrapped
+     int64_t smooth_reported_ns;
+ 
++    // Playhead-step diagnostic (see AudioTrack_observePlayheadStep). The
++    // anchor is where the clock last was; the counters describe the polls
++    // since it.
++    bool step_anchored;
++    int64_t step_anchor_ns;
++    double step_est_offset;   // smoothed estimate - clock, frames, at the anchor
++    double step_head_offset;  // unwrapped raw head - clock, frames, at the anchor
++    unsigned step_polls;
++    unsigned step_limited;    // polls the drift limiter clamped
++    unsigned step_resets;     // times the smoothing window was reset
++    int64_t step_logged_ns;   // rate limit
++    unsigned step_lines;      // per-session cap
++    bool step_probed;         // a previous getTimestamp probe to compare with
++    uint32_t step_probe_fpos;
++    int64_t step_probe_nano;
++
+     void *chunk;
+     int chunksize;
+     jbyteArray bytearray;
+@@ -513,6 +529,7 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+     p->smooth_head = 0;
+     p->smooth_reported = 0;
+     p->smooth_reported_ns = 0;
++    p->step_resets++;
+ }
+ 
+ // Forget everything derived from the current track's buffer and clock: what
+@@ -536,6 +553,7 @@ static void AudioTrack_resetClock(struct priv *p)
+     p->raw_pending = 0;
+     p->raw_input_len = 0;
+     AudioTrack_resetPlayheadSmoothing(p);
++    p->step_anchored = false;
+     // The worker sets write_outstanding before the JNI call a stop/reset can
+     // interrupt, so it survives the reset without being copied; only the
+     // stall clock restarts.
+@@ -615,7 +633,10 @@ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
+         int64_t drift = est - expected;
+         if (drift && llabs(drift) < ao->samplerate) {
+             int64_t allowed = llround(elapsed * 0.1);
+-            est = MPCLAMP(est, expected - allowed, expected + allowed);
++            int64_t limited = MPCLAMP(est, expected - allowed, expected + allowed);
++            if (limited != est)
++                p->step_limited++;
++            est = limited;
+         }
+     }
+     p->smooth_reported = est;
+@@ -628,6 +649,7 @@ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
+         p->smooth_next = 0;
+         p->smooth_sampled = 0;
+         p->smooth_reported_ns = 0;
++        p->step_resets++;
+     }
+     return (uint32_t)est;
+ }
+@@ -772,6 +794,89 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+     return pos * (uint32_t)p->raw_rate_mult;
+ }
+ 
++// Diagnostic for the passthrough clock, where the smoothed playhead is the
++// only audio clock the core has. A step is the smoothed estimate moving
++// against real time: (estimate - clock) drifting more than
++// PLAYHEAD_STEP_MS from where it was at the anchor -- the same quantity
++// the core sees as its audio clock jumping, whether the HAL's head stalled,
++// jumped, or the smoother reset. Writes do not enter it, and the head's
++// HAL-period sawtooth is averaged out by the smoother before it is read.
++//
++// A line names the raw getPlaybackHeadPosition, written_frames and the
++// smoothed estimate, how far the estimate and the raw head moved against the
++// clock since the anchor, how many of the polls since then the drift limiter
++// clamped and how often the smoothing window was reset, and a getTimestamp
++// probe (framePosition, nanoTime, whether framePosition advanced since the
++// previous probe). The probe is observation only: the passthrough clock
++// never reads p->timestamp, so filling it here feeds nothing.
++//
++// Rate limited per session: no two lines within PLAYHEAD_STEP_MIN_NS, and at
++// most PLAYHEAD_STEP_MAX_LINES lines. A suppressed step keeps its anchor, so
++// the next line reports the whole movement since the previous one.
++#define PLAYHEAD_STEP_MS 20
++#define PLAYHEAD_STEP_MIN_NS MP_TIME_S_TO_NS(5)
++#define PLAYHEAD_STEP_MAX_LINES 120
++
++static void AudioTrack_observePlayheadStep(struct ao *ao, uint32_t estimate)
++{
++    struct priv *p = ao->priv;
++    if (!estimate) { // not started, or just flushed
++        p->step_anchored = false;
++        return;
++    }
++    int64_t now = mp_time_ns();
++    double clock = MP_TIME_NS_TO_S(now) * ao->samplerate;
++    double est_offset = (double)p->smooth_reported - clock;
++    double head_offset = (double)p->smooth_head - clock;
++    if (!p->step_anchored) {
++        p->step_anchored = true;
++        p->step_anchor_ns = now;
++        p->step_est_offset = est_offset;
++        p->step_head_offset = head_offset;
++        p->step_polls = p->step_limited = p->step_resets = 0;
++        return;
++    }
++    p->step_polls++;
++    double est_step = est_offset - p->step_est_offset;
++    if (fabs(est_step) <= ao->samplerate * PLAYHEAD_STEP_MS / 1000.0)
++        return;
++    if (p->step_lines >= PLAYHEAD_STEP_MAX_LINES ||
++        (p->step_logged_ns && now - p->step_logged_ns < PLAYHEAD_STEP_MIN_NS))
++        return;
++
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    bool ts_ok = MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp);
++    uint32_t fpos = 0;
++    int64_t nano = 0;
++    int advancing = -1; // no previous probe to compare with
++    if (ts_ok) {
++        fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
++        nano = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
++        if (p->step_probed)
++            advancing = fpos != p->step_probe_fpos;
++        p->step_probed = true;
++        p->step_probe_fpos = fpos;
++        p->step_probe_nano = nano;
++    }
++    double ms = 1000.0 / ao->samplerate;
++    MP_VERBOSE(ao, "playhead step: est=%+dms head=%+dms over %dms; raw=%u written=%u "
++               "smoothed=%u polls=%u limited=%u resets=%u ts=%d fpos=%u nano=%lld "
++               "tsAgeMs=%d tsAdvancing=%d\n",
++               (int)lround(est_step * ms),
++               (int)lround((head_offset - p->step_head_offset) * ms),
++               (int)((now - p->step_anchor_ns) / 1000000),
++               p->last_head_raw, p->written_frames, estimate,
++               p->step_polls, p->step_limited, p->step_resets,
++               ts_ok, fpos, (long long)nano,
++               ts_ok && nano ? (int)((mp_raw_time_ns() - nano) / 1000000) : -1,
++               advancing);
++    p->step_logged_ns = now;
++    p->step_lines++;
++    if (p->step_lines == PLAYHEAD_STEP_MAX_LINES)
++        MP_VERBOSE(ao, "playhead step: line budget spent, further steps go unlogged\n");
++    p->step_anchored = false; // re-anchor on the next poll
++}
++
+ // Pair the delay with the instant its selected playhead represents, in mpv time.
+ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+ {
+@@ -783,8 +888,10 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+     const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
+                              p->raw_passthrough;
+     uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao, sample_time);
+-    if (passthrough)
++    if (passthrough) {
+         playhead = AudioTrack_smoothPlayhead(ao, playhead, sample_time);
++        AudioTrack_observePlayheadStep(ao, playhead);
++    }
+     // A head can legitimately step past written_frames by a HAL period on
+     // direct tracks; absorb small overshoots. Larger ones are wrap arithmetic
+     // (negative) or a stale counter (huge), both left to the delay tripwire.

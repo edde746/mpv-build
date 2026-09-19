@@ -1,4 +1,5 @@
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 27c7f6c..65e57ae 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
 @@ -57,6 +57,7 @@
@@ -9,7 +10,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  #include <string.h>
  #include <sys/resource.h>
  #include <time.h>
-@@ -305,6 +306,84 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
+@@ -306,6 +307,84 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
      return event ? "event" : "periodic";
  }
  
@@ -94,7 +95,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // --- end mediacodec stats core
  
  typedef AChoreographer *(*mp_get_choreographer_fn)(void);
-@@ -886,6 +965,9 @@ struct priv {
+@@ -895,6 +974,9 @@ struct priv {
      uint64_t frame_seq;
      uint32_t stats_frames;
      struct stats_cadence osd_stats;
@@ -104,22 +105,28 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  
      // Choreographer vsync sampler (shared, see vsync_sampler); these are
      // owned by that sampler's lock while attached.
-@@ -2932,6 +3014,23 @@ static uint64_t osd_failures(const struct osd_shared *s)
+@@ -3015,6 +3097,29 @@ static uint64_t osd_failures(const struct osd_shared *s)
             s->present_hist[3] + s->present_hist[4];
  }
  
-+static bool present_feedback_on(const struct priv *p)
++// Reports only arrive from the NDK frame-rendered callback (API 33+). On any
++// other source no intent could ever be matched, so none is recorded: the
++// display-side counters stay at zero instead of overrun growing forever.
++static bool present_reports_on(const struct priv *p)
 +{
 +    return p->present_source && !strcmp(p->present_source, "ndk");
 +}
 +
++// The line names its source so a zero reads right: on an "off:*" source
++// only the submission-side counters are live.
 +static void present_log_stats(struct vo *vo, const char *why)
 +{
 +    struct priv *p = vo->priv;
 +    const struct present_stats *s = &p->present;
-+    MP_VERBOSE(vo, "video-present %s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
++    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
 +               "measured=%u untimed=%u unmatched=%u overrun=%u\n",
-+               why, s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
++               why, p->present_source,
++               s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
 +               s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
 +               s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
 +               s->measured, s->untimed, s->unmatched, s->overrun);
@@ -128,11 +135,11 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  // One tick per OSD_STATS_INTERVAL_FRAMES flips; each line decides its own
  // cadence through stats_due.
  static void stats_tick(struct vo *vo)
-@@ -2948,6 +3047,12 @@ static void stats_tick(struct vo *vo)
+@@ -3031,6 +3136,12 @@ static void stats_tick(struct vo *vo)
          if (why)
              osd_log_stats_snapshot(vo, why, &s);
      }
-+    if (present_feedback_on(p)) {
++    if (p->present_source) {
 +        const char *why = stats_due(&p->present_cadence,
 +                                    present_failures(&p->present));
 +        if (why)
@@ -141,7 +148,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  }
  
  static void osd_init(struct vo *vo)
-@@ -3346,6 +3451,31 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3426,6 +3537,33 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      return VO_TRUE;
  }
  
@@ -157,15 +164,17 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 +        p->present_source = source;
 +        MP_VERBOSE(vo, "video-present feedback: %s\n", source);
 +    }
-+    present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), vsync);
-+    AVMediaCodecRendered reports[16];
-+    int n;
-+    while ((n = av_mediacodec_drain_rendered(buffer, reports,
-+                                             MP_ARRAY_SIZE(reports))) > 0)
-+    {
-+        for (int i = 0; i < n; i++) {
-+            present_observe(&p->present, reports[i].media_time_us,
-+                            reports[i].system_nano, p->queue_period);
++    if (present_reports_on(p)) {
++        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), vsync);
++        AVMediaCodecRendered reports[16];
++        int n;
++        while ((n = av_mediacodec_drain_rendered(buffer, reports,
++                                                 MP_ARRAY_SIZE(reports))) > 0)
++        {
++            for (int i = 0; i < n; i++) {
++                present_observe(&p->present, reports[i].media_time_us,
++                                reports[i].system_nano, p->queue_period);
++            }
 +        }
 +    }
 +}
@@ -173,7 +182,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
  static void flip_page(struct vo *vo)
  {
      struct priv *p = vo->priv;
-@@ -3379,6 +3509,7 @@ static void flip_page(struct vo *vo)
+@@ -3459,6 +3597,7 @@ static void flip_page(struct vo *vo)
              : av_mediacodec_release_buffer(buffer, 1);
      if (ret >= 0)
          p->submitted_frame_id = p->cur_frame_id;
@@ -181,7 +190,7 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      mp_image_unrefp(&p->cur_image);
      p->cur_pts = 0;
      p->cur_frame_id = 0;
-@@ -3425,6 +3556,7 @@ static void reset_video(struct vo *vo)
+@@ -3505,6 +3644,7 @@ static void reset_video(struct vo *vo)
      p->prepared_epoch = 0;
      mediacodec_timing_reset(&p->timing);
      osd_cadence_reset(&p->cadence);
@@ -189,11 +198,11 @@ diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
      p->osd_pts = MP_NOPTS_VALUE;
      if (p->osd_threads_created) {
          mp_mutex_lock(&p->osd_lock);
-@@ -3480,6 +3612,8 @@ static void uninit(struct vo *vo)
+@@ -3560,6 +3700,8 @@ static void uninit(struct vo *vo)
      p->opts_cache = NULL;
      mp_image_unrefp(&p->cur_image);
  
-+    if (present_feedback_on(p))
++    if (p->present_source)
 +        present_log_stats(vo, "final");
      osd_uninit(vo);
  

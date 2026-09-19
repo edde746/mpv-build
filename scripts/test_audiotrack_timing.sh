@@ -24,10 +24,13 @@ E="$root/scripts/extract.py"
 # read it. Exercise the deadline actually handed to ao_read_data, not a test-side
 # reimplementation of that arithmetic; the write/watchdog loop stays on Android.
 python3 "$E" type "$src" "$workdir/audiotrack_clock.inc" --name priv
+python3 "$E" define "$src" "$workdir/audiotrack_clock.inc" --append \
+    --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
 python3 "$E" symbol "$src" "$workdir/audiotrack_clock.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_smoothPlayhead \
     --fn head_rate --fn head_jump_is_wrap \
-    --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_getLatency
+    --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
+    --fn AudioTrack_getLatency
 python3 "$E" range "$src" "$workdir/audiotrack_read.inc" \
     --first "            int read_samples =" --last "ao_read_data(" --last-inclusive
 printf '(void)samples;\n' >> "$workdir/audiotrack_read.inc"
@@ -40,12 +43,14 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name IEC61937_AC3 --name IEC61937_DTS1 --name IEC61937_DTS2 \
     --name IEC61937_DTS3 --name IEC61937_DTSHD --name IEC61937_EAC3 \
     --name DTSHD_BURST_HEADER \
-    --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS
+    --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
+    --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
     --fn head_rate --fn head_jump_is_wrap \
-    --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_getLatency \
+    --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
+    --fn AudioTrack_getLatency \
     --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
     --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
