@@ -1,5 +1,5 @@
 diff --git a/video/out/vulkan/context_moltenvk.m b/video/out/vulkan/context_moltenvk.m
-index 70c7cdc..b0974af 100644
+index 70c7cdc..89cb643 100644
 --- a/video/out/vulkan/context_moltenvk.m
 +++ b/video/out/vulkan/context_moltenvk.m
 @@ -76,6 +76,36 @@ static bool moltenvk_check_visible(struct ra_ctx *ctx)
@@ -18,9 +18,9 @@ index 70c7cdc..b0974af 100644
 +// layer kCGColorSpaceITUR_2100_PQ with EDR on and forwards the HDR metadata
 +// as CAEDRMetadata, leaving the mapping to the panel with WindowServer, as
 +// AVFoundation does. No key, or headroom at 1 and below, reports an unknown
-+// display: the hint stays off and mpv keeps tone-mapping into the sRGB
-+// swapchain, which is what an SDR screen wants and what every screen got
-+// before the key existed.
++// display: the hint stays off and mpv keeps tone-mapping to SDR on the
++// untagged pass-through swapchain, which is what an SDR screen wants and
++// what every screen got before the key existed.
 +static NSString *const kMpvEDRHeadroomKey = @"mpvEDRHeadroom";
 +
 +static struct pl_color_space moltenvk_preferred_csp(struct ra_ctx *ctx)
