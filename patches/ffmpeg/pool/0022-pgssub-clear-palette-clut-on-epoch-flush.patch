@@ -1,0 +1,49 @@
+Subject: [PATCH] avcodec/pgssubdec: clear a palette's CLUT when its epoch restarts
+
+A PGS palette segment is only a delta while the display set carrying it is
+Normal state. At an acquisition point or an epoch start the segment replaces
+the palette: every entry it does not carry is transparent. libbluray, which
+implements the disc spec, spells that out in graphics_processor.c's
+_decode_pds -- state 0 calls pg_decode_palette_update, anything else calls
+pg_decode_palette, which memsets the entry table before applying the segment
+(clause 8.8.3.1.1).
+
+pgssubdec releases the epoch in flush_cache(), but flush_cache() only zeroes
+palettes.count; PGSSubPalette.clut keeps its contents, and the next epoch's
+first palette segment reuses that same slot and writes only the entries it
+carries. Everything else silently inherits the previous epoch's colours.
+
+The visible failure is a caption whose bitmap background index is not among
+the entries the new palette carries: it renders in whatever colour an earlier
+caption left at that index, so the subtitles sit in an opaque box whose shade
+changes from caption to caption -- black, grey, or the same white as the text.
+Reported against Plezy as a forced PGS track on a UHD remux (edde746/plezy#2391);
+media3's decoder hides it only because it zeroes all 256 entries on every
+palette segment, which is wrong for the delta case.
+
+Clear the CLUT where the slot is handed out. Within an epoch find_palette()
+returns the palette that already exists, so Normal-state delta updates keep
+inheriting entries exactly as before; only a slot re-issued after a flush
+starts transparent.
+
+Verified against the pinned n8.0.1: a retail 208-display-set forced PGS track
+renders byte-identically across 1500 frames before and after, while a stream
+whose second display set is an acquisition point or an epoch start loses the
+phantom box and a Normal-state delta keeps its authored one. Not upstream yet;
+drop this patch once the pinned FFmpeg clears the CLUT itself.
+
+diff --git a/libavcodec/pgssubdec.c b/libavcodec/pgssubdec.c
+index 20583c9..d5789e5 100644
+--- a/libavcodec/pgssubdec.c
++++ b/libavcodec/pgssubdec.c
+@@ -346,6 +346,10 @@ static int parse_palette_segment(AVCodecContext *avctx,
+         }
+         palette = &ctx->palettes.palette[ctx->palettes.count++];
+         palette->id  = id;
++        /* flush_cache() only drops the count, so this slot can still hold the
++         * previous epoch's CLUT. Every entry a new epoch does not define is
++         * fully transparent. */
++        memset(palette->clut, 0, sizeof(palette->clut));
+     }
+ 
+     /* Skip palette version */

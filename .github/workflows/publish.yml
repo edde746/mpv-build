@@ -100,6 +100,9 @@ jobs:
       - name: Test MediaCodec pre-decode frame shedding
         run: bash ./scripts/test_mediacodec_shed.sh
 
+      - name: Test PGS palette cache across an epoch
+        run: bash ./scripts/test_pgs_palette.sh
+
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 

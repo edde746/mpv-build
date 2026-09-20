@@ -6,3 +6,4 @@
 # pool entry stays the single source of truth and the resolved order stays
 # series.common first.
 0020-avfilter-audio-frame-pool-exact-size.patch
+0022-pgssub-clear-palette-clut-on-epoch-flush.patch

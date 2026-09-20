@@ -278,6 +278,15 @@ is the oracle for every unit's last frame, and a stream the reader keeps
 refusing switches shedding off rather than logging per unit. Pass an
 already-patched source directory as the first argument to run offline.
 
+Run the PGS palette regression with `bash scripts/test_pgs_palette.sh`. It
+compiles pgssubdec's palette cache -- `find_palette`, `flush_cache` and the
+palette segment parser -- and drives an epoch boundary across it: a palette
+segment inside one epoch still updates, inheriting the entries it omits, while
+a palette slot re-issued after the epoch flush starts fully transparent instead
+of keeping the previous epoch's colours (the stale entry that drew an opaque
+box behind PGS subtitles). Pass an already-patched source directory to run
+offline.
+
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers
 exactly the render's margins in surface pixels, rounds a scaled plane outward,
