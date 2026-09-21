@@ -320,7 +320,7 @@
     },
     "vulkan": {
       "kind": "prebuilt",
-      "version": "1.4.1",
+      "version": "1.4.2",
       "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.1/MoltenVK-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
