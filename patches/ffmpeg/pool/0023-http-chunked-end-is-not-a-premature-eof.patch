@@ -1,0 +1,61 @@
+Subject: [PATCH] avformat/http: do not reconnect at the end of a chunked body
+
+A response framed with Transfer-Encoding: chunked leaves s->filesize at
+UINT64_MAX. When the connection is persistent (multiple_requests, which
+the HLS demuxer sets on every playlist and segment it opens), the last
+chunk sets s->chunkend and http_buf_read() reports the completed body as
+AVERROR_EOF. http_read_stream() then tests for a premature end with
+`s->off < s->filesize`, which is true of every chunked response, and --
+with reconnect enabled -- treats the clean end as a dropped connection.
+
+The reconnect never recovers: http_connect() resets every per-response
+field except chunkend, so the very first read on the new connection is
+AVERROR_EOF again, and the loop walks its whole backoff (0, 1, 3, 7, 15,
+31, 63, ... seconds, each a fresh GET of the same playlist) before
+failing with EIO. For an HLS variant playlist that means no segment is
+ever requested. Plezy hits this whenever a Plex custom access URL sits
+behind a reverse proxy or tunnel that re-frames the playlist as chunked
+(edde746/plezy#2406): PMS reached directly answers with Content-Length
+and plays, the same title through the proxy spins forever. mpv
+propagates the player's reconnect/reconnect_streamed options to every
+nested HLS open, so the demuxer's persistent connections carry them.
+
+Treat an EOF with chunkend set as the end it is, ahead of the streamed
+and premature-end tests -- unless reconnect_at_eof asked for exactly
+that reconnect -- and reset chunkend with the rest of the per-response
+state in http_connect() so a later seek, request or reconnect_at_eof
+reconnect on the same context does not start at EOF.
+
+Verified on n8.0.1: a chunked HLS VOD served over a keep-alive connection
+probes and plays with reconnect=1,reconnect_streamed=1 where it used to
+re-request the playlist on the backoff schedule; Content-Length framing,
+chunked without reconnect, and a genuinely truncated Content-Length body
+(which still logs "Stream ends prematurely" and reconnects) behave as
+before. Not upstream yet; drop this patch once the pinned FFmpeg carries
+the fix.
+
+diff --git a/libavformat/http.c b/libavformat/http.c
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -1604,6 +1604,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
+     s->off              = 0;
+     s->icy_data_read    = 0;
+     s->filesize         = UINT64_MAX;
++    s->chunkend         = 0;
+     s->willclose        = 0;
+     s->end_chunked_post = 0;
+     s->end_header       = 0;
+@@ -1772,6 +1773,13 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+         if (read_ret == AVERROR_EXIT)
+             break;
+ 
++        /* The last chunk of a persistent chunked response is the end of the
++         * body, not a dropped connection: filesize is unknown for chunked
++         * transfers, so the premature-end test below cannot tell them apart.
++         * reconnect_at_eof asks to reconnect at exactly this point. */
++        if (read_ret == AVERROR_EOF && s->chunkend && !s->reconnect_at_eof)
++            break;
++
+         if (h->is_streamed && !s->reconnect_streamed)
+             break;
+ 
