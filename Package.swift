@@ -151,38 +151,38 @@ let package = Package(
 
         .binaryTarget(
             name: "Libavcodec",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavcodec-89db455509ea.xcframework.zip",
-            checksum: "5a97172006fa8cb1c95d6f3da5316617fcf9d86ce54ec8d6f25a1f7cf0213cd2"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavcodec-895cedfbad9a.xcframework.zip",
+            checksum: "5745a5bd1ee797309bf7b72834fdae71255b4f19fb1874256d6fde772ebb8c09"
         ),
         .binaryTarget(
             name: "Libavdevice",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavdevice-89db455509ea.xcframework.zip",
-            checksum: "9b11f5d5183af083e70589dea52c8c74f75395a3dc0f2b1715279aedf7abfa34"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavdevice-895cedfbad9a.xcframework.zip",
+            checksum: "5845f7764bcc3e14cbf1a4be62fb1f6ee04f86a6bffc56a3719c0cdba317582f"
         ),
         .binaryTarget(
             name: "Libavformat",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavformat-89db455509ea.xcframework.zip",
-            checksum: "c4371270a3c2480e6c3c3b9b0192d3b6845027d7fd98a057ca2c7d3abd93dcfd"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavformat-895cedfbad9a.xcframework.zip",
+            checksum: "717f3a2690b124fcbbf0057937eb480cf209a6b9fa8c9a14b3d20acfa5cecd4a"
         ),
         .binaryTarget(
             name: "Libavfilter",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavfilter-89db455509ea.xcframework.zip",
-            checksum: "44976cefc629e2d7a11ac953b38be66478447db2d825b08826e61ba9d8b0b388"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavfilter-895cedfbad9a.xcframework.zip",
+            checksum: "7c467d0ecec54f5bd9af5d00c528ce4008123738ac9bcf23c31d0f5f189d81df"
         ),
         .binaryTarget(
             name: "Libavutil",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavutil-89db455509ea.xcframework.zip",
-            checksum: "647641d7b2b8737b0eacb743e97dff7adb43c0ef0754334b40fb66d0072933a4"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libavutil-895cedfbad9a.xcframework.zip",
+            checksum: "0ae7e19e4e33951271526be81d4753de069c74860d5584436d33e8087e152f40"
         ),
         .binaryTarget(
             name: "Libswresample",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libswresample-89db455509ea.xcframework.zip",
-            checksum: "819d01fc7a57e9b92ec44baf554f4f307c5fce60339e8e5f538db422f545da01"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libswresample-895cedfbad9a.xcframework.zip",
+            checksum: "429a98bd1de0dfdec473694d35beb12e9874968b62c9dddfe163b2dd44f14fd1"
         ),
         .binaryTarget(
             name: "Libswscale",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libswscale-89db455509ea.xcframework.zip",
-            checksum: "f3232f013ecdc585c954f1a8f85f525c6ca0494cc0ac29cd85cf10fa7efbb07d"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libswscale-895cedfbad9a.xcframework.zip",
+            checksum: "ba0541fb606e350a1eddb9a4a2f758260b22c0d6b66e8207c6c8200ca4afe8fb"
         ),
 
         .binaryTarget(
@@ -199,8 +199,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-17e6dbb7c7be.xcframework.zip",
-            checksum: "8d8014e15f6626314488d8c8d5570279389f44578c075465cda0200fb7e2a5a1"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-03552394ad90.xcframework.zip",
+            checksum: "246509c06e61c0b03279ffc27a4868d924b6fbc693649ed5e951c63450fef369"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
