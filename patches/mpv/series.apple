@@ -26,3 +26,4 @@
 0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch
 0028-ao-coreaudio-uninit-on-init-failure.patch
 0029-moltenvk-report-display-colorspace.patch
+0030-avfoundation-hdr10plus-per-frame-metadata.patch

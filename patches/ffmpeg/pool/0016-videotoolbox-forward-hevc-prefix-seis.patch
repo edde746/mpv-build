@@ -1,0 +1,199 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 23:50:00 +0200
+Subject: [PATCH] videotoolbox: forward HEVC prefix SEIs so HDR10+ reaches the sink
+
+A plain-HEVC HDR10+ file played on an Apple TV 4K into an HDR10+ panel
+(Samsung S90D) is signalled as HDR10: the panel's input banner reads
+"HDR", not the HDR10+ wordmark. Dolby Vision profile 8 + HDR10+ hybrids
+and AVPlayer playing the same stream both light HDR10+ (plezy#2404).
+
+The HEVC hwaccel hands VideoToolbox the parameter sets and the VCL slices
+of an access unit and nothing else, so the decoder never sees the prefix
+SEI messages carrying the HDR signalling - mastering display colour
+volume, content light level, and the per-frame HDR10+ (SMPTE ST 2094-40)
+T.35 payload. VideoToolbox propagates exactly that per-frame display
+metadata from the compressed bitstream onto its output pixel buffers, and
+AVSampleBufferDisplayLayer signals HDR10+ to the sink from there - the
+same private-attachment route the Dolby Vision RPUs already take through
+videotoolbox_hevc_decode_dovi_p81_rpu. The DV session derives its dynamic
+metadata from the RPU, which is why hybrids were fine.
+
+Three changes, all confined to the plain HEVC session:
+
+- Append every prefix SEI NAL of the access unit to the VT sample after
+  the parameter sets and before the first slice. Suffix SEIs (picture
+  hashes) stay out. The Dolby Vision session is left alone: feeding it
+  the SEIs on top of the RPU stopped HDR10+ output from DV + HDR10+
+  hybrids on the same panel.
+- Enable kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata
+  and, on tvOS 17+, GeneratePerFrameHDRDisplayMetadata on every session,
+  not only the Dolby Vision one.
+- Mirror the container's colr/mdcv/clli into the HEVC format description.
+  Without them VideoToolbox "guesses" the colour info from the SPS and
+  treats the stream as a plain 10-bit decode.
+
+Validated A/B on the Apple TV 4K (3rd gen, tvOS 26) + S90D: HEVC HDR10+
+now reads HDR10+ on the panel, plain HEVC HDR10 still reads HDR, and DV
+profile 8 + HDR10+ still reads HDR10+.
+---
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index 82c01b5..2d2f7a2 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -28,6 +28,7 @@
+ #include "libavutil/hwcontext_videotoolbox.h"
+ #include "dovi_convert.h"
+ #include "libavutil/dovi_meta.h"
++#include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/mem.h"
+ #include "vt_internal.h"
+ #include "libavutil/avutil.h"
+@@ -1032,6 +1033,68 @@ static CFDataRef videotoolbox_dovi_extradata_create(const AVDOVIDecoderConfigura
+     return CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
+ }
+ 
++// A container sample description carries the stream's colour signalling
++// (colr) and its static HDR metadata (mdcv, clli) next to the hvcC, and
++// VideoToolbox reads them from the format description: without them the
++// session "guesses" the colour info from the SPS and treats the stream as a
++// plain 10-bit decode, attaching no per-frame HDR display metadata to its
++// output even when the access units carry ST 2094-40 SEIs. Mirror what the
++// container knows into the format description (plezy#2404).
++static void videotoolbox_add_hdr_extensions(CFMutableDictionaryRef config_info,
++                                            AVCodecContext *avctx)
++{
++    CFStringRef primaries = av_map_videotoolbox_color_primaries_from_av(avctx->color_primaries);
++    CFStringRef transfer  = av_map_videotoolbox_color_trc_from_av(avctx->color_trc);
++    CFStringRef matrix    = av_map_videotoolbox_color_matrix_from_av(avctx->colorspace);
++    const AVPacketSideData *sd;
++
++    if (primaries)
++        CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_ColorPrimaries, primaries);
++    if (transfer)
++        CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_TransferFunction, transfer);
++    if (matrix)
++        CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_YCbCrMatrix, matrix);
++
++    sd = av_packet_side_data_get(avctx->coded_side_data, avctx->nb_coded_side_data,
++                                 AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
++    if (sd && sd->size >= sizeof(AVMasteringDisplayMetadata)) {
++        const AVMasteringDisplayMetadata *mdm = (const AVMasteringDisplayMetadata *)sd->data;
++        if (mdm->has_primaries && mdm->has_luminance) {
++            // ISO/IEC 23008-2 D.2.28 payload: primaries in G, B, R order as
++            // 0.00002 units, white point likewise, luminance in 0.0001 cd/m2.
++            static const int gbr[3] = {1, 2, 0};
++            uint8_t buf[24];
++            for (int i = 0; i < 3; i++) {
++                AV_WB16(buf + i * 4,     av_rescale(mdm->display_primaries[gbr[i]][0].num, 50000, mdm->display_primaries[gbr[i]][0].den));
++                AV_WB16(buf + i * 4 + 2, av_rescale(mdm->display_primaries[gbr[i]][1].num, 50000, mdm->display_primaries[gbr[i]][1].den));
++            }
++            AV_WB16(buf + 12, av_rescale(mdm->white_point[0].num, 50000, mdm->white_point[0].den));
++            AV_WB16(buf + 14, av_rescale(mdm->white_point[1].num, 50000, mdm->white_point[1].den));
++            AV_WB32(buf + 16, av_rescale(mdm->max_luminance.num, 10000, mdm->max_luminance.den));
++            AV_WB32(buf + 20, av_rescale(mdm->min_luminance.num, 10000, mdm->min_luminance.den));
++            CFDataRef data = CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
++            if (data) {
++                CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_MasteringDisplayColorVolume, data);
++                CFRelease(data);
++            }
++        }
++    }
++
++    sd = av_packet_side_data_get(avctx->coded_side_data, avctx->nb_coded_side_data,
++                                 AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
++    if (sd && sd->size >= sizeof(AVContentLightMetadata)) {
++        const AVContentLightMetadata *clm = (const AVContentLightMetadata *)sd->data;
++        uint8_t buf[4];
++        AV_WB16(buf,     clm->MaxCLL);
++        AV_WB16(buf + 2, clm->MaxFALL);
++        CFDataRef data = CFDataCreate(kCFAllocatorDefault, buf, sizeof(buf));
++        if (data) {
++            CFDictionarySetValue(config_info, kCMFormatDescriptionExtension_ContentLightLevelInfo, data);
++            CFRelease(data);
++        }
++    }
++}
++
+ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec_type,
+                                                           AVCodecContext *avctx)
+ {
+@@ -1066,6 +1129,8 @@ static CFDictionaryRef videotoolbox_decoder_config_create(CMVideoCodecType codec
+                                  kCMFormatDescriptionYCbCrMatrix_ITU_R_2020);
+         }
+     }
++    if (codec_type == kCMVideoCodecType_HEVC)
++        videotoolbox_add_hdr_extensions(config_info, avctx);
+ 
+     avc_info = CFDictionaryCreateMutable(kCFAllocatorDefault,
+                                          1,
+@@ -1292,7 +1357,13 @@ static int videotoolbox_start(AVCodecContext *avctx)
+         return -1;
+     }
+ 
+-    if (!status && videotoolbox->cm_codec_type == kCMVideoCodecType_DolbyVisionHEVC_FF) {
++    // Per-frame HDR display metadata is what turns an HDR10 stream into HDR10+
++    // at the HDMI sink: VideoToolbox propagates the bitstream's ST 2094-40 SEI
++    // (forwarded in videotoolbox_hevc_start_frame) and, on tvOS 17+, can
++    // generate it for HDR content that carries none. Both were only enabled
++    // on the Dolby Vision session; plain HEVC HDR10+ needs them as well
++    // (plezy#2404).
++    if (!status) {
+         OSStatus property_status;
+ 
+ #if AV_HAS_BUILTIN(__builtin_available)
+@@ -1406,6 +1477,46 @@ static int videotoolbox_h264_end_frame(AVCodecContext *avctx)
+     return ret;
+ }
+ 
++// HEVC hwaccel hands VideoToolbox the parameter sets and the VCL slices of
++// an access unit and nothing else, so the decoder never sees the prefix SEI
++// messages that carry the HDR signalling: mastering display colour volume,
++// content light level and the per-frame HDR10+ (SMPTE ST 2094-40) T.35
++// payload. VideoToolbox propagates exactly that per-frame display metadata
++// from the compressed bitstream onto its output pixel buffers
++// (kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata, on by
++// default), and AVSampleBufferDisplayLayer signals HDR10+ to the sink from
++// there - the same private-attachment route the Dolby Vision RPUs take.
++// Without the SEIs an HDR10+ file plays as plain HDR10 (plezy#2404).
++//
++// Prefix SEIs must precede the first VCL NAL of their access unit, so they
++// are appended here, after decode_params has written the parameter sets and
++// before the first decode_slice. Suffix SEIs (picture hashes) stay out.
++//
++// The Dolby Vision session is left alone: it derives its dynamic metadata
++// from the RPU, and feeding it the SEIs on top stops HDR10+ output from
++// DV + HDR10+ hybrids on non-DV sinks (observed on a Samsung S90D).
++static int videotoolbox_hevc_append_prefix_seis(AVCodecContext *avctx)
++{
++    HEVCContext *h = avctx->priv_data;
++
++    if (videotoolbox_session_is_dovi(avctx))
++        return 0;
++
++    for (int i = 0; i < h->pkt.nb_nals; i++) {
++        H2645NAL *nal = &h->pkt.nals[i];
++        int ret;
++
++        if (nal->type != HEVC_NAL_SEI_PREFIX || nal->raw_size <= 2)
++            continue;
++
++        ret = videotoolbox_common_decode_slice(avctx, nal->raw_data, nal->raw_size);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
+ static int videotoolbox_hevc_start_frame(AVCodecContext *avctx,
+                                          const AVBufferRef *buffer_ref,
+                                          const uint8_t *buffer,
+@@ -1419,7 +1530,7 @@ static int videotoolbox_hevc_start_frame(AVCodecContext *avctx,
+     frame->crop_top    = 0;
+     frame->crop_bottom = 0;
+ 
+-    return 0;
++    return videotoolbox_hevc_append_prefix_seis(avctx);
+ }
+ 
+ static int videotoolbox_hevc_decode_dovi_p81_rpu(AVCodecContext *avctx,

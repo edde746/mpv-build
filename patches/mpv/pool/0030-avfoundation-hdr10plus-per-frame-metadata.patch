@@ -1,0 +1,162 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 20 Sep 2026 23:50:00 +0200
+Subject: [PATCH] vo_avfoundation: attach HDR10+ per-frame metadata to display samples
+
+Companion to the ffmpeg patch that forwards HEVC prefix SEIs to
+VideoToolbox (plezy#2404). HEVC carries HDR10+ (SMPTE ST 2094-40) as a
+per-frame T.35 user-data SEI; FFmpeg parses it into
+AV_FRAME_DATA_DYNAMIC_HDR_PLUS on every decoded frame, hwaccel included,
+and mpv keeps that side data on the mp_image. It travels no further on its
+own: Core Video only has attachment keys for the static HDR10 metadata.
+
+AVSampleBufferDisplayLayer accepts HDR10+ from one documented place, the
+per-sample attachment kCMSampleAttachmentKey_HDR10PlusPerFrameData: the
+SEI payload as sent, starting at itu_t_t35_country_code, which overrides
+whatever the decoder attached to the pixel buffer. Serialize the parsed
+metadata back with av_dynamic_hdr_plus_to_t35 into a per-VO scratch and
+set it on each enqueued video sample. Applies to the geometry and
+composite render outputs as well: those keep the frame's PQ tags and the
+metadata describes the scene, not the pixel grid.
+
+Dolby Vision frames are skipped - their RPU is the dynamic metadata the DV
+pipeline presents - as are non-PQ transfers, and a pixel buffer that
+already carries DolbyVisionRPUData. One-shot info log on the first attached
+frame; one-shot warning when the OS is too old (pre-16) or the payload
+cannot be serialized, in which case playback continues as HDR10.
+---
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 84ef62c..686e99a 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -23,6 +23,8 @@
+ #include <arm_neon.h>
+ #endif
+ #include <libavutil/hwcontext.h>
++#include <libavutil/frame.h>
++#include <libavutil/hdr_dynamic_metadata.h>
+ #include <libavutil/hwcontext_videotoolbox.h>
+ #include <libavutil/pixfmt.h>
+ #include "common/common.h"
+@@ -420,6 +422,13 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+     // One-shot log for dropping a composite that changed the sample size.
+     bool composite_size_mismatch_logged;
+ 
++    // HDR10+ (SMPTE ST 2094-40) per-frame metadata, serialized once per frame
++    // into this scratch as the T.35 payload the display pipeline expects.
++    // One-shot logs: first attached frame, and a frame refused by the OS.
++    uint8_t hdr10plus_t35[6 + AV_HDR_PLUS_MAX_PAYLOAD_SIZE];
++    bool hdr10plus_attached_logged;
++    bool hdr10plus_unsupported_logged;
++
+     // App-active presentation resync (iOS/tvOS). The system suspends the
+     // autonomous AVSampleBufferDisplayLayer on resign-active without setting
+     // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
+@@ -1570,6 +1579,96 @@ static void restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
+     }
+ }
+ 
++// --- HDR10+ per-frame metadata ---
++// HEVC carries HDR10+ (SMPTE ST 2094-40) as a per-frame T.35 user-data SEI.
++// FFmpeg parses it into AV_FRAME_DATA_DYNAMIC_HDR_PLUS on every decoded frame,
++// hwaccel included, and mpv keeps that side data on the mp_image. It travels no
++// further on its own: Core Video only has attachment keys for the static HDR10
++// metadata, so a VideoToolbox pixel buffer arrives without it and the display
++// layer signals plain HDR10 to the sink. AVSampleBufferDisplayLayer forwards
++// HDR10+ from one place, the per-sample attachment
++// kCMSampleAttachmentKey_HDR10PlusPerFrameData: the SEI payload as sent,
++// starting at itu_t_t35_country_code (plezy#2404).
++//
++// av_dynamic_hdr_plus_to_t35() writes the payload from application_mode on and
++// leaves the 48-bit T.35 header to the caller: country code US (0xB5),
++// terminal provider Samsung (0x003C), provider oriented code 0x0001 and
++// application identifier 4 name ST 2094-40, the same values FFmpeg's SEI
++// parser matches before it hands the rest to av_dynamic_hdr_plus_from_t35().
++static const uint8_t hdr10plus_t35_header[6] = {0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04};
++
++static const AVDynamicHDRPlus *find_hdr10plus_side_data(const mp_image_t *mpi)
++{
++    for (int i = 0; i < mpi->num_ff_side_data; i++) {
++        const struct mp_ff_side_data *sd = &mpi->ff_side_data[i];
++        if (sd->type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS && sd->buf &&
++            sd->buf->size >= sizeof(AVDynamicHDRPlus))
++            return (const AVDynamicHDRPlus *)sd->buf->data;
++    }
++    return NULL;
++}
++
++// Dolby Vision frames are left alone: their RPU is the dynamic metadata the DV
++// pipeline presents (tvOS derives HDR10+ from it itself for a DV-less sink),
++// and a second, competing description of the same frame is not something to
++// hand the display. HDR10+ is defined over PQ only, so other transfers are
++// skipped as well.
++static void attach_hdr10plus_metadata(struct vo *vo, const mp_image_t *mpi,
++                                      CVPixelBufferRef pixbuf, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (mpi->params.color.transfer != PL_COLOR_TRC_PQ ||
++        mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        return;
++    const AVDynamicHDRPlus *hdr_plus = find_hdr10plus_side_data(mpi);
++    if (!hdr_plus)
++        return;
++    if (CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL))
++        return;
++
++    if (@available(iOS 16.0, tvOS 16.0, macOS 13.0, *)) {
++        uint8_t *payload = p->hdr10plus_t35 + sizeof(hdr10plus_t35_header);
++        size_t payload_size = sizeof(p->hdr10plus_t35) - sizeof(hdr10plus_t35_header);
++        int ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
++        if (ret < 0) {
++            if (!p->hdr10plus_unsupported_logged) {
++                MP_WARN(vo, "HDR10+ metadata could not be serialized (%d); "
++                            "presenting as HDR10\n", ret);
++                p->hdr10plus_unsupported_logged = true;
++            }
++            return;
++        }
++        memcpy(p->hdr10plus_t35, hdr10plus_t35_header, sizeof(hdr10plus_t35_header));
++        size_t t35_size = sizeof(hdr10plus_t35_header) + payload_size;
++
++        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, true);
++        if (!attachments || CFArrayGetCount(attachments) < 1)
++            return;
++        CFMutableDictionaryRef sample_attachments =
++            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++        CFDataRef t35 = CFDataCreate(NULL, p->hdr10plus_t35, t35_size);
++        if (!t35)
++            return;
++        CFDictionarySetValue(sample_attachments,
++                             kCMSampleAttachmentKey_HDR10PlusPerFrameData, t35);
++        CFRelease(t35);
++
++        if (!p->hdr10plus_attached_logged) {
++            MP_INFO(vo, "HDR10+ per-frame metadata attached to the display "
++                        "samples (%zu bytes, %d window%s)\n",
++                    t35_size, hdr_plus->num_windows,
++                    hdr_plus->num_windows == 1 ? "" : "s");
++            p->hdr10plus_attached_logged = true;
++        }
++    } else if (!p->hdr10plus_unsupported_logged) {
++        MP_WARN(vo, "HDR10+ metadata present but this OS cannot forward it; "
++                    "presenting as HDR10\n");
++        p->hdr10plus_unsupported_logged = true;
++    }
++}
++// --- end HDR10+ per-frame metadata ---
++
+ static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf)
+ {
+     if (!pixbuf || !vo->params)
+@@ -3430,6 +3529,11 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+             return NULL;
+         }
+ 
++        // Geometry and composite renders keep the frame's PQ tags, and the
++        // metadata describes the scene rather than the pixel grid, so it
++        // applies to whichever buffer is enqueued.
++        attach_hdr10plus_metadata(vo, mpi, finalBuffer, buf);
++
+         // Release composited output buffer (always owned by us)
+         if (needsRelease)
+             CVPixelBufferRelease(finalBuffer);

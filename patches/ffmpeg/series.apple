@@ -17,3 +17,4 @@
 0013-videotoolbox-never-signal-dolby-vision-metadata-compression.patch
 0014-videotoolbox-fall-back-to-plain-hevc-session.patch
 0015-hevc-downlevel-skipped-nal-log.patch
+0016-videotoolbox-forward-hevc-prefix-seis.patch
