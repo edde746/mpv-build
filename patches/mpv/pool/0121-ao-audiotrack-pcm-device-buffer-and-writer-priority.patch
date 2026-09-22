@@ -1,0 +1,183 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index d57c17c..ae19fdb 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -21,10 +21,12 @@
+  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <errno.h>
+ #include <math.h>
+ #include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <sys/resource.h>
+ 
+ #include "ao.h"
+ #include "internal.h"
+@@ -38,8 +40,8 @@
+ static mp_static_mutex jni_static_lock = MP_STATIC_MUTEX_INITIALIZER;
+ static int jni_static_use_count = 0;
+ 
+-// Output stall watchdog. A healthy blocking write returns within one buffer
+-// duration (75-150 ms PCM, a few hundred ms passthrough); a device whose HAL
++// Output stall watchdog. A healthy blocking write returns within one write
++// duration (the doubled driver minimum, tens of ms); a device whose HAL
+ // stopped consuming keeps the writer inside AudioTrack.write for good, and
+ // with it the audio clock and the video waiting on it. Several seconds of
+ // neither a completed write nor a moving playback head is far beyond any
+@@ -51,6 +53,10 @@ static int jni_static_use_count = 0;
+ #define STALL_MAX_RECREATES 1
+ #define STALL_POLL_NS MP_TIME_MS_TO_NS(250)
+ 
++// android.os.Process.THREAD_PRIORITY_AUDIO: the niceness of the platform's
++// own audio client threads.
++#define THREAD_PRIORITY_AUDIO (-16)
++
+ enum {
+     RAW_SYNC_PA = 0,
+     RAW_SYNC_PB,
+@@ -93,6 +99,7 @@ struct priv {
+     bool head_reset_pending;   // anchor the head counter on its next read
+     bool ts_reset_pending;     // anchor the timestamp counter on its next fetch
+     int64_t latency_warn_ns;   // rate limit for the delay tripwire
++    int track_frames;          // the PCM track's frameCount, for getLatency()
+ 
+     // Accounting/parser state belongs to this generation, under lock. Only
+     // the worker touches the buffers; reset never clears or frees their data.
+@@ -430,6 +437,21 @@ static const struct {
+ };
+ #undef ENTRY
+ 
++// ao.c takes device_buffer as the floor of the queue the core keeps in front
++// of this AO (max of it and --audio-buffer). The worker fills an empty track
++// - at start, after every seek and on resume - in one burst that takes a
++// whole track buffer from that queue, and the queue reports an underrun the
++// moment a read finds it short, so a queue no deeper than the track is
++// drained on the spot: a 500 ms PCM track tripped it at every start and seek
++// under the 200 ms default. Ask for twice the track so a burst leaves a full
++// track behind; the decoder has that long to refill before the next wake.
++// A raw track keeps its own accounting (see the raw sizing above).
++static int AudioTrack_queueFloor(struct ao *ao, int frames)
++{
++    struct priv *p = ao->priv;
++    return p->raw_passthrough ? frames : frames * 2;
++}
++
+ static int AudioTrack_New(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -503,12 +525,18 @@ static int AudioTrack_New(struct ao *ao)
+         return -1;
+     }
+ 
+-    // Raw encodings report the buffer size in bitstream bytes.
+-    if (!p->raw_passthrough && AudioTrack.getBufferSizeInFramesV23) {
+-        int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
+-        if (bufferSize > 0) {
+-            MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
+-            ao->device_buffer = bufferSize;
++    // Raw encodings report the buffer size in bitstream bytes. The platform
++    // may round the requested PCM buffer up; the real frameCount is what
++    // getLatency() folds in.
++    if (!p->raw_passthrough) {
++        p->track_frames = p->size / (af_fmt_to_bytes(ao->format) * ao->channels.num);
++        if (AudioTrack.getBufferSizeInFramesV23) {
++            int bufferSize = MP_JNI_CALL_INT(audiotrack, AudioTrack.getBufferSizeInFramesV23);
++            if (bufferSize > 0) {
++                MP_VERBOSE(ao, "AudioTrack.getBufferSizeInFrames = %d\n", bufferSize);
++                p->track_frames = bufferSize;
++                ao->device_buffer = AudioTrack_queueFloor(ao, bufferSize);
++            }
+         }
+     }
+ 
+@@ -901,8 +929,17 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+         playhead = p->written_frames;
+     uint32_t diff = p->written_frames - playhead;
+     double delay = diff / (double)(ao->samplerate);
+-    if (!p->timestamp_set && !passthrough)
+-        delay += (double)MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency)/1000.0;
++    if (!p->timestamp_set && !passthrough) {
++        // AudioTrack.getLatency() is the AudioFlinger pipeline plus this
++        // track's whole buffer (AudioTrack::updateLatency_l, "don't believe
++        // this lie"). The buffer's share is already in written - playhead;
++        // adding it again put a 500 ms track over mpv's 0.5 s desync
++        // threshold at every start, seek and resume until getTimestamp
++        // took over. Keep the pipeline part.
++        double pipeline = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getLatency) / 1000.0
++                        - p->track_frames / (double)ao->samplerate;
++        delay += MPMAX(pipeline, 0.0);
++    }
+     // Anchored counters make delay > 2 s unreachable through accounting; a
+     // trip here means the HAL is lying in a way anchoring cannot absorb.
+     // Report it instead of silently returning 0, which hid exactly this class
+@@ -1442,6 +1479,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     struct priv *p = ao->priv;
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     mp_thread_set_name("ao/audiotrack");
++    // Only the device buffer outlives a stalled worker, and at default
++    // niceness the worker shares the CPU with the app's UI and raster
++    // threads through the memory-pressure storms that stall it. media3 runs
++    // its playback thread at THREAD_PRIORITY_AUDIO, and the platform grants
++    // the same to the thread that starts a native AudioTrack (AudioTrack::
++    // start() in libaudioclient) - a Java-created track never does. Linux
++    // niceness is per thread, so who=0 names this thread. Best effort: a
++    // refusal leaves it where it was.
++    if (setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
++        MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
+     mp_mutex_lock(&p->lock);
+     while (!atomic_load(&p->thread_terminate)) {
+         if (atomic_exchange(&p->recreate_requested, false)) {
+@@ -1855,20 +1902,40 @@ static int init(struct ao *ao)
+         MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d, budget=%d, chunk=%d)\n",
+                    p->size, buffer_size, budget, p->chunksize);
+     } else {
+-        // Double the driver minimum, clamped to 75-150 ms. AudioTrack rejects
+-        // a PCM buffer that is not a whole number of frames.
++        // AudioFlinger drains this buffer in ~20 ms mixer periods and mixes
++        // silence once it is empty, so it is the only slack that survives a
++        // stall of the whole process: mpv's own queue in front of it needs
++        // the worker thread to move. Upstream opens twice the driver minimum
++        // clamped to 75-150 ms, which a low-RAM TV box drained inside one
++        // memory-pressure storm (the app's trim callback, the demuxer trim
++        // and the kernel's reclaim landed together and the core missed the
++        // next read). media3 opens 500 ms for PCM whatever the driver
++        // minimum; hold at least that. The core's own queue in front of it
++        // is sized through AudioTrack_queueFloor.
++        //
++        // A blocking write is only woken once half the buffer is free
++        // (ServerProxy::releaseBuffer wakes the client at the track's
++        // notification threshold, frameCount / 2 for a streaming track), so
++        // the fill saws between half and full: the floor a stalled process
++        // keeps is half of this, and the worker takes half a buffer from
++        // the queue in one burst when it wakes. A SHIELD measured 12000 to
++        // 24000 of 24000 frames.
++        //
++        // The write stays the doubled driver minimum. The queue reports an
++        // underrun whenever it holds less than one read, so a
++        // half-second read would turn the larger buffer into a larger
++        // trip-wire. AudioTrack rejects a PCM buffer that is not a whole
++        // number of frames.
+         const int frame = bps * ao->channels.num;
+-        int min = 0.075 * p->samplerate * frame;
+-        int max = min * 2;
+-        min = (min + frame - 1) / frame * frame;
+-        max = (max + frame - 1) / frame * frame;
+-        p->size = MPCLAMP(buffer_size * 2, min, max);
+-        p->size = (p->size + frame - 1) / frame * frame;
+-        MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, min=%d, max=%d)\n", p->size, buffer_size, min, max);
+-        p->chunksize = p->size;
++        const int doubled = MP_ALIGN_UP(buffer_size * 2, frame);
++        const int half_second = p->samplerate / 2 * frame;
++        p->size = MPMAX(doubled, half_second);
++        p->chunksize = MPMIN(doubled, p->size / 4 / frame * frame);
++        MP_VERBOSE(ao, "Setting bufferSize = %d (driver=%d, floor=%d, chunk=%d)\n",
++                   p->size, buffer_size, half_second, p->chunksize);
+     }
+     mp_assert(p->size % bps == 0);
+-    ao->device_buffer = p->size / bps;
++    ao->device_buffer = AudioTrack_queueFloor(ao, p->size / bps);
+ 
+     p->chunk = talloc_size(ao, p->chunksize);
+ 

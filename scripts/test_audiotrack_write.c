@@ -2,6 +2,7 @@
 // The injected device can ignore pause while write is gated; it reads the live
 // buffer again at completion and enforces JNI reference lifetime throughout.
 #include <assert.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,6 +75,7 @@ static void mp_mutex_lock(mp_mutex *m) { assert(!pthread_mutex_lock(m)); }
 static void mp_mutex_unlock(mp_mutex *m) { assert(!pthread_mutex_unlock(m)); }
 static void mp_cond_signal(mp_cond *c) { assert(!pthread_cond_signal(c)); }
 static void mp_thread_set_name(const char *name) { (void)name; }
+#define mp_strerror(e) strerror(e)
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }

@@ -32,3 +32,4 @@
 0118-ao-audiotrack-position-reanchor.patch
 0119-ao-audiotrack-playhead-step-log.patch
 0120-vo-mediacodec-distrust-render-times-off-the-vsync-clock.patch
+0121-ao-audiotrack-pcm-device-buffer-and-writer-priority.patch

@@ -44,6 +44,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name IEC61937_DTS3 --name IEC61937_DTSHD --name IEC61937_EAC3 \
     --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
+    --name THREAD_PRIORITY_AUDIO \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_resetClock \
