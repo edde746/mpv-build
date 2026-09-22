@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index d57c17c..ae19fdb 100644
+index d57c17c..47d9155 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,10 +21,12 @@
@@ -112,7 +112,7 @@ index d57c17c..ae19fdb 100644
      // Anchored counters make delay > 2 s unreachable through accounting; a
      // trip here means the HAL is lying in a way anchoring cannot absorb.
      // Report it instead of silently returning 0, which hid exactly this class
-@@ -1442,6 +1479,16 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -1442,6 +1479,26 @@ static MP_THREAD_VOID ao_thread(void *arg)
      struct priv *p = ao->priv;
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      mp_thread_set_name("ao/audiotrack");
@@ -124,12 +124,22 @@ index d57c17c..ae19fdb 100644
 +    // start() in libaudioclient) - a Java-created track never does. Linux
 +    // niceness is per thread, so who=0 names this thread. Best effort: a
 +    // refusal leaves it where it was.
-+    if (setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
++    //
++    // Not for a raw track. Its budget is bytes, so at a low bitrate it holds
++    // up to a second of audio against a 200 ms core queue, and the writer
++    // fills it in one burst whenever the HAL starts taking data (Fire TV's
++    // Dolby track holds the first writes until the sink locks, then drains
++    // them at once). A writer that outranks the core empties the queue
++    // inside that burst and trips the short-read wire; at the default it
++    // yields to the refill. The depth is the raw track's own slack, so the
++    // priority buys nothing there.
++    if (!p->raw_passthrough &&
++        setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
 +        MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
      mp_mutex_lock(&p->lock);
      while (!atomic_load(&p->thread_terminate)) {
          if (atomic_exchange(&p->recreate_requested, false)) {
-@@ -1855,20 +1902,40 @@ static int init(struct ao *ao)
+@@ -1855,20 +1912,40 @@ static int init(struct ao *ao)
          MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d, budget=%d, chunk=%d)\n",
                     p->size, buffer_size, budget, p->chunksize);
      } else {
