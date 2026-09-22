@@ -1,0 +1,55 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index ba37b04..dce13a6 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -356,6 +356,7 @@ struct present_stats {
+     struct present_hold prev; // the newest matched, timed report
+     uint32_t measured;   // reports matched to a timed release
+     uint32_t untimed;    // reports matched to an untimed or unsnapped release
++    uint32_t unclocked;  // reports carrying a time not on the vsync clock
+     uint32_t unmatched;  // reports with no intent: stragglers across a reset
+     uint32_t overrun;    // intents overwritten before any report arrived
+     uint32_t hist[5];    // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
+@@ -414,6 +415,16 @@ static bool present_hold_missed(struct present_stats *s,
+     return missed;
+ }
+ 
++// A render time the platform did not actually take: Tegra on Android 9
++// answers the Java frame-rendered listener with system_nano 0 for every
++// frame. Read as a hold, that is one miss per frame and a drop count that
++// climbs at the frame rate for a picture that is perfectly smooth. Nothing
++// this VO releases can land a second from the vsync it targeted -- the
++// intent ring is not that deep -- so a report that far off is not a
++// measurement, and the pair it would have formed is not a hold. It is not
++// a failure either: the platform is unmeasurable, which the count names.
++#define PRESENT_REPORT_SANE_NS (1 * INT64_C(1000000000))
++
+ // Returns whether the display held the previous frame off its cadence.
+ static bool present_observe(struct present_stats *s, int64_t media_us,
+                             int64_t system_nano, int64_t period_ns)
+@@ -427,6 +438,10 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
+             s->untimed++;
+             return false;
+         }
++        if (llabs(system_nano - e->vsync) > PRESENT_REPORT_SANE_NS) {
++            s->unclocked++;
++            return false;
++        }
+         int64_t err = system_nano - e->vsync;
+         s->measured++;
+         s->err_last_ns = err;
+@@ -3261,12 +3276,12 @@ static void present_log_stats(struct vo *vo, const char *why)
+     struct priv *p = vo->priv;
+     const struct present_stats *s = &p->present;
+     MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
+-               "measured=%u missed=%u untimed=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
++               "measured=%u missed=%u untimed=%u unclocked=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
+                why, p->present_source,
+                s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
+                s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
+                s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
+-               s->measured, s->missed, s->untimed, s->late, s->unsnapped,
++               s->measured, s->missed, s->untimed, s->unclocked, s->late, s->unsnapped,
+                s->unmatched, s->overrun);
+ }
+ 

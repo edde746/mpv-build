@@ -395,6 +395,29 @@ static void test_present_reports_match_intents(void)
     CHECK_EQ(present_failures(&s), 1, "an untimed present is a failure, unmatched reports are not");
     CHECK_EQ(s.missed, 0, "reports out of release order are never read as a hold");
 
+    // A platform that answers the listener with no clock at all (Tegra on
+    // Android 9 reports system_nano 0 for every frame) measures nothing:
+    // each report is unclocked, never a miss and never a failure, and the
+    // hold chain restarts on the first pair of real times.
+    struct present_stats z = {0};
+    for (int n = 0; n < 4; n++) {
+        present_record(&z, n, EPOCH + n * period, period);
+        CHECK_EQ(present_observe(&z, n, 0, period), false,
+                 "a report a second or more off its vsync is not a hold");
+    }
+    CHECK_EQ(z.unclocked, 4, "reports off the vsync clock are unclocked");
+    CHECK_EQ(z.measured + z.missed + z.untimed, 0, "and neither measured, missed nor untimed");
+    CHECK_EQ(present_failures(&z), 0, "an unmeasurable platform is not a failure");
+    present_record(&z, 4, EPOCH + 4 * period, period);
+    present_observe(&z, 4, EPOCH + 4 * period, period);
+    present_record(&z, 5, EPOCH + 5 * period, period);
+    CHECK_EQ(present_observe(&z, 5, EPOCH + 7 * period, period), true,
+             "the first pair of real times reads as a hold again");
+    present_record(&z, 6, EPOCH + 6 * period, period);
+    present_observe(&z, 6, EPOCH + 6 * period + PRESENT_REPORT_SANE_NS, period);
+    CHECK_EQ(z.unclocked, 4, "exactly a second off is still a measurement");
+    CHECK_EQ(z.measured, 3, "and enters the histogram");
+
     // A device whose reports sit a constant distance from the intended vsync
     // (Tensor reports the release timestamp, 0.8 of a period early) misses
     // nothing; a frame it holds a vsync too long is a miss, and the short

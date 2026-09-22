@@ -31,3 +31,4 @@
 0117-ao-audiotrack-raw-dts-hd.patch
 0118-ao-audiotrack-position-reanchor.patch
 0119-ao-audiotrack-playhead-step-log.patch
+0120-vo-mediacodec-distrust-render-times-off-the-vsync-clock.patch
