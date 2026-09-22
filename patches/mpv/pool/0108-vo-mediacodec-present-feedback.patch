@@ -109,12 +109,12 @@ index 27c7f6c..65e57ae 100644
             s->present_hist[3] + s->present_hist[4];
  }
  
-+// Reports only arrive from the NDK frame-rendered callback (API 33+). On any
-+// other source no intent could ever be matched, so none is recorded: the
-+// display-side counters stay at zero instead of overrun growing forever.
++// Reports arrive from a registered frame-rendered listener ("jni", "ndk");
++// on an "off:*" source no intent could ever be matched, so none is recorded:
++// the display-side counters stay at zero instead of overrun growing forever.
 +static bool present_reports_on(const struct priv *p)
 +{
-+    return p->present_source && !strcmp(p->present_source, "ndk");
++    return p->present_source && strncmp(p->present_source, "off:", 4);
 +}
 +
 +// The line names its source so a zero reads right: on an "off:*" source

@@ -11,6 +11,7 @@
 0010-mediacodec-live-output-surface.patch
 0011-mediacodec-real-time-rate-and-nonref-shedding.patch
 # 0012 refines 0009's registration into the asynchronous mode the app asks
-# for with ndk_async, and restores the priority MediaFormat key that
+# for with async, and restores the priority MediaFormat key that
 # belongs beside the operating rate 0011 declares.
 0012-mediacodec-async-decode-and-priority.patch
+0024-mediacodec-jni-async-and-feedback.patch

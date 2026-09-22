@@ -1,0 +1,779 @@
+Subject: [PATCH] avcodec/mediacodec: bring the Java wrapper to parity with the NDK one
+
+The Java MediaCodec wrapper decodes synchronously, reports no rendered
+frames and cannot update a running codec, because MediaCodec.Callback and
+OnFrameRenderedListener need a Java object a library cannot ship and
+setParameters takes a Bundle. Those three are exactly what the fork built
+on the NDK wrapper, which below API 28 cannot read the decoder's crop
+rectangle (AMediaFormat_getRect is API 28; the crop-* keys exist only in the
+Java MediaFormat) and so sizes padded output buffers as the picture.
+
+Let the application register a callback bridge class
+(av_jni_set_mediacodec_callback_class, contract in jni.h): the wrapper
+instantiates it per codec, binds the natives with RegisterNatives, and
+routes MediaCodec.setCallback and setOnFrameRenderedListener through it on
+a Looper thread the object owns. setParameters copies the keys MediaCodec
+accepts as parameters into a Bundle. The decoder no longer gates
+asynchronous mode and rendered-frame feedback on ndk_codec; the feedback
+source is "jni" or "ndk", and consumers treat anything but "off:*" as on.
+The option is `async`, since it no longer names a wrapper.
+
+diff --git a/libavcodec/ffjni.h b/libavcodec/ffjni.h
+index d1e86f8..84b14d7 100644
+--- a/libavcodec/ffjni.h
++++ b/libavcodec/ffjni.h
+@@ -83,6 +83,16 @@ int ff_jni_exception_get_summary(JNIEnv *env, jthrowable exception, char **error
+  */
+ int ff_jni_exception_check(JNIEnv *env, int log, void *log_ctx);
+ 
++/*
++ * The application's MediaCodec callback bridge class registered with
++ * av_jni_set_mediacodec_callback_class, or NULL when none is: the Java
++ * MediaCodec wrapper then has no asynchronous mode and no rendered-frame
++ * feedback.
++ *
++ * @return global JNI reference to the class, or NULL
++ */
++void *ff_jni_get_mediacodec_callback_class(void);
++
+ /*
+  * Jni field type.
+  */
+diff --git a/libavcodec/jni.c b/libavcodec/jni.c
+index fcb4837..1e3fe2a 100644
+--- a/libavcodec/jni.c
++++ b/libavcodec/jni.c
+@@ -36,6 +36,7 @@
+ 
+ static void *java_vm;
+ static void *android_app_ctx;
++static void *mediacodec_callback_class;
+ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ int av_jni_set_java_vm(void *vm, void *log_ctx)
+@@ -121,4 +122,44 @@ void *av_jni_get_android_app_ctx(void)
+ #endif
+ }
+ 
++int av_jni_set_mediacodec_callback_class(void *callback_class, void *log_ctx)
++{
++#if CONFIG_JNI
++    jobjectRefType type;
++
++    JNIEnv *env = ff_jni_get_env(log_ctx);
++    if (!env)
++        return AVERROR(EINVAL);
++
++    type = (*env)->GetObjectRefType(env, callback_class);
++    if (type != JNIGlobalRefType) {
++        av_log(log_ctx, AV_LOG_ERROR, "MediaCodec callback class must be passed as a global reference");
++        return AVERROR(EINVAL);
++    }
++
++    pthread_mutex_lock(&lock);
++    mediacodec_callback_class = callback_class;
++    pthread_mutex_unlock(&lock);
++
++    return 0;
++#else
++    return AVERROR(ENOSYS);
++#endif
++}
++
++void *ff_jni_get_mediacodec_callback_class(void)
++{
++#if CONFIG_JNI
++    void *cls;
++
++    pthread_mutex_lock(&lock);
++    cls = mediacodec_callback_class;
++    pthread_mutex_unlock(&lock);
++
++    return cls;
++#else
++    return NULL;
++#endif
++}
++
+ #endif
+diff --git a/libavcodec/jni.h b/libavcodec/jni.h
+index 955cd28..e4ba8ea 100644
+--- a/libavcodec/jni.h
++++ b/libavcodec/jni.h
+@@ -64,4 +64,44 @@ int av_jni_set_android_app_ctx(void *app_ctx, void *log_ctx);
+  */
+ void *av_jni_get_android_app_ctx(void);
+ 
++/*
++ * Register the application's MediaCodec callback bridge class. The Java
++ * MediaCodec wrapper needs a Java object to receive MediaCodec.Callback and
++ * MediaCodec.OnFrameRenderedListener events, and a library cannot ship one;
++ * without this class the Java wrapper decodes synchronously and reports no
++ * rendered frames (the NDK wrapper is unaffected).
++ *
++ * The class extends android.media.MediaCodec.Callback, implements
++ * android.media.MediaCodec.OnFrameRenderedListener and declares:
++ *
++ *   <init>(long codec)                creates the object and the Looper thread
++ *                                     its callbacks run on
++ *   android.os.Handler handler()      the Handler on that thread
++ *   void release()                    returns only once no callback will
++ *                                     touch native again; stops the thread
++ *
++ * and forwards every callback to these static natives, which libavcodec
++ * registers on the class (RegisterNatives) when the first codec uses it:
++ *
++ *   static native void nativeOnInputAvailable(long codec, int index)
++ *   static native void nativeOnOutputAvailable(long codec, int index,
++ *           int offset, int size, long presentationTimeUs, int flags)
++ *   static native void nativeOnFormatChanged(long codec,
++ *           android.media.MediaFormat format)
++ *   static native void nativeOnError(long codec, int errorCode,
++ *           String diagnosticInfo)
++ *   static native void nativeOnFrameRendered(long codec,
++ *           long presentationTimeUs, long nanoTime)
++ *
++ * `codec` is the value the constructor received. release() must serialize
++ * against the callbacks (a callback that observes release is dropped), since
++ * the native side frees `codec` right after release() returns.
++ *
++ * This function is only available on Android.
++ *
++ * @param callback_class global JNI reference to the class
++ * @return 0 on success, < 0 otherwise
++ */
++int av_jni_set_mediacodec_callback_class(void *callback_class, void *log_ctx);
++
+ #endif /* AVCODEC_JNI_H */
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index 9fd8e84..5bc0d96 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -165,7 +165,7 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+     unsigned head, tail;
+     int n = 0;
+ 
+-    if (strcmp(ctx->rendered_source, "ndk"))
++    if (!strncmp(ctx->rendered_source, "off:", 4))
+         return AVERROR(ENOSYS);
+     if (max < 0)
+         return AVERROR(EINVAL);
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index 53c5c65..260bf3e 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -131,10 +131,12 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+ 
+ /**
+  * Where the rendered-frame feedback of the codec owning `buffer` comes from:
+- * "ndk" when AMediaCodec_setOnFrameRenderedCallback is registered, otherwise
+- * an "off:" reason — "off:java" (the Java wrapper has no listener class to
+- * hand the platform), "off:api" (the NDK predates Android 13), "off:codec"
+- * (the codec refused the callback), "off:surface" (no output surface).
++ * "jni" when MediaCodec.setOnFrameRenderedListener is registered through the
++ * application's callback bridge class (jni.h), "ndk" when
++ * AMediaCodec_setOnFrameRenderedCallback is, otherwise an "off:" reason —
++ * "off:api" (no bridge class on the Java wrapper, or the platform predates
++ * the listener: Java API 23, NDK Android 13), "off:codec" (the codec refused
++ * the callback), "off:surface" (no output surface).
+  */
+ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+ 
+@@ -169,7 +171,8 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+  *
+  * @return 0 when the platform accepted the parameter, AVERROR(ENOSYS) when
+  * `avctx` is not an opened MediaCodec decoder or the platform predates
+- * runtime parameters (NDK below API 26), another negative value otherwise.
++ * runtime parameters (Java API 19, NDK API 26), another negative value
++ * otherwise.
+  */
+ int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate);
+ 
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index 035a8e2..6cae0eb 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -22,12 +22,15 @@
+ 
+ #include <dlfcn.h>
+ #include <jni.h>
++#include <pthread.h>
+ #include <stdbool.h>
++#include <stdint.h>
+ #include <media/NdkMediaFormat.h>
+ #include <media/NdkMediaCodec.h>
+ #include <android/native_window_jni.h>
+ 
+ #include "libavutil/avassert.h"
++#include "libavutil/macros.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/avstring.h"
+ 
+@@ -195,6 +198,9 @@ struct JNIAMediaCodecFields {
+     jmethodID set_input_surface_id;
+     jmethodID signal_end_of_input_stream_id;
+     jmethodID set_output_surface_id;
++    jmethodID set_callback_id;
++    jmethodID set_on_frame_rendered_listener_id;
++    jmethodID set_parameters_id;
+ 
+     jclass mediainfo_class;
+ 
+@@ -205,6 +211,12 @@ struct JNIAMediaCodecFields {
+     jfieldID presentation_time_us_id;
+     jfieldID size_id;
+ 
++    jclass bundle_class;
++
++    jmethodID bundle_init_id;
++    jmethodID bundle_put_int_id;
++    jmethodID bundle_put_long_id;
++
+ };
+ 
+ #define OFFSET(x) offsetof(struct JNIAMediaCodecFields, x)
+@@ -249,6 +261,9 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
+         { "android/media/MediaCodec", "setInputSurface", "(Landroid/view/Surface;)V", FF_JNI_METHOD, OFFSET(set_input_surface_id), 0 },
+         { "android/media/MediaCodec", "signalEndOfInputStream", "()V", FF_JNI_METHOD, OFFSET(signal_end_of_input_stream_id), 0 },
+         { "android/media/MediaCodec", "setOutputSurface", "(Landroid/view/Surface;)V", FF_JNI_METHOD, OFFSET(set_output_surface_id), 0 },
++        { "android/media/MediaCodec", "setCallback", "(Landroid/media/MediaCodec$Callback;Landroid/os/Handler;)V", FF_JNI_METHOD, OFFSET(set_callback_id), 0 },
++        { "android/media/MediaCodec", "setOnFrameRenderedListener", "(Landroid/media/MediaCodec$OnFrameRenderedListener;Landroid/os/Handler;)V", FF_JNI_METHOD, OFFSET(set_on_frame_rendered_listener_id), 0 },
++        { "android/media/MediaCodec", "setParameters", "(Landroid/os/Bundle;)V", FF_JNI_METHOD, OFFSET(set_parameters_id), 0 },
+ 
+     { "android/media/MediaCodec$BufferInfo", NULL, NULL, FF_JNI_CLASS, OFFSET(mediainfo_class), 1 },
+ 
+@@ -258,6 +273,12 @@ static const struct FFJniField jni_amediacodec_mapping[] = {
+         { "android/media/MediaCodec.BufferInfo", "presentationTimeUs", "J", FF_JNI_FIELD, OFFSET(presentation_time_us_id), 1 },
+         { "android/media/MediaCodec.BufferInfo", "size", "I", FF_JNI_FIELD, OFFSET(size_id), 1 },
+ 
++    { "android/os/Bundle", NULL, NULL, FF_JNI_CLASS, OFFSET(bundle_class), 1 },
++
++        { "android/os/Bundle", "<init>", "()V", FF_JNI_METHOD, OFFSET(bundle_init_id), 1 },
++        { "android/os/Bundle", "putInt", "(Ljava/lang/String;I)V", FF_JNI_METHOD, OFFSET(bundle_put_int_id), 1 },
++        { "android/os/Bundle", "putLong", "(Ljava/lang/String;J)V", FF_JNI_METHOD, OFFSET(bundle_put_long_id), 1 },
++
+     { NULL }
+ };
+ #undef OFFSET
+@@ -279,6 +300,15 @@ typedef struct FFAMediaCodecJni {
+     jobject input_buffers;
+     jobject output_buffers;
+ 
++    // The application's callback bridge object (jni.h), created on the first
++    // asynchronous or rendered-frame registration and released with the
++    // codec; NULL until then.
++    jobject callback;
++    FFAMediaCodecOnAsyncNotifyCallback async_cb;
++    void *async_userdata;
++    FFAMediaCodecOnFrameRendered rendered_cb;
++    void *rendered_userdata;
++
+     int INFO_TRY_AGAIN_LATER;
+     int INFO_OUTPUT_BUFFERS_CHANGED;
+     int INFO_OUTPUT_FORMAT_CHANGED;
+@@ -1340,6 +1370,8 @@ DECLARE_FF_AMEDIACODEC_CREATE_FUNC(createCodecByName,   CREATE_CODEC_BY_NAME)
+ DECLARE_FF_AMEDIACODEC_CREATE_FUNC(createDecoderByType, CREATE_DECODER_BY_TYPE)
+ DECLARE_FF_AMEDIACODEC_CREATE_FUNC(createEncoderByType, CREATE_ENCODER_BY_TYPE)
+ 
++static void mediacodec_jni_bridge_release(JNIEnv *env, FFAMediaCodecJni *codec);
++
+ static int mediacodec_jni_delete(FFAMediaCodec* ctx)
+ {
+     int ret = 0;
+@@ -1357,6 +1389,10 @@ static int mediacodec_jni_delete(FFAMediaCodec* ctx)
+         ret = AVERROR_EXTERNAL;
+     }
+ 
++    // The codec no longer produces events; a callback still in flight
++    // finishes inside release() before the struct goes away.
++    mediacodec_jni_bridge_release(env, codec);
++
+     (*env)->DeleteGlobalRef(env, codec->input_buffers);
+     codec->input_buffers = NULL;
+ 
+@@ -1813,12 +1849,354 @@ static int mediacodec_jni_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *
+     return 0;
+ }
+ 
+-static int mediacodec_jni_setAsyncNotifyCallback(FFAMediaCodec *codec,
++// The application's callback bridge class (jni.h): resolved once per
++// process from the class av_jni_set_mediacodec_callback_class registered,
++// with the natives below bound to it. The class reference stays the
++// application's.
++struct JNIMediaCodecCallbackBridge {
++    jclass cls;
++    jmethodID init_id;
++    jmethodID handler_id;
++    jmethodID release_id;
++    int state; // 0 unresolved, 1 ready, -1 unusable
++};
++
++static struct JNIMediaCodecCallbackBridge callback_bridge;
++static pthread_mutex_t callback_bridge_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void JNICALL mediacodec_jni_onInputAvailable(JNIEnv *env, jclass cls,
++                                                    jlong handle, jint index)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)(intptr_t)handle;
++    codec->async_cb.onAsyncInputAvailable(&codec->api, codec->async_userdata, index);
++}
++
++static void JNICALL mediacodec_jni_onOutputAvailable(JNIEnv *env, jclass cls,
++                                                     jlong handle, jint index,
++                                                     jint offset, jint size,
++                                                     jlong presentation_time_us,
++                                                     jint flags)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)(intptr_t)handle;
++    FFAMediaCodecBufferInfo info = {
++        .offset = offset,
++        .size = size,
++        .presentationTimeUs = presentation_time_us,
++        .flags = flags,
++    };
++    codec->async_cb.onAsyncOutputAvailable(&codec->api, codec->async_userdata,
++                                           index, &info);
++}
++
++static void JNICALL mediacodec_jni_onFormatChanged(JNIEnv *env, jclass cls,
++                                                   jlong handle, jobject format)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)(intptr_t)handle;
++    FFAMediaFormat *media_format = mediaformat_jni_newFromObject(format);
++    if (!media_format)
++        return;
++    codec->async_cb.onAsyncFormatChanged(&codec->api, codec->async_userdata,
++                                         media_format);
++    ff_AMediaFormat_delete(media_format);
++}
++
++static void JNICALL mediacodec_jni_onError(JNIEnv *env, jclass cls,
++                                           jlong handle, jint error_code,
++                                           jstring diagnostic)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)(intptr_t)handle;
++    char *detail = diagnostic ? ff_jni_jstring_to_utf_chars(env, diagnostic, codec) : NULL;
++    // CodecException carries a vendor error code, not a status the platform
++    // maps for us; the diagnostic string is what names it.
++    codec->async_cb.onAsyncError(&codec->api, codec->async_userdata,
++                                 AVERROR_EXTERNAL, detail ? detail : "CodecException");
++    av_free(detail);
++}
++
++static void JNICALL mediacodec_jni_onFrameRendered(JNIEnv *env, jclass cls,
++                                                   jlong handle,
++                                                   jlong presentation_time_us,
++                                                   jlong nano_time)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)(intptr_t)handle;
++    FFAMediaCodecOnFrameRendered cb = codec->rendered_cb;
++    if (cb)
++        cb(&codec->api, codec->rendered_userdata, presentation_time_us, nano_time);
++}
++
++static const JNINativeMethod callback_bridge_natives[] = {
++    { "nativeOnInputAvailable", "(JI)V", (void *)mediacodec_jni_onInputAvailable },
++    { "nativeOnOutputAvailable", "(JIIIJI)V", (void *)mediacodec_jni_onOutputAvailable },
++    { "nativeOnFormatChanged", "(JLandroid/media/MediaFormat;)V", (void *)mediacodec_jni_onFormatChanged },
++    { "nativeOnError", "(JILjava/lang/String;)V", (void *)mediacodec_jni_onError },
++    { "nativeOnFrameRendered", "(JJJ)V", (void *)mediacodec_jni_onFrameRendered },
++};
++
++// ENOSYS when the application registered no class; a class that does not
++// meet the jni.h contract is reported once and treated the same.
++static int mediacodec_jni_bridge_resolve(JNIEnv *env, void *log_ctx)
++{
++    struct JNIMediaCodecCallbackBridge *bridge = &callback_bridge;
++    int ret = AVERROR(ENOSYS);
++
++    pthread_mutex_lock(&callback_bridge_lock);
++    if (bridge->state == 1) {
++        ret = 0;
++        goto done;
++    }
++    if (bridge->state < 0)
++        goto done;
++
++    bridge->cls = ff_jni_get_mediacodec_callback_class();
++    if (!bridge->cls) {
++        av_log(log_ctx, AV_LOG_VERBOSE,
++               "No MediaCodec callback bridge class registered (av_jni_set_mediacodec_callback_class)\n");
++        goto done;
++    }
++
++    bridge->init_id = (*env)->GetMethodID(env, bridge->cls, "<init>", "(J)V");
++    if (ff_jni_exception_check(env, 1, log_ctx) < 0)
++        goto unusable;
++    bridge->handler_id = (*env)->GetMethodID(env, bridge->cls, "handler", "()Landroid/os/Handler;");
++    if (ff_jni_exception_check(env, 1, log_ctx) < 0)
++        goto unusable;
++    bridge->release_id = (*env)->GetMethodID(env, bridge->cls, "release", "()V");
++    if (ff_jni_exception_check(env, 1, log_ctx) < 0)
++        goto unusable;
++
++    if ((*env)->RegisterNatives(env, bridge->cls, callback_bridge_natives,
++                                FF_ARRAY_ELEMS(callback_bridge_natives)) < 0 ||
++        ff_jni_exception_check(env, 1, log_ctx) < 0)
++        goto unusable;
++
++    bridge->state = 1;
++    ret = 0;
++    goto done;
++
++unusable:
++    av_log(log_ctx, AV_LOG_ERROR,
++           "MediaCodec callback bridge class does not meet the jni.h contract\n");
++    bridge->state = -1;
++done:
++    pthread_mutex_unlock(&callback_bridge_lock);
++    return ret;
++}
++
++// The codec's bridge object, created on first use; its Handler is what the
++// platform delivers callbacks on.
++static int mediacodec_jni_bridge_object(JNIEnv *env, FFAMediaCodecJni *codec,
++                                        jobject *handler)
++{
++    jobject object;
++    int ret;
++
++    ret = mediacodec_jni_bridge_resolve(env, codec);
++    if (ret < 0)
++        return ret;
++
++    if (!codec->callback) {
++        object = (*env)->NewObject(env, callback_bridge.cls, callback_bridge.init_id,
++                                   (jlong)(intptr_t)codec);
++        if (ff_jni_exception_check(env, 1, codec) < 0 || !object)
++            return AVERROR_EXTERNAL;
++        codec->callback = (*env)->NewGlobalRef(env, object);
++        (*env)->DeleteLocalRef(env, object);
++        if (!codec->callback)
++            return AVERROR(ENOMEM);
++    }
++
++    *handler = (*env)->CallObjectMethod(env, codec->callback, callback_bridge.handler_id);
++    if (ff_jni_exception_check(env, 1, codec) < 0 || !*handler) {
++        (*env)->DeleteLocalRef(env, *handler);
++        *handler = NULL;
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++static void mediacodec_jni_bridge_release(JNIEnv *env, FFAMediaCodecJni *codec)
++{
++    if (!codec->callback)
++        return;
++    (*env)->CallVoidMethod(env, codec->callback, callback_bridge.release_id);
++    ff_jni_exception_check(env, 1, codec);
++    (*env)->DeleteGlobalRef(env, codec->callback);
++    codec->callback = NULL;
++    codec->rendered_cb = NULL;
++    codec->rendered_userdata = NULL;
++}
++
++static int mediacodec_jni_setAsyncNotifyCallback(FFAMediaCodec *ctx,
+                                                  const FFAMediaCodecOnAsyncNotifyCallback *callback,
+                                                  void *userdata)
+ {
+-    av_log(codec, AV_LOG_ERROR, "Doesn't support aync mode with JNI, please try ndk_codec=1\n");
+-    return AVERROR(ENOSYS);
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
++    JNIEnv *env = NULL;
++    jobject handler = NULL;
++    int ret;
++
++    if (!codec->jfields.set_callback_id) {
++        av_log(codec, AV_LOG_ERROR, "setCallback(Callback, Handler) unavailable (API 23)\n");
++        return AVERROR(ENOSYS);
++    }
++    if (!callback ||
++        !callback->onAsyncInputAvailable ||
++        !callback->onAsyncOutputAvailable ||
++        !callback->onAsyncFormatChanged ||
++        !callback->onAsyncError)
++        return AVERROR(EINVAL);
++
++    JNI_GET_ENV_OR_RETURN(env, codec, AVERROR_EXTERNAL);
++
++    ret = mediacodec_jni_bridge_object(env, codec, &handler);
++    if (ret < 0)
++        return ret;
++
++    // Set before the platform can deliver: events follow start(), but the
++    // callback thread has no other guard.
++    codec->async_cb = *callback;
++    codec->async_userdata = userdata;
++
++    (*env)->CallVoidMethod(env, codec->object, codec->jfields.set_callback_id,
++                           codec->callback, handler);
++    (*env)->DeleteLocalRef(env, handler);
++    if (ff_jni_exception_check(env, 1, codec) < 0)
++        return AVERROR_EXTERNAL;
++
++    return 0;
++}
++
++static int mediacodec_jni_setOnFrameRenderedCallback(FFAMediaCodec *ctx,
++        FFAMediaCodecOnFrameRendered callback, void *userdata)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
++    JNIEnv *env = NULL;
++    jobject handler = NULL;
++    int ret;
++
++    if (!codec->jfields.set_on_frame_rendered_listener_id)
++        return AVERROR(ENOSYS);
++
++    JNI_GET_ENV_OR_RETURN(env, codec, AVERROR_EXTERNAL);
++
++    if (!callback) {
++        codec->rendered_cb = NULL;
++        codec->rendered_userdata = NULL;
++        if (!codec->callback)
++            return 0;
++        (*env)->CallVoidMethod(env, codec->object,
++                               codec->jfields.set_on_frame_rendered_listener_id, NULL, NULL);
++        if (ff_jni_exception_check(env, 1, codec) < 0)
++            return AVERROR_EXTERNAL;
++        return 0;
++    }
++
++    ret = mediacodec_jni_bridge_object(env, codec, &handler);
++    if (ret < 0)
++        return ret;
++
++    codec->rendered_cb = callback;
++    codec->rendered_userdata = userdata;
++
++    (*env)->CallVoidMethod(env, codec->object,
++                           codec->jfields.set_on_frame_rendered_listener_id,
++                           codec->callback, handler);
++    (*env)->DeleteLocalRef(env, handler);
++    if (ff_jni_exception_check(env, 1, codec) < 0) {
++        codec->rendered_cb = NULL;
++        codec->rendered_userdata = NULL;
++        return AVERROR_EXTERNAL;
++    }
++
++    return 0;
++}
++
++// MediaCodec.setParameters takes a Bundle, and a MediaFormat cannot be
++// enumerated before API 29, so the bridge copies the keys a running codec
++// accepts as parameters (MediaCodec.PARAMETER_KEY_*, operating-rate and
++// priority), typed as the platform declares them. hdr10-plus-info is a
++// ByteBuffer and has no caller here.
++static const struct {
++    const char *key;
++    int is_long;
++} jni_codec_parameter_keys[] = {
++    { "operating-rate", 0 },
++    { "priority", 0 },
++    { "video-bitrate", 0 },
++    { "request-sync", 0 },
++    { "drop-input-frames", 0 },
++    { "drop-start-time-us", 1 },
++    { "time-offset-us", 1 },
++    { "low-latency", 0 },
++    { "tunnel-peek", 0 },
++};
++
++static int mediacodec_jni_setParameters(FFAMediaCodec *ctx, const FFAMediaFormat *params)
++{
++    FFAMediaCodecJni *codec = (FFAMediaCodecJni *)ctx;
++    FFAMediaFormat *format = (FFAMediaFormat *)params;
++    JNIEnv *env = NULL;
++    jobject bundle = NULL;
++    int copied = 0;
++    int ret = 0;
++
++    if (!codec->jfields.set_parameters_id)
++        return AVERROR(ENOSYS);
++    if (!format)
++        return AVERROR(EINVAL);
++
++    JNI_GET_ENV_OR_RETURN(env, codec, AVERROR_EXTERNAL);
++
++    bundle = (*env)->NewObject(env, codec->jfields.bundle_class, codec->jfields.bundle_init_id);
++    if (ff_jni_exception_check(env, 1, codec) < 0 || !bundle)
++        return AVERROR_EXTERNAL;
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(jni_codec_parameter_keys); i++) {
++        const char *key = jni_codec_parameter_keys[i].key;
++        jstring jkey;
++
++        if (jni_codec_parameter_keys[i].is_long) {
++            int64_t value;
++            if (!ff_AMediaFormat_getInt64(format, key, &value))
++                continue;
++            jkey = ff_jni_utf_chars_to_jstring(env, key, codec);
++            if (!jkey) {
++                ret = AVERROR_EXTERNAL;
++                goto done;
++            }
++            (*env)->CallVoidMethod(env, bundle, codec->jfields.bundle_put_long_id, jkey, (jlong)value);
++        } else {
++            int32_t value;
++            if (!ff_AMediaFormat_getInt32(format, key, &value))
++                continue;
++            jkey = ff_jni_utf_chars_to_jstring(env, key, codec);
++            if (!jkey) {
++                ret = AVERROR_EXTERNAL;
++                goto done;
++            }
++            (*env)->CallVoidMethod(env, bundle, codec->jfields.bundle_put_int_id, jkey, (jint)value);
++        }
++        (*env)->DeleteLocalRef(env, jkey);
++        if (ff_jni_exception_check(env, 1, codec) < 0) {
++            ret = AVERROR_EXTERNAL;
++            goto done;
++        }
++        copied++;
++    }
++
++    if (!copied) {
++        av_log(codec, AV_LOG_WARNING, "setParameters: no parameter key to apply\n");
++        ret = AVERROR(EINVAL);
++        goto done;
++    }
++
++    (*env)->CallVoidMethod(env, codec->object, codec->jfields.set_parameters_id, bundle);
++    if (ff_jni_exception_check(env, 1, codec) < 0)
++        ret = AVERROR_EXTERNAL;
++
++done:
++    (*env)->DeleteLocalRef(env, bundle);
++    return ret;
+ }
+ 
+ static const FFAMediaFormat media_format_jni = {
+@@ -1881,7 +2259,9 @@ static const FFAMediaCodec media_codec_jni = {
+     .cleanOutputBuffers = mediacodec_jni_cleanOutputBuffers,
+     .signalEndOfInputStream = mediacodec_jni_signalEndOfInputStream,
+     .setAsyncNotifyCallback = mediacodec_jni_setAsyncNotifyCallback,
++    .setOnFrameRenderedCallback = mediacodec_jni_setOnFrameRenderedCallback,
+     .setOutputSurface = mediacodec_jni_setOutputSurface,
++    .setParameters = mediacodec_jni_setParameters,
+ };
+ 
+ typedef struct FFAMediaFormatNdk {
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+index 1cdf601..2170f33 100644
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -242,12 +242,13 @@ struct FFAMediaCodec {
+     // For encoder with FFANativeWindow as input.
+     int (*signalEndOfInputStream)(FFAMediaCodec *);
+ 
+-    // Introduced in Android API 28
++    // Java API 23 (needs the application's callback bridge class, jni.h) /
++    // NDK API 28. Registered between configure and start.
+     int (*setAsyncNotifyCallback)(FFAMediaCodec *codec,
+                                   const FFAMediaCodecOnAsyncNotifyCallback *callback,
+                                   void *userdata);
+ 
+-    // NDK only, introduced in Android API 33 (T). NULL callback unregisters.
++    // Java API 23 (bridge class) / NDK API 33 (T). NULL callback unregisters.
+     int (*setOnFrameRenderedCallback)(FFAMediaCodec *codec,
+                                       FFAMediaCodecOnFrameRendered callback,
+                                       void *userdata);
+@@ -256,9 +257,10 @@ struct FFAMediaCodec {
+     // at another Surface. NULL when the platform lacks the entry point.
+     int (*setOutputSurface)(FFAMediaCodec *codec, FFANativeWindow *window);
+ 
+-    // NDK API 26: hand a running codec a parameter update (an AMediaFormat
+-    // of the keys to change). NULL where the platform lacks the entry point
+-    // and on the Java wrapper, which carries no Bundle bridge.
++    // Java API 19 / NDK API 26: hand a running codec a parameter update (an
++    // AMediaFormat of the keys to change; the Java wrapper copies the keys
++    // MediaCodec accepts as parameters into its Bundle). NULL where the
++    // platform lacks the entry point.
+     int (*setParameters)(FFAMediaCodec *codec, const FFAMediaFormat *params);
+ };
+ 
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 7744c7b..e0a602c 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -1199,8 +1199,9 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+                      OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "ndk_codec", "Use MediaCodec from NDK",
+                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
+-    { "ndk_async", "Drive the NDK MediaCodec asynchronously: never wait on the codec",
+-                   OFFSET(use_async), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
++    { "async", "Drive MediaCodec asynchronously: never wait on the codec "
++               "(the Java wrapper needs the application's callback bridge class, see jni.h)",
++               OFFSET(use_async), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
+             OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
+     { "frame_rate", "The stream's frame rate, informational to the codec (MediaFormat frame-rate), zero for unspecified",
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index a9d2fe7..ad5a3f2 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -876,7 +876,9 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
+ }
+ 
+ // Between configure and start, where the platform accepts the callback.
+-// Failure is not an error: the decoder is complete in synchronous mode.
++// Failure is not an error: the decoder is complete in synchronous mode. On
++// the Java wrapper this needs the application's callback bridge class
++// (jni.h); without one the wrapper refuses and the decoder stays synchronous.
+ static void mediacodec_dec_init_async(AVCodecContext *avctx, MediaCodecDecContext *s)
+ {
+     static const FFAMediaCodecOnAsyncNotifyCallback cb = {
+@@ -889,10 +891,6 @@ static void mediacodec_dec_init_async(AVCodecContext *avctx, MediaCodecDecContex
+ 
+     if (!s->use_async)
+         return;
+-    if (!s->use_ndk_codec) {
+-        av_log(avctx, AV_LOG_VERBOSE, "Asynchronous mode needs ndk_codec=1\n");
+-        return;
+-    }
+ 
+     ff_cond_init(&s->async_cond, NULL);
+     s->async_input = av_fifo_alloc2(16, sizeof(int32_t), AV_FIFO_FLAG_AUTO_GROW);
+@@ -1225,6 +1223,8 @@ static void mediacodec_dec_on_frame_rendered(FFAMediaCodec *codec, void *userdat
+ 
+ // Only a surface-backed video codec renders anything. Registration failures
+ // are diagnostics, never errors: the decoder is complete without feedback.
++// The source names the wrapper that reports ("jni", "ndk") or, prefixed
++// "off:", why nothing will.
+ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
+                                              MediaCodecDecContext *s)
+ {
+@@ -1234,10 +1234,6 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
+         s->rendered_source = "off:surface";
+         return;
+     }
+-    if (!s->use_ndk_codec) {
+-        s->rendered_source = "off:java";
+-        return;
+-    }
+     ret = ff_AMediaCodec_setOnFrameRenderedCallback(s->codec,
+             mediacodec_dec_on_frame_rendered, s);
+     if (ret == AVERROR(ENOSYS)) {
+@@ -1245,7 +1241,7 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
+     } else if (ret < 0) {
+         s->rendered_source = "off:codec";
+     } else {
+-        s->rendered_source = "ndk";
++        s->rendered_source = s->use_ndk_codec ? "ndk" : "jni";
+     }
+     av_log(avctx, AV_LOG_VERBOSE, "Frame-rendered feedback: %s\n",
+            s->rendered_source);
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index f096c73..afaa9e6 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -114,7 +114,7 @@ typedef struct MediaCodecDecContext {
+     AVBufferRef *device_ref;
+ 
+     // Frame-rendered feedback; see av_mediacodec_drain_rendered.
+-    const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
++    const char *rendered_source;      // "jni", "ndk" or an "off:" reason, never NULL
+     AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
+     atomic_uint rendered_head;        // consumer
+     atomic_uint rendered_tail;        // producer

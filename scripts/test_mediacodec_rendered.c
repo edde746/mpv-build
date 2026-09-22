@@ -91,12 +91,16 @@ static void test_full_ring_drops_the_newest(void)
 static void test_feedback_off_is_enosys(void)
 {
     AVMediaCodecRendered out[4];
-    reset("off:java");
+    reset("off:api");
     mediacodec_dec_rendered_push(&ctx, 1, 1);
     check(av_mediacodec_drain_rendered(&buffer, out, 4) == AVERROR(ENOSYS),
           "a codec without feedback answers ENOSYS, whatever the ring holds");
-    check(strcmp(av_mediacodec_rendered_source(&buffer), "off:java") == 0,
+    check(strcmp(av_mediacodec_rendered_source(&buffer), "off:api") == 0,
           "the source explains why feedback is off");
+    reset("jni");
+    mediacodec_dec_rendered_push(&ctx, 2, 2);
+    check(av_mediacodec_drain_rendered(&buffer, out, 4) == 1 && out[0].media_time_us == 2,
+          "the Java wrapper's listener is a source like the NDK callback");
     reset("ndk");
     check(av_mediacodec_drain_rendered(&buffer, out, -1) == AVERROR(EINVAL),
           "a negative capacity is rejected");
