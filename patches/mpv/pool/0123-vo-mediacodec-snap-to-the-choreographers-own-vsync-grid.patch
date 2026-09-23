@@ -1,0 +1,289 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index dce13a6..361b396 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -184,6 +184,39 @@ static int64_t mediacodec_timing_snap(struct mediacodec_timing *timing,
+          ? after : before;
+ }
+ 
++// The period releases snap with. The phase comes from Choreographer frame
++// times, which run on SurfaceFlinger's vsync model: the clock it latches
++// buffers against. That model can disagree with the display mode: an Amlogic
++// box fits 15.71 ms to a 16.68 ms mode for whole sessions, and snapped with
++// the mode's period, every 500 ms resample moves the grid by ~2 ms and frames
++// land a vsync off in 3:2 pairs all session long. Media3 1.11 takes both
++// phase and period from the Choreographer's frame timelines; here spacing_ns
++// is the gap between the first two timelines' expected presentation times
++// (0 below API 33, or before the first), over the vsyncs nominal_ns (the
++// mode's period) says it spans, since an app render rate below the mode's
++// spaces them by several. Within 2% the mode's period stands, and this is a
++// deliberate departure from media3: a Pixel 7's panel runs at 11.057 ms
++// under its 90 Hz mode, and its timelines are spaced by the mode's 11.111 ms
++// on most samples and by SurfaceFlinger's ~11.05 ms model on the rest.
++// Following them sample by sample, as media3 does, showed 4 to 11 frames a
++// vsync early in 5 minutes there (media3 itself 0 to 12), against 0 to 1 on
++// the mode's period. It also stands for a gap that is not a whole number of
++// vsyncs within a quarter. Consecutive frame callback times are no
++// substitute for the timelines: a Pixel's and a Fire TV's jitter by more
++// than a millisecond.
++static int64_t mediacodec_grid_period(int64_t spacing_ns, int64_t nominal_ns)
++{
++    if (spacing_ns <= 0 || nominal_ns <= 0)
++        return nominal_ns;
++    int64_t vsyncs = (spacing_ns + nominal_ns / 2) / nominal_ns;
++    if (vsyncs < 1 || vsyncs > 3)
++        return nominal_ns;
++    int64_t measured = spacing_ns / vsyncs;
++    int64_t diff = measured > nominal_ns ? measured - nominal_ns
++                                         : nominal_ns - measured;
++    return diff * 50 <= nominal_ns || diff * 4 > nominal_ns ? nominal_ns : measured;
++}
++
+ // Release timestamp, on now_ns's clock, for a frame due at raw_target_ns;
+ // 0 releases untimed, i.e. at the next vsync. sample_ns is a vsync timestamp
+ // on that clock, or 0 when none is fresh; period_ns is the display period, or
+@@ -486,6 +519,13 @@ typedef void (*mp_post_frame_callback_delayed64_fn)(
+ typedef void (*mp_refresh_rate_callback)(int64_t vsync_period_ns, void *data);
+ typedef void (*mp_register_refresh_rate_callback_fn)(
+     AChoreographer *, mp_refresh_rate_callback, void *);
++// API 33: a vsync callback carries SurfaceFlinger's frame timelines.
++typedef void (*mp_post_vsync_callback_fn)(
++    AChoreographer *, AChoreographer_vsyncCallback, void *);
++typedef int64_t (*mp_frame_data_time_fn)(const AChoreographerFrameCallbackData *);
++typedef size_t (*mp_frame_data_count_fn)(const AChoreographerFrameCallbackData *);
++typedef int64_t (*mp_frame_data_present_fn)(
++    const AChoreographerFrameCallbackData *, size_t);
+ 
+ // --- mediacodec geometry core
+ 
+@@ -1075,8 +1115,9 @@ struct priv {
+ 
+     // VO thread only
+     struct mediacodec_timing timing;
+-    int64_t queue_period;
+-    int64_t queue_period_changed;
++    int64_t queue_period; // the grid releases snap with
++    int64_t queue_mode;   // the display mode's period it was taken under
++    int64_t queue_period_changed; // when queue_mode last changed
+     int64_t queue_offset;
+     struct m_config_cache *opts_cache;
+ 
+@@ -1113,10 +1154,14 @@ static int64_t restore_frame_time(long frame_time)
+ // samples for whichever vo is attached; between clients it holds no frame
+ // callback and sleeps in the Looper.
+ //
+-// The same Choreographer reports the display's vsync period (API 30) as it
+-// changes: the grid the timed release snaps to. Media3 re-reads the refresh
+-// rate on the main thread's display listener; here the period reaches the vo
+-// on the Choreographer's own thread, before any frame is timed against it.
++// The same Choreographer reports the display mode's vsync period (API 30) as
++// it changes. Where it has frame timelines (API 33), every 500 ms resample
++// also takes the next vsync's callback, whose timelines are spaced by
++// SurfaceFlinger's own vsync model: the grid it latches against, which need
++// not be the mode's (mediacodec_grid_period). Media3 1.11 reads both from the
++// same timelines on API 33 and the refresh rate on the main thread's display
++// listener below it; here both reach the vo on the Choreographer's own thread,
++// before any frame is timed against them.
+ static struct {
+     mp_static_mutex lock;
+     bool started;   // thread created (or creation attempted)
+@@ -1129,29 +1174,59 @@ static struct {
+     mp_post_frame_callback64_fn post_frame_callback64;
+     mp_post_frame_callback_delayed64_fn post_frame_callback_delayed64;
+     mp_register_refresh_rate_callback_fn register_refresh_rate_callback;
++    mp_post_vsync_callback_fn post_timeline_callback;
++    mp_frame_data_time_fn timeline_frame_time;
++    mp_frame_data_count_fn timeline_count;
++    mp_frame_data_present_fn timeline_presentation;
+     AChoreographer *choreographer;
+     mp_thread thread;
+     struct vo *client; // the attached vo, or NULL
+-    int posted;        // frame callbacks outstanding
++    int posted;        // callbacks outstanding
+     int64_t vsync_period; // from the refresh-rate callback, 0 until known
++    int64_t vsync_spacing; // frame timelines' spacing, 0 until known
+ } vsync_sampler = { .lock = MP_STATIC_MUTEX_INITIALIZER };
+ 
+ // vsync_sampler.lock held.
+ static void post_vsync_callback(bool delayed);
+ 
+-static void record_vsync(int64_t frame_time)
++static void timeline_callback(const AChoreographerFrameCallbackData *data,
++                              void *arg)
+ {
+     mp_mutex_lock(&vsync_sampler.lock);
+     vsync_sampler.posted--;
+     struct vo *vo = vsync_sampler.client;
+     if (vo) {
+-        struct priv *p = vo->priv;
+-        p->vsync_sample = frame_time;
++        ((struct priv *)vo->priv)->vsync_sample =
++            vsync_sampler.timeline_frame_time(data);
++        if (vsync_sampler.timeline_count(data) >= 2) {
++            int64_t spacing = vsync_sampler.timeline_presentation(data, 1) -
++                              vsync_sampler.timeline_presentation(data, 0);
++            vsync_sampler.vsync_spacing = spacing > 0 ? spacing : 0;
++        }
+         post_vsync_callback(true);
+     }
+     mp_mutex_unlock(&vsync_sampler.lock);
+ }
+ 
++static void record_vsync(int64_t frame_time)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    vsync_sampler.posted--;
++    struct vo *vo = vsync_sampler.client;
++    if (vo) {
++        ((struct priv *)vo->priv)->vsync_sample = frame_time;
++        // The next vsync's timelines complete the resample (API 33).
++        if (vsync_sampler.post_timeline_callback && vsync_sampler.posted <= 1) {
++            vsync_sampler.posted++;
++            vsync_sampler.post_timeline_callback(vsync_sampler.choreographer,
++                                                 timeline_callback, NULL);
++        } else {
++            post_vsync_callback(true);
++        }
++    }
++    mp_mutex_unlock(&vsync_sampler.lock);
++}
++
+ // The display's vsync period changed (or is first known). A fresh phase
+ // sample on the new grid is requested at once rather than at the next
+ // 500 ms resample, and the attached vo re-times its next frame against it.
+@@ -1160,6 +1235,7 @@ static void refresh_rate_callback(int64_t vsync_period_ns, void *data)
+     mp_mutex_lock(&vsync_sampler.lock);
+     if (vsync_period_ns > 0 && vsync_period_ns != vsync_sampler.vsync_period) {
+         vsync_sampler.vsync_period = vsync_period_ns;
++        vsync_sampler.vsync_spacing = 0;
+         struct vo *vo = vsync_sampler.client;
+         if (vo) {
+             MP_VERBOSE(vo, "Choreographer vsync period: %.3f Hz\n",
+@@ -1281,6 +1357,17 @@ static void start_vsync_sampler(void)
+         dlsym(lib, "AChoreographer_postFrameCallbackDelayed64");
+     vsync_sampler.register_refresh_rate_callback =
+         dlsym(lib, "AChoreographer_registerRefreshRateCallback");
++    vsync_sampler.post_timeline_callback =
++        dlsym(lib, "AChoreographer_postVsyncCallback");
++    vsync_sampler.timeline_frame_time =
++        dlsym(lib, "AChoreographerFrameCallbackData_getFrameTimeNanos");
++    vsync_sampler.timeline_count =
++        dlsym(lib, "AChoreographerFrameCallbackData_getFrameTimelinesLength");
++    vsync_sampler.timeline_presentation = dlsym(lib,
++        "AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos");
++    if (!vsync_sampler.timeline_frame_time || !vsync_sampler.timeline_count ||
++        !vsync_sampler.timeline_presentation)
++        vsync_sampler.post_timeline_callback = NULL;
+ 
+     bool have64 = vsync_sampler.post_frame_callback64 &&
+                   vsync_sampler.post_frame_callback_delayed64;
+@@ -1321,6 +1408,7 @@ static void init_vsync_sampler(struct vo *vo)
+     vsync_sampler.client = vo;
+     p->vsync_attached = true;
+     p->vsync_sample = 0;
++    vsync_sampler.vsync_spacing = 0;
+     post_vsync_callback(false);
+     mp_mutex_unlock(&vsync_sampler.lock);
+ }
+@@ -3463,8 +3551,9 @@ static int64_t read_vsync_sample(struct priv *p)
+     return sample;
+ }
+ 
+-// The vsync period the Choreographer reports, 0 where the platform does not
+-// (below API 30, or before its first callback).
++// The display mode's period as the Choreographer's refresh-rate callback
++// reports it, 0 where the platform does not (below API 30, or before its
++// first callback).
+ static int64_t read_vsync_period(void)
+ {
+     mp_mutex_lock(&vsync_sampler.lock);
+@@ -3473,6 +3562,25 @@ static int64_t read_vsync_period(void)
+     return period;
+ }
+ 
++// SurfaceFlinger's vsync spacing from the frame timelines, 0 until known.
++static int64_t read_vsync_spacing(void)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    int64_t spacing = vsync_sampler.vsync_spacing;
++    mp_mutex_unlock(&vsync_sampler.lock);
++    return spacing;
++}
++
++// A new grid leaves the last sample stale (vsync_sample_is_fresh): take a
++// fresh one now rather than at the next 500 ms resample.
++static void request_vsync_sample(struct vo *vo)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    if (vsync_sampler.client == vo)
++        post_vsync_callback(false);
++    mp_mutex_unlock(&vsync_sampler.lock);
++}
++
+ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+                                   int64_t mono_now)
+ {
+@@ -3481,8 +3589,8 @@ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+            sample <= mono_now + p->queue_period;
+ }
+ 
+-// The Choreographer's own period where it reports one; else the core's
+-// display_fps (the embedder's --display-fps-override, or what
++// The display mode's period: the Choreographer's where it reports one; else
++// the core's display_fps (the embedder's --display-fps-override, or what
+ // VOCTRL_GET_DISPLAY_FPS returned) as a plausibility-bounded interval.
+ static int64_t plausible_period(double period)
+ {
+@@ -3491,7 +3599,7 @@ static int64_t plausible_period(double period)
+     return llround(period);
+ }
+ 
+-static int64_t display_period(struct vo *vo)
++static int64_t mode_period(struct vo *vo)
+ {
+     int64_t period = plausible_period(read_vsync_period());
+     if (period)
+@@ -3504,19 +3612,34 @@ static int64_t display_period(struct vo *vo)
+ static void update_queue_timing(struct vo *vo, double frame_duration)
+ {
+     struct priv *p = vo->priv;
+-    int64_t mono_now = monotonic_now_ns();
+-    int64_t period = display_period(vo);
+-
+-    if (period != p->queue_period) {
+-        // The media cadence anchor is period-independent; only the snap
+-        // preference was made against the old grid.
++    int64_t nominal = mode_period(vo);
++    int64_t period = mediacodec_grid_period(read_vsync_spacing(), nominal);
++
++    bool mode_changed = nominal != p->queue_mode;
++    bool was_timelines = !mode_changed && p->queue_period != nominal;
++    if (mode_changed) {
++        // The media cadence anchor is period-independent; only the vsync
++        // sample and the snap preference were taken against the old mode.
+         p->timing.vsync_hysteresis_offset_ns = 0;
+-        p->queue_period = period;
+-        p->queue_period_changed = mono_now;
++        p->queue_period_changed = monotonic_now_ns();
++        p->queue_mode = nominal;
++        request_vsync_sample(vo);
++    }
++    // A new timelines' period needs no such restart, whether a refit or a
++    // switch to or from the mode's: the sampler takes it together with a
++    // vsync sample on its grid, and media3 adopts each one as it comes.
++    if (period != nominal && !was_timelines) {
++        MP_VERBOSE(vo, "Timing releases on the Choreographer's %.3f ms "
++                       "vsync grid (display mode %.3f ms).\n",
++                   period / 1e6, nominal / 1e6);
+     }
++    p->queue_period = period;
+ 
++    // A refit moves the budget by microseconds; only a new grid resets it.
+     int64_t offset = mediacodec_prepare_lead(period, frame_duration);
+-    if (offset == p->queue_offset)
++    int64_t moved = offset > p->queue_offset ? offset - p->queue_offset
++                                             : p->queue_offset - offset;
++    if (p->queue_offset && moved < 1000000)
+         return;
+ 
+     p->queue_offset = offset;

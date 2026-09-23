@@ -576,7 +576,7 @@ struct priv {
     bool cur_synthetic, osd_threads_created, osd_missing_logged;
     bool vsync_attached;
     int osd_lock, osd_wakeup;
-    int64_t vsync_sample, queue_period, queue_period_changed, queue_offset;
+    int64_t vsync_sample, queue_period, queue_mode, queue_period_changed, queue_offset;
     struct mediacodec_timing timing;
     struct osd_cadence cadence;
     struct osd_shared osd;
@@ -586,9 +586,20 @@ struct priv {
     const char *present_source;
 };
 
-// Stands in for the production process-lifetime sampler: its lock, and the
-// vsync period the Choreographer reported (0 until it has).
-static struct { int lock; int64_t vsync_period; } vsync_sampler;
+// Stands in for the production process-lifetime sampler: its lock, the vsync
+// period the Choreographer reported (0 until it has), the spacing of its
+// frame timelines (0 until known), and the vo it samples for.
+static struct {
+    int lock;
+    int64_t vsync_period, vsync_spacing;
+    struct vo *client;
+} vsync_sampler;
+static unsigned resamples;
+static void post_vsync_callback(bool delayed)
+{
+    (void)delayed;
+    resamples++;
+}
 
 // Frames the VO reports to the core as dropped (vo_increment_drop_count).
 static int64_t drops;
@@ -1063,6 +1074,89 @@ static void test_choreographer_period_and_cadence_across_a_switch(void)
     CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
 
+static void test_choreographer_grid_rules(void)
+{
+    const int64_t mode = 16683350; // 59.94 Hz
+    CHECK_EQ(mediacodec_grid_period(0, mode), mode, "an unmeasured grid is the mode's");
+    CHECK_EQ(mediacodec_grid_period(mode - 60000, mode), mode,
+             "within 2% of the mode, the mode's period stands");
+    CHECK_EQ(mediacodec_grid_period(15708000, mode), 15708000,
+             "a Choreographer off the mode keeps its own spacing");
+    CHECK_EQ(mediacodec_grid_period(2 * 15708000, mode), 15708000,
+             "timelines two vsyncs apart still measure one vsync");
+    CHECK_EQ(mediacodec_grid_period(4 * mode, mode), mode,
+             "a gap of four vsyncs is too late to measure");
+    CHECK_EQ(mediacodec_grid_period(mode * 13 / 10, mode), mode,
+             "a gap between whole vsyncs is not a vsync gap");
+}
+
+static void test_releases_follow_an_off_mode_choreographer(void)
+{
+    // An Amlogic box's SurfaceFlinger fits 15.71 ms to a 59.94 Hz mode for
+    // whole sessions; its Choreographer ticks on that grid, and it latches
+    // against it. Every release across resamples stays on that grid.
+    const int64_t mode = 16683350, grid = 15708000;
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 1e9 / 59.94, 0};
+    vsync_sampler.vsync_period = mode;
+    vsync_sampler.vsync_spacing = grid;
+    vsync_sampler.client = &vo;
+    unsigned resampled = resamples;
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    const int64_t duration = llround(1e9 / 23.976);
+    for (int i = 0; i < 48; i++) { // two seconds: four 500 ms resamples
+        AVMediaCodecBuffer buffer = {.pts = llround(i * duration / 1e3)};
+        struct mp_image image = {.pts = i * duration / 1e9, .planes[3] = &buffer,
+                                 .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 1 + i,
+            .pts = EPOCH + 1000 * MS + i * duration, .duration = duration};
+        in.frame_queued = &frame;
+        if (!i)
+            clock_ns = frame.pts - 200 * MS;
+        CHECK_EQ(present_queued(&vo), false, "the frame waits for its window");
+        CHECK_EQ(p.queue_period, grid, "the Choreographer's spacing is the grid");
+        clock_ns = in.wakeup_pts;
+        if (i % 12 == 0)
+            p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / grid) * grid;
+        CHECK_EQ(present_queued(&vo), true, "the frame is released");
+        CHECK_EQ(buffer.timestamp != 0, true, "the release is timed");
+        CHECK_EQ((published.vsync - EPOCH) % grid, 0,
+                 "every release targets a line of the Choreographer's grid");
+        // The first frame has no grid yet (see test_driver_refresh_and_cadence).
+        CHECK_EQ(!i || buffer.timestamp - clock_ns >= mediacodec_codec_lead(grid), true,
+                 "the codec still gets its lead");
+    }
+    CHECK_EQ(resamples > resampled, true, "a first display mode asks for a fresh sample");
+
+    // SurfaceFlinger refits its model by microseconds, and a Pixel's
+    // timelines fall back to the mode's spacing from one sample to the next.
+    // The sample the sampler took with the new spacing stays good: every
+    // release stays snapped, without asking for another.
+    const int64_t spacings[] = {grid + 6000, mode, grid};
+    for (int i = 0; i < 3; i++) {
+        resampled = resamples;
+        vsync_sampler.vsync_spacing = spacings[i];
+        AVMediaCodecBuffer next = {.pts = llround((48 + i) * duration / 1e3)};
+        struct mp_image image = {.pts = (48 + i) * duration / 1e9,
+                                 .planes[3] = &next, .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 49 + i,
+            .pts = EPOCH + 1000 * MS + (48 + i) * duration, .duration = duration};
+        in.frame_queued = &frame;
+        if (!present_queued(&vo)) {
+            clock_ns = in.wakeup_pts;
+            CHECK_EQ(present_queued(&vo), true, "the frame after a new spacing is released");
+        }
+        CHECK_EQ(p.queue_period, spacings[i] == mode ? mode : spacings[i],
+                 "the grid follows the timelines");
+        CHECK_EQ(resamples, resampled, "a new spacing is not a new display mode");
+        CHECK_EQ(published.vsync != 0, true, "the release after a new spacing stays snapped");
+    }
+    vsync_sampler.vsync_period = vsync_sampler.vsync_spacing = 0;
+    vsync_sampler.client = NULL;
+}
+
 static void test_drop_pause_redraw_resume(void)
 {
     const int64_t period = 40 * MS, base = EPOCH + 1000 * MS;
@@ -1306,6 +1400,8 @@ int main(void)
     test_driver_refresh_and_cadence();
     test_refresh_transition_and_late_frame();
     test_choreographer_period_and_cadence_across_a_switch();
+    test_choreographer_grid_rules();
+    test_releases_follow_an_off_mode_choreographer();
     test_drop_pause_redraw_resume();
     test_clock_domain_drift();
     test_speed_change_admission();

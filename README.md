@@ -167,13 +167,17 @@ refresh hysteresis, clock drift across the mp_time/CLOCK_MONOTONIC boundary,
 playback-speed changes, seek during preparation, dropped-frame still redraws
 without resetting cadence, the invariant the codec submission lead exists
 for: every frame reaches MediaCodec at least two display periods before the
-presentation timestamp it is given, not before its raw deadline, and the
-sparse statistics cadence (a line when a failure counter moves, on the first
-tick, and as a 60 s heartbeat otherwise), and the video-plane presentation
-feedback: a release records the vsync it aimed at, the codec's rendered
-report is matched back by presentation time and bucketed by vsync error, and
-a reset forgets intents but keeps the counters. Pass an already-patched
-source directory as the first argument to run offline.
+presentation timestamp it is given, not before its raw deadline; releases
+snapped with the Choreographer's own vsync spacing when it disagrees with the
+display mode (an Amlogic box's SurfaceFlinger runs 15.71 ms against a
+16.68 ms mode), so every release stays on the grid SurfaceFlinger latches
+against across resamples and changes in that spacing; the sparse statistics
+cadence (a line when a failure counter moves, on the first tick, and as a
+60 s heartbeat otherwise), and the video-plane presentation feedback: a
+release records the vsync it aimed at, the codec's rendered report is matched
+back by presentation time and bucketed by vsync error, and a reset forgets
+intents but keeps the counters. Pass an already-patched source directory as
+the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It extracts the freestanding scheduler core and request dispatcher of the

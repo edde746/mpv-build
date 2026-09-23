@@ -31,10 +31,10 @@ python3 "$E" region "$src" "$workdir/mediacodec_stats_core.inc" --start "mediaco
 # driver reads, then each production function by name.
 python3 "$E" range "$src" "$workdir/mediacodec_timing_driver.inc" \
     --first "#define VSYNC_SAMPLE_MAX_AGE_NS" --last "static int64_t read_vsync_sample"
-for fn in read_vsync_sample read_vsync_period vsync_sample_is_fresh plausible_period \
-          display_period update_queue_timing get_release_target prepare_osd \
-          submit_deadline prepare_frame draw_frame present_reports_on present_feedback \
-          flip_page reset_video; do
+for fn in read_vsync_sample read_vsync_period read_vsync_spacing request_vsync_sample \
+          vsync_sample_is_fresh plausible_period mode_period update_queue_timing \
+          get_release_target prepare_osd submit_deadline prepare_frame draw_frame \
+          present_reports_on present_feedback flip_page reset_video; do
     python3 "$E" symbol "$src" "$workdir/mediacodec_timing_driver.inc" --append --fn "$fn"
 done
 

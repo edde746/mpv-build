@@ -34,3 +34,4 @@
 0120-vo-mediacodec-distrust-render-times-off-the-vsync-clock.patch
 0121-ao-audiotrack-pcm-device-buffer-and-writer-priority.patch
 0122-ao-audiotrack-raw-queue-floor-in-time.patch
+0123-vo-mediacodec-snap-to-the-choreographers-own-vsync-grid.patch
