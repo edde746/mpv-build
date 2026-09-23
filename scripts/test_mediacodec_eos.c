@@ -115,6 +115,7 @@ typedef struct MediaCodecDecContext {
     int eos;
     uint64_t output_buffer_count;
     ssize_t current_input_buffer;
+    int input_since_flush;
     atomic_int serial;
     int async_mode;
     AVMutex async_lock;

@@ -91,6 +91,9 @@ jobs:
       - name: Test MediaCodec end of stream after a flush
         run: bash ./scripts/test_mediacodec_eos.sh
 
+      - name: Test MediaCodec flush before the first input
+        run: bash ./scripts/test_mediacodec_flush.sh
+
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh
 

@@ -15,3 +15,4 @@
 # belongs beside the operating rate 0011 declares.
 0012-mediacodec-async-decode-and-priority.patch
 0024-mediacodec-jni-async-and-feedback.patch
+0025-mediacodec-skip-flush-before-first-input.patch

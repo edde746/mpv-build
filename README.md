@@ -249,6 +249,16 @@ first, output finished before the flush is still dropped without pre-empting
 a drain that has not started, and the polled decoder reads the flag alone.
 Pass an already-patched source directory as the first argument to run offline.
 
+Run the MediaCodec flush regression with `bash scripts/test_mediacodec_flush.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and drives
+the production flush entry against the polled and the asynchronous decoder:
+a seek on a codec that has handed out no input (the one a resume position
+makes right after opening the decoder) leaves it unflushed and keeps the
+asynchronous codec's offered slots and timestamps, a seek after input flushes
+it, back-to-back seeks flush once, and an oversized first access unit still
+gives its slot back through a flush. Pass an already-patched source directory
+as the first argument to run offline.
+
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding

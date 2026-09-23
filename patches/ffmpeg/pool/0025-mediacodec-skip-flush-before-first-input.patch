@@ -1,0 +1,95 @@
+Subject: [PATCH] avcodec/mediacodec: leave a codec that has taken no input unflushed
+
+A player that resumes mid-file opens the decoder and seeks at once, so the
+codec it has just started is flushed before it has been given any input.
+MediaCodec documents that a flush before the first output may lose the
+codec-specific data start() submitted from csd-*. On an RK3576 box
+(c2.rk.hevc.decoder), every session that began with that flush later failed
+an ordinary seek flush with a fatal codec error (CodecException error_14)
+and mpv fell back to software decoding; sessions started from the beginning,
+which are never flushed before their first output, did not (Plezy #2431).
+
+Until an input buffer has been dequeued the codec holds nothing a flush
+could discard, so skip the platform flush there. Every input slot passes
+through ff_mediacodec_dec_dequeue_input, which marks the context; a real
+flush clears the mark. Once any slot has been handed out, including the one
+an oversized access unit is dropped from, flushing is unchanged.
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index ad5a3f2..d597294 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -971,7 +971,8 @@ int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s)
+ }
+ 
+ // A free input slot: the index, AVERROR(EAGAIN) when none is available within
+-// timeout_us, another negative value on a codec error.
++// timeout_us, another negative value on a codec error. Every slot handed out
++// here is one a later flush has to give back.
+ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout_us)
+ {
+     int32_t index;
+@@ -981,7 +982,10 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+         ssize_t idx = ff_AMediaCodec_dequeueInputBuffer(s->codec, timeout_us);
+         if (ff_AMediaCodec_infoTryAgainLater(s->codec, idx))
+             return AVERROR(EAGAIN);
+-        return idx < 0 ? AVERROR_EXTERNAL : idx;
++        if (idx < 0)
++            return AVERROR_EXTERNAL;
++        s->input_since_flush = 1;
++        return idx;
+     }
+ 
+     ff_mutex_lock(&s->async_lock);
+@@ -989,7 +993,10 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+     if (ret >= 0)
+         ret = av_fifo_read(s->async_input, &index, 1) >= 0 ? 0 : AVERROR(EAGAIN);
+     ff_mutex_unlock(&s->async_lock);
+-    return ret < 0 ? ret : index;
++    if (ret < 0)
++        return ret;
++    s->input_since_flush = 1;
++    return index;
+ }
+ 
+ enum {
+@@ -1073,6 +1080,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+     atomic_fetch_add(&s->serial, 1);
+     atomic_init(&s->hw_buffer_count, 0);
+     s->current_input_buffer = -1;
++    s->input_since_flush = 0;
+     // Every shed frame the codec had yet to pass is moot after a flush.
+     s->pending_drops = 0;
+ 
+@@ -1585,6 +1593,17 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+ */
+ int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
+ {
++    /* No input buffer has left the codec since it started or was last
++     * flushed, so it holds nothing to discard: a player that opens the
++     * decoder and seeks to a resume position straight away lands here.
++     * Keep MediaCodec.flush() out of that window: a flush before the first
++     * output may drop the codec-specific data start() submitted (MediaCodec,
++     * "Codec-specific Data"), and sessions on Rockchip's c2.rk.hevc.decoder
++     * flushed there later failed an ordinary seek flush with a fatal codec
++     * error. */
++    if (!s->input_since_flush)
++        return 1;
++
+     if (!s->surface || !s->delay_flush || atomic_load(&s->refcount) == 1) {
+         int ret;
+ 
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index afaa9e6..ab520fb 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -79,6 +79,9 @@ typedef struct MediaCodecDecContext {
+ 
+     uint64_t output_buffer_count;
+     ssize_t current_input_buffer;
++    // An input buffer was taken from the codec since it started or was last
++    // flushed. Until one is, a flush has nothing to discard and is skipped.
++    int input_since_flush;
+ 
+     bool delay_flush;
+     atomic_int serial;
