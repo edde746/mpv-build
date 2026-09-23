@@ -1,0 +1,91 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 361b396..c964ff7 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -21,7 +21,7 @@
+  * Decoded buffers go straight to the --wid Surface (no GPU pass, decoder
+  * dataspace intact) and are released with a presentation timestamp snapped
+  * to the Choreographer vsync grid when a fresh sample exists, and are handed
+- * to the codec about two display periods before that timestamp.
++ * to the codec 50 ms before that timestamp, as media3 hands them over.
+  * The embedder owns all geometry; software frames are
+  * refused so the Surface never becomes a CPU producer.
+  *
+@@ -255,17 +255,17 @@ static int64_t mediacodec_timing_release(struct mediacodec_timing *timing,
+     return snapped - period_ns * 8 / 10;
+ }
+ 
+-// How far before the presentation timestamp the buffer has to reach the
+-// codec. MediaCodec.releaseOutputBuffer(int, long) asks for about two display
+-// periods, and does not return the buffer to the decoder until the timestamp
+-// passes, so the lead is capped. An unknown period keeps a fixed budget.
+-static int64_t mediacodec_codec_lead(int64_t period_ns)
+-{
+-    if (period_ns <= 0)
+-        return 50000000;
+-    int64_t lead = 2 * period_ns;
+-    return lead < 100000000 ? lead : 100000000;
+-}
++// How far before its release timestamp a frame is handed to the codec:
++// media3's early-scheduling threshold (MediaCodecVideoRenderer's
++// DEFAULT_EARLY_SCHEDULING_THRESHOLD_US), whatever the display period. media3
++// checks it about every 10 ms, so its handoffs spread over 40-50 ms; this VO
++// wakes at the threshold. Two display periods, the handoff the MediaCodec
++// documentation suggests, left a MediaTek Fire TV showing 7 frames a vsync
++// early in 35 minutes of 24p, against none at 50 ms. MediaCodec does not
++// return a buffer released with releaseOutputBuffer(int, long) to the
++// decoder until its timestamp passes, so the lead also bounds how many
++// decoded frames the surface holds.
++#define MEDIACODEC_CODEC_LEAD_NS INT64_C(50000000)
+ 
+ // The timestamp mediacodec_timing_release would choose, evaluated without
+ // committing the cadence anchor or the snap preference and without the
+@@ -291,9 +291,7 @@ static int64_t mediacodec_timing_preview(const struct mediacodec_timing *timing,
+ // codec lead, the 80% pull-back, and the cadence-correction bound.
+ static int64_t mediacodec_prepare_lead(int64_t period_ns, double duration_ns)
+ {
+-    int64_t lead = mediacodec_codec_lead(period_ns) + period_ns + 20000000;
+-    if (lead < 50000000)
+-        lead = 50000000;
++    int64_t lead = MEDIACODEC_CODEC_LEAD_NS + period_ns + 20000000;
+     if (period_ns > 0 && isfinite(duration_ns) && duration_ns > 0) {
+         int64_t render = llround(fmin(2 * duration_ns + period_ns, 500000000));
+         if (render > lead)
+@@ -3533,7 +3531,7 @@ static int preinit(struct vo *vo)
+ // ahead of the raw deadline by the prediction bound and most of a period.
+ static int64_t mediacodec_release_horizon(int64_t period_ns)
+ {
+-    return mediacodec_codec_lead(period_ns) + TIMED_RELEASE_PREDICT_BOUND_NS
++    return MEDIACODEC_CODEC_LEAD_NS + TIMED_RELEASE_PREDICT_BOUND_NS
+          + 2 * (period_ns > 0 ? period_ns : 0) + TIMED_RELEASE_CLOCK_SLOP_NS;
+ }
+ 
+@@ -3646,8 +3644,7 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
+     vo_set_queue_params(vo, offset, 1);
+     if (period) {
+         MP_VERBOSE(vo, "Timed release: %.3f Hz, prepare %.1f ms, codec %.1f ms ahead.\n",
+-                   1e9 / period, offset / 1e6,
+-                   mediacodec_codec_lead(period) / 1e6);
++                   1e9 / period, offset / 1e6, MEDIACODEC_CODEC_LEAD_NS / 1e6);
+     }
+ }
+ 
+@@ -3757,8 +3754,7 @@ static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
+     if (frame->pts <= 0 || frame->display_synced)
+         return 0;
+ 
+-    int64_t lead = mediacodec_codec_lead(p->queue_period);
+-    int64_t raw_deadline = frame->pts - lead;
++    int64_t raw_deadline = frame->pts - MEDIACODEC_CODEC_LEAD_NS;
+     int64_t mono_now = monotonic_now_ns();
+     if (mono_now <= 0)
+         return raw_deadline;
+@@ -3774,7 +3770,7 @@ static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
+     // deadline: the 80% pull-back alone puts the timestamp most of a period
+     // ahead of it, and clamping there is what leaves the codec short. The
+     // hold is bounded by construction, at exactly one lead.
+-    int64_t deadline = monotonic_to_mp_time_ns(timestamp) - lead;
++    int64_t deadline = monotonic_to_mp_time_ns(timestamp) - MEDIACODEC_CODEC_LEAD_NS;
+     return deadline > 0 ? deadline : raw_deadline;
+ }
+ 

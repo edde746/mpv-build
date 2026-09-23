@@ -788,12 +788,12 @@ static void test_preparation_does_not_submit_early(void)
     p.vsync_sample = frame.pts - 2 * 40 * MS;
     CHECK_EQ(present_queued(&vo), false, "120ms preparation cannot submit");
     CHECK_EQ(buffer.releases, 0, "no immediate release at the old budget");
-    CHECK_EQ(vo.admission_offset, 140 * MS,
+    CHECK_EQ(vo.admission_offset, 120 * MS,
              "OSD horizon still reaches past the codec window");
     CHECK_EQ(requested.pts * 1000, 12500, "OSD is prepared before admission");
-    // Two display periods before the timestamp the codec is actually given
-    // (the chosen vsync minus 80% of a period), not before the raw deadline.
-    CHECK_EQ(in.wakeup_pts, frame.pts - 32 * MS - 80 * MS,
+    // The codec lead before the timestamp the codec is actually given (the
+    // chosen vsync minus 80% of a period), not before the raw deadline.
+    CHECK_EQ(in.wakeup_pts, frame.pts - 32 * MS - 50 * MS,
              "admission counts back from the presentation timestamp");
     unsigned prepared = requests;
     in.paused = true;
@@ -807,8 +807,8 @@ static void test_preparation_does_not_submit_early(void)
     CHECK_EQ(present_queued(&vo), true, "admit at the codec boundary");
     CHECK_EQ(buffer.releases, 1, "submit once");
     CHECK_EQ(buffer.timestamp, frame.pts - 32 * MS, "preserve minus 0.8P snap");
-    CHECK_EQ(monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns, 80 * MS,
-             "the codec gets two display periods of notice");
+    CHECK_EQ(monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns, 50 * MS,
+             "the codec gets media3's 50 ms of notice, not two display periods");
     CHECK_EQ(published.seq, requested.seq, "OSD gets its matching video release");
     CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
@@ -937,16 +937,16 @@ static void test_driver_refresh_and_cadence(void)
                 mediacodec_release_horizon(period));
             CHECK_EQ(buffer.timestamp, expected, "admission preserves cadence/snap");
             // The whole point of admitting against the corrected timestamp:
-            // MediaCodec must still get its two display periods of notice.
-            // The first frame after a period change has no grid yet, so its
-            // deadline is set from the raw pts and the 80% pull-back eats
-            // into the window until a Choreographer sample is trusted.
+            // MediaCodec must still get its full lead of notice. The first
+            // frame after a period change has no grid yet, so its deadline
+            // is set from the raw pts and the 80% pull-back eats into the
+            // window until a Choreographer sample is trusted.
             int64_t window = monotonic_to_mp_time_ns(buffer.timestamp) - clock_ns;
-            if (i && window < 2 * period) {
+            if (i && window < MEDIACODEC_CODEC_LEAD_NS) {
                 fprintf(stderr, "FAIL: %.3f fps / %.3f Hz submitted %" PRId64
                         "us before its timestamp, needs %" PRId64 "us\n",
                         rates[r].fps, rates[r].hz, window / 1000,
-                        2 * period / 1000);
+                        MEDIACODEC_CODEC_LEAD_NS / 1000);
                 exit(1);
             }
             int64_t shown = presented_vsync(buffer.timestamp, clock_ns, EPOCH, period);
@@ -973,15 +973,14 @@ static void test_refresh_transition_and_late_frame(void)
     in.frame_queued = &frame;
     clock_ns = frame.pts - 120 * MS;
     CHECK_EQ(present_queued(&vo), false, "prepare before refresh transition");
-    int64_t old_flip = in.wakeup_pts;
     unsigned old_requests = requests;
     vo.period = 1e9 / 120;
-    clock_ns = old_flip;
-    CHECK_EQ(present_queued(&vo), false, "old 25Hz deadline cannot submit at 120Hz");
-    CHECK_EQ(buffer.releases, 0, "refresh tightening never releases untimed");
+    clock_ns = frame.pts - 60 * MS;
+    CHECK_EQ(present_queued(&vo), false, "a refresh transition does not submit early");
+    CHECK_EQ(buffer.releases, 0, "refresh transition never releases untimed");
     CHECK_EQ(requests, old_requests, "refresh keeps prepared OSD");
-    CHECK_EQ(in.wakeup_pts, frame.pts - 2 * llround(vo.period),
-             "refresh transition rearms the interruptible timer");
+    CHECK_EQ(in.wakeup_pts, frame.pts - 50 * MS,
+             "the codec lead does not follow the display period");
     // An OSD invalidation while the video waits must reprepare its pose.
     p.osd.epoch++;
     CHECK_EQ(present_queued(&vo), false, "OSD invalidation does not submit video");
@@ -1125,7 +1124,7 @@ static void test_releases_follow_an_off_mode_choreographer(void)
         CHECK_EQ((published.vsync - EPOCH) % grid, 0,
                  "every release targets a line of the Choreographer's grid");
         // The first frame has no grid yet (see test_driver_refresh_and_cadence).
-        CHECK_EQ(!i || buffer.timestamp - clock_ns >= mediacodec_codec_lead(grid), true,
+        CHECK_EQ(!i || buffer.timestamp - clock_ns >= MEDIACODEC_CODEC_LEAD_NS, true,
                  "the codec still gets its lead");
     }
     CHECK_EQ(resamples > resampled, true, "a first display mode asks for a fresh sample");
