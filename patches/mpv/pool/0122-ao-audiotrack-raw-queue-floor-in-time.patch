@@ -1,0 +1,38 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index 47d9155..f1d3397 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -445,11 +445,22 @@ static const struct {
+ // drained on the spot: a 500 ms PCM track tripped it at every start and seek
+ // under the 200 ms default. Ask for twice the track so a burst leaves a full
+ // track behind; the decoder has that long to refill before the next wake.
+-// A raw track keeps its own accounting (see the raw sizing above).
++//
++// A raw track's buffer is bitstream bytes, so the audio it holds moves with
++// the bitrate: the AC-3 budget is 640 ms of a 384 kb/s stream, against the
++// 320 ms queue its byte count used to ask for, and refilling it half at a
++// time emptied that queue mid-film (one to four times in five minutes on a
++// Google TV Streamer). No common bitrate puts more than 1.3 s in a raw budget
++// (raw_buffer_budget), so a refill takes at most ~0.7 s and a one-second
++// queue absorbs it. Only the first fill of a track under ~250 kb/s can still
++// find it short, and a track plays nothing until that fill completes.
++#define RAW_QUEUE_FLOOR_S 1.0
+ static int AudioTrack_queueFloor(struct ao *ao, int frames)
+ {
+     struct priv *p = ao->priv;
+-    return p->raw_passthrough ? frames : frames * 2;
++    if (p->raw_passthrough)
++        return lrint(RAW_QUEUE_FLOOR_S * ao->samplerate);
++    return frames * 2;
+ }
+ 
+ static int AudioTrack_New(struct ao *ao)
+@@ -1489,7 +1500,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     // refusal leaves it where it was.
+     //
+     // Not for a raw track. Its budget is bytes, so at a low bitrate it holds
+-    // up to a second of audio against a 200 ms core queue, and the writer
++    // more audio than the core queues in front of it, and the writer
+     // fills it in one burst whenever the HAL starts taking data (Fire TV's
+     // Dolby track holds the first writes until the sink locks, then drains
+     // them at once). A writer that outranks the core empties the queue
