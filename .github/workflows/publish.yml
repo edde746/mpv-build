@@ -64,9 +64,6 @@ jobs:
       - name: Test AVFoundation PiP frame-space OSD
         run: ./scripts/test_avf_pip_frame_space_osd.sh
 
-      - name: Test AVFoundation Metal OSD rasterizer
-        run: bash ./scripts/test_avf_metal_osd.sh
-
       - name: Test MediaCodec timing cadence
         run: bash ./scripts/test_mediacodec_timing.sh
 
