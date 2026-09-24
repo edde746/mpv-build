@@ -1,6 +1,7 @@
 sd_ass: preserve the complete event-prefetch render state
 
-The Android mediacodec VO requests isolated event-prefetch state. Keep at most
+The shared render-ahead pipeline (osd_ahead) requests isolated event-prefetch
+state with OSD_DRAW_PREFETCH. Keep at most
 two reusable ASS renderers with their packers so intervening current-frame
 renders cannot evict the prepared renderer and atlas. At exact-time promotion,
 release only the old renderer's event-layout snapshots through
@@ -13,32 +14,6 @@ and output deselection discard the pending renderer. Other subtitle decoders
 accept the render hint without changing behavior. This path does not enable
 persistent libass layout caching.
 
-diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index e1bf520..e1d8eb6 100644
---- a/DOCS/man/vo.rst
-+++ b/DOCS/man/vo.rst
-@@ -752,10 +752,17 @@ Available video output drivers are:
-     known to the VO, pre-rendered for the next frame from the observed frame
-     cadence while the current one waits for its deadline, and, while the OSD
-     is static, for the first frame of the next subtitle event ahead of its
--    start (never past what the subtitle decoders have read). Event pre-renders
--    warm the renderer and GPU caches but are not presented directly: each
--    request uses a timestamp-matched render, reusing the prepared atlas when
--    the pixels match. A render that repeats the pixels already on screen is
-+    start (never past what the subtitle decoders have read). ASS event
-+    pre-renders retain a separate renderer and packed atlas, so intervening
-+    current-frame renders cannot evict their prepared state. At handoff only
-+    the old renderer's event-layout snapshots are released; both renderers,
-+    their raster/font caches and worker pools remain reusable. The exact
-+    requested timestamp is rendered, including repeated requests at the same
-+    timestamp: an unchanged result reuses the prepared atlas, not an image
-+    accepted by age. Reset, option changes and output deselection discard the
-+    pending renderer. This prefetch path is used by this Android VO; it does
-+    not enable persistent libass layout caching.
-+    A render that repeats the pixels already on screen is
-     folded into them and costs no swap. Rasterized frames are
-     uploaded and composed on the GPU while the present thread is idle, and
-     presented through a GLES2 surface over the OSD Surface with the same
 diff --git a/sub/dec_sub.c b/sub/dec_sub.c
 index 3b094a6..363cd00 100644
 --- a/sub/dec_sub.c
@@ -453,17 +428,3 @@ index 5cbc6d0..fc2506b 100644
  {
      struct sd_lavc_priv *priv = sd->priv;
      struct mp_subtitle_opts *opts = sd->opts;
-diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 9b292e2..60a8d14 100644
---- a/video/out/vo_mediacodec.c
-+++ b/video/out/vo_mediacodec.c
-@@ -1396,7 +1396,8 @@ static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
-     struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-     int64_t render_ns;
-     struct sub_bitmap_list *sbs =
--        osd_slot_render(vo, rs, event_start + 0.001, res, 0, &render_ns);
-+        osd_slot_render(vo, rs, event_start + 0.001, res,
-+                        OSD_DRAW_PREFETCH, &render_ns);
-     double render_s = render_ns / 1e9;
-     mp_mutex_lock(&p->osd_lock);
-     bool keep = sbs && p->osd.epoch == epoch;

@@ -192,6 +192,18 @@ pre-render, or a repaint after seeking.
 Completed animation poses use an immutable bounded FIFO rather than replacing
 each other while the presenter waits. Queue regressions cover ordered handoff,
 full-capacity admission, wraparound, release ownership, and epoch cancellation.
+The same pipeline renders subtitles for vo_avfoundation (patch 0032): the
+Apple series lists 0031 with the sub/ patches it needs (0006 render threads,
+0011, 0012, the sub/ half of 0013 and the sub/ half of 0014). The request
+scenarios also cover the helpers a presenter on the video thread uses: a
+request counts as served even when the OSD did not change, only the newest
+flipped result is drawn, and every queued result, and nothing else, notifies
+the presenter (vo_avfoundation redraws the paused frame with a result that
+missed it). `bash scripts/test_avf_osd_ahead.sh` applies the Apple series and
+checks how long flip_page may hold a frame's video for its subtitles: until
+half the queue lead is left, not at all while the render thread is behind,
+a bounded time for untimed frames (redraws, and frames shown while paused),
+and as long as before in the composite modes.
 
 Run the OSD surface-retirement regression with
 `bash scripts/test_mediacodec_rebind.sh`. It applies the full Android series

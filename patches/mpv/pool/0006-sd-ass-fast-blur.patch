@@ -1,0 +1,25 @@
+sd_ass: enable libass fast blur like the ExoPlayer path
+
+Plezy's ExoPlayer subtitle path (android/libass AssKt.c) enables
+ASS_FEATURE_FAST_BLUR on the track. The mpv path did not, so the same file
+rendered with a fixed 9-tap minimum blur kernel. On blur-heavy
+motion-tracked signs that is a large share of the per-frame cost behind
+late signs and post-cut bleed on Fire TV (edde746/plezy#2242).
+
+No other libass feature is turned on here, so everything else stays at its
+upstream default, as on the ExoPlayer path.
+
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -261,6 +270,10 @@ static void assobjects_init(struct sd *sd)
+ 
+     ctx->ass_track = ass_new_track(ctx->ass_library);
+     ctx->ass_track->track_type = TRACK_TYPE_ASS;
++    // Match the ExoPlayer path: kernels sized to the actual blur radius
++    // instead of the fixed 9-tap minimum. Sub-perceptual output change,
++    // large win on per-frame re-blurred motion-tracked signs.
++    ass_track_set_feature(ctx->ass_track, ASS_FEATURE_FAST_BLUR, 1);
+ 
+     ctx->shadow_track = ass_new_track(ctx->ass_library);
+     ctx->shadow_track->PlayResX = MP_ASS_FONT_PLAYRESX;

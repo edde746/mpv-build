@@ -35,8 +35,9 @@ python3 "$E" region "$vo" "$workdir/mediacodec_osd_core.inc" --append \
 
 python3 "$E" symbol "$module" "$workdir/mediacodec_osd_request.inc" \
     --fn osd_find_release --fn osd_free_slot --fn osd_post_result \
-    --fn osd_service_request --fn osd_ahead_file_request \
-    --fn osd_ahead_invalidate --fn osd_ahead_publish_release
+    --fn osd_notify_posted --fn osd_mark_served --fn osd_service_request --fn osd_ahead_file_request \
+    --fn osd_ahead_invalidate --fn osd_ahead_publish_release \
+    --fn osd_ahead_take_newest
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_mediacodec_osd.c" -lm

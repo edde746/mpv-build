@@ -1,0 +1,796 @@
+avfoundation: render subtitles through the shared osd_ahead pipeline
+
+On Apple TV a subtitle frame that took longer than the queue lead to render
+made the video late with it: flip_page rendered the frame's subtitles on the
+VO thread and enqueued the video sample only afterwards. A heavy sign (the
+Ex2 sample, 105-122 ms on an Apple TV 4K) cost a late video frame every
+time it appeared.
+
+Render them on the shared render-ahead pipeline (osd_ahead.[ch], as
+vo_mediacodec does): draw_frame files the frame's request as soon as the
+frame is known, the pipeline pre-renders the frame its cadence predicts
+next and, while the OSD is static, the next subtitle event on a separate
+renderer (0013), and flip_page presents the result. flip_page waits for it
+only as avf_osd_wait_until allows: a timed frame keeps half its queue lead
+for the video, and does not wait at all while the render thread is still
+on an older frame; subtitles that arrive later are shown with a later
+frame, and of several ready results only the newest is drawn. The composite
+modes wait as the synchronous path did. When the render thread cannot
+start, the synchronous path renders as before.
+
+While paused no later frame comes. A frame shown while paused (a seek) has
+no queue lead to protect and waits like a redraw, and a result that still
+arrives after its frame wakes the VO thread, which redraws the frame on
+screen with it without filing a new request.
+
+The inline overlay now draws every item of a frame's list into one buffer;
+before, a second item (the OSD, a secondary subtitle) replaced the first.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 686e99a..06d2846 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -31,6 +31,7 @@
+ #include "options/m_config.h"
+ #include "options/m_option.h"
+ #include "osdep/timer.h"
++#include "osd_ahead.h"
+ #include "vo.h"
+ #include "video/fmt-conversion.h"
+ #include "video/mp_image.h"
+@@ -57,6 +58,46 @@
+     struct mp_osd_res osd_res;
+ };
+ 
++// The canvas libass lays the OSD out on (res) and the pixel size of the
++// overlay buffer it is drawn into.
++struct avf_osd_canvas {
++    int w, h;
++    struct mp_osd_res res;
++};
++
++// --- avf osd ahead policy
++
++// How long flip_page may wait for its frame's subtitles before it enqueues
++// the video without them, as an mp_time_ns deadline (0: do not wait).
++// Subtitles render ahead on the shared pipeline's thread (osd_ahead.h), so
++// the wait is normally just the handoff of a result that is already there.
++// A timed frame keeps at least half its queue lead for the video: a slow
++// render costs the subtitle a frame, never the video. While the render
++// thread is still busy with an older frame, waiting would only buy part of
++// that render, so the frame does not wait and shows what is ready. An
++// untimed frame (a redraw, or any frame while paused) has no deadline to
++// keep and waits a bounded time; a result later than that is shown on its
++// own while paused (ahead_present_late). The composite modes draw the subtitle into the
++// video sample itself, so they wait as the synchronous path did.
++#define AVF_OSD_UNTIMED_WAIT_NS INT64_C(250000000)
++#define AVF_OSD_COMPOSITE_WAIT_NS INT64_C(1000000000)
++
++static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
++                                  int64_t queue_lead_ns, bool timed,
++                                  bool composite, bool behind)
++{
++    if (composite)
++        return now + AVF_OSD_COMPOSITE_WAIT_NS;
++    if (behind)
++        return 0;
++    if (!timed)
++        return now + AVF_OSD_UNTIMED_WAIT_NS;
++    int64_t until = present_ns - queue_lead_ns / 2;
++    return until > now ? until : 0;
++}
++
++// --- end avf osd ahead policy
++
+ enum avf_osd_draw_path {
+     AVF_OSD_DRAW_NONE = 0,
+     AVF_OSD_DRAW_DIRECT_LIBASS,
+@@ -328,6 +369,31 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+     int osd_pool_w, osd_pool_h;
+     bool osd_needs_enqueue;
+ 
++    // Subtitles render ahead on the shared pipeline's thread (osd_ahead.h)
++    // and flip_page presents the results. When that thread cannot start,
++    // render_osd renders synchronously instead.
++    struct osd_ahead ahead;
++    struct osd_cadence ahead_cadence;        // VO thread
++    struct avf_osd_canvas ahead_canvas;      // written under ahead.lock
++    bool ahead_canvas_valid;
++    struct avf_osd_canvas ahead_render_canvas; // render thread, latched
++    uint64_t ahead_frame_seq;                // VO thread
++    double ahead_last_pts;                   // pts of the last request
++    struct {
++        bool valid, timed;
++        uint64_t seq, epoch;
++    } ahead_req;                             // this frame's request
++    // The last frame flip_page enqueued, kept for a paused redraw with a
++    // result that arrived after it (ahead_present_late).
++    struct mp_image *ahead_shown_image;      // VO thread
++    bool ahead_replay;                       // VO thread: redraw, no request
++    atomic_bool ahead_paused;                // mirrors ahead.paused
++    atomic_bool ahead_late_result;           // render thread -> VO thread
++    struct {
++        int presented, waited, gave_up, behind, dropped, late, max_late;
++        int64_t wait_ns, wait_max_ns;
++    } ahead_perf;
++
+     // Per-IOSurface dirty-rect tracking for partial OSD buffer clears. Pool
+     // buffers are recycled with their previous contents intact and this code
+     // is their only writer, so remembering what was last drawn into each
+@@ -457,6 +523,7 @@ static CGFloat get_screen_scale(void)
+ 
+ static void dispatch_main_sync_safe(dispatch_block_t block);
+ static void clear_subtitle_cache(struct priv *p);
++static void ahead_invalidate(struct priv *p, double pts);
+ static void release_ci_compositor(struct priv *p);
+ static const struct m_sub_options avfoundation_conf;
+ 
+@@ -1825,14 +1892,16 @@ static int clip_u10(double value)
+ // Union of the part destination rects, clamped to the OSD buffer. Both draw
+ // paths only write inside these rects, so this bounds everything non-blank
+ // without scanning the rendered pixels.
+-static void update_subtitle_bounds_from_parts(struct priv *p,
+-                                              struct sub_bitmaps *imgs)
++static void reset_subtitle_bounds(struct priv *p)
+ {
+     p->subtitle_x0 = p->osd_w;
+     p->subtitle_y0 = p->osd_h;
+     p->subtitle_x1 = 0;
+     p->subtitle_y1 = 0;
++}
+ 
++static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs)
++{
+     if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
+         return;
+ 
+@@ -1849,6 +1918,13 @@ static void update_subtitle_bounds_from_parts(struct priv *p,
+     }
+ }
+ 
++static void update_subtitle_bounds_from_parts(struct priv *p,
++                                              struct sub_bitmaps *imgs)
++{
++    reset_subtitle_bounds(p);
++    extend_subtitle_bounds(p, imgs);
++}
++
+ // Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
+ // Everything lands in a biplanar format: the display pipeline only handles
+ // NV12/P010-family surfaces reliably (tri-planar 'y420' is not used by any
+@@ -2666,6 +2742,67 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
+     return pixbuf;
+ }
+ 
++// Draw every item of list into one overlay buffer: the frame's subtitles and
++// OSD share the inline layer, so one item must not replace another. NULL
++// when nothing could be drawn.
++static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
++                                                          struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    CGContextRef context = NULL;
++    bool drawn = false;
++    for (int n = 0; n < list->num_items; n++) {
++        struct sub_bitmaps *imgs = list->items[n];
++        if (!imgs->num_parts)
++            continue;
++        int64_t t = mp_time_ns();
++        if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++            p->perf.blend_ns += mp_time_ns() - t;
++            drawn = true;
++            continue;
++        }
++        if (!context) {
++            CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++            context = colorSpace ? CGBitmapContextCreate(
++                base, w, h, 8, stride, colorSpace,
++                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
++            ) : NULL;
++            if (colorSpace)
++                CGColorSpaceRelease(colorSpace);
++            if (!context)
++                continue;
++        }
++        draw_subtitle_bitmaps(context, imgs, h);
++        p->perf.cg_ns += mp_time_ns() - t;
++        drawn = true;
++    }
++    if (context)
++        CGContextRelease(context);
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    if (!drawn) {
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++    return pixbuf;
++}
++
+ static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
+                                                   int64_t media_pts_ns,
+                                                   bool *needed)
+@@ -2831,10 +2968,15 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+         p->osd_needs_enqueue = true;
+ }
+ 
+-// Render OSD/subtitles for an already computed geometry.
+-static bool render_osd_with_geometry(struct vo *vo, double pts,
+-                                     struct avf_render_geometry geometry,
+-                                     int frame_h)
++static const bool osd_formats[SUBBITMAP_COUNT] = {
++    [SUBBITMAP_BGRA] = true,
++    [SUBBITMAP_LIBASS] = true,
++};
++
++// The OSD canvas for a frame of height frame_h shown with geometry. False
++// when there is nothing to draw on.
++static bool osd_canvas(struct vo *vo, struct avf_render_geometry geometry,
++                       int frame_h, struct avf_osd_canvas *out)
+ {
+     struct priv *p = vo->priv;
+ 
+@@ -2883,44 +3025,124 @@ static bool render_osd_with_geometry(struct vo *vo, double pts,
+         osd_h = osd_res.h;
+     }
+ 
+-    if (!osd_res_equals(p->osd_res, osd_res)) {
+-        p->osd_res = osd_res;
+-        p->osd_change_id = 0;
+-    }
+-    p->osd_w = osd_w;
+-    p->osd_h = osd_h;
++    *out = (struct avf_osd_canvas){.w = osd_w, .h = osd_h, .res = osd_res};
++    return true;
++}
+ 
+-    static const bool formats[SUBBITMAP_COUNT] = {
+-        [SUBBITMAP_BGRA] = true,
+-        [SUBBITMAP_LIBASS] = true,
+-    };
++static bool osd_canvas_equal(const struct avf_osd_canvas *a,
++                             const struct avf_osd_canvas *b)
++{
++    return a->w == b->w && a->h == b->h && osd_res_equals(a->res, b->res);
++}
+ 
+-    // Reset flag before calling osd_draw
+-    p->osd_callback_invoked = false;
++// Forget the displayed subtitle; the inline layer then needs a clear sample.
++static void drop_displayed_subtitle(struct priv *p)
++{
++    p->has_subtitle = false;
++    p->osd_change_id = 0;
++    if (p->cachedSubtitleImage) {
++        CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = NULL;
++    }
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
++    }
++    if (should_use_inline_osd_layer(p))
++        p->osd_needs_enqueue = true;
++}
+ 
+-    osd_draw(vo->osd, osd_res, pts, 0, formats, draw_osd_cb, vo);
++// Inline layer: the whole list becomes the overlay buffer the next OSD
++// sample carries.
++static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
+ 
+-    // If callback wasn't invoked, there are no subtitles for this PTS
+-    // Clear any cached subtitle state
+-    if (!p->osd_callback_invoked && p->has_subtitle) {
+-        p->has_subtitle = false;
+-        p->osd_change_id = 0;
+-        if (p->cachedSubtitleImage) {
+-            CGImageRelease(p->cachedSubtitleImage);
+-            p->cachedSubtitleImage = NULL;
++    int parts = 0;
++    for (int n = 0; n < list->num_items; n++)
++        parts += list->items[n]->num_parts;
++    if (!parts) {
++        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
++            p->perf.empty++;
++            drop_displayed_subtitle(p);
+         }
+-        if (p->cachedSubtitleBuffer) {
+-            CVPixelBufferRelease(p->cachedSubtitleBuffer);
+-            p->cachedSubtitleBuffer = NULL;
++        return;
++    }
++
++    if (list->change_id && list->change_id == p->osd_change_id &&
++        p->has_subtitle && p->cachedSubtitleBuffer)
++    {
++        p->perf.skipped++;
++        return;
++    }
++
++    int64_t t_render = mp_time_ns();
++    CVPixelBufferRef subtitleBuffer = render_subtitle_list_pixel_buffer(vo, list);
++    if (!subtitleBuffer)
++        return;
++    if (p->cachedSubtitleBuffer)
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++    p->cachedSubtitleBuffer = subtitleBuffer;
++
++    int64_t t_bounds = mp_time_ns();
++    reset_subtitle_bounds(p);
++    for (int n = 0; n < list->num_items; n++)
++        extend_subtitle_bounds(p, list->items[n]);
++    osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
++        p->subtitle_x0, p->subtitle_y0,
++        p->subtitle_x1, p->subtitle_y1});
++    p->perf.bounds_ns += mp_time_ns() - t_bounds;
++
++    int64_t render_ns = mp_time_ns() - t_render;
++    p->perf.renders++;
++    p->perf.total_ns += render_ns;
++    p->perf.max_ns = MPMAX(p->perf.max_ns, render_ns);
++    if (render_ns > MP_TIME_MS_TO_NS(8) && mp_msg_test(vo->log, MSGL_V)) {
++        int64_t now = mp_time_ns();
++        if (now - p->perf.last_spike_ns > MP_TIME_MS_TO_NS(1000)) {
++            p->perf.last_spike_ns = now;
++            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d)\n",
++                       render_ns / 1e6, parts, p->osd_w, p->osd_h);
+         }
+-        if (should_use_inline_osd_layer(p))
+-            p->osd_needs_enqueue = true;
+     }
+ 
+-    return true;
++    p->osd_change_id = list->change_id;
++    p->has_subtitle = true;
++    p->osd_needs_enqueue = true;
++}
++
++// Make list, rendered on canvas, what the next frame shows.
++static void apply_osd_list(struct vo *vo, const struct avf_osd_canvas *canvas,
++                           struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++
++    if (!osd_res_equals(p->osd_res, canvas->res)) {
++        p->osd_res = canvas->res;
++        p->osd_change_id = 0;
++    }
++    p->osd_w = canvas->w;
++    p->osd_h = canvas->h;
++
++    if (should_use_inline_osd_layer(p)) {
++        present_inline_osd_list(vo, list);
++        return;
++    }
++
++    // The composite modes keep per-item images (draw_osd_cb), which the
++    // video sample composites.
++    p->osd_callback_invoked = false;
++    for (int n = 0; n < list->num_items; n++)
++        draw_osd_cb(vo, list->items[n]);
++
++    // If callback wasn't invoked, there are no subtitles for this PTS
++    // Clear any cached subtitle state
++    if (!p->osd_callback_invoked && p->has_subtitle)
++        drop_displayed_subtitle(p);
+ }
+ 
+-// Render OSD/subtitles synchronously so timed clear samples are never skipped.
++// Render OSD/subtitles synchronously so timed clear samples are never
++// skipped. Only used when the render-ahead thread is unavailable.
+ static void render_osd(struct vo *vo, double pts)
+ {
+     struct priv *p = vo->priv;
+@@ -2928,9 +3150,268 @@ static void render_osd(struct vo *vo, double pts)
+     int frame_h = p->next_image ? p->next_image->h : 0;
+     struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
+ 
+-    render_osd_with_geometry(vo, pts, geometry, frame_h);
++    struct avf_osd_canvas canvas;
++    if (!osd_canvas(vo, geometry, frame_h, &canvas))
++        return;
++    struct sub_bitmap_list *list = osd_render(vo->osd, canvas.res, pts, 0, osd_formats);
++    apply_osd_list(vo, &canvas, list);
++    talloc_free(list);
+ }
+ 
++// --- subtitle render-ahead (osd_ahead.h)
++
++// Render thread: a result was queued. While paused, flip_page runs only for
++// the core's redraws, so nothing would show a result that missed its frame;
++// wake the VO thread to present it.
++static void ahead_result_posted(void *ctx)
++{
++    struct vo *vo = ctx;
++    struct priv *p = vo->priv;
++    if (!atomic_load(&p->ahead_paused))
++        return;
++    atomic_store(&p->ahead_late_result, true);
++    vo_wakeup(vo);
++}
++
++// Locked.
++static void ahead_latch_canvas(void *ctx)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    p->ahead_render_canvas = p->ahead_canvas;
++}
++
++static void ahead_canvas_size(void *ctx, int *w, int *h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    *w = p->ahead_render_canvas.w;
++    *h = p->ahead_render_canvas.h;
++}
++
++static struct mp_osd_res ahead_canvas_res(void *ctx, int w, int h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    return p->ahead_render_canvas.res;
++}
++
++static void ahead_start(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!vo->osd)
++        return;
++    p->ahead.log = vo->log;
++    p->ahead.osd = vo->osd;
++    p->ahead.formats = osd_formats;
++    p->ahead.cb = (struct osd_ahead_callbacks){
++        .ctx = vo,
++        .latch_canvas = ahead_latch_canvas,
++        .canvas_size = ahead_canvas_size,
++        .canvas_res = ahead_canvas_res,
++        .result_posted = ahead_result_posted,
++    };
++    p->ahead_last_pts = MP_NOPTS_VALUE;
++    if (!osd_ahead_start(&p->ahead))
++        MP_WARN(vo, "Subtitle render thread unavailable; rendering on the VO thread\n");
++}
++
++// File this frame's subtitles with the render thread: pinned to the frame
++// for a new one, an immediate repaint for a redraw. flip_page presents them.
++static void ahead_file_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++
++    p->ahead_req.valid = false;
++    if (!s->started || !p->next_image || p->ahead_replay)
++        return;
++
++    int frame_h = p->next_image->h;
++    struct avf_render_geometry geometry =
++        get_render_geometry(vo, p->next_image->w, frame_h);
++    struct avf_osd_canvas canvas;
++    if (!osd_canvas(vo, geometry, frame_h, &canvas))
++        return;
++
++    double pts = p->next_pts;
++    bool redraw = frame->redraw;
++    if (!redraw) {
++        if (pts == MP_NOPTS_VALUE)
++            osd_cadence_reset(&p->ahead_cadence);
++        else
++            osd_cadence_observe(&p->ahead_cadence, frame->frame_id, pts);
++    }
++
++    mp_mutex_lock(&s->lock);
++    if (!p->ahead_canvas_valid || !osd_canvas_equal(&p->ahead_canvas, &canvas)) {
++        // Nothing rendered for the old canvas may reach this one.
++        p->ahead_canvas = canvas;
++        p->ahead_canvas_valid = true;
++        osd_ahead_invalidate(s, pts);
++    }
++    osd_ahead_file_request(s, (struct osd_request){
++        .pts = pts,
++        .delta = redraw ? 0 : osd_cadence_delta(&p->ahead_cadence),
++        .seq = redraw ? 0 : ++p->ahead_frame_seq,
++        .epoch = s->epoch,
++    });
++    if (!redraw)
++        s->stats.frames++;
++    // What the filing became: a repaint moves to a new epoch, or adopts a
++    // pending frame of the same pts.
++    p->ahead_req.valid = true;
++    p->ahead_req.seq = s->request.seq;
++    p->ahead_req.epoch = s->request.epoch;
++    // While paused a new frame (a seek) is shown at once: there is no queue
++    // lead to protect.
++    p->ahead_req.timed = !redraw && frame->pts > 0 && !s->paused;
++    mp_mutex_unlock(&s->lock);
++    p->ahead_last_pts = pts;
++}
++
++// Present what the render thread has for this frame, waiting only as long
++// as avf_osd_wait_until allows. A result that arrives later is shown with a
++// later frame; of several ready ones only the newest is drawn.
++static void ahead_present(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    bool composite = should_composite_into_video(p);
++
++    mp_mutex_lock(&s->lock);
++    if (p->ahead_req.valid && p->ahead_req.seq) {
++        osd_ahead_publish_release(s, (struct osd_release){
++            .seq = p->ahead_req.seq,
++            .timestamp = p->next_present_host_ns,
++        });
++    }
++    if (p->ahead_req.valid) {
++        int64_t now = mp_time_ns();
++        bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
++                      s->served_seq + 1 < p->ahead_req.seq;
++        int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
++            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), p->ahead_req.timed,
++            composite, behind);
++        if (behind)
++            p->ahead_perf.behind++;
++        if (until > now) {
++            bool served = osd_ahead_wait_served(s, p->ahead_req.epoch,
++                                                p->ahead_req.seq, until);
++            int64_t waited = mp_time_ns() - now;
++            p->ahead_perf.waited++;
++            p->ahead_perf.wait_ns += waited;
++            p->ahead_perf.wait_max_ns = MPMAX(p->ahead_perf.wait_max_ns, waited);
++            if (!served)
++                p->ahead_perf.gave_up++;
++        }
++    }
++    int dropped;
++    struct osd_result r = osd_ahead_take_newest(s, &dropped);
++    struct sub_bitmap_list *list = r.slot >= 0 ? s->slots[r.slot].sbs : NULL;
++    mp_mutex_unlock(&s->lock);
++    p->ahead_req.valid = false;
++    p->ahead_perf.dropped += dropped;
++
++    // The taken slot stays immutable while it is present_slot.
++    if (!list)
++        return;
++    p->ahead_perf.presented++;
++    if (r.seq && r.seq < p->ahead_frame_seq) {
++        int late = (int)(p->ahead_frame_seq - r.seq);
++        p->ahead_perf.late++;
++        p->ahead_perf.max_late = MPMAX(p->ahead_perf.max_late, late);
++    }
++    apply_osd_list(vo, &p->ahead_canvas, list);
++}
++
++// Nothing the render thread has rendered or is rendering counts as shown any
++// more: repaint in full at pts.
++static void ahead_invalidate(struct priv *p, double pts)
++{
++    if (!p->ahead.started)
++        return;
++    mp_mutex_lock(&p->ahead.lock);
++    osd_ahead_invalidate(&p->ahead, pts);
++    mp_mutex_unlock(&p->ahead.lock);
++}
++
++static void ahead_set_paused(struct priv *p, bool paused)
++{
++    if (!p->ahead.started)
++        return;
++    mp_mutex_lock(&p->ahead.lock);
++    p->ahead.paused = paused;
++    mp_cond_broadcast(&p->ahead.wakeup);
++    mp_mutex_unlock(&p->ahead.lock);
++    atomic_store(&p->ahead_paused, paused);
++    // A result queued just before the pause saw playback still running and
++    // is waiting for a frame that will not come.
++    if (paused)
++        atomic_store(&p->ahead_late_result, true);
++}
++
++static void flip_page(struct vo *vo);
++static bool draw_frame(struct vo *vo, struct vo_frame *frame);
++
++// Paused: redraw the frame on screen with a result that arrived after it, as
++// the core's redraw would, but without filing a request. A filing is a
++// repaint, which would discard the very result that is ready and render it
++// again.
++static void ahead_present_late(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    if (!s->started || !p->ahead_shown_image)
++        return;
++    mp_mutex_lock(&s->lock);
++    struct osd_result *head = osd_result_head(&s->results);
++    bool ready = s->paused && head && (!head->seq || head->release.seq == head->seq);
++    mp_mutex_unlock(&s->lock);
++    if (!ready)
++        return;
++    struct vo_frame frame = {
++        .pts = 0,
++        .duration = -1,
++        .redraw = true,
++        .still = true,
++        .current = p->ahead_shown_image,
++        .num_frames = 1,
++        .frames = {p->ahead_shown_image},
++    };
++    p->ahead_replay = true;
++    if (draw_frame(vo, &frame))
++        flip_page(vo);
++    p->ahead_replay = false;
++}
++
++static void report_ahead_perf(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    if (!s->started || !mp_msg_test(vo->log, MSGL_V))
++        return;
++    mp_mutex_lock(&s->lock);
++    struct osd_ahead_stats st = s->stats;
++    struct osd_spec spec = s->spec;
++    uint32_t prefetch = s->prefetch.count;
++    mp_mutex_unlock(&s->lock);
++    int nw = MPMAX(p->ahead_perf.waited, 1);
++    MP_VERBOSE(vo, "osd-ahead: presented=%d waited=%d (avg %.2fms max %.2fms) "
++               "gave_up=%d behind=%d dropped=%d late=%d (max %d frames) | "
++               "renders=%u/%u maxMs=%d hist=%u,%u,%u,%u,%u spec=%u/%u/%u "
++               "horizonSkips=%u prefetch=%u coalesced=%u stale=%u\n",
++               p->ahead_perf.presented, p->ahead_perf.waited,
++               p->ahead_perf.wait_ns / nw / 1e6, p->ahead_perf.wait_max_ns / 1e6,
++               p->ahead_perf.gave_up, p->ahead_perf.behind, p->ahead_perf.dropped,
++               p->ahead_perf.late, p->ahead_perf.max_late,
++               st.renders_changed, st.renders, (int)(st.render_ns_max / 1000000),
++               st.render_hist[0], st.render_hist[1], st.render_hist[2],
++               st.render_hist[3], st.render_hist[4],
++               spec.hits, spec.misses, spec.skips, spec.horizon_skips, prefetch,
++               st.coalesced, st.stale);
++    memset(&p->ahead_perf, 0, sizeof(p->ahead_perf));
++}
++
++// --- end subtitle render-ahead
++
+ static bool ensure_ci_compositor(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -3318,6 +3799,7 @@ static int preinit(struct vo *vo)
+     // The OSD layer's lifetime follows the option: created here, kept in step
+     // by sync_osd_layer_frame.
+     ensure_osd_layer(vo);
++    ahead_start(vo);
+ 
+     vo->hwdec_devs = hwdec_devices_create();
+     p->hwctx = (struct mp_hwdec_ctx){
+@@ -3606,12 +4088,15 @@ static void flip_page(struct vo *vo)
+         CMSampleBufferRef osd_buf = NULL;
+         bool osd_needed = false;
+ 
+-        // The OSD is rendered and enqueued before the video sample on
+-        // purpose: the adjacent enqueues are what keep subtitle changes
+-        // presenting on the exact frame they belong to. A slow subtitle
+-        // render delays the video enqueue with it rather than letting the
+-        // video run ahead of the subtitles.
+-        render_osd(vo, p->next_pts);
++        // The OSD is enqueued before the video sample on purpose: the
++        // adjacent enqueues are what keep subtitle changes presenting on the
++        // exact frame they belong to. The subtitles were rendered ahead;
++        // when they are late, the video goes without them (ahead_present).
++        if (p->ahead.started) {
++            ahead_present(vo);
++        } else {
++            render_osd(vo, p->next_pts);
++        }
+ 
+         int64_t osd_pts_ns = sample_presentation_pts_ns(p);
+         osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
+@@ -3674,9 +4159,16 @@ static void flip_page(struct vo *vo)
+     // Report often enough that short capture sessions still carry data.
+     if (p->perf.renders >= 32 ||
+         (p->perf.renders > 0 && p->perf.frames >= 300))
++    {
+         report_osd_perf(vo);
++        report_ahead_perf(vo);
++    }
+ 
+-    mp_image_unrefp(&p->next_image);
++    if (p->next_image) {
++        mp_image_unrefp(&p->ahead_shown_image);
++        p->ahead_shown_image = p->next_image;
++        p->next_image = NULL;
++    }
+ }
+ 
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -3718,6 +4210,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
+             &p->next_timebase_rate);
+     }
++    ahead_file_frame(vo, frame);
+     return true;
+ }
+ 
+@@ -3752,6 +4245,7 @@ static void clear_subtitle_cache(struct priv *p)
+     p->osd_needs_enqueue = false;
+     p->osd_callback_invoked = false;
+     p->subtitle_x0 = p->subtitle_y0 = p->subtitle_x1 = p->subtitle_y1 = 0;
++    ahead_invalidate(p, p->ahead_last_pts);
+ }
+ 
+ // Helper to clear all subtitle state (called on video change/stop)
+@@ -3777,6 +4271,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
+     MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
+ 
+     // Clear subtitles when video configuration changes
++    struct priv *p = vo->priv;
++    p->ahead_last_pts = MP_NOPTS_VALUE;
++    osd_cadence_reset(&p->ahead_cadence);
++    mp_image_unrefp(&p->ahead_shown_image);
+     clear_subtitle_state(vo);
+     sync_osd_layer_frame(vo);
+ 
+@@ -3788,6 +4286,10 @@ static void uninit(struct vo *vo)
+     struct priv *p = vo->priv;
+ 
+     report_osd_perf(vo);
++    report_ahead_perf(vo);
++    if (p->ahead.started)
++        osd_ahead_stop(&p->ahead);
++    osd_ahead_destroy(&p->ahead);
+ 
+ #if TARGET_OS_IPHONE
+     if (p->app_resign_observer || p->app_active_observer) {
+@@ -3820,6 +4322,7 @@ static void uninit(struct vo *vo)
+     }
+ 
+     mp_image_unrefp(&p->next_image);
++    mp_image_unrefp(&p->ahead_shown_image);
+     sample_buffer_renderer_flush(p->displayLayer, true);
+     sample_buffer_renderer_flush(p->osdLayer, true);
+ 
+@@ -3896,6 +4399,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         if (atomic_exchange(&p->pending_layer_geometry_sync, false))
+             handle_layer_geometry_change(vo);
+         update_avfoundation_options(vo);
++        if (atomic_exchange(&p->ahead_late_result, false))
++            ahead_present_late(vo);
+         return VO_TRUE;
+     case VOCTRL_VO_OPTS_CHANGED:
+         update_avfoundation_options(vo);
+@@ -3914,6 +4419,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         // skip. Reference VOs (gpu/gpu-next) hold the last frame through
+         // seeks; the OSD layer still drops so stale subtitles don't linger
+         // over the held frame.
++        p->ahead_last_pts = MP_NOPTS_VALUE;
++        osd_cadence_reset(&p->ahead_cadence);
+         clear_subtitle_state(vo);
+         p->not_ready_drop_count = 0;
+         p->last_not_ready_drop_ns = 0;
+@@ -3940,10 +4447,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_PAUSE:
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, true);
++        ahead_set_paused(p, true);
+         return VO_TRUE;
+     case VOCTRL_RESUME:
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, false);
++        ahead_set_paused(p, false);
+         return VO_TRUE;
+     case VOCTRL_REDRAW:
+         p->osd_change_id = 0;

@@ -1,0 +1,26 @@
+vo_mediacodec: document compacted atlases on the OSD plane
+
+The vo.rst half of 0014, split from it so the sub/ half can be shared with
+the other VOs.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -763,8 +763,15 @@
+     pending renderer. This prefetch path is used by this Android VO; it does
+     not enable persistent libass layout caching.
+     A render that repeats the pixels already on screen is
+-    folded into them and costs no swap. Rasterized frames are
+-    uploaded and composed on the GPU while the present thread is idle, and
++    folded into them and costs no swap. Glyph masks normally remain separate
++    and are composed on the GPU. Heavy overlap is flattened before upload
++    only when the masks occupy more than four times the composited RGBA
++    area in bytes; tracks requiring per-mask VSFilter color correction keep
++    their masks. Transparent pixels are skipped and opaque pixels copied
++    directly during CPU composition. Both workers use display priority.
++    Queue lookahead keeps a 50 ms/two-display-period floor and budgets two
++    source-frame intervals plus a composition display period, capped at 500 ms.
++    Rasterized frames are uploaded while the present thread is idle, and
+     presented through a GLES2 surface over the OSD Surface with the same
+     presentation timestamp the video buffer got, so both latch on one vsync.
+     The video is never held back for the OSD: under load subtitle updates

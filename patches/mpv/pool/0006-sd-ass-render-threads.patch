@@ -1,0 +1,28 @@
+sd_ass: let libass pick its render thread count
+
+Plezy's ExoPlayer subtitle path (android/libass AssKt.c) lets libass pick
+its render thread count with ass_set_threads(renderer, 0). Do the same on
+the mpv path, and log what it picked. The patched libass autodetects the
+core count when the call is never made, so this only makes the choice
+explicit; it is also the renderer setup patch 0013 splits into two
+renderers.
+
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -240,6 +240,15 @@ static void enable_output(struct sd *sd, bool enable)
+     } else {
+         ctx->ass_renderer = ass_renderer_init(ctx->ass_library);
+ 
++        // Same renderer setup as Plezy's ExoPlayer libass path (AssKt.c):
++        // the pool size is autodetected from the core count. mpv's message
++        // callback is thread-safe, which ass_set_threads requires.
++        unsigned threads = ass_set_threads(ctx->ass_renderer, 0);
++        if (threads)
++            MP_VERBOSE(sd, "libass rendering threads: %u\n", threads);
++        else
++            MP_WARN(sd, "libass built without threading support\n");
++
+         mp_ass_configure_fonts(ctx->ass_renderer, sd->opts->sub_style,
+                                sd->global, sd->log);
+     }

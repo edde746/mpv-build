@@ -30,10 +30,10 @@ index a77c20d..b5929ab 100644
      'video/out/vo_image.c',
 diff --git a/video/out/osd_ahead.c b/video/out/osd_ahead.c
 new file mode 100644
-index 0000000..4270873
+index 0000000..69dfb8d
 --- /dev/null
 +++ b/video/out/osd_ahead.c
-@@ -0,0 +1,819 @@
+@@ -0,0 +1,874 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -549,7 +549,8 @@ index 0000000..4270873
 +}
 +
 +// Locked. Preserve every accepted future pose until presentation or invalidation.
-+static void osd_post_result(struct osd_ahead *s, struct osd_render_state *rs,
++// Locked. Returns whether the result was queued.
++static bool osd_post_result(struct osd_ahead *s, struct osd_render_state *rs,
 +                            int slot, const struct osd_request *req)
 +{
 +    struct osd_release release = osd_find_release(s, req->seq);
@@ -558,7 +559,7 @@ index 0000000..4270873
 +    {
 +        s->stats.stale++;
 +        rs->force_full = true;
-+        return;
++        return false;
 +    }
 +    struct osd_result r = {
 +        .slot = slot, .seq = req->seq, .epoch = req->epoch,
@@ -569,11 +570,27 @@ index 0000000..4270873
 +    assert(queued);
 +    if (!queued) {
 +        rs->force_full = true;
-+        return;
++        return false;
 +    }
 +    rs->posted_change_id = s->slots[slot].sbs->change_id;
 +    rs->force_full = false;
 +    mp_cond_broadcast(&s->wakeup);
++    return true;
++}
++
++static void osd_notify_posted(struct osd_ahead *s, bool queued)
++{
++    if (queued && s->cb.result_posted)
++        s->cb.result_posted(s->cb.ctx);
++}
++
++// Locked. The request is done: its result, if the OSD changed, is posted.
++static void osd_mark_served(struct osd_ahead *s, const struct osd_request *req)
++{
++    s->served_seq = req->seq;
++    s->served_epoch = req->epoch;
++    if (s->served_waiter)
++        mp_cond_broadcast(&s->wakeup);
 +}
 +
 +static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs,
@@ -596,16 +613,19 @@ index 0000000..4270873
 +                                                rs->force_full, req.delta);
 +    s->spec.slot = -1;
 +    if (hit == OSD_SPEC_HIT) {
-+        if (spec_slot >= 0)
-+            osd_post_result(s, rs, spec_slot, &req);
++        bool queued = spec_slot >= 0 && osd_post_result(s, rs, spec_slot, &req);
 +        osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++        osd_mark_served(s, &req);
 +        mp_mutex_unlock(&s->lock);
 +        rs->last = req;
++        osd_notify_posted(s, queued);
 +        return;
 +    }
 +    // Admission reserves queue capacity and consuming speculation frees its
 +    // slot; an active frame and event prefetch cannot exhaust the working slots.
 +    int slot = osd_free_slot(s);
++    if (slot < 0)
++        osd_mark_served(s, &req);
 +    mp_mutex_unlock(&s->lock);
 +    if (slot < 0) {
 +        rs->last = req;
@@ -615,11 +635,12 @@ index 0000000..4270873
 +    bool posted = osd_render_pass(s, rs, req.pts, slot);
 +
 +    mp_mutex_lock(&s->lock);
-+    if (posted)
-+        osd_post_result(s, rs, slot, &req);
++    bool queued = posted && osd_post_result(s, rs, slot, &req);
 +    osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++    osd_mark_served(s, &req);
 +    mp_mutex_unlock(&s->lock);
 +    rs->last = req;
++    osd_notify_posted(s, queued);
 +}
 +
 +static void osd_speculate(struct osd_ahead *s, struct osd_render_state *rs,
@@ -804,6 +825,40 @@ index 0000000..4270873
 +    mp_cond_broadcast(&s->wakeup);
 +}
 +
++// Locked.
++bool osd_ahead_wait_served(struct osd_ahead *s, uint64_t epoch, uint64_t seq,
++                           int64_t until)
++{
++    s->served_waiter = true;
++    bool served;
++    while (!(served = s->served_epoch == epoch && s->served_seq >= seq)) {
++        if (s->terminate || s->epoch != epoch || mp_time_ns() >= until)
++            break;
++        mp_cond_timedwait_until(&s->wakeup, &s->lock, until);
++    }
++    s->served_waiter = false;
++    return served;
++}
++
++// Locked.
++struct osd_result osd_ahead_take_newest(struct osd_ahead *s, int *dropped)
++{
++    struct osd_result newest = {.slot = -1};
++    *dropped = 0;
++    for (struct osd_result *head; (head = osd_result_head(&s->results));) {
++        if (head->seq && head->release.seq != head->seq)
++            break; // its frame has not been flipped yet
++        if (newest.slot >= 0)
++            (*dropped)++;
++        newest = osd_result_pop(&s->results);
++    }
++    if (newest.slot >= 0) {
++        s->present_slot = newest.slot;
++        mp_cond_broadcast(&s->wakeup); // queue capacity for the render thread
++    }
++    return newest;
++}
++
 +bool osd_ahead_start(struct osd_ahead *s)
 +{
 +    assert(!s->started);
@@ -855,10 +910,10 @@ index 0000000..4270873
 +}
 diff --git a/video/out/osd_ahead.h b/video/out/osd_ahead.h
 new file mode 100644
-index 0000000..7373148
+index 0000000..7d62fc4
 --- /dev/null
 +++ b/video/out/osd_ahead.h
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,258 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -1016,6 +1071,10 @@ index 0000000..7373148
 +    // Render thread: the OSD resolution for a w x h canvas under the latched
 +    // description.
 +    struct mp_osd_res (*canvas_res)(void *ctx, int w, int h);
++    // Render thread, unlocked: a result was queued. A presenter that runs
++    // only when a frame is shown needs this: while paused, no later frame
++    // comes to show a result that missed its own. Optional.
++    void (*result_posted)(void *ctx);
 +};
 +
 +// Counters the VO reads for its statistics (writer noted per field).
@@ -1052,6 +1111,10 @@ index 0000000..7373148
 +    // render -> presenter
 +    struct osd_result_queue results;
 +    int present_slot;           // slot on screen or being presented, -1 none
++    // render -> presenter: the last request the render thread finished,
++    // whether or not it posted a result (an unchanged OSD posts none).
++    uint64_t served_seq, served_epoch;
++    bool served_waiter;         // broadcast wakeup when a request is served
 +
 +    struct osd_ahead_stats stats;
 +    struct osd_spec spec;       // render (counters read by the VO thread)
@@ -1083,6 +1146,19 @@ index 0000000..7373148
 +void osd_ahead_invalidate(struct osd_ahead *s, double pts);
 +// Locked. Publish when the frame with release.seq is shown.
 +void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release);
++
++// For a presenter that draws on the thread that flips the video, and so must
++// know when to stop waiting for a frame's subtitles.
++// Locked. Wait, releasing the lock, until the render thread has served the
++// request (epoch, seq) or until `until` (mp_time_ns). Returns whether it was
++// served; false also when the timeline moved to another epoch.
++bool osd_ahead_wait_served(struct osd_ahead *s, uint64_t epoch, uint64_t seq,
++                           int64_t until);
++// Locked. Pop every result whose frame has been flipped (or that is an
++// unpinned repaint) and return the newest, with slot -1 when there is none;
++// *dropped counts the older ones popped with it. The newest becomes
++// present_slot.
++struct osd_result osd_ahead_take_newest(struct osd_ahead *s, int *dropped);
 +
 +// Scheduler core, freestanding (see the osd ahead scheduler core region).
 +int64_t osd_median_ns(const int64_t *v, int n);

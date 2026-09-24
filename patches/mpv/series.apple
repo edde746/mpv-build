@@ -28,3 +28,10 @@
 0029-moltenvk-report-display-colorspace.patch
 0030-avfoundation-hdr10plus-per-frame-metadata.patch
 0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
+0006-sd-ass-render-threads.patch
+0011-sub-render-horizon-for-vo-prefetch.patch
+0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared.patch
+0013-sd-ass-isolate-event-prefetch-renderer.patch
+0014-ass-mp-compact-high-overdraw-atlases.patch
+0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
+0032-avfoundation-render-subtitles-through-the-shared-osd-pipeline.patch

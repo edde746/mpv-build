@@ -1,3 +1,16 @@
+ass_mp: compact high-overdraw atlases
+
+A sign made of many large, overlapping libass masks can need an atlas far
+bigger than the frame it covers. The Ex2 sample's hold sign is 131 blurred
+drawings, 153 Mpx of masks on a 4K canvas: the atlas exceeds what
+mp_image_alloc accepts, packing fails and the sign is never shown. When a
+VO takes both formats, flatten such a list into BGRA before packing: only
+when the masks occupy more than four times the composited RGBA area in
+bytes, so ordinary dialogue and animation stay on the cheap mask path.
+Transparent pixels are skipped and opaque ones copied directly during the
+composition. Tracks that need per-mask VSFilter color correction keep their
+masks.
+
 diff --git a/sub/ass_mp.c b/sub/ass_mp.c
 --- a/sub/ass_mp.c
 +++ b/sub/ass_mp.c
@@ -234,24 +247,3 @@ diff --git a/sub/sd.h b/sub/sd.h
      struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
                                         int format, double pts, bool prefetch);
      char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
-diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
---- a/DOCS/man/vo.rst
-+++ b/DOCS/man/vo.rst
-@@ -763,8 +763,15 @@
-     pending renderer. This prefetch path is used by this Android VO; it does
-     not enable persistent libass layout caching.
-     A render that repeats the pixels already on screen is
--    folded into them and costs no swap. Rasterized frames are
--    uploaded and composed on the GPU while the present thread is idle, and
-+    folded into them and costs no swap. Glyph masks normally remain separate
-+    and are composed on the GPU. Heavy overlap is flattened before upload
-+    only when the masks occupy more than four times the composited RGBA
-+    area in bytes; tracks requiring per-mask VSFilter color correction keep
-+    their masks. Transparent pixels are skipped and opaque pixels copied
-+    directly during CPU composition. Both workers use display priority.
-+    Queue lookahead keeps a 50 ms/two-display-period floor and budgets two
-+    source-frame intervals plus a composition display period, capped at 500 ms.
-+    Rasterized frames are uploaded while the present thread is idle, and
-     presented through a GLES2 surface over the OSD Surface with the same
-     presentation timestamp the video buffer got, so both latch on one vsync.
-     The video is never held back for the OSD: under load subtitle updates

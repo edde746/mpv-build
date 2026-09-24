@@ -23,9 +23,15 @@ struct osd_ahead {
     uint64_t release_seq, epoch;
     bool terminate, present_failed, requested;
     struct osd_request request;
+    uint64_t served_seq, served_epoch;
+    bool served_waiter;
     struct osd_ahead_stats stats;
     struct osd_slot slots[OSD_SLOTS];
     int lock, wakeup;
+    struct {
+        void *ctx;
+        void (*result_posted)(void *ctx);
+    } cb;
 };
 struct sub_bitmap_list { int change_id; };
 struct osd_render_state {
@@ -295,13 +301,81 @@ static void test_expired_release_does_not_authorize_or_suppress_a_clear(void)
     take(&p, &blank, publish(&p, 200));
 }
 
+// The helpers for a presenter on the video thread (vo_avfoundation): it
+// learns when its frame's request is done even when the OSD did not change,
+// and draws only the newest flipped result.
+static void test_flip_thread_presenter_takes_the_newest_flipped_result(void)
+{
+    struct priv p = warmed();
+    request(&p, 10.02, 101, false); // sign
+    check(p.osd.served_seq == 101 && p.osd.served_epoch == 7,
+          "a request that posts is served");
+    request(&p, 10.06, 102, false); // blank
+    request(&p, 10.07, 103, false); // still blank: nothing to post
+    check(p.osd.served_seq == 103 && p.osd.results.count == 2,
+          "an unchanged OSD posts nothing but its request is still served");
+    request(&p, 10.125, 104, false); // dialogue, not flipped yet
+    publish(&p, 101);
+    publish(&p, 102);
+    publish(&p, 103);
+
+    int dropped = -1;
+    struct osd_result r = osd_ahead_take_newest(&p.osd, &dropped);
+    check(r.seq == 102 && dropped == 1 && p.osd.slots[r.slot].sbs == &blank,
+          "the newest flipped result wins over an older ready one");
+    check(p.osd.present_slot == r.slot, "the taken slot is the one on screen");
+    check(osd_result_head(&p.osd.results) && osd_result_head(&p.osd.results)->seq == 104,
+          "a result whose frame is not flipped yet stays queued");
+
+    r = osd_ahead_take_newest(&p.osd, &dropped);
+    check(r.slot == -1 && dropped == 0, "nothing more is ready before the flip");
+    publish(&p, 104);
+    r = osd_ahead_take_newest(&p.osd, &dropped);
+    check(r.seq == 104 && p.osd.slots[r.slot].sbs == &dialogue,
+          "the flipped dialogue is taken");
+}
+
+static int posted_notifications;
+static void count_posted(void *ctx)
+{
+    (void)ctx;
+    posted_notifications++;
+}
+
+// A presenter that runs only on frames (vo_avfoundation while paused) learns
+// of every queued result and of nothing else: a render with nothing new, or
+// one a repaint cancelled, must not wake it.
+static void test_queued_results_notify_the_presenter(void)
+{
+    struct priv p = warmed();
+    p.osd.cb.result_posted = count_posted;
+    posted_notifications = 0;
+    request(&p, 10.02, 101, false); // sign
+    check(posted_notifications == 1, "a queued result notifies");
+    request(&p, 10.03, 102, false); // the same sign
+    check(posted_notifications == 1, "an unchanged OSD does not notify");
+    p.osd_pts = 10.06;
+    p.after_render = invalidate;
+    request(&p, 10.06, 103, false); // cancelled while rendering
+    check(posted_notifications == 1, "a result the epoch rejected does not notify");
+    service_pending(&p); // the repaint
+    check(posted_notifications == 2, "the repaint's result notifies");
+    p.osd.slots[2].sbs = &dialogue;
+    osd_spec_store(&p.osd.spec, 10.125, p.osd.epoch, 2);
+    request(&p, 10.125, 104, false);
+    check(p.osd.results.count == 2 && posted_notifications == 3,
+          "a pre-rendered result served from its slot notifies");
+}
+
 int main(void)
 {
+    test_flip_thread_presenter_takes_the_newest_flipped_result();
     test_warmed_images_require_timestamp_validation();
     test_three_pixel_states_survive_a_busy_presenter();
     test_cancelled_clear_is_not_suppressed_by_render_history();
     test_render_finishing_after_cancellation_can_still_clear();
     test_expired_release_does_not_authorize_or_suppress_a_clear();
+    test_queued_results_notify_the_presenter();
     printf("mediacodec osd requests: all content scenarios passed\n");
     return 0;
 }
