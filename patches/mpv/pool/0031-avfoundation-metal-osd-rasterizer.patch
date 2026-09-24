@@ -1,0 +1,773 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 08:00:00 +0200
+Subject: [PATCH] vo_avfoundation: rasterize the inline OSD layer on the GPU
+
+Heavy ASS typesetting played noticeably worse on Apple TV than on
+players that composite subtitles on the GPU. The inline OSD layer's
+buffer is display-sized (3840x2160 on a 4K output), and every changed
+subtitle frame was cleared and blended into it on the VO thread, one
+part at a time on the CPU, before the video sample could be enqueued.
+Animated signs change every frame, so that cost landed on every frame.
+
+Draw the part list with Metal instead. Copy the parts' bitmaps into a
+shelf-packed atlas texture (a linear buffer, so the upload is row
+copies; mpv's own atlas can be wider than any Apple GPU texture) and
+draw each part as a textured quad into the pool buffer (IOSurface-backed
+and Metal-compatible already), with premultiplied source-over blending:
+the composition blend_libass_bgra() and blend_bgra_over_bgra() perform.
+The atlas is capped at about 32 MiB; a frame with more coverage is drawn
+in further passes, in part order. The first pass clears the target, so
+recycled buffers need no CPU clear. The draw waits for the GPU before
+returning, keeping the OSD-then-video enqueue order that presents
+subtitle changes on their frame.
+
+Only the pixels of the OSD layer's buffers change. The video samples,
+and with them Dolby Vision and HDR passthrough, are untouched, and the
+OSD stays a separate, timebase-driven AVSampleBufferDisplayLayer. The
+composite paths (composite-osd, PiP) keep the CPU buffer they read back.
+The CPU path remains the fallback when Metal setup or a render fails,
+and --avfoundation-osd-gpu=no selects it outright. osd-perf now reports
+the Metal renders with their upload and GPU time.
+
+Measured on an Apple TV 4K (A15), Dolby Vision 4K episode, 4K OSD. A
+synthetic track of about 200 full-width blurred parts per frame renders
+in 52 ms instead of 59-61 ms (interleaved runs), 12 of it the atlas copy
+and 38 GPU execution, so it stays over a 24 fps frame. Ordinary dialogue
+and signs cost 4-9 ms per render on either path.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 686e99a..300bfc3 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -19,6 +19,7 @@
+ #include <stdlib.h>
+ #include <stdatomic.h>
+ #include <limits.h>
++#include <time.h>
+ #if defined(__aarch64__)
+ #include <arm_neon.h>
+ #endif
+@@ -40,6 +41,7 @@
+ #import <CoreMedia/CoreMedia.h>
+ #import <AVFoundation/AVFoundation.h>
+ #import <CoreGraphics/CoreGraphics.h>
++#import <CoreVideo/CoreVideo.h>
+ #import <CoreImage/CoreImage.h>
+ #import <QuartzCore/QuartzCore.h>
+ #import <Metal/Metal.h>
+@@ -91,6 +93,7 @@
+     int presentation;
+     int osd_max_height;
+     bool osd_video_res;
++    bool osd_gpu;
+ };
+ 
+ // --- avf sync servo core (host-testable; keep freestanding) ---
+@@ -298,6 +301,434 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+ }
+ // --- end avf sync servo core ---
+ 
++// --- avf metal osd core ---
++//
++// Rasterizes an OSD part list into a BGRA pixel buffer on the GPU. The parts'
++// bitmaps (libass coverage masks, or premultiplied BGRA for bitmap subtitles)
++// are copied into an atlas texture and each part is drawn as a textured quad
++// with premultiplied source-over blending, the same composition
++// blend_libass_bgra() and blend_bgra_over_bgra() perform on the CPU. The first
++// render pass clears the whole target, so a recycled pool buffer needs no CPU
++// clear. The draw blocks until the GPU finished: the caller enqueues the buffer
++// right after, and a sample buffer carries no GPU fence.
++//
++// The atlas is packed here rather than reusing mpv's: that one is laid out for
++// area, not for a texture size limit (15368 pixels wide for a 4K sign), and
++// copying only the parts is less than copying its bounding box. Its memory is
++// capped; parts beyond one atlas are drawn in further passes, in order.
++//
++// Freestanding apart from the sub_bitmaps fields it reads, so the host harness
++// (scripts/test_avf_metal_osd.sh) compiles it verbatim.
++
++static const char avf_metal_osd_shader[] =
++    "#include <metal_stdlib>\n"
++    "using namespace metal;\n"
++    "struct Part { float4 dst; float4 src; float4 color; };\n"
++    "struct Frag { float4 pos [[position]]; float2 uv; float4 color [[flat]];\n"
++    "              float4 src [[flat]]; };\n"
++    "vertex Frag osd_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],\n"
++    "                       const device Part *parts [[buffer(0)]],\n"
++    "                       constant float2 &size [[buffer(1)]])\n"
++    "{\n"
++    "    Part p = parts[iid];\n"
++    "    float2 t = float2(float(vid & 1), float(vid >> 1));\n"
++    "    float2 xy = mix(p.dst.xy, p.dst.zw, t);\n"
++    "    Frag o;\n"
++    "    o.pos = float4(xy.x / size.x * 2.0 - 1.0, 1.0 - xy.y / size.y * 2.0, 0.0, 1.0);\n"
++    "    o.uv = mix(p.src.xy, p.src.zw, t);\n"
++    "    o.color = p.color;\n"
++    "    o.src = p.src;\n"
++    "    return o;\n"
++    "}\n"
++    // libass bitmaps are drawn 1:1, so a coverage texel is read, not filtered.
++    "fragment float4 osd_mask_fragment(Frag in [[stage_in]],\n"
++    "                                  texture2d<float, access::read> atlas [[texture(0)]])\n"
++    "{\n"
++    "    uint2 texel = uint2(clamp(in.uv, in.src.xy, in.src.zw - 1.0));\n"
++    "    float a = atlas.read(texel).r * in.color.a;\n"
++    "    return float4(in.color.rgb * a, a);\n"
++    "}\n"
++    // Bitmap subtitles are scaled. Clamping to the part's own texel centers
++    // keeps bilinear filtering from reading its atlas neighbors.
++    "fragment float4 osd_bgra_fragment(Frag in [[stage_in]],\n"
++    "                                  texture2d<float> atlas [[texture(0)]])\n"
++    "{\n"
++    "    constexpr sampler s(coord::pixel, filter::linear, address::clamp_to_edge);\n"
++    "    return atlas.sample(s, clamp(in.uv, in.src.xy + 0.5, in.src.zw - 0.5));\n"
++    "}\n";
++
++// One instance of the quad; layout matches the shader's Part.
++struct avf_metal_osd_part {
++    float dst[4];   // x0, y0, x1, y1 in target pixels
++    float src[4];   // x0, y0, x1, y1 in atlas pixels
++    float color[4]; // straight RGB plus opacity; coverage atlases only
++};
++
++// Atlases live in linear, CPU-written buffers, so the upload is row copies. On
++// an Apple TV 4K (A15) a full-screen 4K sign uploaded through replaceRegion
++// cost two-thirds more for the same GPU time.
++struct avf_metal_osd_atlas {
++    id<MTLBuffer> buffer;
++    id<MTLTexture> texture; // views buffer
++    size_t stride;
++};
++
++struct avf_metal_osd {
++    id<MTLDevice> device;
++    id<MTLCommandQueue> queue;
++    id<MTLRenderPipelineState> mask_pipeline;
++    id<MTLRenderPipelineState> bgra_pipeline;
++    CVMetalTextureCacheRef texture_cache;
++    struct avf_metal_osd_atlas atlas[2]; // [0] R8 coverage, [1] BGRA; grow-only
++    id<MTLBuffer> parts;                 // grow-only
++};
++
++struct avf_metal_osd_timing {
++    int64_t upload_ns; // atlas and part upload (CPU)
++    int64_t gpu_ns;    // encode, submit and wait
++    int64_t exec_ns;   // of gpu_ns, GPU execution (command buffer timestamps)
++};
++
++static int64_t avf_metal_osd_now_ns(void)
++{
++    return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++}
++
++static id<MTLRenderPipelineState> avf_metal_osd_pipeline(id<MTLDevice> device,
++                                                          id<MTLLibrary> library,
++                                                          NSString *fragment,
++                                                          NSError **error)
++{
++    id<MTLFunction> vs = [library newFunctionWithName:@"osd_vertex"];
++    id<MTLFunction> fs = [library newFunctionWithName:fragment];
++    MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
++    desc.vertexFunction = vs;
++    desc.fragmentFunction = fs;
++    MTLRenderPipelineColorAttachmentDescriptor *color = desc.colorAttachments[0];
++    color.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    color.blendingEnabled = YES;
++    color.rgbBlendOperation = MTLBlendOperationAdd;
++    color.alphaBlendOperation = MTLBlendOperationAdd;
++    color.sourceRGBBlendFactor = MTLBlendFactorOne;
++    color.sourceAlphaBlendFactor = MTLBlendFactorOne;
++    color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    id<MTLRenderPipelineState> state = nil;
++    if (vs && fs)
++        state = [device newRenderPipelineStateWithDescriptor:desc error:error];
++    [desc release];
++    [vs release];
++    [fs release];
++    return state;
++}
++
++static void avf_metal_osd_uninit(struct avf_metal_osd *m)
++{
++    [m->parts release];
++    for (int i = 0; i < 2; i++) {
++        [m->atlas[i].texture release];
++        [m->atlas[i].buffer release];
++    }
++    if (m->texture_cache)
++        CFRelease(m->texture_cache);
++    [m->bgra_pipeline release];
++    [m->mask_pipeline release];
++    [m->queue release];
++    [m->device release];
++    *m = (struct avf_metal_osd){0};
++}
++
++static bool avf_metal_osd_init(struct avf_metal_osd *m, char *err, size_t err_size)
++{
++    @autoreleasepool {
++        *m = (struct avf_metal_osd){0};
++        m->device = MTLCreateSystemDefaultDevice();
++        if (!m->device) {
++            snprintf(err, err_size, "no Metal device");
++            return false;
++        }
++        m->queue = [m->device newCommandQueue];
++        NSError *error = nil;
++        id<MTLLibrary> library =
++            [m->device newLibraryWithSource:@(avf_metal_osd_shader) options:nil error:&error];
++        if (library) {
++            m->mask_pipeline = avf_metal_osd_pipeline(m->device, library,
++                                                      @"osd_mask_fragment", &error);
++            if (m->mask_pipeline) {
++                m->bgra_pipeline = avf_metal_osd_pipeline(m->device, library,
++                                                          @"osd_bgra_fragment", &error);
++            }
++            [library release];
++        }
++        if (CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, m->device, NULL,
++                                      &m->texture_cache) != kCVReturnSuccess)
++            m->texture_cache = NULL;
++        if (!m->queue || !m->mask_pipeline || !m->bgra_pipeline || !m->texture_cache) {
++            snprintf(err, err_size, "%s", error ? error.localizedDescription.UTF8String
++                                                : "Metal setup failed");
++            avf_metal_osd_uninit(m);
++            return false;
++        }
++        return true;
++    }
++}
++
++// Drop texture-cache entries for pool buffers that have since been freed.
++static void avf_metal_osd_flush(struct avf_metal_osd *m)
++{
++    if (m->texture_cache)
++        CVMetalTextureCacheFlush(m->texture_cache, 0);
++}
++
++// Atlas geometry per slot. Width holds any part of a 4K OSD (two coverage
++// masks per shelf); the row cap bounds memory to 32-36 MiB per slot. A frame
++// whose parts do not fit is drawn in several passes.
++static int avf_metal_osd_atlas_w(int slot)
++{
++    return slot ? 4096 : 8192;
++}
++
++static int avf_metal_osd_atlas_max_h(int slot)
++{
++    return slot ? 2304 : 4096;
++}
++
++// The slot's atlas texture, at least h rows tall (h within the cap).
++static id<MTLTexture> avf_metal_osd_atlas_texture(struct avf_metal_osd *m, int slot,
++                                                  MTLPixelFormat format, int bpp, int h)
++{
++    struct avf_metal_osd_atlas *a = &m->atlas[slot];
++    if (a->texture && (int)a->texture.height >= h)
++        return a->texture;
++
++    // Round up so a slowly growing atlas does not reallocate every frame.
++    int th = MPMAX(h, a->texture ? (int)a->texture.height : 0);
++    th = MPMIN((th + 255) & ~255, avf_metal_osd_atlas_max_h(slot));
++    int tw = avf_metal_osd_atlas_w(slot);
++    size_t align = [m->device minimumLinearTextureAlignmentForPixelFormat:format];
++    size_t stride = ((size_t)tw * bpp + align - 1) / align * align;
++
++    [a->texture release];
++    [a->buffer release];
++    *a = (struct avf_metal_osd_atlas){
++        .buffer = [m->device newBufferWithLength:stride * th
++                                         options:MTLResourceStorageModeShared],
++        .stride = stride,
++    };
++    if (!a->buffer)
++        return nil;
++    MTLTextureDescriptor *desc =
++        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
++                                                           width:tw
++                                                          height:th
++                                                       mipmapped:NO];
++    desc.usage = MTLTextureUsageShaderRead;
++    desc.storageMode = MTLStorageModeShared;
++    a->texture = [a->buffer newTextureWithDescriptor:desc offset:0 bytesPerRow:stride];
++    return a->texture;
++}
++
++static void avf_metal_osd_copy_part(struct avf_metal_osd_atlas *a, int bpp,
++                                    struct sub_bitmap *sb, int x, int y)
++{
++    uint8_t *dst = (uint8_t *)a->buffer.contents + (size_t)y * a->stride + (size_t)x * bpp;
++    size_t row = (size_t)sb->w * bpp;
++    for (int r = 0; r < sb->h; r++) {
++        memcpy(dst + (size_t)r * a->stride,
++               (const uint8_t *)sb->bitmap + (ptrdiff_t)r * sb->stride, row);
++    }
++}
++
++// Advance the shelf walk to a cw x ch cell: *x/*y become its position.
++static void avf_metal_osd_shelf(int atlas_w, int cw, int ch, int *x, int *y, int *row_h)
++{
++    if (*x + cw > atlas_w) {
++        *x = 0;
++        *y += *row_h;
++        *row_h = 0;
++    }
++    *row_h = MPMAX(*row_h, ch);
++}
++
++// Run one render pass over parts [first, first + n) of the part buffer, after
++// clearing the target or on top of what earlier passes drew.
++static bool avf_metal_osd_pass(struct avf_metal_osd *m, id<MTLTexture> target, bool clear,
++                               id<MTLRenderPipelineState> pipeline, id<MTLTexture> atlas,
++                               int first, int n, int64_t *exec_ns,
++                               char *err, size_t err_size)
++{
++    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
++    pass.colorAttachments[0].texture = target;
++    pass.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
++    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
++
++    id<MTLCommandBuffer> cmd = [m->queue commandBuffer];
++    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
++    if (n > 0) {
++        float size[2] = {(float)target.width, (float)target.height};
++        [enc setRenderPipelineState:pipeline];
++        [enc setVertexBuffer:m->parts
++                      offset:(NSUInteger)first * sizeof(struct avf_metal_osd_part)
++                     atIndex:0];
++        [enc setVertexBytes:size length:sizeof(size) atIndex:1];
++        [enc setFragmentTexture:atlas atIndex:0];
++        // Instances rasterize and blend in submission order, which is the
++        // part order the CPU composition uses.
++        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip
++                vertexStart:0
++                vertexCount:4
++              instanceCount:n];
++    }
++    [enc endEncoding];
++    [cmd commit];
++    [cmd waitUntilCompleted];
++    *exec_ns += (int64_t)((cmd.GPUEndTime - cmd.GPUStartTime) * 1e9);
++    if (cmd.status != MTLCommandBufferStatusCompleted) {
++        snprintf(err, err_size, "command buffer failed: %s",
++                 cmd.error ? cmd.error.localizedDescription.UTF8String : "unknown error");
++        return false;
++    }
++    return true;
++}
++
++// Render imgs (NULL or no parts: clear only) into target, replacing all of its
++// contents. target must be an IOSurface-backed, Metal-compatible 32BGRA buffer.
++static bool avf_metal_osd_draw(struct avf_metal_osd *m, CVPixelBufferRef target,
++                               struct sub_bitmaps *imgs,
++                               struct avf_metal_osd_timing *timing,
++                               char *err, size_t err_size)
++{
++    @autoreleasepool {
++        int64_t t0 = avf_metal_osd_now_ns();
++        int64_t pass_ns = 0, exec_ns = 0;
++        bool ok = false;
++
++        CVMetalTextureRef target_ref = NULL;
++        if (CVMetalTextureCacheCreateTextureFromImage(
++                kCFAllocatorDefault, m->texture_cache, target, NULL,
++                MTLPixelFormatBGRA8Unorm, CVPixelBufferGetWidth(target),
++                CVPixelBufferGetHeight(target), 0, &target_ref) != kCVReturnSuccess ||
++            !target_ref)
++        {
++            snprintf(err, err_size, "cannot wrap the OSD buffer as a render target");
++            return false;
++        }
++        id<MTLTexture> rt = CVMetalTextureGetTexture(target_ref);
++
++        if (!imgs || imgs->num_parts <= 0) {
++            int64_t t = avf_metal_osd_now_ns();
++            ok = avf_metal_osd_pass(m, rt, true, nil, nil, 0, 0, &exec_ns, err, err_size);
++            pass_ns += avf_metal_osd_now_ns() - t;
++            goto done;
++        }
++
++        int slot;
++        if (imgs->format == SUBBITMAP_LIBASS) {
++            slot = 0;
++        } else if (imgs->format == SUBBITMAP_BGRA) {
++            slot = 1;
++        } else {
++            snprintf(err, err_size, "unsupported OSD format %d", (int)imgs->format);
++            goto done;
++        }
++        int bpp = slot ? 4 : 1;
++        int atlas_w = avf_metal_osd_atlas_w(slot);
++        int max_h = avf_metal_osd_atlas_max_h(slot);
++        id<MTLRenderPipelineState> pipeline = slot ? m->bgra_pipeline : m->mask_pipeline;
++
++        // Layout pass: the shelf walk alone sizes the atlas, up to its cap.
++        int x = 0, y = 0, row_h = 0;
++        for (int i = 0; i < imgs->num_parts; i++) {
++            struct sub_bitmap *sb = &imgs->parts[i];
++            if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++                continue;
++            int cw = sb->w, ch = sb->h;
++            if (cw > atlas_w || ch > max_h) {
++                snprintf(err, err_size, "part %dx%d larger than the atlas", sb->w, sb->h);
++                goto done;
++            }
++            avf_metal_osd_shelf(atlas_w, cw, ch, &x, &y, &row_h);
++            x += cw;
++        }
++        id<MTLTexture> atlas = avf_metal_osd_atlas_texture(
++            m, slot, slot ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatR8Unorm, bpp,
++            MPMIN(y + row_h, max_h));
++        if (!atlas) {
++            snprintf(err, err_size, "atlas allocation failed");
++            goto done;
++        }
++        int atlas_h = (int)atlas.height;
++
++        size_t bytes = (size_t)imgs->num_parts * sizeof(struct avf_metal_osd_part);
++        if (!m->parts || m->parts.length < bytes) {
++            [m->parts release];
++            m->parts = [m->device newBufferWithLength:MPMAX(bytes * 2, (size_t)4096)
++                                              options:MTLResourceStorageModeShared];
++            if (!m->parts) {
++                snprintf(err, err_size, "part buffer allocation failed");
++                goto done;
++            }
++        }
++
++        // Placement pass: copy each part and write its quad, in part order.
++        // When the atlas is full, draw what it holds and refill it.
++        struct avf_metal_osd_part *out = m->parts.contents;
++        int count = 0, first = 0;
++        bool clear = true;
++        x = y = row_h = 0;
++        for (int i = 0; i < imgs->num_parts; i++) {
++            struct sub_bitmap *sb = &imgs->parts[i];
++            if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++                continue;
++            int cw = sb->w, ch = sb->h;
++            int nx = x, ny = y, nrow_h = row_h;
++            avf_metal_osd_shelf(atlas_w, cw, ch, &nx, &ny, &nrow_h);
++            if (ny + ch > atlas_h) {
++                int64_t t = avf_metal_osd_now_ns();
++                ok = avf_metal_osd_pass(m, rt, clear, pipeline, atlas, first, count - first,
++                                        &exec_ns, err, err_size);
++                pass_ns += avf_metal_osd_now_ns() - t;
++                if (!ok)
++                    goto done;
++                clear = false;
++                first = count;
++                nx = ny = 0;
++                nrow_h = ch;
++            }
++            x = nx;
++            y = ny;
++            row_h = nrow_h;
++            avf_metal_osd_copy_part(&m->atlas[slot], bpp, sb, x, y);
++            int dw = sb->dw > 0 ? sb->dw : sb->w;
++            int dh = sb->dh > 0 ? sb->dh : sb->h;
++            uint32_t c = sb->libass.color;
++            out[count++] = (struct avf_metal_osd_part){
++                .dst = {sb->x, sb->y, sb->x + dw, sb->y + dh},
++                .src = {x, y, x + sb->w, y + sb->h},
++                .color = {((c >> 24) & 0xff) / 255.0f, ((c >> 16) & 0xff) / 255.0f,
++                          ((c >> 8) & 0xff) / 255.0f, (0xff - (c & 0xff)) / 255.0f},
++            };
++            x += cw;
++        }
++        int64_t t = avf_metal_osd_now_ns();
++        ok = avf_metal_osd_pass(m, rt, clear, pipeline, atlas, first, count - first,
++                                &exec_ns, err, err_size);
++        pass_ns += avf_metal_osd_now_ns() - t;
++
++    done:
++        CFRelease(target_ref);
++        if (timing) {
++            int64_t total = avf_metal_osd_now_ns() - t0;
++            timing->upload_ns = total - pass_ns;
++            timing->gpu_ns = pass_ns;
++            timing->exec_ns = exec_ns;
++        }
++        return ok;
++    }
++}
++// --- end avf metal osd core ---
++
+ struct priv {
+     struct mp_hwdec_ctx hwctx;
+     struct m_config_cache *opts_cache;
+@@ -347,6 +778,9 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+         int renders, skipped, empty, frames;
+         int64_t total_ns, max_ns;
+         int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
++        // Metal rasterizer share of total_ns (gpu_renders of renders).
++        int gpu_renders;
++        int64_t upload_ns, gpu_ns, exec_ns;
+         int64_t enqueue_ns, video_sample_ns;
+         // Scheduling margin of enqueued OSD samples: sample PTS minus the
+         // timebase position at enqueue. Negative/small lead means the
+@@ -356,6 +790,13 @@ static double avf_servo_rate(int64_t error_ns, double nominal_rate,
+         int64_t last_spike_ns;
+     } perf;
+ 
++    // Inline OSD layer buffers are rasterized on the GPU when avfoundation-
++    // osd-gpu is set; the CPU path stays as the fallback. VO thread only.
++    struct avf_metal_osd metal_osd;
++    bool metal_osd_ready;
++    bool metal_osd_failed;          // setup failed: CPU for this VO
++    bool metal_osd_draw_error_logged;
++
+     // Compositing mode support
+     __strong id<MTLDevice> mtlDevice;
+     __strong CIContext *ciContext;
+@@ -1225,6 +1666,7 @@ static void update_avfoundation_options(struct vo *vo)
+     int old_queue_lead_ms = p->opts->queue_lead_ms;
+     int old_osd_max_height = p->opts->osd_max_height;
+     bool old_osd_video_res = p->opts->osd_video_res;
++    bool old_osd_gpu = p->opts->osd_gpu;
+ 
+     if (!m_config_cache_update(p->opts_cache))
+         return;
+@@ -1237,8 +1679,9 @@ static void update_avfoundation_options(struct vo *vo)
+         old_pip_composite_osd != p->opts->pip_composite_osd;
+     bool osd_scale_changed = old_osd_max_height != p->opts->osd_max_height ||
+         old_osd_video_res != p->opts->osd_video_res;
++    bool osd_gpu_changed = old_osd_gpu != p->opts->osd_gpu;
+ 
+-    if (!composite_changed && !osd_scale_changed)
++    if (!composite_changed && !osd_scale_changed && !osd_gpu_changed)
+         return;
+ 
+     if (composite_changed) {
+@@ -1252,6 +1695,8 @@ static void update_avfoundation_options(struct vo *vo)
+                    p->opts->osd_max_height,
+                    p->opts->osd_video_res ? "yes" : "no");
+     }
++    if (osd_gpu_changed)
++        MP_VERBOSE(vo, "OSD rasterizer updated: gpu: %s\n", p->opts->osd_gpu ? "yes" : "no");
+ 
+     clear_subtitle_cache(p);
+     if (composite_changed && !should_composite_into_video(p))
+@@ -2559,7 +3004,60 @@ static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
+     return result;
+ }
+ 
+-static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
++// Whether the inline OSD layer's buffers are rasterized on the GPU. The
++// composite paths keep the CPU buffer: they read it back per video frame and
++// run in PiP, where the app is in the background.
++static bool use_metal_osd(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->opts || !p->opts->osd_gpu || !should_use_inline_osd_layer(p) ||
++        p->metal_osd_failed)
++        return false;
++    if (!p->metal_osd_ready) {
++        int64_t t = mp_time_ns();
++        char err[256] = "";
++        p->metal_osd_ready = avf_metal_osd_init(&p->metal_osd, err, sizeof(err));
++        if (p->metal_osd_ready) {
++            MP_VERBOSE(vo, "OSD rasterizer: Metal (setup %.1f ms)\n",
++                       (mp_time_ns() - t) / 1e6);
++        } else {
++            p->metal_osd_failed = true;
++            MP_WARN(vo, "Metal OSD rasterizer unavailable (%s); using the CPU\n", err);
++        }
++    }
++    return p->metal_osd_ready;
++}
++
++// Render imgs (NULL: nothing) into pixbuf on the GPU, replacing its contents.
++// On failure the buffer's contents are unknown; the CPU path must clear it all.
++static bool draw_osd_metal(struct vo *vo, CVPixelBufferRef pixbuf,
++                           struct sub_bitmaps *imgs)
++{
++    struct priv *p = vo->priv;
++    struct avf_metal_osd_timing timing = {0};
++    char err[256] = "";
++
++    if (!avf_metal_osd_draw(&p->metal_osd, pixbuf, imgs, &timing, err, sizeof(err))) {
++        if (!p->metal_osd_draw_error_logged) {
++            p->metal_osd_draw_error_logged = true;
++            MP_WARN(vo, "Metal OSD render failed (%s); using the CPU\n", err);
++        }
++        osd_buf_record_dirty(p, pixbuf, (struct mp_rect){0, 0, INT_MAX, INT_MAX});
++        return false;
++    }
++    // Clear-only renders are not OSD renders; keep the averages per render.
++    if (imgs) {
++        p->perf.gpu_renders++;
++        p->perf.upload_ns += timing.upload_ns;
++        p->perf.gpu_ns += timing.gpu_ns;
++        p->perf.exec_ns += timing.exec_ns;
++    }
++    return true;
++}
++
++// A pool buffer, with whatever its last use left in it.
++static CVPixelBufferRef acquire_osd_pixel_buffer(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+     int w = p->osd_w;
+@@ -2579,14 +3077,22 @@ static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
+         MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
+         return NULL;
+     }
++    return pixbuf;
++}
++
++// CPU clear of what the buffer's last recorded use drew.
++static bool clear_osd_pixel_buffer(struct vo *vo, CVPixelBufferRef pixbuf)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
+ 
+     CVPixelBufferLockBaseAddress(pixbuf, 0);
+     void *base = CVPixelBufferGetBaseAddress(pixbuf);
+     size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
+     if (!base || !stride) {
+         CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        CVPixelBufferRelease(pixbuf);
+-        return NULL;
++        return false;
+     }
+ 
+     int64_t t = mp_time_ns();
+@@ -2610,6 +3116,24 @@ static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
+     p->perf.clear_ns += mp_time_ns() - t;
+ 
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return true;
++}
++
++static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    CVPixelBufferRef pixbuf = acquire_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return NULL;
++
++    if (use_metal_osd(vo) && draw_osd_metal(vo, pixbuf, NULL)) {
++        osd_buf_record_dirty(p, pixbuf, (struct mp_rect){0, 0, 0, 0});
++        return pixbuf;
++    }
++    if (!clear_osd_pixel_buffer(vo, pixbuf)) {
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
+     return pixbuf;
+ }
+ 
+@@ -2623,10 +3147,20 @@ static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
+     if (!imgs || imgs->num_parts == 0)
+         return NULL;
+ 
+-    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    CVPixelBufferRef pixbuf = acquire_osd_pixel_buffer(vo);
+     if (!pixbuf)
+         return NULL;
+ 
++    // The caller records the drawn bounds as the buffer's dirty rect, which
++    // holds for the GPU render too: it cleared everything else.
++    if (use_metal_osd(vo) && draw_osd_metal(vo, pixbuf, imgs))
++        return pixbuf;
++
++    if (!clear_osd_pixel_buffer(vo, pixbuf)) {
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
+     CVPixelBufferLockBaseAddress(pixbuf, 0);
+     void *base = CVPixelBufferGetBaseAddress(pixbuf);
+     size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
+@@ -2779,6 +3313,7 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+     }
+ 
+     int64_t t_render = mp_time_ns();
++    int gpu_renders_before = p->perf.gpu_renders;
+     bool rendered = false;
+     if (need_image) {
+         CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
+@@ -2820,8 +3355,9 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+         int64_t now = mp_time_ns();
+         if (now - p->perf.last_spike_ns > MP_TIME_MS_TO_NS(1000)) {
+             p->perf.last_spike_ns = now;
+-            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d)\n",
+-                       render_ns / 1e6, imgs->num_parts, p->osd_w, p->osd_h);
++            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d %s)\n",
++                       render_ns / 1e6, imgs->num_parts, p->osd_w, p->osd_h,
++                       p->perf.gpu_renders > gpu_renders_before ? "metal" : "cpu");
+         }
+     }
+ 
+@@ -3318,6 +3854,9 @@ static int preinit(struct vo *vo)
+     // The OSD layer's lifetime follows the option: created here, kept in step
+     // by sync_osd_layer_frame.
+     ensure_osd_layer(vo);
++    // Compile the Metal OSD pipeline now, while nothing is on screen, rather
++    // than on the first subtitle.
++    use_metal_osd(vo);
+ 
+     vo->hwdec_devs = hwdec_devices_create();
+     p->hwctx = (struct mp_hwdec_ctx){
+@@ -3572,7 +4111,8 @@ static void report_osd_perf(struct vo *vo)
+         double ne = MPMAX(p->perf.enq_count, 1);
+         MP_VERBOSE(vo,
+             "osd-perf: n=%d avg=%.2fms max=%.2fms "
+-            "[clear %.2f blend %.2f cg %.2f bounds %.2f] enq %.2f | "
++            "[clear %.2f blend %.2f cg %.2f bounds %.2f] "
++            "metal=%d [upload %.2f gpu %.2f exec %.2f] enq %.2f | "
+             "vid %.3f (/frame) | "
+             "margin avg=%.1f min=%.1fms drops=%d | "
+             "skip=%d empty=%d osd=%dx%d\n",
+@@ -3583,6 +4123,10 @@ static void report_osd_perf(struct vo *vo)
+             p->perf.blend_ns / n / 1e6,
+             p->perf.cg_ns / n / 1e6,
+             p->perf.bounds_ns / n / 1e6,
++            p->perf.gpu_renders,
++            p->perf.upload_ns / n / 1e6,
++            p->perf.gpu_ns / n / 1e6,
++            p->perf.exec_ns / n / 1e6,
+             p->perf.enqueue_ns / n / 1e6,
+             p->perf.video_sample_ns / nf / 1e6,
+             p->perf.lead_sum_ns / ne / 1e6,
+@@ -3669,6 +4213,8 @@ static void flip_page(struct vo *vo)
+         if (p->swUploadPool)
+             CVPixelBufferPoolFlush(p->swUploadPool, kCVPixelBufferPoolFlushExcessBuffers);
+         prune_osd_buf_states(p, mp_time_ns());
++        if (p->metal_osd_ready)
++            avf_metal_osd_flush(&p->metal_osd);
+     }
+ 
+     // Report often enough that short capture sessions still carry data.
+@@ -3868,6 +4414,8 @@ static void uninit(struct vo *vo)
+     }
+ 
+     release_osd_layer(vo);
++    avf_metal_osd_uninit(&p->metal_osd);
++    p->metal_osd_ready = false;
+ 
+     [p->ciContext release];
+     p->ciContext = nil;
+@@ -3975,6 +4523,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     // Rasterize the OSD at the video's pixel density instead of the
+     // display's (1:1 over the on-screen video rect).
+     {"osd-video-res", OPT_BOOL(osd_video_res)},
++    // Rasterize inline-layer OSD buffers on the GPU (Metal); the CPU blend
++    // remains the fallback.
++    {"osd-gpu", OPT_BOOL(osd_gpu)},
+     {0},
+ };
+ 
+@@ -3984,6 +4535,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     .size = sizeof(struct avfoundation_opts),
+     .defaults = &(const struct avfoundation_opts){
+         .queue_lead_ms = 128,
++        .osd_gpu = true,
+         // tvOS has no PiP, so nothing needs the media timebase there; the
+         // host-time model is the one that never accumulates clock drift
+         // against mpv's audio-slaved schedule (plezy#1776).

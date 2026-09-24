@@ -27,3 +27,4 @@
 0028-ao-coreaudio-uninit-on-init-failure.patch
 0029-moltenvk-report-display-colorspace.patch
 0030-avfoundation-hdr10plus-per-frame-metadata.patch
+0031-avfoundation-metal-osd-rasterizer.patch
