@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Build the pinned libass with its series for the host and check that a static
-# frame rendered twice is reported unchanged the second time (the series'
-# layout cache must not hand the next frame a copy with a fresh bitmap
-# pointer). Pass an already-patched libass tree for offline use; otherwise
+# Build the pinned libass with its series for the host and run the series'
+# behavioral harnesses against it: a static frame rendered twice is reported
+# unchanged the second time (the layout cache must not hand the next frame a
+# copy with a fresh bitmap pointer), and a cached shaping result is only reused
+# for a run whose every HarfBuzz input matches. Pass an already-patched libass
+# tree for offline use; otherwise
 # fetch and patch the pinned source in a temporary directory. Needs the host's
 # freetype, fribidi, harfbuzz and libunibreak via pkg-config, autotools, and a
 # system font.
@@ -70,9 +72,11 @@ link=()
 case "$(uname -s)" in
     Darwin) link=(-liconv -framework CoreText -framework CoreFoundation) ;;
 esac
-cc -O1 -std=c11 -Wall -Wextra -Werror -I"$source_dir" \
-    -o "$workdir/test" "$root/scripts/test_libass_change_detection.c" \
-    "$build/libass/.libs/libass.a" \
-    $(pkg-config --libs freetype2 fribidi harfbuzz libunibreak) \
-    "${link[@]}" -lpthread -lm
-"$workdir/test"
+for harness in test_libass_change_detection test_libass_shape_cache; do
+    cc -O1 -std=c11 -Wall -Wextra -Werror -I"$source_dir" \
+        -o "$workdir/$harness" "$root/scripts/$harness.c" \
+        "$build/libass/.libs/libass.a" \
+        $(pkg-config --libs freetype2 fribidi harfbuzz libunibreak) \
+        "${link[@]}" -lpthread -lm
+    "$workdir/$harness"
+done

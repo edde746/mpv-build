@@ -12,6 +12,11 @@
 #                      layout cache, and the build-system threading option;
 #                      the fork's font-guard and layout-cache fixes are
 #                      folded in
+#   shape cache        HarfBuzz results cached per run (font, size, segment
+#                      properties, features, text and its context), so
+#                      animated and frame-by-frame typesetting stops
+#                      re-shaping the same text every frame
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
+0004-ass-cache-shaping-results.patch

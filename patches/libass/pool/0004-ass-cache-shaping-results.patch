@@ -1,0 +1,560 @@
+diff --git a/libass/ass_cache.c b/libass/ass_cache.c
+index 38dc2d2..282e59f 100644
+--- a/libass/ass_cache.c
++++ b/libass/ass_cache.c
+@@ -353,6 +353,48 @@ const CacheDesc glyph_metrics_cache_desc = {
+ };
+ 
+ 
++// shape cache
++static bool shape_key_move(void *dst, void *src)
++{
++    ShapeHashKey *d = dst, *s = src;
++    if (!d)
++        return true;
++
++    *d = *s;
++    d->text.str = ass_copy_string(s->text);
++    if (!d->text.str)
++        return false;
++    ass_cache_inc_ref(s->font);
++    return true;
++}
++
++static void shape_key_destruct(void *key)
++{
++    ShapeHashKey *k = key;
++    free((void *) k->text.str);
++    ass_cache_dec_ref(k->font);
++}
++
++static void shape_value_destruct(void *value)
++{
++    ShapeHashValue *v = value;
++    free(v->glyphs);
++}
++
++size_t ass_shape_construct(void *key, void *value, void *priv);
++
++const CacheDesc shape_cache_desc = {
++    .hash_func = shape_hash,
++    .compare_func = shape_compare,
++    .key_move_func = shape_key_move,
++    .key_destruct_func = shape_key_destruct,
++    .construct_func = ass_shape_construct,
++    .value_destruct_func = shape_value_destruct,
++    .key_size = sizeof(ShapeHashKey),
++    .value_size = sizeof(ShapeHashValue)
++};
++
++
+ 
+ // Cache data
+ typedef struct cache_item {
+@@ -812,6 +854,11 @@ Cache *ass_glyph_metrics_cache_create(void)
+     return ass_cache_create(&glyph_metrics_cache_desc);
+ }
+ 
++Cache *ass_shape_cache_create(void)
++{
++    return ass_cache_create(&shape_cache_desc);
++}
++
+ Cache *ass_face_size_metrics_cache_create(void)
+ {
+     return ass_cache_create(&face_size_metrics_cache_desc);
+diff --git a/libass/ass_cache.h b/libass/ass_cache.h
+index 5069ad8..d2588be 100644
+--- a/libass/ass_cache.h
++++ b/libass/ass_cache.h
+@@ -44,6 +44,22 @@ typedef struct {
+     int asc, desc;  // ascender/descender
+ } OutlineHashValue;
+ 
++// One shaped glyph: HarfBuzz's glyph index, cluster (relative to the start of
++// the key's text) and unscaled position, as hb_glyph_info_t/hb_glyph_position_t
++// carry them.
++typedef struct {
++    uint32_t glyph_index;
++    uint32_t cluster;
++    int32_t x_advance, y_advance;
++    int32_t x_offset, y_offset;
++} ShapedGlyph;
++
++typedef struct {
++    bool valid;
++    unsigned count;
++    ShapedGlyph *glyphs;
++} ShapeHashValue;
++
+ // Create definitions for bitmap, outline and composite hash keys
+ #define CREATE_STRUCT_DEFINITIONS
+ #include "ass_cache_template.h"
+@@ -132,6 +148,7 @@ Cache *ass_font_cache_create(void);
+ Cache *ass_outline_cache_create(void);
+ Cache *ass_face_size_metrics_cache_create(void);
+ Cache *ass_glyph_metrics_cache_create(void);
++Cache *ass_shape_cache_create(void);
+ Cache *ass_bitmap_cache_create(void);
+ Cache *ass_composite_cache_create(void);
+ 
+diff --git a/libass/ass_cache_template.h b/libass/ass_cache_template.h
+index 8245eb7..39186c7 100644
+--- a/libass/ass_cache_template.h
++++ b/libass/ass_cache_template.h
+@@ -119,6 +119,25 @@ START(glyph, glyph_hash_key)
+     GENERIC(unsigned, flags) // glyph decoration flags
+ END(GlyphHashKey)
+ 
++// describes one HarfBuzz shaping call; the result depends on nothing else.
++// text holds the run's UTF-32 codepoints plus the context HarfBuzz reads
++// around it; the run starts item_offset codepoints into it.
++// Fixed-width members are ordered so no padding sits between them (the hash
++// covers their byte range).
++// font is refed and text is duplicated when inserted; both released when dropped
++START(shape, shape_hash_key)
++    GENERIC(ASS_Font *, font)
++    GENERIC(double, size) // font size
++    GENERIC(const void *, language) // hb_language_t
++    GENERIC(int, face_index)
++    GENERIC(int, direction) // hb_direction_t
++    GENERIC(unsigned, script) // hb_script_t
++    GENERIC(unsigned, features) // one bit per OpenType feature value
++    GENERIC(unsigned, item_offset)
++    GENERIC(unsigned, item_length)
++    STRING(text)
++END(ShapeHashKey)
++
+ // describes an outline drawing
+ // on call to ass_cache_get(), text is a non-owning view;
+ // its content is duplicated when inserted; the copy is freed when dropped
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 9dcf5d4..12526cf 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -121,7 +121,8 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
+     if (!state->cache_client)
+         return false;
+ 
+-    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache, state->cache_client)))
++    if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache,
++                                         priv->cache.shape_cache, state->cache_client)))
+         return false;
+ 
+     state->image_pool = image_pool_create();  // NULL => fall back to malloc
+@@ -184,9 +185,11 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
+     priv->cache.outline_cache = ass_outline_cache_create();
+     priv->cache.face_size_metrics_cache = ass_face_size_metrics_cache_create();
+     priv->cache.metrics_cache = ass_glyph_metrics_cache_create();
++    priv->cache.shape_cache = ass_shape_cache_create();
+     if (!priv->cache.font_cache || !priv->cache.bitmap_cache ||
+         !priv->cache.composite_cache || !priv->cache.outline_cache ||
+-        !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache)
++        !priv->cache.face_size_metrics_cache || !priv->cache.metrics_cache ||
++        !priv->cache.shape_cache)
+         goto fail;
+ 
+     if (!ass_cache_client_set_init(&priv->cache.client_set))
+@@ -313,6 +316,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
+     ass_cache_done(render_priv->cache.outline_cache);
+     ass_cache_done(render_priv->cache.face_size_metrics_cache);
+     ass_cache_done(render_priv->cache.metrics_cache);
++    ass_cache_done(render_priv->cache.shape_cache);
+     ass_cache_done(render_priv->cache.font_cache);
+     ass_cache_client_set_done(&render_priv->cache.client_set);
+ 
+@@ -4089,6 +4093,7 @@ static void check_cache_limits(ASS_Renderer *priv, CacheStore *cache)
+     ass_cache_cut(cache->composite_cache, cache->composite_max_size);
+     ass_cache_cut(cache->bitmap_cache, cache->bitmap_max_size);
+     ass_cache_cut(cache->outline_cache, cache->glyph_max);
++    ass_cache_cut(cache->shape_cache, SHAPE_CACHE_MAX_SIZE);
+ }
+ 
+ /**
+diff --git a/libass/ass_render.h b/libass/ass_render.h
+index 2002a01..63731ab 100644
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -48,6 +48,9 @@
+ #define BITMAP_CACHE_MAX_SIZE (128 * MEGABYTE)
+ #define COMPOSITE_CACHE_RATIO 2
+ #define COMPOSITE_CACHE_MAX_SIZE (BITMAP_CACHE_MAX_SIZE / COMPOSITE_CACHE_RATIO)
++// Shaping results are small (24 bytes per glyph plus the key's text); 16 MiB
++// holds tens of thousands of runs, several frames of dense typesetting.
++#define SHAPE_CACHE_MAX_SIZE (16 * MEGABYTE)
+ 
+ #define PARSED_FADE (1<<0)
+ #define PARSED_A    (1<<1)
+@@ -342,6 +345,7 @@ typedef struct {
+     Cache *composite_cache;
+     Cache *face_size_metrics_cache;
+     Cache *metrics_cache;
++    Cache *shape_cache;
+     CacheClientSet client_set;
+     size_t glyph_max;
+     size_t bitmap_max_size;
+diff --git a/libass/ass_render_api.c b/libass/ass_render_api.c
+index 08ab4be..764daa8 100644
+--- a/libass/ass_render_api.c
++++ b/libass/ass_render_api.c
+@@ -36,6 +36,7 @@ static void ass_reconfigure(ASS_Renderer *priv)
+     ass_cache_empty(priv->cache.composite_cache);
+     ass_cache_empty(priv->cache.bitmap_cache);
+     ass_cache_empty(priv->cache.outline_cache);
++    ass_cache_empty(priv->cache.shape_cache);
+ 
+     priv->width = settings->frame_width;
+     priv->height = settings->frame_height;
+diff --git a/libass/ass_shaper.c b/libass/ass_shaper.c
+index 16daac7..c6bb928 100644
+--- a/libass/ass_shaper.c
++++ b/libass/ass_shaper.c
+@@ -65,6 +65,7 @@ struct ass_shaper {
+     // Glyph and face-size metrics caches, to speed up shaping
+     Cache *face_size_metrics_cache;
+     Cache *metrics_cache;
++    Cache *shape_cache; // shaping results, shared by every renderer thread
+     CacheClient *cache_client;
+ 
+     hb_font_funcs_t *font_funcs;
+@@ -649,22 +650,19 @@ hb_shaper_get_run_language(ASS_Shaper *shaper, hb_script_t script)
+ }
+ 
+ /**
+- * \brief Feed a run of shaped characters into the GlyphInfo array.
++ * \brief Feed a run of shaped glyphs into the GlyphInfo array.
+  *
+  * \param glyphs GlyphInfo array
+- * \param buf buffer of shaped run
+- * \param offset offset into GlyphInfo array
++ * \param shaped shaped glyphs of the run
++ * \param count number of shaped glyphs
++ * \param offset index into the GlyphInfo array of the shaped text's start
+  */
+ static void
+-shape_harfbuzz_process_run(GlyphInfo *glyphs, hb_buffer_t *buf, int offset)
++shape_harfbuzz_process_run(GlyphInfo *glyphs, const ShapedGlyph *shaped,
++                           unsigned count, int offset)
+ {
+-    int j;
+-    int num_glyphs = hb_buffer_get_length(buf);
+-    hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, NULL);
+-    hb_glyph_position_t *pos    = hb_buffer_get_glyph_positions(buf, NULL);
+-
+-    for (j = 0; j < num_glyphs; j++) {
+-        unsigned idx = glyph_info[j].cluster + offset;
++    for (unsigned j = 0; j < count; j++) {
++        unsigned idx = shaped[j].cluster + offset;
+         GlyphInfo *info = glyphs + idx;
+         GlyphInfo *root = info;
+ 
+@@ -683,11 +681,11 @@ shape_harfbuzz_process_run(GlyphInfo *glyphs, hb_buffer_t *buf, int offset)
+ 
+         // set position and advance
+         info->skip = false;
+-        info->glyph_index = glyph_info[j].codepoint;
+-        info->offset.x    = ass_lrint(pos[j].x_offset * info->scale_x);
+-        info->offset.y    = ass_lrint(-pos[j].y_offset * info->scale_y);
+-        info->advance.x   = ass_lrint(pos[j].x_advance * info->scale_x);
+-        info->advance.y   = ass_lrint(-pos[j].y_advance * info->scale_y);
++        info->glyph_index = shaped[j].glyph_index;
++        info->offset.x    = ass_lrint(shaped[j].x_offset * info->scale_x);
++        info->offset.y    = ass_lrint(-shaped[j].y_offset * info->scale_y);
++        info->advance.x   = ass_lrint(shaped[j].x_advance * info->scale_x);
++        info->advance.y   = ass_lrint(-shaped[j].y_advance * info->scale_y);
+ 
+         // accumulate advance in the root glyph
+         root->cluster_advance.x += info->advance.x;
+@@ -695,6 +693,121 @@ shape_harfbuzz_process_run(GlyphInfo *glyphs, hb_buffer_t *buf, int offset)
+     }
+ }
+ 
++/**
++ * \brief Make *font the HarfBuzz font for info's font, face and size,
++ * keeping the previous run's font when those match.
++ */
++static bool update_hb_font(ASS_Shaper *shaper, GlyphInfo *info,
++                           hb_font_t **font, GlyphInfo **font_info)
++{
++    if (*font && (*font_info)->font == info->font &&
++            (*font_info)->face_index == info->face_index &&
++            (*font_info)->font_size == info->font_size)
++        return true;
++
++    hb_font_destroy(*font);
++    *font = get_hb_font(shaper, info);
++    *font_info = info;
++    return *font;
++}
++
++/**
++ * \brief Shape text[item_offset, item_offset + item_length) into shaper->buf,
++ * with the rest of text as context.
++ */
++static void shape_text(ASS_Shaper *shaper, hb_font_t *font,
++                       const FriBidiChar *text, unsigned text_len,
++                       unsigned item_offset, unsigned item_length,
++                       const hb_segment_properties_t *props)
++{
++    hb_buffer_t *buf = shaper->buf;
++    hb_buffer_pre_allocate(buf, item_length);
++    hb_buffer_add_utf32(buf, text, text_len, item_offset, item_length);
++    hb_buffer_set_segment_properties(buf, props);
++    hb_shape(font, buf, shaper->features, shaper->n_features);
++}
++
++/**
++ * \brief Copy the shaped glyphs out of buf.
++ */
++static ShapedGlyph *copy_shaped_glyphs(hb_buffer_t *buf, unsigned *count)
++{
++    unsigned n = hb_buffer_get_length(buf);
++    hb_glyph_info_t *glyph_info = hb_buffer_get_glyph_infos(buf, NULL);
++    hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, NULL);
++
++    ShapedGlyph *shaped = malloc(FFMAX(n, 1) * sizeof(*shaped));
++    if (!shaped)
++        return NULL;
++    for (unsigned j = 0; j < n; j++) {
++        shaped[j] = (ShapedGlyph) {
++            .glyph_index = glyph_info[j].codepoint,
++            .cluster = glyph_info[j].cluster,
++            .x_advance = pos[j].x_advance,
++            .y_advance = pos[j].y_advance,
++            .x_offset = pos[j].x_offset,
++            .y_offset = pos[j].y_offset,
++        };
++    }
++    *count = n;
++    return shaped;
++}
++
++/**
++ * \brief The OpenType feature values, one bit each. Fails if a value other
++ * than 0 or 1 is set, which would not survive the packing.
++ */
++static bool feature_bits(ASS_Shaper *shaper, unsigned *bits)
++{
++    unsigned b = 0;
++    for (int i = 0; i < shaper->n_features; i++) {
++        if (shaper->features[i].value > 1)
++            return false;
++        b |= shaper->features[i].value << i;
++    }
++    *bits = b;
++    return true;
++}
++
++typedef struct {
++    ASS_Shaper *shaper;
++    GlyphInfo *info;        // first glyph of the run: font, face and size
++    hb_font_t **font;       // the caller's current HarfBuzz font
++    GlyphInfo **font_info;
++} ShapeContext;
++
++size_t ass_shape_construct(void *key, void *value, void *priv)
++{
++    ShapeHashKey *k = key;
++    ShapeHashValue *v = value;
++    ShapeContext *ctx = priv;
++    ASS_Shaper *shaper = ctx->shaper;
++
++    *v = (ShapeHashValue) { .valid = false };
++    if (!update_hb_font(shaper, ctx->info, ctx->font, ctx->font_info))
++        return 1;
++
++    hb_segment_properties_t props = HB_SEGMENT_PROPERTIES_DEFAULT;
++    props.direction = (hb_direction_t) k->direction;
++    props.script = (hb_script_t) k->script;
++    props.language = (hb_language_t) k->language;
++    shape_text(shaper, *ctx->font, (const FriBidiChar *) k->text.str,
++               k->text.len / sizeof(FriBidiChar), k->item_offset,
++               k->item_length, &props);
++    v->glyphs = copy_shaped_glyphs(shaper->buf, &v->count);
++    hb_buffer_reset(shaper->buf);
++    if (!v->glyphs)
++        return 1;
++
++    v->valid = true;
++    return sizeof(ShapeHashKey) + k->text.len + v->count * sizeof(ShapedGlyph);
++}
++
++// HarfBuzz keeps HB_BUFFER_CONTEXT_LENGTH (5) codepoints of context on each
++// side of a run and reads no further; the shape cache keys on a window at
++// least that wide, so equal keys shape identically.
++#define SHAPE_CONTEXT_LENGTH 8
++
+ /**
+  * \brief Shape event text with HarfBuzz. Full OpenType shaping.
+  * \param glyphs glyph clusters
+@@ -703,10 +816,9 @@ shape_harfbuzz_process_run(GlyphInfo *glyphs, hb_buffer_t *buf, int offset)
+ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
+ {
+     int i;
+-    hb_buffer_t *buf = shaper->buf;
+     hb_font_t *font = NULL;
+-    const GlyphInfo *font_info = NULL;
+-    hb_segment_properties_t props = HB_SEGMENT_PROPERTIES_DEFAULT;
++    GlyphInfo *font_info = NULL;
++    bool ok = true;
+ 
+     // Initialize: skip all glyphs, this is undone later as needed
+     for (i = 0; i < len; i++)
+@@ -719,18 +831,7 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
+         }
+ 
+         int offset = i;
+-        const GlyphInfo *info = glyphs + offset;
+-        // These are all per-run inputs to get_hb_font. Glyph processing
+-        // leaves them unchanged; features and segment properties stay per-run.
+-        if (!font || font_info->font != info->font ||
+-                font_info->face_index != info->face_index ||
+-                font_info->font_size != info->font_size) {
+-            hb_font_destroy(font);
+-            font = get_hb_font(shaper, glyphs + offset);
+-            if (!font)
+-                return false;
+-            font_info = info;
+-        }
++        GlyphInfo *info = glyphs + offset;
+         int run_id = glyphs[offset].shape_run_id;
+         int level = shaper->emblevels[offset];
+ 
+@@ -738,43 +839,89 @@ static bool shape_harfbuzz(ASS_Shaper *shaper, GlyphInfo *glyphs, size_t len)
+         while (i < (len - 1) && run_id == glyphs[i + 1].shape_run_id &&
+                 level == shaper->emblevels[i + 1])
+             i++;
++        unsigned item_length = i - offset + 1;
+ 
+-        hb_buffer_pre_allocate(buf, i - offset + 1);
+-
+-        int lead_context = 0, trail_context = 0;
++        // The text HarfBuzz sees: the whole event, or the run plus an
++        // adjacent shaping control on either side.
++        const FriBidiChar *text;
++        unsigned text_len, item_offset;
+         if (shaper->whole_text_layout) {
+-            hb_buffer_add_utf32(buf, shaper->event_text, len,
+-                    offset, i - offset + 1);
++            text = shaper->event_text;
++            text_len = len;
++            item_offset = offset;
+         } else {
++            int lead_context = 0, trail_context = 0;
+             if (offset > 0 && !glyphs[offset].starts_new_run &&
+                     is_shaping_control(glyphs[offset - 1].symbol))
+                 lead_context = 1;
+             if (i < (len - 1) && !glyphs[i + 1].starts_new_run &&
+                     is_shaping_control(glyphs[i + 1].symbol))
+                 trail_context = 1;
+-
+-            hb_buffer_add_utf32(buf,
+-                    shaper->event_text + offset - lead_context,
+-                    i - offset + 1 + lead_context + trail_context,
+-                    lead_context, i - offset + 1);
++            text = shaper->event_text + offset - lead_context;
++            text_len = item_length + lead_context + trail_context;
++            item_offset = lead_context;
+         }
+ 
++        hb_segment_properties_t props = HB_SEGMENT_PROPERTIES_DEFAULT;
+         props.direction = FRIBIDI_LEVEL_IS_RTL(level) ?
+             HB_DIRECTION_RTL : HB_DIRECTION_LTR;
+         props.script = glyphs[offset].script;
+         props.language  = hb_shaper_get_run_language(shaper, props.script);
+-        hb_buffer_set_segment_properties(buf, &props);
+ 
+         set_run_features(shaper, glyphs + offset);
+-        hb_shape(font, buf, shaper->features, shaper->n_features);
+ 
+-        shape_harfbuzz_process_run(glyphs, buf,
+-                shaper->whole_text_layout ? 0 : offset - lead_context);
+-        hb_buffer_reset(buf);
++        // Animated and frame-by-frame typesetting shapes the same runs every
++        // frame; reuse the result instead of shaping again.
++        unsigned features;
++        if (shaper->shape_cache && feature_bits(shaper, &features)) {
++            unsigned pre = FFMIN(item_offset, SHAPE_CONTEXT_LENGTH);
++            unsigned post = FFMIN(text_len - item_offset - item_length,
++                                  SHAPE_CONTEXT_LENGTH);
++            const FriBidiChar *window = text + item_offset - pre;
++            ShapeHashKey key = {
++                .font = info->font,
++                .size = info->font_size,
++                .language = props.language,
++                .face_index = info->face_index,
++                .direction = props.direction,
++                .script = props.script,
++                .features = features,
++                .item_offset = pre,
++                .item_length = item_length,
++                .text = {
++                    .str = (const char *) window,
++                    .len = (pre + item_length + post) * sizeof(FriBidiChar),
++                },
++            };
++            ShapeContext ctx = { shaper, info, &font, &font_info };
++            ShapeHashValue *val = ass_cache_get(shaper->shape_cache,
++                                                shaper->cache_client, &key, &ctx);
++            if (val && val->valid) {
++                shape_harfbuzz_process_run(glyphs, val->glyphs, val->count,
++                                           window - shaper->event_text);
++                continue;
++            }
++        }
++
++        // Not cacheable, or the cache could not hold it: shape directly.
++        if (!update_hb_font(shaper, info, &font, &font_info)) {
++            ok = false;
++            break;
++        }
++        shape_text(shaper, font, text, text_len, item_offset, item_length, &props);
++        unsigned count;
++        ShapedGlyph *shaped = copy_shaped_glyphs(shaper->buf, &count);
++        hb_buffer_reset(shaper->buf);
++        if (!shaped) {
++            ok = false;
++            break;
++        }
++        shape_harfbuzz_process_run(glyphs, shaped, count, text - shaper->event_text);
++        free(shaped);
+     }
+ 
+     hb_font_destroy(font);
+-    return true;
++    return ok;
+ }
+ 
+ /**
+@@ -1131,7 +1278,8 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
+ /**
+  * \brief Create a new shaper instance
+  */
+-ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache, CacheClient *cache_client)
++ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache,
++                           Cache *shape_cache, CacheClient *cache_client)
+ {
+     assert(metrics_cache);
+ 
+@@ -1145,6 +1293,7 @@ ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache,
+         goto error;
+     shaper->face_size_metrics_cache = face_size_metrics_cache;
+     shaper->metrics_cache = metrics_cache;
++    shaper->shape_cache = shape_cache;
+     shaper->cache_client = cache_client;
+ 
+     hb_font_funcs_t *funcs = shaper->font_funcs = hb_font_funcs_create();
+diff --git a/libass/ass_shaper.h b/libass/ass_shaper.h
+index 3167c42..97c27ab 100644
+--- a/libass/ass_shaper.h
++++ b/libass/ass_shaper.h
+@@ -31,7 +31,8 @@ typedef struct ass_shaper ASS_Shaper;
+ #endif
+ 
+ void ass_shaper_info(ASS_Library *lib);
+-ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache, CacheClient *cache_client);
++ASS_Shaper *ass_shaper_new(Cache *metrics_cache, Cache *face_size_metrics_cache,
++                           Cache *shape_cache, CacheClient *cache_client);
+ void ass_shaper_free(ASS_Shaper *shaper);
+ bool ass_create_hb_font(ASS_Font *font, int index);
+ void ass_shaper_set_kerning(ASS_Shaper *shaper, bool kern);

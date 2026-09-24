@@ -202,10 +202,10 @@ handoff. Update the application and Android libmpv artifacts together; a
 timeout quarantines a live producer rather than releasing resources it may
 still use.
 
-Run the libass change-detection regression with
-`bash scripts/test_libass_change_detection.sh`. It fetches the pinned upstream
-libass, applies `patches/libass/series.common` (the threaded renderer, layout
-cache and fast blur that used to be the edde746/libass fork), builds it for the
+Run the libass series regressions with `bash scripts/test_libass_series.sh`.
+It fetches the pinned upstream libass, applies `patches/libass/series.common`
+(the threaded renderer, layout cache and fast blur that used to be the
+edde746/libass fork, and the shape cache), builds it for the
 host (freetype, fribidi, harfbuzz and libunibreak via pkg-config) and checks
 that a static frame is reported unchanged on repeat and after handing off a
 prefetched renderer while another renderer has advanced the same track.
@@ -215,7 +215,10 @@ renderer reuse; overlapping-event renders settle unchanged on a same-timestamp
 repeat, and clearing the old owner's cache again leaves the new owner's frame
 unchanged. Cue expiry clears both renderers without preserving stale pixels.
 mpv's subtitle packer relies on that unchanged result to reuse its prepared
-atlas. Pass an already-patched source directory as the first argument to run
+atlas. The shape-cache harness renders cues whose shaped runs differ from an
+earlier cue in one input (font size, font, kerning) through
+one renderer and requires each frame to match a renderer that has shaped nothing
+else. Pass an already-patched source directory as the first argument to run
 offline.
 
 `scripts/test_libass_rounding.c` checks the ARMv7 VFP rounding fast path against
