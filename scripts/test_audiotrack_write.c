@@ -27,6 +27,7 @@
 #define MP_THREAD_RETURN() return NULL
 #define AF_FORMAT_S_DTS 99
 #define AF_FORMAT_S_DTSHD 98
+#define AF_FORMAT_S_TRUEHD 97
 
 typedef pthread_t mp_thread;
 typedef pthread_mutex_t mp_mutex;
@@ -62,7 +63,7 @@ struct ao { void *priv; int samplerate, sstride, format; };
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static atomic_llong now_ns;
-static int entered, permitted, idle, head_queries, pauses, failures, warnings;
+static int entered, permitted, idle, head_queries, pauses, failures, warnings, reloads;
 static int underrun_queries;
 static char last_warning[256];
 static int response, input_bytes;
@@ -306,6 +307,8 @@ static int AudioTrack_New(struct ao *ao);
 static void AudioTrack_recreateOrFail(struct ao *ao);
 static void AudioTrack_checkRouteChange(struct ao *ao) { (void)ao; }
 static void ao_request_failure(struct ao *ao) { (void)ao; failures++; }
+static void ao_request_reload(struct ao *ao) { (void)ao; reloads++; }
+static const char *af_fmt_to_str(int format) { (void)format; return "spdif"; }
 static int ao_read_data(struct ao *, void **, int, int64_t, void *, bool, bool);
 #include "audiotrack_write.inc"
 
@@ -346,7 +349,7 @@ struct fixture {
 static void setup(struct fixture *f, bool raw, int format, bool direct)
 {
     memset(f, 0, sizeof(*f));
-    entered = permitted = idle = head_queries = pauses = failures = warnings = 0;
+    entered = permitted = idle = head_queries = pauses = failures = warnings = reloads = 0;
     response = input_bytes = track_count = underrun_queries = step_lines = 0;
     pause_after_write = true;
     atomic_store(&now_ns, MP_TIME_S_TO_NS(1));
@@ -743,6 +746,40 @@ static void check_watchdog_after_reset(void)
     expect_delay(&f, 0);
     teardown(&f);
     puts("PASS: restart keeps an old blocked write visible to the existing watchdog");
+}
+
+// #1804's failure on a raw TrueHD track: the route took it and never plays
+// it. A new track would stall the same way, so instead of the recreate every
+// other track gets, the monitor demotes TrueHD: it flags every later TrueHD
+// stream, stands the AO down, releases the writer and asks for a reload,
+// after which init() refuses TrueHD and the core decodes it.
+static void check_truehd_stall_demotes(void)
+{
+    struct fixture f;
+    setup(&f, true, 14, true);
+    f.ao.format = AF_FORMAT_S_TRUEHD; // the worker idles on the paused track
+    atomic_store(&f.p.play_requested, true);
+    atomic_store(&f.p.write_outstanding, true); // a write the device never took
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+    mp_mutex_lock(&gate);
+    int sampled = head_queries + 2;
+    int interrupted = pauses + 1;
+    mp_mutex_unlock(&gate);
+    wait_counter(&head_queries, sampled);
+    atomic_fetch_add(&now_ns, STALL_TIMEOUT_NS + 1);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    wait_counter(&pauses, interrupted);
+    assert(reloads == 1 && atomic_load(thd_raw_failed()) && atomic_load(&f.p.failed));
+    assert(!atomic_load(&f.p.recreate_requested) && !atomic_load(&f.p.recovery_attempts));
+    assert(!failures && track_count == 1);
+    atomic_store(&f.p.monitor_terminate, true);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    assert(!pthread_join(f.p.monitor, NULL));
+    f.p.monitor_created = false;
+    atomic_store(&f.p.play_requested, false);
+    teardown(&f);
+    puts("PASS: a stalled raw TrueHD track demotes TrueHD to decoding instead of recreating");
 }
 
 // The reported bug: on a Xiaomi Pad 8 Pro, flush() leaves the render
@@ -1161,5 +1198,6 @@ int main(void)
     check_iec_delayed_reset_smoothing();
     check_iec_playhead_step_line();
     check_recreate_anchors_fresh_track();
+    check_truehd_stall_demotes(); // last: the demotion is process-wide
     return 0;
 }

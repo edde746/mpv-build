@@ -23,6 +23,11 @@ jobs:
       - name: Validate patch series
         run: python3 scripts/patches.py check
 
+      # test_audiotrack_truehd.sh encodes its TrueHD fixtures with the host
+      # ffmpeg's truehd encoder and spdif muxer.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Test patch framework
         run: bash scripts/test_patches.sh
 
@@ -104,6 +109,7 @@ jobs:
               checked += 1
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
+                subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_rebind.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_letterbox.sh', str(dest)], check=True)

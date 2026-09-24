@@ -1,0 +1,650 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index 97150a8..7a3ccf6 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -122,6 +122,22 @@ struct priv {
+     bool raw_depth_logged;// first burst's Pd has sized the track in bursts
+     bool raw_rate_verified;// DTS-HD: the core header confirmed the track rate
+ 
++    // Raw TrueHD (AudioTrack_thdMatWord): the MAT frame is peeled off each
++    // burst and its access units are rebuilt in rawbuf, complete units first.
++    int thd_mat_pos;      // byte offset in the current MAT frame
++    bool thd_synced;      // unit boundaries known: a major sync was found
++    uint16_t thd_window[4];// words seen while scanning for a major sync
++    int thd_window_len;
++    int thd_fill;         // rawbuf bytes holding units, complete or not
++    int thd_complete;     // complete units at the start of rawbuf
++    int thd_complete_end; // where they end; the unit in progress starts here
++    int thd_unit_len;     // bytes of the unit in progress, 0 between units
++    int thd_credit;       // units completed since write() last returned
++    int thd_capacity;     // rawbuf bytes
++    int thd_group_bytes;  // bytes of the write in flight
++    int thd_group_units;  // units of the write in flight
++    bool thd_code_warned;
++
+     // Route polling for passthrough tracks (see AudioTrack_checkRouteChange)
+     jint routed_device;      // 0 = none observed yet
+     bool routing_lost;
+@@ -328,6 +344,7 @@ static struct JNIAudioFormat {
+     jint ENCODING_E_AC3;
+     jint ENCODING_DTS;
+     jint ENCODING_DTS_HD;
++    jint ENCODING_DOLBY_TRUEHD;
+     jint CHANNEL_OUT_MONO;
+     jint CHANNEL_OUT_STEREO;
+     jint CHANNEL_OUT_FRONT_CENTER;
+@@ -347,6 +364,7 @@ static const struct MPJniField AudioFormat_mapping[] = {
+     {"ENCODING_E_AC3", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_E_AC3), 0},
+     {"ENCODING_DTS", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS), 0},
+     {"ENCODING_DTS_HD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DTS_HD), 0},
++    {"ENCODING_DOLBY_TRUEHD", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ENCODING_DOLBY_TRUEHD), 0},
+     {"CHANNEL_OUT_MONO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_MONO), 1},
+     {"CHANNEL_OUT_STEREO", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_STEREO), 1},
+     {"CHANNEL_OUT_FRONT_CENTER", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(CHANNEL_OUT_FRONT_CENTER), 1},
+@@ -380,14 +398,18 @@ static const struct MPJniField AudioFormatBuilder_mapping[] = {
+ 
+ static struct JNIAudioManager {
+     jclass clazz;
++    jmethodID getDirectPlaybackSupport;
+     jint ERROR_DEAD_OBJECT;
+     jint STREAM_MUSIC;
++    jint DIRECT_PLAYBACK_BITSTREAM_SUPPORTED;
+ } AudioManager;
+ #define OFFSET(member) offsetof(struct JNIAudioManager, member)
+ static const struct MPJniField AudioManager_mapping[] = {
+     {"android/media/AudioManager", NULL, MP_JNI_CLASS, OFFSET(clazz), 1},
+     {"STREAM_MUSIC", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STREAM_MUSIC), 1},
+     {"ERROR_DEAD_OBJECT", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(ERROR_DEAD_OBJECT), 0},
++    {"getDirectPlaybackSupport", "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)I", MP_JNI_STATIC_METHOD, OFFSET(getDirectPlaybackSupport), 0},
++    {"DIRECT_PLAYBACK_BITSTREAM_SUPPORTED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(DIRECT_PLAYBACK_BITSTREAM_SUPPORTED), 0},
+     {0}
+ };
+ #undef OFFSET
+@@ -571,6 +593,21 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+     p->step_resets++;
+ }
+ 
++// Forget a raw TrueHD track's unit reassembly (AudioTrack_thdMatWord).
++static void AudioTrack_thdReset(struct priv *p)
++{
++    p->thd_mat_pos = 0;
++    p->thd_synced = false;
++    p->thd_window_len = 0;
++    p->thd_fill = 0;
++    p->thd_complete = 0;
++    p->thd_complete_end = 0;
++    p->thd_unit_len = 0;
++    p->thd_credit = 0;
++    p->thd_group_bytes = 0;
++    p->thd_group_units = 0;
++}
++
+ // Forget everything derived from the current track's buffer and clock: what
+ // stop() needs after a flush, and what a replacement track needs from zero.
+ static void AudioTrack_resetClock(struct priv *p)
+@@ -591,6 +628,7 @@ static void AudioTrack_resetClock(struct priv *p)
+     p->raw_have_byte = false;
+     p->raw_pending = 0;
+     p->raw_input_len = 0;
++    AudioTrack_thdReset(p);
+     AudioTrack_resetPlayheadSmoothing(p);
+     p->step_anchored = false;
+     // The worker sets write_outstanding before the JNI call a stop/reset can
+@@ -972,6 +1010,27 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+ #define IEC61937_DTS3  0x0d
+ #define IEC61937_DTSHD 0x11
+ #define IEC61937_EAC3  0x15
++#define IEC61937_TRUEHD 0x16
++
++// libavformat's MAT frame, the payload of every TrueHD burst (spdifenc.c):
++// fixed codes at three offsets, and between them access units copied
++// verbatim with zero padding in front of each, all in whole 16-bit words.
++// A code may split a unit, and a unit may run on into the next frame.
++#define MAT_FRAME_SIZE 61424
++#define MAT_BURST_SIZE 61440
++#define MAT_START_LEN  20
++#define MAT_MIDDLE_POS 30708
++#define MAT_MIDDLE_LEN 12
++#define MAT_END_POS    (MAT_FRAME_SIZE - 16)
++
++// A TrueHD access unit lasts 1/1200 s at every 48 kHz-family rate. Its length
++// is a 12-bit count of 16-bit words, and a major-sync unit carries the rate
++// family in the high nibble of byte 8 (0-2: 48/96/192 kHz, 8-10: 44.1 kHz).
++#define THD_UNITS_PER_S   1200
++#define THD_MAX_UNIT      (0xfff * 2)
++// Kodi's raw TrueHD sink writes 24 units at a time (xbmc#20550: fewer played
++// nothing on a SHIELD); keep its write shape.
++#define THD_GROUP_UNITS   24
+ 
+ // The DTS type IV burst payload: libavformat's 10-byte start code, the
+ // packet size (big-endian), then the whole core+substream packet.
+@@ -1022,60 +1081,310 @@ static int raw_buffer_budget(int format)
+         // The 8-channel 192 kHz carrier bounds a 512-sample MA frame at 32 KiB
+         // (spdifenc: pkt_offset - preamble); 1.4 s at HRA's 1.5 Mb/s floor.
+         return 8 * 32768;
++    case AF_FORMAT_S_TRUEHD:
++        // Three MAT frames' worth, 1.5 times Kodi's two: 80 ms at TrueHD's
++        // 18 Mb/s ceiling, 250-370 ms of a typical 4-6 Mb/s Atmos track and
++        // 1.5 s of a 1 Mb/s stereo one, inside the 2 s delay clamp.
++        return 3 * MAT_BURST_SIZE;
+     default:
+         return 0;
+     }
+ }
+ 
++// The AudioFormat a route probe asks about, or NULL when the builder is
++// missing or fails.
++static jobject AudioTrack_probeFormat(struct ao *ao, jint format,
++                                      jint samplerate, jint channel_config)
++{
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (!AudioFormatBuilder.clazz)
++        return NULL;
++    jobject builder = MP_JNI_NEW(AudioFormatBuilder.clazz, AudioFormatBuilder.ctor);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !builder)
++        return NULL;
++    jobject tmp = MP_JNI_CALL_OBJECT(builder, AudioFormatBuilder.setEncoding, format);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(builder, AudioFormatBuilder.setSampleRate, samplerate);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(builder, AudioFormatBuilder.setChannelMask, channel_config);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    jobject afmt = MP_JNI_CALL_OBJECT(builder, AudioFormatBuilder.build);
++    MP_JNI_LOCAL_FREEP(&builder);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        MP_JNI_LOCAL_FREEP(&afmt);
++    return afmt;
++}
++
++// The movie attributes every passthrough track uses, for a route probe.
++static jobject AudioTrack_probeAttributes(struct ao *ao)
++{
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    if (!AudioAttributesBuilder.clazz)
++        return NULL;
++    jobject builder = MP_JNI_NEW(AudioAttributesBuilder.clazz, AudioAttributesBuilder.ctor);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !builder)
++        return NULL;
++    jobject tmp = MP_JNI_CALL_OBJECT(builder, AudioAttributesBuilder.setUsage, AudioAttributes.USAGE_MEDIA);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    tmp = MP_JNI_CALL_OBJECT(builder, AudioAttributesBuilder.setContentType, AudioAttributes.CONTENT_TYPE_MOVIE);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    jobject attr = MP_JNI_CALL_OBJECT(builder, AudioAttributesBuilder.build);
++    MP_JNI_LOCAL_FREEP(&builder);
++    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++        MP_JNI_LOCAL_FREEP(&attr);
++    return attr;
++}
++
+ // isDirectPlaybackSupported (API 29+): getMinBufferSize alone can accept a
+ // format the route then renders as silence. Unknown counts as supported.
+ static bool AudioTrack_rawRouteSupported(struct ao *ao, jint format,
+                                          jint samplerate, jint channel_config)
+ {
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+-    if (!AudioTrack.isDirectPlaybackSupported ||
+-        !AudioFormatBuilder.clazz || !AudioAttributesBuilder.clazz)
++    if (!AudioTrack.isDirectPlaybackSupported)
+         return true;
+ 
+-    jobject tmp = NULL;
++    jobject afmt = AudioTrack_probeFormat(ao, format, samplerate, channel_config);
++    jobject attr = AudioTrack_probeAttributes(ao);
++    bool supported = true; // a malfunctioning probe is not a "no"
++    if (afmt && attr) {
++        supported = MP_JNI_DO(CallStaticBooleanMethod, AudioTrack.clazz,
++                              AudioTrack.isDirectPlaybackSupported, afmt, attr);
++        if (MP_JNI_EXCEPTION_LOG(ao) < 0)
++            supported = true;
++    }
++    MP_JNI_LOCAL_FREEP(&afmt);
++    MP_JNI_LOCAL_FREEP(&attr);
++    return supported;
++}
+ 
+-    jobject format_builder = MP_JNI_NEW(AudioFormatBuilder.clazz, AudioFormatBuilder.ctor);
+-    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !format_builder)
+-        return true;
+-    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setEncoding, format);
+-    MP_JNI_LOCAL_FREEP(&tmp);
+-    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setSampleRate, samplerate);
+-    MP_JNI_LOCAL_FREEP(&tmp);
+-    tmp = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.setChannelMask, channel_config);
+-    MP_JNI_LOCAL_FREEP(&tmp);
+-    jobject afmt = MP_JNI_CALL_OBJECT(format_builder, AudioFormatBuilder.build);
+-    MP_JNI_LOCAL_FREEP(&format_builder);
++enum { ROUTE_UNKNOWN = -1, ROUTE_NONE, ROUTE_OFFLOAD, ROUTE_BITSTREAM };
++
++// How the route takes one track shape, asked the way Plezy's
++// AudioOutputPolicy asks before it names a codec in audio-spdif, so the AO
++// opens the transport the app vouched for. API 33+: getDirectPlaybackSupport,
++// where only the bitstream bit makes ROUTE_BITSTREAM - an offload-only
++// profile says nothing about an IEC 61937 track, which is PCM-shaped. API
++// 29-32: isDirectPlaybackSupported, which cannot tell the two apart. Below
++// that, or when the probe itself fails, ROUTE_UNKNOWN.
++static int AudioTrack_routeSupport(struct ao *ao, jint format,
++                                   jint samplerate, jint channel_config)
++{
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    const bool api33 = AudioManager.getDirectPlaybackSupport &&
++                       AudioManager.DIRECT_PLAYBACK_BITSTREAM_SUPPORTED;
++    if (!api33 && !AudioTrack.isDirectPlaybackSupported)
++        return ROUTE_UNKNOWN;
++
++    jobject afmt = AudioTrack_probeFormat(ao, format, samplerate, channel_config);
++    jobject attr = AudioTrack_probeAttributes(ao);
++    int support = ROUTE_UNKNOWN;
++    if (afmt && attr) {
++        if (api33) {
++            jint flags = MP_JNI_CALL_STATIC_INT(AudioManager.clazz,
++                AudioManager.getDirectPlaybackSupport, afmt, attr);
++            if (MP_JNI_EXCEPTION_LOG(ao) >= 0) {
++                support = !flags ? ROUTE_NONE :
++                    (flags & AudioManager.DIRECT_PLAYBACK_BITSTREAM_SUPPORTED)
++                        ? ROUTE_BITSTREAM : ROUTE_OFFLOAD;
++            }
++        } else {
++            bool direct = MP_JNI_DO(CallStaticBooleanMethod, AudioTrack.clazz,
++                                    AudioTrack.isDirectPlaybackSupported, afmt, attr);
++            if (MP_JNI_EXCEPTION_LOG(ao) >= 0)
++                support = direct ? ROUTE_BITSTREAM : ROUTE_NONE;
++        }
++    }
++    MP_JNI_LOCAL_FREEP(&afmt);
++    MP_JNI_LOCAL_FREEP(&attr);
++    return support;
++}
+ 
+-    jobject attr_builder = MP_JNI_NEW(AudioAttributesBuilder.clazz, AudioAttributesBuilder.ctor);
+-    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !attr_builder) {
+-        MP_JNI_LOCAL_FREEP(&afmt);
+-        return true;
++// Process-wide, like the route: once a raw TrueHD track has failed, every
++// later TrueHD stream decodes rather than try it again.
++static atomic_bool *thd_raw_failed(void)
++{
++    static atomic_bool failed;
++    return &failed;
++}
++
++// TrueHD has two transports, tried in Kodi's order. The MAT carrier
++// (ENCODING_IEC61937 at 192 kHz/7.1) wherever the route bitstreams it; else
++// the raw ENCODING_DOLBY_TRUEHD track of Kodi's "AudioTrack (RAW)" sink, at
++// the same 192 kHz/7.1 and in 24-unit writes, for routes with no carrier at
++// all (a TCL C8K's eARC port offers only the native offload profile). The
++// carrier stays first because raw TrueHD in media3's shape - the stream's own
++// rate - took one write and never played on #1804's box and froze a Box R for
++// ten seconds, both routes whose carrier plays. With no route oracle (API <
++// 29) the carrier is kept, as before, and a route that answers no to both
++// gets the carrier it always got. Returns 0 when TrueHD must decode: the
++// route has no carrier and a raw track already failed in this process.
++static jint AudioTrack_trueHdEncoding(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    const int carrier = AudioTrack_routeSupport(ao, AudioFormat.ENCODING_IEC61937,
++                                                ao->samplerate, p->channel_config);
++    if (carrier == ROUTE_UNKNOWN || carrier == ROUTE_BITSTREAM) {
++        MP_VERBOSE(ao, "TrueHD: keeping the MAT carrier\n");
++        return AudioFormat.ENCODING_IEC61937;
+     }
+-    tmp = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.setUsage, AudioAttributes.USAGE_MEDIA);
+-    MP_JNI_LOCAL_FREEP(&tmp);
+-    tmp = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.setContentType, AudioAttributes.CONTENT_TYPE_MOVIE);
+-    MP_JNI_LOCAL_FREEP(&tmp);
+-    jobject attr = MP_JNI_CALL_OBJECT(attr_builder, AudioAttributesBuilder.build);
+-    MP_JNI_LOCAL_FREEP(&attr_builder);
++    if (atomic_load(thd_raw_failed())) {
++        MP_WARN(ao, "TrueHD: route refuses the MAT carrier and a raw TrueHD "
++                "track failed earlier; decoding\n");
++        return 0;
++    }
++    if (!p->cfg_raw_passthrough || !AudioFormat.ENCODING_DOLBY_TRUEHD ||
++        !AudioTrack.writeBufferV21 ||
++        AudioTrack_routeSupport(ao, AudioFormat.ENCODING_DOLBY_TRUEHD,
++                                ao->samplerate, p->channel_config) <= ROUTE_NONE)
++    {
++        MP_VERBOSE(ao, "TrueHD: route refuses the MAT carrier and raw TrueHD; "
++                   "trying the carrier\n");
++        return AudioFormat.ENCODING_IEC61937;
++    }
++    MP_VERBOSE(ao, "TrueHD: route refuses the MAT carrier; raw TrueHD at %d Hz\n",
++               ao->samplerate);
++    return AudioFormat.ENCODING_DOLBY_TRUEHD;
++}
+ 
+-    bool supported = true;
+-    if (MP_JNI_EXCEPTION_LOG(ao) < 0 || !afmt || !attr)
+-        goto done; // a malfunctioning probe is not a "no"
++// Give up on raw TrueHD for the rest of the process. The AO stands down and
++// asks the core to reopen it; init() then refuses TrueHD and the core falls
++// back to decoding it. Any thread.
++static void AudioTrack_thdDemote(struct ao *ao, const char *why)
++{
++    struct priv *p = ao->priv;
++    atomic_store(thd_raw_failed(), true);
++    if (atomic_exchange(&p->failed, true))
++        return;
++    MP_WARN(ao, "%s; TrueHD decodes from now on\n", why);
++    ao_request_reload(ao);
++}
+ 
+-    supported = MP_JNI_DO(CallStaticBooleanMethod, AudioTrack.clazz,
+-                          AudioTrack.isDirectPlaybackSupported, afmt, attr);
+-    if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+-        supported = true;
++// Drop the unit in progress and scan for the next major sync. After a reset,
++// a resync or a corrupt header, unit boundaries are unknown until then: a
++// burst picked up mid-stream opens on the tail of a unit the previous frame
++// began.
++static void AudioTrack_thdLoseSync(struct priv *p)
++{
++    p->thd_fill = p->thd_complete_end;
++    p->thd_unit_len = 0;
++    p->thd_synced = false;
++    p->thd_window_len = 0;
++}
+ 
+-done:
+-    MP_JNI_LOCAL_FREEP(&afmt);
+-    MP_JNI_LOCAL_FREEP(&attr);
+-    return supported;
++static void AudioTrack_thdPut(struct priv *p, uint16_t word)
++{
++    uint8_t *dst = (uint8_t *)p->rawbuf + p->thd_fill;
++    dst[0] = word >> 8;
++    dst[1] = word & 0xff;
++    p->thd_fill += 2;
++}
++
++// One word of the access-unit stream, MAT codes already removed. Zero words
++// between units are padding; a unit's first word holds its length.
++static void AudioTrack_thdStreamWord(struct ao *ao, uint16_t word)
++{
++    struct priv *p = ao->priv;
++    if (!p->thd_synced) {
++        // A major-sync unit's length and timing words are followed by
++        // f8726fba; the unit starts two words before it.
++        uint16_t *w = p->thd_window;
++        if (p->thd_window_len == 4) {
++            memmove(w, w + 1, 3 * sizeof(*w));
++            p->thd_window_len = 3;
++        }
++        w[p->thd_window_len++] = word;
++        if (p->thd_window_len < 4 || w[2] != 0xf872 || w[3] != 0x6fba)
++            return;
++        const int len = (w[0] & 0xfff) * 2;
++        if (len < 10 || p->thd_fill + len > p->thd_capacity)
++            return;
++        p->thd_synced = true;
++        p->thd_window_len = 0;
++        p->thd_unit_len = len;
++        for (int n = 0; n < 4; n++)
++            AudioTrack_thdPut(p, w[n]);
++        return; // at least a word short of the rate nibble
++    }
++    if (!p->thd_unit_len) {
++        if (!word)
++            return;
++        const int len = (word & 0xfff) * 2;
++        if (len < 4 || p->thd_fill + len > p->thd_capacity) {
++            AudioTrack_thdLoseSync(p);
++            return;
++        }
++        p->thd_unit_len = len;
++    }
++    AudioTrack_thdPut(p, word);
++    const int start = p->thd_complete_end;
++    if (p->thd_fill - start < p->thd_unit_len)
++        return;
++    const uint8_t *unit = (const uint8_t *)p->rawbuf + start;
++    if (p->thd_unit_len >= 10 && unit[4] == 0xf8 && unit[5] == 0x72 &&
++        unit[6] == 0x6f && unit[7] == 0xba)
++    {
++        const int ratebits = unit[8] >> 4;
++        if (ratebits & 8) {
++            // Its units last 1/1102.5 s against a 192 kHz track and clock.
++            AudioTrack_thdDemote(ao, "44.1 kHz-family TrueHD has no raw shape here");
++            AudioTrack_thdLoseSync(p);
++            return;
++        }
++        if (ratebits > 2) {
++            AudioTrack_thdLoseSync(p); // f8726fba inside a unit, not a sync
++            return;
++        }
++    }
++    p->thd_complete++;
++    p->thd_complete_end = p->thd_fill;
++    p->thd_unit_len = 0;
++    p->thd_credit++;
++}
++
++// One word of a TrueHD burst's payload, the MAT frame: its codes are dropped
++// and the rest is the unit stream. The fixed offsets are the whole parse, so
++// each code's first word is checked; a frame that does not match is not
++// trusted with unit boundaries.
++static void AudioTrack_thdMatWord(struct ao *ao, uint8_t b0, uint8_t b1)
++{
++    struct priv *p = ao->priv;
++    const int pos = p->thd_mat_pos;
++    p->thd_mat_pos += 2;
++    const uint16_t word = b0 << 8 | b1;
++    const uint16_t code = pos == 0 ? 0x079e : pos == MAT_MIDDLE_POS ? 0xc3c1 :
++                          pos == MAT_END_POS ? 0xc3c2 : 0;
++    if (code && word != code) {
++        if (!p->thd_code_warned) {
++            p->thd_code_warned = true;
++            MP_WARN(ao, "TrueHD burst has no MAT code at offset %d; resyncing\n", pos);
++        }
++        AudioTrack_thdLoseSync(p);
++    }
++    if (pos < MAT_START_LEN || pos >= MAT_END_POS ||
++        (pos >= MAT_MIDDLE_POS && pos < MAT_MIDDLE_POS + MAT_MIDDLE_LEN))
++        return;
++    AudioTrack_thdStreamWord(ao, word);
++}
++
++// Bytes and count of the whole THD_GROUP_UNITS groups at the front of rawbuf.
++static int AudioTrack_thdGroup(struct priv *p, int *units)
++{
++    const uint8_t *buf = p->rawbuf;
++    *units = p->thd_complete / THD_GROUP_UNITS * THD_GROUP_UNITS;
++    int bytes = 0;
++    for (int n = 0; n < *units; n++)
++        bytes += ((buf[bytes] & 0xf) << 8 | buf[bytes + 1]) * 2;
++    return bytes;
++}
++
++// Drop units the track has taken from the front of rawbuf.
++static void AudioTrack_thdTake(struct priv *p, int bytes, int units)
++{
++    memmove(p->rawbuf, (uint8_t *)p->rawbuf + bytes, p->thd_fill - bytes);
++    p->thd_fill -= bytes;
++    p->thd_complete_end -= bytes;
++    p->thd_complete -= units;
+ }
+ 
+ // Unwraps IEC 61937 (LE words from libavformat's spdif muxer) back into the
+@@ -1083,7 +1392,8 @@ done:
+ // arrives without a preamble, so the frame header supplies its length. A
+ // DTS-HD burst carries its own header (DTSHD_BURST_HEADER) inside Pd, and
+ // Pd is padded past the packet, so the header's size field bounds the copy.
+-// dst needs len + sizeof(raw_dts_header) bytes.
++// dst needs len + sizeof(raw_dts_header) bytes. TrueHD bursts go to the unit
++// reassembly in rawbuf instead (AudioTrack_thdMatWord) and never touch dst.
+ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+                                      const uint8_t *src, int len)
+ {
+@@ -1100,6 +1410,16 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+         const uint8_t lo = p->raw_byte, hi = src[i++];
+         p->raw_have_byte = false;
+ 
++        if (p->raw_state == RAW_PAYLOAD && p->raw_data_type == IEC61937_TRUEHD) {
++            AudioTrack_thdMatWord(ao, hi, lo);
++            p->raw_payload_left -= 2;
++            if (p->raw_payload_left <= 0) {
++                p->raw_payload_left = 0;
++                p->raw_state = RAW_SYNC_PA;
++            }
++            continue;
++        }
++
+         if (p->raw_state == RAW_PAYLOAD) {
+             // Payload words are byte-swapped; a lone final byte rides high.
+             dst[out++] = hi;
+@@ -1179,6 +1499,12 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+             p->raw_state = RAW_PD;
+             break;
+         case RAW_PD:
++            if ((ao->format == AF_FORMAT_S_TRUEHD) != (p->raw_data_type == IEC61937_TRUEHD)) {
++                MP_WARN(ao, "IEC 61937 data type 0x%x in a %s stream\n",
++                        p->raw_data_type, af_fmt_to_str(ao->format));
++                p->raw_state = RAW_SYNC_PA;
++                break;
++            }
+             switch (p->raw_data_type) {
+             case IEC61937_AC3:
+             case IEC61937_DTS1:
+@@ -1190,6 +1516,14 @@ static int AudioTrack_unwrapIEC61937(struct ao *ao, uint8_t *dst,
+             case IEC61937_DTSHD:
+                 p->raw_payload_left = word; // Pd in bytes
+                 break;
++            case IEC61937_TRUEHD:
++                // Pd in bytes: one whole MAT frame, the layout the unit
++                // parse depends on.
++                p->raw_payload_left = word == MAT_FRAME_SIZE ? word : 0;
++                if (!p->raw_payload_left)
++                    MP_WARN(ao, "TrueHD burst of %d bytes is not a MAT frame\n", word);
++                p->thd_mat_pos = 0;
++                break;
+             default:
+                 MP_WARN(ao, "unexpected IEC 61937 data type 0x%x\n",
+                         p->raw_data_type);
+@@ -1289,7 +1623,32 @@ static int AudioTrack_write(struct ao *ao, int len)
+     jmethodID method;
+     int count = len, sample_size = 1;
+ 
+-    if (p->raw_passthrough) {
++    if (p->raw_passthrough && ao->format == AF_FORMAT_S_TRUEHD) {
++        if (!p->raw_pending) {
++            AudioTrack_unwrapIEC61937(ao, NULL, buf, len);
++            // Credit the audio the completed units hold, 1/1200 s each, not
++            // the carrier they came in: units dropped before a major sync
++            // were never queued, and counting them would offset A/V sync by
++            // their length for the rest of the epoch.
++            const int credit = p->thd_credit *
++                (ao->samplerate / THD_UNITS_PER_S) * ao->sstride;
++            p->thd_credit = 0;
++            int units;
++            const int bytes = AudioTrack_thdGroup(p, &units);
++            if (!bytes)
++                return credit; // held until a whole group is complete
++            p->raw_pending = bytes;
++            p->raw_input_len = credit;
++            p->thd_group_bytes = bytes;
++            p->thd_group_units = units;
++            jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++            MP_JNI_LOCAL_FREEP(&bbuf);
++        }
++        buffer = p->bbuf;
++        method = AudioTrack.writeBufferV21;
++        count = p->raw_pending;
++    } else if (p->raw_passthrough) {
+         if (!p->raw_pending) {
+             p->raw_pending = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
+             if (!p->raw_pending)
+@@ -1362,7 +1721,11 @@ static int AudioTrack_write(struct ao *ao, int len)
+         return ret;
+     if (p->raw_passthrough) {
+         p->raw_pending -= ret;
+-        return p->raw_pending ? 0 : p->raw_input_len;
++        if (p->raw_pending)
++            return 0;
++        if (ao->format == AF_FORMAT_S_TRUEHD)
++            AudioTrack_thdTake(p, p->thd_group_bytes, p->thd_group_units);
++        return p->raw_input_len;
+     }
+     return ret * sample_size;
+ }
+@@ -1669,6 +2032,20 @@ static MP_THREAD_VOID monitor_thread(void *arg)
+         char why[96];
+         snprintf(why, sizeof(why), "AudioTrack accepted no audio for %d ms",
+                  (int)(stalled_ns / 1000000));
++        if (p->raw_passthrough && ao->format == AF_FORMAT_S_TRUEHD) {
++            // #1804's failure: the route took the raw TrueHD track and does
++            // not play it. A new track would stall the same way; decode.
++            AudioTrack_thdDemote(ao, why);
++            mp_mutex_lock(&p->track_lock);
++            if (p->audiotrack) {
++                // Releases the worker from its blocking write; it then
++                // finds p->failed and idles until the reload uninits it.
++                MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
++                MP_JNI_EXCEPTION_LOG(ao);
++            }
++            mp_mutex_unlock(&p->track_lock);
++            continue;
++        }
+         if (!AudioTrack_beginRecovery(ao, why))
+             continue;
+         atomic_store(&p->write_progress_ns, now);
+@@ -1818,6 +2195,12 @@ static int init(struct ao *ao)
+         int rate_mult = 1;
+         jint raw_format = p->cfg_raw_passthrough
+                         ? raw_encoding_for_format(ao->format, &rate_mult) : 0;
++        if (ao->format == AF_FORMAT_S_TRUEHD) {
++            const jint encoding = AudioTrack_trueHdEncoding(ao);
++            if (!encoding)
++                goto error;
++            raw_format = encoding == AudioFormat.ENCODING_IEC61937 ? 0 : encoding;
++        }
+         if (raw_format && ao->format == AF_FORMAT_S_DTSHD &&
+             AudioFormat.ENCODING_IEC61937 &&
+             AudioTrack_rawRouteSupported(ao, AudioFormat.ENCODING_IEC61937,
+@@ -1833,7 +2216,7 @@ static int init(struct ao *ao)
+                        af_fmt_to_str(ao->format));
+             raw_format = 0;
+         }
+-        if (raw_format &&
++        if (raw_format && ao->format != AF_FORMAT_S_TRUEHD &&
+             !AudioTrack_rawRouteSupported(ao, raw_format,
+                                           ao->samplerate / rate_mult,
+                                           p->channel_config)) {
+@@ -1889,6 +2272,13 @@ static int init(struct ao *ao)
+         p->channel_config,
+         p->format
+     );
++    if (p->raw_passthrough && (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0) &&
++        ao->format == AF_FORMAT_S_TRUEHD)
++    {
++        // Raw TrueHD is only opened on a route that refuses the carrier.
++        MP_WARN(ao, "raw TrueHD rejected (buffer size %d); decoding\n", buffer_size);
++        goto error;
++    }
+     if (p->raw_passthrough && (MP_JNI_EXCEPTION_LOG(ao) < 0 || buffer_size <= 0)) {
+         MP_WARN(ao, "raw passthrough rejected (buffer size %d), trying IEC 61937\n",
+                 buffer_size);
+@@ -1920,6 +2310,11 @@ static int init(struct ao *ao)
+         // driver minimum of carrier data, as before.
+         const int budget = raw_buffer_budget(ao->format);
+         p->chunksize = MP_ALIGN_UP(buffer_size * 2, bps);
++        if (ao->format == AF_FORMAT_S_TRUEHD) {
++            // Units arrive a MAT frame at a time and leave in whole groups;
++            // read one burst per pass.
++            p->chunksize = MAT_BURST_SIZE;
++        }
+         p->size = MP_ALIGN_UP(MPMAX(buffer_size * 2, budget), bps);
+         MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d, budget=%d, chunk=%d)\n",
+                    p->size, buffer_size, budget, p->chunksize);
+@@ -1973,6 +2368,12 @@ static int init(struct ao *ao)
+     if (p->raw_passthrough) {
+         MP_VERBOSE(ao, "Using NIO ByteBuffer for raw passthrough\n");
+         int capacity = p->chunksize + sizeof(p->raw_dts_header);
++        if (ao->format == AF_FORMAT_S_TRUEHD) {
++            // Units short of a whole group, the one in progress, and all that
++            // one burst can complete: whole groups leave before the next read.
++            capacity = p->chunksize + (THD_GROUP_UNITS + 1) * THD_MAX_UNIT;
++            p->thd_capacity = capacity;
++        }
+         p->rawbuf = talloc_size(ao, capacity);
+         jobject bbuf = (*env)->NewDirectByteBuffer(env, p->rawbuf, capacity);
+         p->bbuf = (*env)->NewGlobalRef(env, bbuf);

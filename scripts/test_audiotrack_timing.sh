@@ -42,16 +42,22 @@ python3 "$E" type "$src" "$workdir/audiotrack_write.inc" --append --name priv
 python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name IEC61937_AC3 --name IEC61937_DTS1 --name IEC61937_DTS2 \
     --name IEC61937_DTS3 --name IEC61937_DTSHD --name IEC61937_EAC3 \
+    --name IEC61937_TRUEHD --name MAT_FRAME_SIZE --name MAT_BURST_SIZE \
+    --name MAT_START_LEN --name MAT_MIDDLE_POS --name MAT_MIDDLE_LEN --name MAT_END_POS \
+    --name THD_UNITS_PER_S --name THD_MAX_UNIT --name THD_GROUP_UNITS \
     --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
     --name THREAD_PRIORITY_AUDIO \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
-    --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_resetClock \
+    --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_thdReset --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
     --fn head_rate --fn head_jump_is_wrap \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
     --fn AudioTrack_getLatency \
+    --fn thd_raw_failed --fn AudioTrack_thdDemote --fn AudioTrack_thdLoseSync \
+    --fn AudioTrack_thdPut --fn AudioTrack_thdStreamWord --fn AudioTrack_thdMatWord \
+    --fn AudioTrack_thdGroup --fn AudioTrack_thdTake \
     --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
     --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \

@@ -326,8 +326,21 @@ PCM timestamp/fallback paths, startup, E-AC3 counter wrap, partial writes
 across stop/reset/recreation, stale write completions without clock credit,
 DTS-HD bursts unwrapping to bare packets with the raw track reopened at
 the core rate, and the passthrough clock's rate-limited `playhead step`
-diagnostic with its observe-only `getTimestamp` probe. Pass an
+diagnostic with its observe-only `getTimestamp` probe, and a stalled raw
+TrueHD track demoting TrueHD to decoding instead of being recreated. Pass an
 already-patched source directory as the first argument to run offline.
+
+Run the raw TrueHD regression with `bash scripts/test_audiotrack_truehd.sh`.
+It encodes TrueHD with the host ffmpeg, packs it into IEC 61937 MAT bursts
+with ffmpeg's spdif muxer, and runs the bursts through the production
+reassembly: every access unit handed to the raw track must be byte-identical
+to the unit ffmpeg packed, in whole groups of 24, credited one unit at a time,
+whether the carrier is read in whole bursts or split mid-word. Streams cover
+small units in wide padding, units larger than the MAT slot (so the codes
+split units and units cross frames), a pickup mid-burst that must resume on a
+major sync, a damaged MAT code, and a 44.1 kHz stream that must demote.
+Pass an already-patched source directory as the first argument to run
+offline, and a media file as the second to check its first audio track too.
 
 ## Make demo app using the local build version
 
