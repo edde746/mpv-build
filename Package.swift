@@ -86,8 +86,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libass",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libass-a9a42d0c0097.xcframework.zip",
-            checksum: "f40b359dbf5e6b954503daf519fadcedc3540666713c2e94a854e01690815580"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libass-b06d6d4f1d02.xcframework.zip",
+            checksum: "b96ff1b9b7c6299b97734f0a19564c7184abcc3cb134be93ff2c24807c87d066"
         ),
 
         .binaryTarget(
@@ -199,8 +199,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-03552394ad90.xcframework.zip",
-            checksum: "246509c06e61c0b03279ffc27a4868d924b6fbc693649ed5e951c63450fef369"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-210e7414c188.xcframework.zip",
+            checksum: "e01a418e6e047d6d871eaa376740189b945885f2e0d81a3a9d716137660614aa"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
