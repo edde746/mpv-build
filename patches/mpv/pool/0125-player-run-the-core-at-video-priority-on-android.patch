@@ -1,0 +1,49 @@
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index f1d3397..97150a8 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -1504,9 +1504,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     // fills it in one burst whenever the HAL starts taking data (Fire TV's
+     // Dolby track holds the first writes until the sink locks, then drains
+     // them at once). A writer that outranks the core empties the queue
+-    // inside that burst and trips the short-read wire; at the default it
+-    // yields to the refill. The depth is the raw track's own slack, so the
+-    // priority buys nothing there.
++    // inside that burst and trips the short-read wire; at the priority it
++    // inherits from the core, which opens the AO, it yields to the refill.
++    // The depth is the raw track's own slack, so the priority buys nothing
++    // there.
+     if (!p->raw_passthrough &&
+         setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
+         MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
+diff --git a/player/client.c b/player/client.c
+index e23b98b..45162fb 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -21,6 +21,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdlib.h>
++#include <sys/resource.h>
+ 
+ #include "common/common.h"
+ #include "common/global.h"
+@@ -591,6 +592,18 @@ static MP_THREAD_VOID core_thread(void *p)
+     struct MPContext *mpctx = p;
+ 
+     mp_thread_set_name("core");
++#if HAVE_ANDROID
++    // THREAD_PRIORITY_VIDEO. At the default niceness the core shares the CPU
++    // with the app's UI and background threads and can fall behind for good
++    // under load: a Box R decoding TrueHD beside a CPU hog showed a tenth of
++    // its frames late and 21.5-22 fps for whole sessions, against 2-16 late
++    // frames per 8 minutes at this priority. Niceness is per thread and
++    // inherited at creation, so everything the core starts follows it: the
++    // VO, the decoder thread, the demuxer and the AO, whose PCM writer raises
++    // itself further. Best effort: a refusal leaves the default.
++    if (setpriority(PRIO_PROCESS, 0, -10) != 0)
++        MP_VERBOSE(mpctx, "core thread priority refused: %s\n", mp_strerror(errno));
++#endif
+ 
+     while (!mpctx->initialized && mpctx->stop_play != PT_QUIT)
+         mp_idle(mpctx);

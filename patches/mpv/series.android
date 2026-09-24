@@ -36,3 +36,4 @@
 0122-ao-audiotrack-raw-queue-floor-in-time.patch
 0123-vo-mediacodec-snap-to-the-choreographers-own-vsync-grid.patch
 0124-vo-mediacodec-hand-frames-to-the-codec-50-ms-ahead-as-media3-does.patch
+0125-player-run-the-core-at-video-priority-on-android.patch
