@@ -90,18 +90,18 @@
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-f10ff46098f5.xcframework.zip",
-              "checksum": "29acc0008ac63ea49161aa75845c44650cabc0745bfc4fc5f61701afe9ee81f0"
+              "asset": "Libmpv-03552394ad90.xcframework.zip",
+              "checksum": "246509c06e61c0b03279ffc27a4868d924b6fbc693649ed5e951c63450fef369"
             }
           },
-          "key": "f10ff46098f5",
+          "key": "03552394ad90",
           "prebuilt": {
-            "ios": "libmpv-all-f10ff46098f5-ios.zip",
-            "isimulator": "libmpv-all-f10ff46098f5-isimulator.zip",
-            "maccatalyst": "libmpv-all-f10ff46098f5-maccatalyst.zip",
-            "macos": "libmpv-all-f10ff46098f5-macos.zip",
-            "tvos": "libmpv-all-f10ff46098f5-tvos.zip",
-            "tvsimulator": "libmpv-all-f10ff46098f5-tvsimulator.zip"
+            "ios": "libmpv-all-03552394ad90-ios.zip",
+            "isimulator": "libmpv-all-03552394ad90-isimulator.zip",
+            "maccatalyst": "libmpv-all-03552394ad90-maccatalyst.zip",
+            "macos": "libmpv-all-03552394ad90-macos.zip",
+            "tvos": "libmpv-all-03552394ad90-tvos.zip",
+            "tvsimulator": "libmpv-all-03552394ad90-tvsimulator.zip"
           }
         }
       }
