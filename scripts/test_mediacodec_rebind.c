@@ -31,28 +31,45 @@ typedef struct window { int refs; bool entered, release; } ANativeWindow;
 struct mediacodec_geometry { int width; };
 struct mediacodec_opts { char *video_rect; int osd_vsync_delay; int64_t osd_surface; };
 struct m_config_cache { struct mediacodec_opts *opts; bool dirty; };
-struct osd_shared {
+struct mp_osd_res { int w, h; };
+struct osd_slot { void *sbs; };
+struct osd_ahead_callbacks {
+    void *ctx;
+    void (*thread_init)(void *ctx);
+    void (*latch_canvas)(void *ctx);
+    void (*canvas_size)(void *ctx, int *w, int *h);
+    struct mp_osd_res (*canvas_res)(void *ctx, int w, int h);
+};
+struct osd_ahead {
+    void *log, *osd;
+    const bool *formats;
+    struct osd_ahead_callbacks cb;
+    mp_mutex lock;
+    mp_cond wakeup;
     bool terminate, paused;
     uint64_t epoch;
-    struct mediacodec_geometry geometry;
-    int vsync_delay, present_slot;
+    int present_slot;
+    struct osd_slot slots[OSD_SLOTS];
+    mp_thread thread;
+    bool started;
 };
-struct osd_slot { void *sbs; };
+struct osd_plane_stats { unsigned swaps; };
 struct priv {
     int64_t osd_surface;
     ANativeWindow *osd_window;
     bool osd_threads_created, osd_missing_logged;
-    mp_thread osd_render_thread, osd_present_thread;
-    mp_mutex osd_lock;
-    mp_cond osd_wakeup;
-    struct osd_shared osd;
-    struct osd_slot osd_slots[OSD_SLOTS];
+    mp_thread osd_present_thread;
+    struct osd_ahead osd;
+    struct mediacodec_geometry osd_geometry;
+    int osd_vsync_delay;
+    struct osd_plane_stats plane;
+    double osd_pts;
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
     uint32_t stats_frames;
     struct stats_cadence { unsigned ticks; } osd_stats;
     struct m_config_cache *opts_cache;
 };
-struct vo { struct priv *priv; void *log; bool want_redraw; };
+struct vo { struct priv *priv; void *log, *osd; bool want_redraw; };
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static bool joining_present, rebound, fail_present_once;
@@ -77,14 +94,21 @@ static bool mediacodec_geometry_parse(const char *s, struct mediacodec_geometry 
 { g->width = atoi(s); return true; }
 static bool mediacodec_geometry_equal(struct mediacodec_geometry a, struct mediacodec_geometry b)
 { return a.width == b.width; }
-static void osd_invalidate_locked(struct priv *p) { p->osd.epoch++; }
+static void osd_ahead_invalidate(struct osd_ahead *s, double pts) { (void)pts; s->epoch++; }
+static const bool osd_gl_formats[1];
+static void osd_render_thread_init(void *ctx) { (void)ctx; }
+static void osd_latch_canvas(void *ctx) { (void)ctx; }
+static void osd_canvas_size(void *ctx, int *w, int *h) { (void)ctx; *w = *h = 0; }
+static struct mp_osd_res osd_canvas_res(void *ctx, int w, int h)
+{ (void)ctx; return (struct mp_osd_res){w, h}; }
 
+// The shared pipeline's render thread, parked until termination.
 static void *osd_render_thread(void *arg)
 {
-    struct priv *p = ((struct vo *)arg)->priv;
-    mp_mutex_lock(&p->osd_lock);
-    while (!p->osd.terminate) mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-    mp_mutex_unlock(&p->osd_lock);
+    struct osd_ahead *s = arg;
+    mp_mutex_lock(&s->lock);
+    while (!s->terminate) mp_cond_wait(&s->wakeup, &s->lock);
+    mp_mutex_unlock(&s->lock);
     return NULL;
 }
 static void *osd_present_thread(void *arg)
@@ -145,13 +169,14 @@ int main(void)
     struct mediacodec_opts opts = {.video_rect = "1920", .osd_vsync_delay = 2};
     struct m_config_cache cache = {.opts = &opts};
     struct priv p = {.opts_cache = &cache, .osd_surface = (intptr_t)&a,
-                     .osd = {.paused = true, .geometry = {.width = 1920}, .vsync_delay = 2}};
+                     .osd = {.paused = true}, .osd_geometry = {.width = 1920},
+                     .osd_vsync_delay = 2};
     struct vo vo = {.priv = &p};
     osd_init(&vo);
     pthread_mutex_lock(&gate);
     wait_for(&a.entered);
     pthread_mutex_unlock(&gate);
-    p.osd_slots[0].sbs = malloc(16);
+    p.osd.slots[0].sbs = malloc(16);
     uint64_t epoch = p.osd.epoch;
     opts.osd_surface = (intptr_t)&b;
     cache.dirty = true;
@@ -166,9 +191,9 @@ int main(void)
     wait_for(&b.entered);
     pthread_mutex_unlock(&gate);
     assert(pthread_join(handoff, NULL) == 0);
-    assert(a.refs == 0 && b.refs == 1 && freed == 1 && p.osd_slots[0].sbs == NULL);
+    assert(a.refs == 0 && b.refs == 1 && freed == 1 && p.osd.slots[0].sbs == NULL);
     assert(!p.osd.terminate && p.osd.paused && p.osd.epoch > epoch);
-    assert(p.osd.geometry.width == 1920 && p.osd.vsync_delay == 2 && vo.want_redraw);
+    assert(p.osd_geometry.width == 1920 && p.osd_vsync_delay == 2 && vo.want_redraw);
     pthread_mutex_lock(&gate);
     b.release = true;
     pthread_cond_broadcast(&changed);

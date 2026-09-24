@@ -13,8 +13,15 @@ if [[ -z "$source_dir" ]]; then
     # and applies the resolved mpv/android series.
     (cd "$root" && python3 scripts/patches.py fetch-pinned mpv android "$source_dir")
 fi
+# The render thread's lifetime is the shared pipeline's (osd_ahead.c); the
+# presenter's and the window's are the VO's.
+python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/osd_ahead.c" \
+    "$workdir/mediacodec_rebind.inc" --return bool --fn osd_ahead_start
+python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/osd_ahead.c" \
+    "$workdir/mediacodec_rebind.inc" --append --return void \
+    --fn osd_ahead_stop --fn osd_ahead_destroy
 python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/vo_mediacodec.c" \
-    "$workdir/mediacodec_rebind.inc" --return void \
+    "$workdir/mediacodec_rebind.inc" --append --return void \
     --fn osd_init --fn osd_uninit --fn update_opts
 cc -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
     "$root/scripts/test_mediacodec_rebind.c" -o "$workdir/test"

@@ -1,5 +1,6 @@
-// Behavioral regressions for the exact freestanding OSD scheduler core
-// extracted from patch 0001 by test_mediacodec_osd.sh: the cadence estimator
+// Behavioral regressions for the exact freestanding OSD scheduler core of the
+// shared render-ahead pipeline (video/out/osd_ahead.[ch]) and vo_mediacodec's
+// swap lead, extracted by test_mediacodec_osd.sh: the cadence estimator
 // that predicts the next frame's pts, the single-use next-frame pre-render,
 // the read horizon cap, the event warming planner and staging lifetime,
 // and the swap lead. No libass, EGL or mpv thread is modelled here.

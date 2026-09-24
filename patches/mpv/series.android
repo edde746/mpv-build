@@ -38,3 +38,5 @@
 0124-vo-mediacodec-hand-frames-to-the-codec-50-ms-ahead-as-media3-does.patch
 0125-player-run-the-core-at-video-priority-on-android.patch
 0126-ao-audiotrack-raw-truehd-where-the-route-refuses-the-mat-carrier.patch
+0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
+0127-vo-mediacodec-render-through-the-shared-osd-pipeline.patch

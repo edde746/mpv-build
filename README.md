@@ -180,9 +180,12 @@ forgets intents but keeps the counters. Pass an already-patched source
 directory as the first argument to run offline.
 
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
-It extracts the freestanding scheduler core and request dispatcher of the
-same patch. Coverage includes frame-cadence prediction, next-frame pre-render
-matching, the subtitle read horizon, event warming and staging lifetime, and
+It applies the full Android series and extracts the freestanding scheduler
+core and request dispatcher of the shared subtitle render-ahead pipeline
+(`video/out/osd_ahead.[ch]`, patch 0031), plus vo_mediacodec's swap lead;
+pass an already-patched source directory to run offline. Coverage includes
+frame-cadence prediction, next-frame pre-render matching, the subtitle read
+horizon, event warming and staging lifetime, and
 swap lead. Request scenarios ensure that a warmed image cannot replace an
 expired cue's blank frame, a newer or overlapping cue, a timestamp-matched
 pre-render, or a repaint after seeking.

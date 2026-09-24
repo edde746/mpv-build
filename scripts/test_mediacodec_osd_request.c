@@ -1,6 +1,7 @@
 // Exercise the production request dispatcher with immutable subtitle snapshots.
 // Rendering, clocks and locks are synchronous host seams; selection, slot
-// ownership, queueing and invalidation are extracted verbatim from patch 0001.
+// ownership, queueing, release publication and invalidation are extracted
+// verbatim from the shared render-ahead pipeline (video/out/osd_ahead.c).
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
@@ -9,11 +10,11 @@
 #include <stdlib.h>
 
 #include "mediacodec_osd_core.inc"
-#include "mediacodec_osd_types.inc"
 
 #define MP_VERBOSE(vo, ...) ((void)(vo), (void)fprintf(stderr, __VA_ARGS__))
 
-struct osd_shared {
+struct osd_ahead_stats { unsigned stale, coalesced; };
+struct osd_ahead {
     struct osd_prefetch prefetch;
     struct osd_spec spec;
     struct osd_result_queue results;
@@ -22,27 +23,24 @@ struct osd_shared {
     uint64_t release_seq, epoch;
     bool terminate, present_failed, requested;
     struct osd_request request;
-    unsigned stale, coalesced;
+    struct osd_ahead_stats stats;
+    struct osd_slot slots[OSD_SLOTS];
+    int lock, wakeup;
 };
 struct sub_bitmap_list { int change_id; };
-struct osd_slot { struct sub_bitmap_list *sbs; };
 struct osd_render_state {
     bool force_full;
     int64_t posted_change_id;
     struct osd_request last;
 };
 struct priv {
-    struct osd_shared osd;
-    struct osd_slot osd_slots[OSD_SLOTS];
-    int osd_lock, osd_wakeup;
+    struct osd_ahead osd; // first: the render seam recovers priv from it
     double osd_pts;
     bool long_sign;
     // Host-only state: one renderer survives all requests, like the worker.
     struct osd_render_state renderer;
     void (*after_render)(struct priv *p);
 };
-struct vo { struct priv *priv; };
-struct mediacodec_geometry { int unused; };
 
 static void mp_mutex_lock(int *lock) { (void)lock; }
 static void mp_mutex_unlock(int *lock) { (void)lock; }
@@ -55,12 +53,10 @@ static struct sub_bitmap_list blank = {.change_id = 1};
 static struct sub_bitmap_list sign = {.change_id = 2};
 static struct sub_bitmap_list dialogue = {.change_id = 3};
 static struct sub_bitmap_list sign_and_dialogue = {.change_id = 4};
-static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
-                            double pts, struct mediacodec_geometry geometry,
-                            int slot)
+static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
+                            double pts, int slot)
 {
-    (void)geometry;
-    struct priv *p = vo->priv;
+    struct priv *p = (struct priv *)s;
     struct sub_bitmap_list *image = &blank;
     double sign_end = p->long_sign ? 11.0 : 10.04;
     if (pts >= 10.0 && pts < sign_end)
@@ -69,7 +65,7 @@ static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
         image = image == &sign ? &sign_and_dialogue : &dialogue;
     bool changed = rs->force_full || image->change_id != rs->posted_change_id;
     if (changed)
-        p->osd_slots[slot].sbs = image;
+        p->osd.slots[slot].sbs = image;
     if (p->after_render) {
         void (*hook)(struct priv *) = p->after_render;
         p->after_render = NULL;
@@ -79,6 +75,11 @@ static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
 }
 
 #include "mediacodec_osd_request.inc"
+
+static void invalidate(struct priv *p)
+{
+    osd_ahead_invalidate(&p->osd, p->osd_pts);
+}
 
 static void check(bool condition, const char *message)
 {
@@ -91,8 +92,7 @@ static void check(bool condition, const char *message)
 static struct priv warmed(void)
 {
     struct priv p = {
-        .osd = {.epoch = 7, .present_slot = 0},
-        .osd_slots = {{&blank}, {&sign}},
+        .osd = {.epoch = 7, .present_slot = 0, .slots = {{.sbs = &blank}, {.sbs = &sign}}},
     };
     osd_prefetch_store(&p.osd.prefetch, 10.0, 1, 7, 1, 0.01);
     return p;
@@ -106,14 +106,12 @@ static void service_pending(struct priv *p)
           "service requires a pending request and reserved queue capacity");
     struct osd_request req = p->osd.request;
     p->osd.requested = false;
-    struct vo vo = {.priv = p};
-    osd_service_request(&vo, &p->renderer, req,
-                        (struct mediacodec_geometry){0});
+    osd_service_request(&p->osd, &p->renderer, req);
 }
 
 static void request(struct priv *p, double pts, uint64_t seq, bool full)
 {
-    osd_file_request(p, (struct osd_request){
+    osd_ahead_file_request(&p->osd, (struct osd_request){
         .pts = pts, .delta = 1001.0 / 24000.0, .seq = seq,
         .epoch = p->osd.epoch, .full = full,
     });
@@ -124,21 +122,18 @@ static struct sub_bitmap_list *head_image(struct priv *p)
 {
     struct osd_result *r = osd_result_head(&p->osd.results);
     check(r != NULL, "request produces an image, including blank clears");
-    return p->osd_slots[r->slot].sbs;
+    return p->osd.slots[r->slot].sbs;
 }
 
 // Host flip seam: supply timestamps, retain the bounded history, and invoke
-// the production publication helper. No MediaCodec or presenter thread runs.
+// the production publication. No MediaCodec or presenter thread runs.
 static struct osd_release publish(struct priv *p, uint64_t seq)
 {
     struct osd_release release = {
         .seq = seq, .timestamp = 1000000000 + (int64_t)seq * 40000000,
         .vsync = 1010000000 + (int64_t)seq * 40000000, .period = 16666667,
     };
-    p->osd.releases[p->osd.release_next] = release;
-    osd_result_publish_release(&p->osd.results, release);
-    p->osd.release_next = (p->osd.release_next + 1) % OSD_RELEASE_HISTORY;
-    p->osd.release_seq = seq;
+    osd_ahead_publish_release(&p->osd, release);
     return release;
 }
 
@@ -150,7 +145,7 @@ static struct osd_result take(struct priv *p, struct sub_bitmap_list *image,
           "consume only a pose with its own published release");
     struct osd_result r = osd_result_pop(&p->osd.results);
     p->osd.present_slot = r.slot;
-    check(p->osd_slots[r.slot].sbs == image,
+    check(p->osd.slots[r.slot].sbs == image,
           "consume the expected pixel state in FIFO order");
     check(r.seq == release.seq && r.release.seq == release.seq &&
           r.release.timestamp == release.timestamp &&
@@ -183,23 +178,23 @@ static void test_warmed_images_require_timestamp_validation(void)
     check(p.osd.prefetch.valid, "the future image stays available for GPU warming");
 
     p = warmed();
-    p.osd_slots[2].sbs = &dialogue;
+    p.osd.slots[2].sbs = &dialogue;
     osd_spec_store(&p.osd.spec, 10.125, 7, 2);
     request(&p, 10.125, 42, false);
     check(head_image(&p) == &dialogue,
           "a matching next-frame image wins over an older event image");
 
     p = warmed();
-    p.osd_slots[2].sbs = &sign;
+    p.osd.slots[2].sbs = &sign;
     osd_spec_store(&p.osd.spec, 10.125, 7, 2);
     p.osd_pts = 10.125;
-    osd_invalidate_locked(&p);
+    invalidate(&p);
     service_pending(&p);
     check(head_image(&p) == &dialogue,
           "a seek invalidates both prepared images");
 
     p = warmed();
-    p.osd_slots[2].sbs = &sign;
+    p.osd.slots[2].sbs = &sign;
     osd_spec_store(&p.osd.spec, 10.125, 7, 2);
     request(&p, 10.125, 42, true);
     check(head_image(&p) == &dialogue,
@@ -215,7 +210,7 @@ static void test_three_pixel_states_survive_a_busy_presenter(void)
 
     request(&p, 10.06, 102, false); // B: the sign must clear
     request(&p, 10.125, 103, false); // C: a different cue appears
-    check(p.osd_slots[a.slot].sbs == &sign,
+    check(p.osd.slots[a.slot].sbs == &sign,
           "rendering B and C cannot overwrite the presenter's held A");
     check(head_image(&p) == &blank,
           "C must not replace B while the presenter is holding A");
@@ -227,7 +222,7 @@ static void test_three_pixel_states_survive_a_busy_presenter(void)
     // Both pending poses must retain their releases after flip history wraps.
     for (uint64_t seq = 104; seq <= 103 + OSD_RELEASE_HISTORY; seq++)
         publish(&p, seq);
-    check(osd_find_release(&p, 102).seq == 0 && osd_find_release(&p, 103).seq == 0,
+    check(osd_find_release(&p.osd, 102).seq == 0 && osd_find_release(&p.osd, 103).seq == 0,
           "the scenario has evicted both pending releases from history");
     take(&p, &blank, b_release);
     take(&p, &dialogue, c_release);
@@ -251,15 +246,15 @@ static void test_cancelled_clear_is_not_suppressed_by_render_history(void)
     struct osd_request old = {
         .pts = 10.06, .seq = 103, .epoch = p.osd.epoch,
     };
-    osd_file_request(&p, old);
-    osd_file_request(&p, (struct osd_request){
+    osd_ahead_file_request(&p.osd, old);
+    osd_ahead_file_request(&p.osd, (struct osd_request){
         .pts = old.pts, .epoch = old.epoch,
     });
     check(p.osd.request.seq == old.seq && p.osd.epoch == old.epoch &&
           head_image(&p) == &blank,
           "an ordinary same-PTS redraw preserves the pending frame's timeline");
     p.osd_pts = 10.06;
-    osd_invalidate_locked(&p);
+    invalidate(&p);
     check(!osd_result_head(&p.osd.results), "invalidation discards accepted old poses");
     check(p.osd.request.seq == 0 && p.osd.request.epoch != old.epoch,
           "forced repaint cancels the old timeline even at the pending frame's PTS");
@@ -277,7 +272,7 @@ static void test_render_finishing_after_cancellation_can_still_clear(void)
     request(&p, 10.02, 101, false);
     take(&p, &sign, release);
     p.osd_pts = 10.06;
-    p.after_render = osd_invalidate_locked;
+    p.after_render = invalidate;
     request(&p, 10.06, 102, false);
     check(!osd_result_head(&p.osd.results),
           "render completion after an epoch barrier must be rejected");

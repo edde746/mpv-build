@@ -1,0 +1,1098 @@
+vo: add a shared subtitle/OSD render-ahead pipeline
+
+vo_mediacodec renders subtitles on a thread of its own, ahead of the video
+that shows them: a request per frame as soon as the frame is known, a
+latest-wins mailbox, a bounded result FIFO, a pre-render of the frame the
+cadence predicts next, and while the OSD is static, of the next subtitle
+event's first frame. Nothing in that pipeline is specific to MediaCodec, and
+vo_avfoundation needs the same thing instead of a second implementation.
+
+Add it as video/out/osd_ahead.[ch]. The code is vo_mediacodec's render
+stage moved as is; what was specific to that VO is now supplied by the VO:
+the canvas size and OSD geometry (callbacks, latched under the lock where
+the geometry used to be copied), the render thread's priority, and the
+presentation itself. The next patch switches vo_mediacodec to it.
+
+scripts/test_mediacodec_osd.sh compiles the scheduler core and the request
+dispatcher from this file.
+
+diff --git a/meson.build b/meson.build
+index a77c20d..b5929ab 100644
+--- a/meson.build
++++ b/meson.build
+@@ -238,6 +238,7 @@ sources = files(
+     'video/out/gpu/video.c',
+     'video/out/gpu/video_shaders.c',
+     'video/out/libmpv_sw.c',
++    'video/out/osd_ahead.c',
+     'video/out/vo.c',
+     'video/out/vo_gpu.c',
+     'video/out/vo_image.c',
+diff --git a/video/out/osd_ahead.c b/video/out/osd_ahead.c
+new file mode 100644
+index 0000000..4270873
+--- /dev/null
++++ b/video/out/osd_ahead.c
+@@ -0,0 +1,819 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <assert.h>
++#include <math.h>
++#include <string.h>
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "mpv_talloc.h"
++#include "osdep/threads.h"
++#include "osdep/timer.h"
++#include "sub/osd.h"
++#include "video/mp_image.h"
++
++#include "osd_ahead.h"
++
++// --- osd ahead scheduler core
++
++#define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
++
++int64_t osd_median_ns(const int64_t *v, int n)
++{
++    int64_t sorted[OSD_MEDIAN_MAX];
++    for (int i = 0; i < n; i++)
++        sorted[i] = v[i];
++    for (int i = 1; i < n; i++) {
++        int64_t key = sorted[i];
++        int j = i - 1;
++        while (j >= 0 && sorted[j] > key) {
++            sorted[j + 1] = sorted[j];
++            j--;
++        }
++        sorted[j + 1] = key;
++    }
++    return n & 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
++}
++
++// The same statistic in seconds, for the media-pts cadence. Its deltas are
++// container timestamps, so nanosecond rounding loses nothing.
++static double median_seconds(const double *v, int n)
++{
++    int64_t ns[OSD_MEDIAN_MAX];
++    for (int i = 0; i < n; i++)
++        ns[i] = llround(v[i] * 1e9);
++    return osd_median_ns(ns, n) / 1e9;
++}
++
++void osd_cadence_reset(struct osd_cadence *c)
++{
++    *c = (struct osd_cadence){0};
++}
++
++void osd_cadence_observe(struct osd_cadence *c, uint64_t frame_id,
++                         double pts)
++{
++    if (c->have_last) {
++        double delta = pts - c->last_pts;
++        if (frame_id != c->last_frame_id + 1 || !(delta > 0) ||
++            delta > OSD_CADENCE_MAX_DELTA)
++        {
++            osd_cadence_reset(c);
++        } else {
++            c->deltas[c->next] = delta;
++            c->next = (c->next + 1) % OSD_CADENCE_SAMPLES;
++            if (c->count < OSD_CADENCE_SAMPLES)
++                c->count++;
++        }
++    }
++    c->have_last = true;
++    c->last_frame_id = frame_id;
++    c->last_pts = pts;
++}
++
++// Median delta in seconds, 0 until enough consecutive frames were seen.
++double osd_cadence_delta(const struct osd_cadence *c)
++{
++    if (c->count < OSD_CADENCE_MIN_SAMPLES)
++        return 0;
++    return median_seconds(c->deltas, c->count);
++}
++
++enum osd_spec_result {
++    OSD_SPEC_MISS,     // render on demand
++    OSD_SPEC_HIT,      // post spec->slot (or nothing when it is -1)
++};
++
++// A request for pts arrived. The speculation is consumed either way. A match
++// tolerates container timestamp rounding (1 ms alternation at 23.976 in
++// Matroska) but never half a frame: ASS times have 10 ms resolution and a
++// few ms of \move are sub-pixel, while the wrong frame is not.
++static enum osd_spec_result osd_spec_service(struct osd_spec *s, double pts,
++                                             uint64_t epoch, bool full,
++                                             double delta)
++{
++    if (!s->valid)
++        return OSD_SPEC_MISS;
++    s->valid = false;
++    double tolerance = OSD_SPEC_TOLERANCE;
++    if (delta > 0 && delta / 4 < tolerance)
++        tolerance = delta / 4;
++    if (full || epoch != s->epoch || !(fabs(pts - s->pts) <= tolerance)) {
++        s->misses++;
++        return OSD_SPEC_MISS;
++    }
++    s->hits++;
++    return OSD_SPEC_HIT;
++}
++
++// Whether to pre-render after serving last_pts, and for which pts.
++//  delta:    cadence from osd_cadence_delta(), 0 when unknown
++//  horizon:  furthest pts the subtitle decoders can render correctly;
++//            NAN when unknown, INFINITY when unbounded
++//  eligible: playing, last request was a real frame, no request pending,
++//            a slot is free
++static bool osd_spec_plan(struct osd_spec *s, double last_pts, double delta,
++                          double horizon, bool eligible, double *out_pts)
++{
++    if (s->valid)
++        return false;
++    if (!eligible || !(delta > 0)) {
++        s->skips++;
++        return false;
++    }
++    double pts = last_pts + delta;
++    if (!(pts <= horizon)) { // also rejects NAN
++        s->horizon_skips++;
++        return false;
++    }
++    *out_pts = pts;
++    return true;
++}
++
++static void osd_spec_store(struct osd_spec *s, double pts, uint64_t epoch,
++                           int slot)
++{
++    s->valid = true;
++    s->pts = pts;
++    s->epoch = epoch;
++    s->slot = slot;
++}
++
++// Warm the next event while the OSD is static. Keep its first image for
++// background atlas upload and composition, not as a result for a later PTS.
++// A timestamp-matched render validates the content; osd_dedup_items reuses
++// the prepared atlas when its pixels match. While warming, requests coalesce
++// and a change that falls due meanwhile waits, so it must fit before
++// anything on screen ends.
++#define OSD_PREFETCH_MIN_LEAD 0.2
++#define OSD_PREFETCH_MAX_LEAD 15.0
++#define OSD_PREFETCH_STATIC_RENDERS 3
++
++// A worst-case guess of what rendering a frame where `events` events start
++// takes: the slowest per-event rate seen so far, with a floor before any
++// heavy sign has been measured. Typesetting is hundreds of events per
++// shot, a dialogue line is one.
++static double osd_prefetch_estimate(const struct osd_prefetch *p, int events)
++{
++    double per_event = p->max_event_s > 0.001 ? p->max_event_s : 0.001;
++    double estimate = 1.25 * per_event * (events > 1 ? events : 1);
++    if (estimate < 0.05)
++        estimate = 0.05;
++    if (estimate > 1.5)
++        estimate = 1.5;
++    return estimate;
++}
++
++// Whether to render next_start's first frame now, playing at pts. Something
++// on screen ending before that start must not wait for the render, so the
++// render's estimate has to fit before it, with margin. The start itself may
++// be overrun: the following timestamp-matched render still benefits from
++// warm caches. Only an attempt that cannot finish within twice its lead is
++// skipped.
++//  eligible: playing, the last request was a real frame, nothing pending,
++//            a slot is free
++static bool osd_prefetch_plan(const struct osd_prefetch *p, double pts,
++                              double next_start, int next_events,
++                              double visible_end, double horizon,
++                              bool eligible)
++{
++    if (!eligible || p->valid || p->unchanged_streak < OSD_PREFETCH_STATIC_RENDERS)
++        return false;
++    if (!(next_start > pts) || !(next_start <= horizon)) // rejects NAN
++        return false;
++    double lead = next_start - pts;
++    if (lead < OSD_PREFETCH_MIN_LEAD || lead > OSD_PREFETCH_MAX_LEAD)
++        return false;
++    if (fabs(next_start - p->attempted_start) < 0.002) // same event, another frame
++        return false;
++    double estimate = osd_prefetch_estimate(p, next_events);
++    if (visible_end > pts && visible_end < next_start &&
++        visible_end - pts < estimate + 0.15)
++        return false;
++    return 2 * lead >= estimate;
++}
++
++static void osd_prefetch_store(struct osd_prefetch *p, double event_start,
++                               int events, uint64_t epoch, int slot,
++                               double render_s)
++{
++    p->valid = slot >= 0;
++    p->event_start = event_start;
++    p->epoch = epoch;
++    p->slot = slot;
++    p->attempted_start = event_start;
++    p->count++;
++    double per_event = render_s / (events > 1 ? events : 1);
++    if (per_event > p->max_event_s)
++        p->max_event_s = per_event;
++}
++
++// Called after servicing a request. Keep the prepared image available to
++// the GPU and pixel deduplication through the first timestamp-matched render
++// at/after its start, then release the staging slot for the next event.
++static void osd_prefetch_retire(struct osd_prefetch *p, double pts, uint64_t epoch)
++{
++    if (epoch != p->epoch || pts >= p->event_start)
++        p->valid = false;
++}
++
++static void osd_prefetch_observe_render(struct osd_prefetch *p, bool changed)
++{
++    p->unchanged_streak = changed ? 0 : p->unchanged_streak + 1;
++}
++
++struct osd_result *osd_result_head(struct osd_result_queue *q)
++{
++    return q->count ? &q->entries[q->first] : NULL;
++}
++
++int osd_result_slot(const struct osd_result_queue *q)
++{
++    return q->count ? q->entries[q->first].slot : -1;
++}
++
++static bool osd_result_holds(const struct osd_result_queue *q, int slot)
++{
++    for (int n = 0; n < q->count; n++) {
++        if (q->entries[(q->first + n) % OSD_RESULT_CAPACITY].slot == slot)
++            return true;
++    }
++    return false;
++}
++
++static bool osd_result_push(struct osd_result_queue *q, struct osd_result r)
++{
++    if (q->count == OSD_RESULT_CAPACITY)
++        return false;
++    q->entries[(q->first + q->count++) % OSD_RESULT_CAPACITY] = r;
++    return true;
++}
++
++struct osd_result osd_result_pop(struct osd_result_queue *q)
++{
++    assert(q->count > 0);
++    struct osd_result r = q->entries[q->first];
++    q->first = (q->first + 1) % OSD_RESULT_CAPACITY;
++    q->count--;
++    return r;
++}
++
++static void osd_result_publish_release(struct osd_result_queue *q,
++                                       struct osd_release release)
++{
++    for (int n = 0; n < q->count; n++) {
++        struct osd_result *r = &q->entries[(q->first + n) % OSD_RESULT_CAPACITY];
++        if (r->seq == release.seq)
++            r->release = release;
++    }
++}
++
++// --- end osd ahead scheduler core
++
++// --- render stage
++
++// Locked. A zero sequence means the release is not retained in the history.
++static struct osd_release osd_find_release(struct osd_ahead *s, uint64_t seq)
++{
++    for (int n = 0; n < OSD_RELEASE_HISTORY; n++) {
++        if (s->releases[n].seq == seq)
++            return s->releases[n];
++    }
++    return (struct osd_release){0};
++}
++
++struct osd_render_state {
++    int last_w, last_h;
++    bool force_full;
++    int64_t posted_change_id; // sub_bitmap_list.change_id of the last result
++    struct osd_request last;  // last serviced request
++    uint64_t planned_seq;     // last.seq whose pre-renders were decided
++    // Per OSD object: the change id libass last reported, and when that
++    // render repeated an earlier one's pixels, the earlier item (id, atlas
++    // layout, atlas) every render with that id is folded into.
++    int dedup_raw[MAX_OSD_PARTS];
++    struct sub_bitmaps *dedup_canon[MAX_OSD_PARTS];
++};
++
++// Locked. Queued and active snapshots stay immutable. Consuming the
++// next-frame pre-render leaves a working slot even with event prefetch held.
++static int osd_free_slot(struct osd_ahead *s)
++{
++    for (int n = 0; n < OSD_SLOTS; n++) {
++        if (osd_result_holds(&s->results, n) || n == s->present_slot)
++            continue;
++        if (s->spec.valid && n == s->spec.slot)
++            continue;
++        if (s->prefetch.valid && n == s->prefetch.slot)
++            continue;
++        return n;
++    }
++    return -1;
++}
++
++static void osd_record_render(struct osd_ahead *s, int64_t render_ns, bool changed)
++{
++    s->stats.renders++;
++    if (changed)
++        s->stats.renders_changed++;
++    s->stats.render_ns_last = render_ns;
++    if (render_ns > s->stats.render_ns_max)
++        s->stats.render_ns_max = render_ns;
++    int64_t ms = render_ns / 1000000;
++    s->stats.render_hist[ms <= 10 ? 0 : ms <= 25 ? 1 : ms <= 42 ? 2 : ms <= 84 ? 3 : 4]++;
++}
++
++// Whether two items draw the same pixels: the same parts at the same places
++// with the same content, wherever each atlas keeps them. Compared part by
++// part; the packer never clears the space between parts.
++static bool osd_same_pixels(const struct sub_bitmaps *a, const struct sub_bitmaps *b)
++{
++    if (a->format != b->format || a->num_parts != b->num_parts ||
++        !a->packed || !b->packed)
++        return false;
++    for (int k = 0; k < a->num_parts; k++) {
++        const struct sub_bitmap *x = &a->parts[k], *y = &b->parts[k];
++        if (x->w != y->w || x->h != y->h || x->x != y->x || x->y != y->y ||
++            x->dw != y->dw || x->dh != y->dh || x->libass.color != y->libass.color)
++            return false;
++    }
++    int bpp = a->format == SUBBITMAP_LIBASS ? 1 : 4;
++    for (int k = 0; k < a->num_parts; k++) {
++        const struct sub_bitmap *x = &a->parts[k], *y = &b->parts[k];
++        if (a->packed->planes[0] == b->packed->planes[0] &&
++            x->src_x == y->src_x && x->src_y == y->src_y)
++            continue; // the packer's own cache: one refcounted buffer
++        const uint8_t *pa = a->packed->planes[0] +
++            (ptrdiff_t)x->src_y * a->packed->stride[0] + (ptrdiff_t)x->src_x * bpp;
++        const uint8_t *pb = b->packed->planes[0] +
++            (ptrdiff_t)y->src_y * b->packed->stride[0] + (ptrdiff_t)y->src_x * bpp;
++        for (int row = 0; row < x->h; row++) {
++            if (memcmp(pa + (ptrdiff_t)row * a->packed->stride[0],
++                       pb + (ptrdiff_t)row * b->packed->stride[0], (size_t)x->w * bpp))
++                return false;
++        }
++    }
++    return true;
++}
++
++// A standalone copy of an item's id, layout and atlas reference.
++struct sub_bitmaps *osd_clone_item(const struct sub_bitmaps *src)
++{
++    struct sub_bitmaps *c = talloc(NULL, struct sub_bitmaps);
++    *c = *src;
++    c->parts = talloc_memdup(c, src->parts, sizeof(src->parts[0]) * src->num_parts);
++    c->packed = mp_image_new_ref(src->packed);
++    talloc_steal(c, c->packed);
++    return c;
++}
++
++// Make dst draw from canon's atlas: same id, same part positions in it.
++static void osd_adopt_item(struct sub_bitmaps *dst, const struct sub_bitmaps *canon)
++{
++    talloc_free(dst->packed);
++    dst->packed = mp_image_new_ref(canon->packed);
++    talloc_steal(dst, dst->packed);
++    MP_RESIZE_ARRAY(dst, dst->parts, canon->num_parts);
++    memcpy(dst->parts, canon->parts, sizeof(canon->parts[0]) * canon->num_parts);
++    dst->num_parts = canon->num_parts;
++    dst->packed_w = canon->packed_w;
++    dst->packed_h = canon->packed_h;
++    dst->change_id = canon->change_id;
++}
++
++// libass reports a change relative to its previous render, and this
++// pipeline renders out of order: the pre-render of an event's first frame,
++// then the frames before it, then that first frame again. The re-render
++// gets a fresh change id and a fresh atlas layout for the same pixels,
++// which would mean a swap and an atlas upload for nothing. An item that
++// repeats a slot's pixels takes over that slot's id and atlas instead, so
++// ids mean pixels again and the cached texture stays valid; the list id, a
++// sum of the object ids, moves with it. A run of unchanged renders after
++// that folds the same way without another pixel compare. Render thread
++// only: it is the sole writer of the slots, so it may read them unlocked.
++static void osd_dedup_items(struct osd_ahead *s, struct osd_render_state *rs,
++                            struct sub_bitmap_list *sbs)
++{
++    for (int i = 0; i < sbs->num_items; i++) {
++        struct sub_bitmaps *imgs = sbs->items[i];
++        int idx = imgs->render_index;
++        if (idx < 0 || idx >= MAX_OSD_PARTS || !imgs->packed)
++            continue;
++        int raw = imgs->change_id;
++        if (raw != rs->dedup_raw[idx] || !rs->dedup_raw[idx]) {
++            rs->dedup_raw[idx] = raw;
++            TA_FREEP(&rs->dedup_canon[idx]);
++            for (int n = 0; n < OSD_SLOTS && !rs->dedup_canon[idx]; n++) {
++                struct sub_bitmap_list *ref = s->slots[n].sbs;
++                for (int j = 0; ref && j < ref->num_items; j++) {
++                    struct sub_bitmaps *r = ref->items[j];
++                    if (r->render_index == idx && r->change_id != raw &&
++                        osd_same_pixels(imgs, r))
++                    {
++                        rs->dedup_canon[idx] = osd_clone_item(r);
++                        break;
++                    }
++                }
++            }
++        }
++        struct sub_bitmaps *canon = rs->dedup_canon[idx];
++        if (canon && canon->change_id != imgs->change_id) {
++            sbs->change_id -= (int64_t)imgs->change_id - canon->change_id;
++            osd_adopt_item(imgs, canon);
++        }
++    }
++}
++
++// Render the OSD for pts on the canvas res describes, folding a render that
++// repeats an uploaded one into that render's atlas. Returns the list, owned
++// by the caller, and its duration.
++static struct sub_bitmap_list *osd_slot_render(struct osd_ahead *s, struct osd_render_state *rs,
++                                               double pts, struct mp_osd_res res,
++                                               int draw_flags, int64_t *render_ns)
++{
++    int64_t t0 = mp_time_ns();
++    struct sub_bitmap_list *sbs =
++        osd_render(s->osd, res, pts, draw_flags, s->formats);
++    *render_ns = mp_time_ns() - t0;
++    if (sbs)
++        osd_dedup_items(s, rs, sbs);
++    return sbs;
++}
++
++// Publish sbs as slot's frame: the bitmap list, the canvas it was rendered
++// on, and that render's letterbox, which the presenter fills opaque black.
++static void osd_slot_store(struct osd_slot *dst, struct sub_bitmap_list *sbs,
++                           int w, int h, struct mp_osd_res res)
++{
++    talloc_free(dst->sbs);
++    dst->sbs = sbs;
++    dst->canvas_w = w;
++    dst->canvas_h = h;
++    dst->ml = res.ml;
++    dst->mt = res.mt;
++    dst->mr = res.mr;
++    dst->mb = res.mb;
++}
++
++// Render the OSD for pts into slot. Returns whether the slot holds a frame
++// that differs from the last one posted (or a forced repaint).
++static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
++                            double pts, int slot)
++{
++    int w = 0, h = 0;
++    s->cb.canvas_size(s->cb.ctx, &w, &h);
++    if (w <= 0 || h <= 0)
++        return false;
++    if (w != rs->last_w || h != rs->last_h) {
++        rs->last_w = w;
++        rs->last_h = h;
++        rs->force_full = true;
++    }
++
++    struct mp_osd_res res = s->cb.canvas_res(s->cb.ctx, w, h);
++
++    int64_t render_ns;
++    struct sub_bitmap_list *sbs = osd_slot_render(s, rs, pts, res, 0, &render_ns);
++    if (!sbs)
++        return false;
++
++    bool changed = rs->force_full || sbs->change_id != rs->posted_change_id;
++    if (render_ns > MP_TIME_MS_TO_NS(100)) {
++        MP_VERBOSE(s, "OSD: slow render at %.3f: %.0f ms (%d items)\n", pts,
++                   render_ns / 1e6, sbs->num_items);
++    }
++
++    mp_mutex_lock(&s->lock);
++    osd_record_render(s, render_ns, changed);
++    osd_prefetch_observe_render(&s->prefetch, changed);
++    mp_mutex_unlock(&s->lock);
++
++    if (!changed) {
++        talloc_free(sbs);
++        return false;
++    }
++
++    osd_slot_store(&s->slots[slot], sbs, w, h, res);
++    return true;
++}
++
++// Locked. Preserve every accepted future pose until presentation or invalidation.
++static void osd_post_result(struct osd_ahead *s, struct osd_render_state *rs,
++                            int slot, const struct osd_request *req)
++{
++    struct osd_release release = osd_find_release(s, req->seq);
++    if (s->terminate || s->present_failed || req->epoch != s->epoch ||
++        (req->seq && req->seq <= s->release_seq && release.seq != req->seq))
++    {
++        s->stats.stale++;
++        rs->force_full = true;
++        return;
++    }
++    struct osd_result r = {
++        .slot = slot, .seq = req->seq, .epoch = req->epoch,
++        .pts = req->pts, .posted = mp_time_ns(), .release = release,
++    };
++    // Admission reserves capacity before rendering; only this thread produces.
++    bool queued = osd_result_push(&s->results, r);
++    assert(queued);
++    if (!queued) {
++        rs->force_full = true;
++        return;
++    }
++    rs->posted_change_id = s->slots[slot].sbs->change_id;
++    rs->force_full = false;
++    mp_cond_broadcast(&s->wakeup);
++}
++
++static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs,
++                                struct osd_request req)
++{
++    rs->force_full |= req.full;
++
++    mp_mutex_lock(&s->lock);
++    if (req.epoch != s->epoch) {
++        rs->force_full = true;
++        mp_mutex_unlock(&s->lock);
++        return;
++    }
++    // A warmed event image is only a cache candidate. It can be animated,
++    // expired, or missing a cue that started since it was rendered.
++    if (rs->force_full || req.epoch != s->prefetch.epoch)
++        s->prefetch.valid = false;
++    int spec_slot = s->spec.valid ? s->spec.slot : -1;
++    enum osd_spec_result hit = osd_spec_service(&s->spec, req.pts, req.epoch,
++                                                rs->force_full, req.delta);
++    s->spec.slot = -1;
++    if (hit == OSD_SPEC_HIT) {
++        if (spec_slot >= 0)
++            osd_post_result(s, rs, spec_slot, &req);
++        osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++        mp_mutex_unlock(&s->lock);
++        rs->last = req;
++        return;
++    }
++    // Admission reserves queue capacity and consuming speculation frees its
++    // slot; an active frame and event prefetch cannot exhaust the working slots.
++    int slot = osd_free_slot(s);
++    mp_mutex_unlock(&s->lock);
++    if (slot < 0) {
++        rs->last = req;
++        return;
++    }
++
++    bool posted = osd_render_pass(s, rs, req.pts, slot);
++
++    mp_mutex_lock(&s->lock);
++    if (posted)
++        osd_post_result(s, rs, slot, &req);
++    osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++    mp_mutex_unlock(&s->lock);
++    rs->last = req;
++}
++
++static void osd_speculate(struct osd_ahead *s, struct osd_render_state *rs,
++                          double pts, uint64_t epoch, int slot)
++{
++    bool rendered = osd_render_pass(s, rs, pts, slot);
++
++    mp_mutex_lock(&s->lock);
++    if (s->epoch == epoch)
++        osd_spec_store(&s->spec, pts, epoch, rendered ? slot : -1);
++    mp_mutex_unlock(&s->lock);
++}
++
++// Warm the event's first frame and retain it for GPU preparation and pixel
++// deduplication. Only a timestamp-matched render can authorize presentation.
++static void osd_prefetch_event(struct osd_ahead *s, struct osd_render_state *rs,
++                               double event_start, int events, uint64_t epoch,
++                               int slot)
++{
++    int w = rs->last_w, h = rs->last_h;
++    if (w <= 0 || h <= 0)
++        return;
++    struct mp_osd_res res = s->cb.canvas_res(s->cb.ctx, w, h);
++    int64_t render_ns;
++    struct sub_bitmap_list *sbs =
++        osd_slot_render(s, rs, event_start + 0.001, res,
++                        OSD_DRAW_PREFETCH, &render_ns);
++    double render_s = render_ns / 1e9;
++    mp_mutex_lock(&s->lock);
++    bool keep = sbs && s->epoch == epoch;
++    if (keep)
++        osd_slot_store(&s->slots[slot], sbs, w, h, res);
++    osd_prefetch_store(&s->prefetch, event_start, events, epoch,
++                       keep ? slot : -1, render_s);
++    mp_mutex_unlock(&s->lock);
++    if (!keep)
++        talloc_free(sbs);
++    MP_VERBOSE(s, "OSD: pre-rendered the event at %.3f (%d events, %.0f ms, %.2fs ahead)\n",
++               event_start, events, render_s * 1e3, event_start - rs->last.pts);
++}
++
++static MP_THREAD_VOID osd_render_thread(void *arg)
++{
++    struct osd_ahead *s = arg;
++    mp_thread_set_name("vo/osd-render");
++    if (s->cb.thread_init)
++        s->cb.thread_init(s->cb.ctx);
++
++    struct osd_render_state rs = {.force_full = true};
++
++    mp_mutex_lock(&s->lock);
++    while (!s->terminate) {
++        if (s->present_failed) {
++            // Nothing will consume results; do not burn CPU on libass.
++            s->requested = false;
++            mp_cond_wait(&s->wakeup, &s->lock);
++            continue;
++        }
++        if (s->results.count == OSD_RESULT_CAPACITY) {
++            mp_cond_wait(&s->wakeup, &s->lock);
++            continue;
++        }
++        if (s->requested) {
++            struct osd_request req = s->request;
++            s->cb.latch_canvas(s->cb.ctx);
++            s->requested = false;
++            mp_mutex_unlock(&s->lock);
++            osd_service_request(s, &rs, req);
++            mp_mutex_lock(&s->lock);
++            continue;
++        }
++
++        // Pre-render the frame the cadence predicts next, once per request,
++        // while the present stage may still be waiting on this one's deadline.
++        if (rs.last.seq == rs.planned_seq) {
++            mp_cond_wait(&s->wakeup, &s->lock);
++            continue;
++        }
++        rs.planned_seq = rs.last.seq;
++        int spec_slot = osd_free_slot(s);
++        bool eligible = !s->paused && rs.last.seq && rs.last.epoch == s->epoch &&
++                        spec_slot >= 0 && !s->spec.valid;
++        double delta = rs.last.delta;
++        double last_pts = rs.last.pts;
++        uint64_t epoch = s->epoch;
++        s->cb.latch_canvas(s->cb.ctx);
++        double horizon = NAN;
++        if (eligible && delta > 0) {
++            // osd_get_sub_render_horizon takes the OSD and decoder locks;
++            // never under s->lock.
++            mp_mutex_unlock(&s->lock);
++            horizon = osd_get_sub_render_horizon(s->osd);
++            mp_mutex_lock(&s->lock);
++            eligible = !s->requested && !s->terminate && s->epoch == epoch;
++        }
++        double pts;
++        if (osd_spec_plan(&s->spec, last_pts, delta, horizon, eligible, &pts)) {
++            mp_mutex_unlock(&s->lock);
++            osd_speculate(s, &rs, pts, epoch, spec_slot);
++            mp_mutex_lock(&s->lock);
++        }
++
++        // With the next frame covered and the OSD static, render the next
++        // event's first frame into a slot of its own.
++        int event_slot = osd_free_slot(s);
++        bool event_eligible = !s->paused && !s->requested && !s->terminate &&
++                              rs.last.seq && rs.last.epoch == s->epoch &&
++                              delta > 0 && event_slot >= 0 && !s->prefetch.valid &&
++                              s->prefetch.unchanged_streak >= OSD_PREFETCH_STATIC_RENDERS;
++        if (!event_eligible)
++            continue;
++        mp_mutex_unlock(&s->lock);
++        double next_start, visible_end;
++        int next_events;
++        osd_get_sub_schedule(s->osd, last_pts, last_pts + OSD_PREFETCH_MIN_LEAD,
++                             &next_start, &next_events, &visible_end);
++        if (isnan(horizon))
++            horizon = osd_get_sub_render_horizon(s->osd);
++        mp_mutex_lock(&s->lock);
++        bool plan = osd_prefetch_plan(&s->prefetch, last_pts, next_start,
++                                      next_events, visible_end, horizon,
++                                      !s->requested && !s->terminate &&
++                                      s->epoch == epoch);
++        mp_mutex_unlock(&s->lock);
++        if (plan) {
++            osd_prefetch_event(s, &rs, next_start, next_events, epoch,
++                               event_slot);
++        }
++        mp_mutex_lock(&s->lock);
++    }
++    mp_mutex_unlock(&s->lock);
++    for (int n = 0; n < MAX_OSD_PARTS; n++)
++        talloc_free(rs.dedup_canon[n]);
++    MP_THREAD_RETURN();
++}
++
++// --- VO-facing API
++
++// Locked.
++void osd_ahead_file_request(struct osd_ahead *s, struct osd_request req)
++{
++    if (s->requested) {
++        s->stats.coalesced++;
++        // A pending full repaint must not be lost to a later partial one, and
++        // a repaint of the frame that is still pending keeps its deadline.
++        if (!req.seq && !req.full && s->request.seq && req.pts == s->request.pts &&
++            req.epoch == s->request.epoch)
++        {
++            req.seq = s->request.seq;
++            req.delta = s->request.delta;
++        }
++        req.full |= s->request.full;
++    }
++    if (!req.seq) {
++        // An immediate repaint replaces the timeline, not merely its tail.
++        req.epoch = ++s->epoch;
++        req.full = true;
++        s->stats.stale += s->results.count;
++        s->results.first = s->results.count = 0;
++        s->spec.valid = s->prefetch.valid = false;
++    }
++    s->request = req;
++    s->requested = true;
++    mp_cond_broadcast(&s->wakeup);
++}
++
++// Locked. Discard everything in flight and repaint at pts.
++void osd_ahead_invalidate(struct osd_ahead *s, double pts)
++{
++    osd_ahead_file_request(s, (struct osd_request){
++        .pts = pts, .epoch = s->epoch, .full = true,
++    });
++}
++
++// Locked.
++void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release)
++{
++    s->releases[s->release_next] = release;
++    osd_result_publish_release(&s->results, release);
++    s->release_next = (s->release_next + 1) % OSD_RELEASE_HISTORY;
++    s->release_seq = release.seq;
++    mp_cond_broadcast(&s->wakeup);
++}
++
++bool osd_ahead_start(struct osd_ahead *s)
++{
++    assert(!s->started);
++    struct osd_ahead fresh = {
++        .log = s->log,
++        .osd = s->osd,
++        .formats = s->formats,
++        .cb = s->cb,
++        .epoch = s->epoch + 1,
++        .paused = s->paused,
++        .present_slot = -1,
++    };
++    for (int n = 0; n < OSD_SLOTS; n++)
++        assert(!s->slots[n].sbs);
++    *s = fresh;
++    mp_mutex_init(&s->lock);
++    mp_cond_init(&s->wakeup);
++    if (mp_thread_create(&s->thread, osd_render_thread, s)) {
++        mp_cond_destroy(&s->wakeup);
++        mp_mutex_destroy(&s->lock);
++        return false;
++    }
++    s->started = true;
++    return true;
++}
++
++void osd_ahead_stop(struct osd_ahead *s)
++{
++    assert(s->started);
++    mp_mutex_lock(&s->lock);
++    s->terminate = true;
++    s->epoch++;
++    mp_cond_broadcast(&s->wakeup);
++    mp_mutex_unlock(&s->lock);
++    mp_thread_join(s->thread);
++}
++
++void osd_ahead_destroy(struct osd_ahead *s)
++{
++    if (s->started) {
++        mp_cond_destroy(&s->wakeup);
++        mp_mutex_destroy(&s->lock);
++        s->started = false;
++    }
++    for (int n = 0; n < OSD_SLOTS; n++) {
++        talloc_free(s->slots[n].sbs);
++        s->slots[n] = (struct osd_slot){0};
++    }
++}
+diff --git a/video/out/osd_ahead.h b/video/out/osd_ahead.h
+new file mode 100644
+index 0000000..7373148
+--- /dev/null
++++ b/video/out/osd_ahead.h
+@@ -0,0 +1,237 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Subtitle/OSD render-ahead pipeline for a VO that shows the OSD on a plane
++ * or layer of its own, above video that must never wait for it.
++ *
++ * The render thread ("vo/osd-render") rasterizes the OSD for a media pts into
++ * one of OSD_SLOTS slots. The VO files a request for every frame as soon as
++ * it knows the frame (osd_ahead_file_request); requests not yet served are
++ * latest-wins under load, while completed frames enter a bounded FIFO
++ * (results) that the VO's presenter drains. Between requests the thread
++ * pre-renders the frame the observed cadence predicts next, and while the OSD
++ * is static, the first frame of the next subtitle event, so a heavy sign is
++ * rasterized before it is due. Pre-rendering never runs past the subtitle
++ * decoders' read horizon, where an undecoded event or a pending segment
++ * switch would make the result wrong. Only the render thread waits for queue
++ * capacity; the video keeps advancing.
++ *
++ * The VO owns presentation: it publishes each frame's release
++ * (osd_ahead_publish_release), pops results, draws their slots and reports
++ * the slot on screen in present_slot. Every field below the lock is shared
++ * under it, and the presenter may wait on wakeup with the same lock.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "osdep/threads.h"
++#include "sub/osd.h"
++
++struct mp_log;
++struct sub_bitmap_list;
++
++// --- osd ahead types
++
++#define OSD_CADENCE_SAMPLES 8
++#define OSD_CADENCE_MIN_SAMPLES 4
++#define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
++
++// Median of at most OSD_MEDIAN_MAX samples: the middle one, or the mean of
++// the middle two. Insertion sort; the rings here are far smaller than a sort
++// would pay for, and no caller's ring is larger than this.
++#define OSD_MEDIAN_MAX 8
++
++// Media-pts cadence of the frames admitted for preparation: median of the
++// last eight consecutive deltas, trusted after four. A frame_id gap, a
++// non-positive delta (seek,
++// backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
++struct osd_cadence {
++    double deltas[OSD_CADENCE_SAMPLES];
++    int count;
++    int next;
++    bool have_last;
++    uint64_t last_frame_id;
++    double last_pts;
++};
++
++struct osd_spec {
++    bool valid;
++    double pts;
++    uint64_t epoch;
++    int slot; // -1: the pre-render found the OSD unchanged, nothing to post
++    uint32_t hits, misses, skips, horizon_skips;
++};
++
++struct osd_prefetch {
++    bool valid;            // a slot holds the next event's first frame
++    double event_start;    // that event's start (video pts)
++    uint64_t epoch;
++    int slot;
++    double attempted_start; // last event start warmed
++    double max_event_s;    // slowest render per event starting, seen so far
++    int unchanged_streak;  // consecutive renders that changed nothing
++    uint32_t count;
++};
++
++// Release timestamp of a flipped frame, by sequence number, in the
++// presenter's clock (vo_mediacodec: the CLOCK_MONOTONIC time handed to
++// MediaCodec).
++struct osd_release {
++    uint64_t seq;
++    int64_t timestamp;  // when the frame is shown, 0 = untimed
++    int64_t vsync;      // the vsync that timestamp targets, 0 = unknown
++    int64_t period;     // display period at release, 0 = unknown
++};
++
++struct osd_result {
++    int slot;        // -1: none
++    uint64_t seq;
++    uint64_t epoch;
++    double pts;      // trace
++    int64_t posted;  // trace: mp_time_ns at post
++    struct osd_release release; // copied before release history can roll over
++};
++
++// Future poses must not replace each other while the presenter waits for an
++// earlier deadline. Bound CPU snapshots; only the renderer waits for capacity.
++#define OSD_RESULT_CAPACITY 4
++struct osd_result_queue {
++    struct osd_result entries[OSD_RESULT_CAPACITY];
++    int first, count;
++};
++
++// Active frame, bounded pending queue, next-frame and event pre-renders.
++#define OSD_SLOTS (OSD_RESULT_CAPACITY + 3)
++#define OSD_RELEASE_HISTORY 16
++
++// One rendered OSD frame: the sub bitmap list for a canvas_w x canvas_h
++// canvas, composited by the VO's presenter. The margins are the letterbox of
++// that render (mp_osd_res ml/mt/mr/mb), which the presenter fills opaque
++// black.
++struct osd_slot {
++    struct sub_bitmap_list *sbs;
++    int canvas_w, canvas_h;
++    int ml, mt, mr, mb;
++};
++
++struct osd_request {
++    double pts;      // render pts, MP_NOPTS_VALUE ok
++    double delta;    // cadence at filing time, 0 when unknown
++    uint64_t seq;    // frame sequence, 0 for an unpinned repaint
++    uint64_t epoch;
++    bool full;
++};
++
++// --- end osd ahead types
++
++struct osd_ahead_callbacks {
++    void *ctx;
++    // Render thread, once at start (thread priority and the like). Optional.
++    void (*thread_init)(void *ctx);
++    // Locked, render thread: latch the canvas description the renders that
++    // follow read, before a request is served and before pre-renders are
++    // planned.
++    void (*latch_canvas)(void *ctx);
++    // Render thread: the canvas size now; <= 0 when there is no canvas.
++    void (*canvas_size)(void *ctx, int *w, int *h);
++    // Render thread: the OSD resolution for a w x h canvas under the latched
++    // description.
++    struct mp_osd_res (*canvas_res)(void *ctx, int w, int h);
++};
++
++// Counters the VO reads for its statistics (writer noted per field).
++struct osd_ahead_stats {
++    uint32_t frames;            // VO: pinned requests filed
++    uint32_t coalesced;         // VO: requests replaced before service
++    uint32_t renders, renders_changed; // render
++    int64_t render_ns_last, render_ns_max; // render
++    uint32_t render_hist[5];    // render: <=10, <=25, <=42, <=84, >84 ms
++    uint32_t stale;             // results cancelled or missing their release
++};
++
++struct osd_ahead {
++    // Set by the VO before osd_ahead_start; constant while running.
++    struct mp_log *log;
++    struct osd_state *osd;
++    const bool *formats;        // SUBBITMAP_COUNT entries, as for osd_render
++    struct osd_ahead_callbacks cb;
++
++    mp_mutex lock;
++    mp_cond wakeup;             // broadcast for any change below
++    bool terminate;
++    bool present_failed;        // nothing will consume results
++    bool paused;
++    uint64_t epoch;
++
++    // VO -> render
++    bool requested;
++    struct osd_request request;
++    // VO -> presenter
++    struct osd_release releases[OSD_RELEASE_HISTORY];
++    int release_next;
++    uint64_t release_seq;       // newest published
++    // render -> presenter
++    struct osd_result_queue results;
++    int present_slot;           // slot on screen or being presented, -1 none
++
++    struct osd_ahead_stats stats;
++    struct osd_spec spec;       // render (counters read by the VO thread)
++    struct osd_prefetch prefetch; // render (counters read by the VO thread)
++
++    // Written by the render thread alone, which may read them unlocked. A
++    // slot a result, present_slot or a pre-render names stays immutable.
++    struct osd_slot slots[OSD_SLOTS];
++
++    mp_thread thread;
++    bool started;               // lock, wakeup and thread exist
++};
++
++// VO thread. Start the render thread with fresh state; only the epoch
++// advances and the pause state carries over. The slots must be empty.
++// Returns false, with nothing left running, when the thread cannot start.
++bool osd_ahead_start(struct osd_ahead *s);
++// VO thread. Terminate and join the render thread; the lock stays usable
++// for a presenter that still runs and for a final statistics read.
++void osd_ahead_stop(struct osd_ahead *s);
++// VO thread, after osd_ahead_stop (or without a start): free the lock and
++// every slot.
++void osd_ahead_destroy(struct osd_ahead *s);
++
++// Locked. File a render request; seq 0 is an immediate, unpinned repaint
++// that replaces the timeline.
++void osd_ahead_file_request(struct osd_ahead *s, struct osd_request req);
++// Locked. Discard everything in flight and repaint at pts.
++void osd_ahead_invalidate(struct osd_ahead *s, double pts);
++// Locked. Publish when the frame with release.seq is shown.
++void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release);
++
++// Scheduler core, freestanding (see the osd ahead scheduler core region).
++int64_t osd_median_ns(const int64_t *v, int n);
++void osd_cadence_reset(struct osd_cadence *c);
++void osd_cadence_observe(struct osd_cadence *c, uint64_t frame_id, double pts);
++double osd_cadence_delta(const struct osd_cadence *c);
++struct osd_result *osd_result_head(struct osd_result_queue *q);
++int osd_result_slot(const struct osd_result_queue *q);
++struct osd_result osd_result_pop(struct osd_result_queue *q);
++
++// A standalone copy of an item's id, layout and atlas reference (talloc
++// root; the atlas is refcounted).
++struct sub_bitmaps *osd_clone_item(const struct sub_bitmaps *src);

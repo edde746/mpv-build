@@ -38,8 +38,18 @@ for fn in read_vsync_sample read_vsync_period read_vsync_spacing request_vsync_s
     python3 "$E" symbol "$src" "$workdir/mediacodec_timing_driver.inc" --append --fn "$fn"
 done
 
-python3 "$E" range "$src" "$workdir/mediacodec_timing_cadence.inc" \
+# The OSD cadence the preparation path feeds lives in the shared render-ahead
+# pipeline (video/out/osd_ahead.[ch]).
+python3 "$E" range "$source_dir/video/out/osd_ahead.h" "$workdir/mediacodec_timing_cadence.inc" \
     --first "#define OSD_CADENCE_SAMPLES" --last "struct osd_spec {"
+python3 "$E" symbol "$source_dir/video/out/osd_ahead.c" "$workdir/mediacodec_timing_cadence.inc" \
+    --append --return int64_t --fn osd_median_ns
+python3 "$E" symbol "$source_dir/video/out/osd_ahead.c" "$workdir/mediacodec_timing_cadence.inc" \
+    --append --return double --fn median_seconds
+python3 "$E" symbol "$source_dir/video/out/osd_ahead.c" "$workdir/mediacodec_timing_cadence.inc" \
+    --append --return void --fn osd_cadence_reset --fn osd_cadence_observe
+python3 "$E" symbol "$source_dir/video/out/osd_ahead.c" "$workdir/mediacodec_timing_cadence.inc" \
+    --append --return double --fn osd_cadence_delta
 
 python3 "$E" symbol "$vo" "$workdir/mediacodec_timing_admission.inc" \
     --fn prepare_queued_frame --fn vo_wakeup_deadline

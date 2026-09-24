@@ -18,7 +18,7 @@ if [[ -z "$source_dir" ]]; then
 fi
 
 # The slot the fill reads, then the two definitions that do the fill.
-python3 "$root/scripts/extract.py" type "$source_dir/video/out/vo_mediacodec.c" \
+python3 "$root/scripts/extract.py" type "$source_dir/video/out/osd_ahead.h" \
     "$workdir/mediacodec_letterbox.inc" --name osd_slot
 python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/vo_mediacodec.c" \
     "$workdir/mediacodec_letterbox.inc" --append --return int --fn osd_gl_bar

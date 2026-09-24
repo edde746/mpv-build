@@ -517,7 +517,6 @@ static void test_present_reports_match_intents(void)
 #define MP_TIME_S_TO_NS(v) ((v) * INT64_C(1000000000))
 #define MP_NOPTS_VALUE (-1e20)
 #define VO_TRUE true
-#define OSD_RELEASE_HISTORY 8
 #define OSD_STATS_INTERVAL_FRAMES 120
 #define MP_VERBOSE(...) ((void)0)
 #define MP_WARN(...) ((void)0)
@@ -560,11 +559,14 @@ struct osd_release {
     int64_t timestamp, vsync, period;
 };
 
-struct osd_shared {
-    uint64_t epoch, release_seq;
+struct osd_ahead_stats {
     unsigned frames;
-    struct osd_release releases[OSD_RELEASE_HISTORY];
-    int release_next, results;
+};
+
+struct osd_ahead {
+    uint64_t epoch;
+    struct osd_ahead_stats stats;
+    int lock, wakeup;
 };
 
 struct priv {
@@ -575,11 +577,10 @@ struct priv {
     double cur_duration, osd_pts;
     bool cur_synthetic, osd_threads_created, osd_missing_logged;
     bool vsync_attached;
-    int osd_lock, osd_wakeup;
     int64_t vsync_sample, queue_period, queue_mode, queue_period_changed, queue_offset;
     struct mediacodec_timing timing;
     struct osd_cadence cadence;
-    struct osd_shared osd;
+    struct osd_ahead osd;
     uint64_t frame_seq;
     unsigned stats_frames;
     struct present_stats present;
@@ -639,7 +640,6 @@ static int64_t mp_time_to_monotonic_ns(int64_t pts) { return pts + clock_offset_
 static int64_t monotonic_to_mp_time_ns(int64_t mono) { return mono - clock_offset_ns; }
 static void mp_mutex_lock(int *lock) { (*lock)++; }
 static void mp_mutex_unlock(int *lock) { (*lock)--; }
-static void mp_cond_broadcast(int *cond) { (void)cond; }
 static unsigned core_wakeups;
 static void wakeup_core(struct vo *vo) { (void)vo; core_wakeups++; }
 #define MPMIN(a, b) ((a) < (b) ? (a) : (b))
@@ -731,9 +731,9 @@ static int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
 // preparation runs with the VO lock released.
 static struct vo_internal *seek_victim;
 
-static void osd_file_request(struct priv *p, struct osd_request request)
+static void osd_ahead_file_request(struct osd_ahead *s, struct osd_request request)
 {
-    (void)p;
+    (void)s;
     requested = request;
     requests++;
     if (seek_victim) {
@@ -742,13 +742,17 @@ static void osd_file_request(struct priv *p, struct osd_request request)
     }
 }
 
-static void osd_result_publish_release(int *results, struct osd_release release)
+static void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release)
 {
-    (void)results;
+    (void)s;
     published = release;
 }
 
-static void osd_invalidate_locked(struct priv *p) { p->osd.epoch++; }
+static void osd_ahead_invalidate(struct osd_ahead *s, double pts)
+{
+    (void)pts;
+    s->epoch++;
+}
 static void stats_tick(struct vo *vo) { (void)vo; }
 
 #include "mediacodec_timing_driver.inc"
