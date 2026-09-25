@@ -70,6 +70,9 @@ jobs:
       - name: Test MediaCodec timing cadence
         run: bash ./scripts/test_mediacodec_timing.sh
 
+      - name: Test MediaCodec vsync sampler under Android 11 mode switches
+        run: bash ./scripts/test_mediacodec_vsync.sh
+
       - name: Test MediaCodec subtitle geometry
         run: bash ./scripts/test_mediacodec_geometry.sh
 

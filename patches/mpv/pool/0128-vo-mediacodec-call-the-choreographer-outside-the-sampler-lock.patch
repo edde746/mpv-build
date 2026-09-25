@@ -1,0 +1,192 @@
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 7904320..a68fadb 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -824,12 +824,24 @@ static struct {
+     int64_t vsync_spacing; // frame timelines' spacing, 0 until known
+ } vsync_sampler = { .lock = MP_STATIC_MUTEX_INITIALIZER };
+ 
++// What a sampler path has reserved (posted++) under vsync_sampler.lock and
++// hands to the Choreographer once the lock is released: issue_vsync_post.
++enum vsync_post {
++    VSYNC_POST_NONE,
++    VSYNC_POST_NOW,      // the next vsync
++    VSYNC_POST_RESAMPLE, // the next vsync 500 ms from now
++    VSYNC_POST_TIMELINE, // the next vsync's frame timelines (API 33)
++};
++
+ // vsync_sampler.lock held.
+-static void post_vsync_callback(bool delayed);
++static enum vsync_post reserve_vsync_post(bool delayed);
++// vsync_sampler.lock not held.
++static void issue_vsync_post(enum vsync_post post);
+ 
+ static void timeline_callback(const AChoreographerFrameCallbackData *data,
+                               void *arg)
+ {
++    enum vsync_post post = VSYNC_POST_NONE;
+     mp_mutex_lock(&vsync_sampler.lock);
+     vsync_sampler.posted--;
+     struct vo *vo = vsync_sampler.client;
+@@ -841,13 +853,15 @@ static void timeline_callback(const AChoreographerFrameCallbackData *data,
+                               vsync_sampler.timeline_presentation(data, 0);
+             vsync_sampler.vsync_spacing = spacing > 0 ? spacing : 0;
+         }
+-        post_vsync_callback(true);
++        post = reserve_vsync_post(true);
+     }
+     mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ }
+ 
+ static void record_vsync(int64_t frame_time)
+ {
++    enum vsync_post post = VSYNC_POST_NONE;
+     mp_mutex_lock(&vsync_sampler.lock);
+     vsync_sampler.posted--;
+     struct vo *vo = vsync_sampler.client;
+@@ -856,20 +870,24 @@ static void record_vsync(int64_t frame_time)
+         // The next vsync's timelines complete the resample (API 33).
+         if (vsync_sampler.post_timeline_callback && vsync_sampler.posted <= 1) {
+             vsync_sampler.posted++;
+-            vsync_sampler.post_timeline_callback(vsync_sampler.choreographer,
+-                                                 timeline_callback, NULL);
++            post = VSYNC_POST_TIMELINE;
+         } else {
+-            post_vsync_callback(true);
++            post = reserve_vsync_post(true);
+         }
+     }
+     mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ }
+ 
+ // The display's vsync period changed (or is first known). A fresh phase
+ // sample on the new grid is requested at once rather than at the next
+ // 500 ms resample, and the attached vo re-times its next frame against it.
++// On Android 11 that request re-enters this function before it returns when
++// the same mode switch also queued a config-changed event: see
++// issue_vsync_post.
+ static void refresh_rate_callback(int64_t vsync_period_ns, void *data)
+ {
++    enum vsync_post post = VSYNC_POST_NONE;
+     mp_mutex_lock(&vsync_sampler.lock);
+     if (vsync_period_ns > 0 && vsync_period_ns != vsync_sampler.vsync_period) {
+         vsync_sampler.vsync_period = vsync_period_ns;
+@@ -879,12 +897,14 @@ static void refresh_rate_callback(int64_t vsync_period_ns, void *data)
+             MP_VERBOSE(vo, "Choreographer vsync period: %.3f Hz\n",
+                        1e9 / vsync_period_ns);
+             ((struct priv *)vo->priv)->vsync_sample = 0;
+-            post_vsync_callback(false);
++            post = reserve_vsync_post(false);
++            // Under the lock: it is what keeps the client alive.
+             vo_event(vo, VO_EVENT_WIN_STATE);
+             vo_wakeup(vo);
+         }
+     }
+     mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ }
+ 
+ static void vsync_callback(long frame_time, void *arg)
+@@ -897,19 +917,48 @@ static void vsync_callback64(int64_t frame_time, void *arg)
+     record_vsync(frame_time);
+ }
+ 
++static enum vsync_post reserve_vsync_post(bool delayed)
++{
++    // One resample may be outstanding; an urgent one may join it.
++    if (!vsync_sampler.ready || (delayed && vsync_sampler.posted) ||
++        vsync_sampler.posted > 1)
++        return VSYNC_POST_NONE;
++    vsync_sampler.posted++;
++    return delayed ? VSYNC_POST_RESAMPLE : VSYNC_POST_NOW;
++}
++
++// Every Choreographer call is made here, never under vsync_sampler.lock. On
++// Android 11 as first released (android-11.0.0_r1; Fire OS 8 behaves so), a
++// post for the next vsync made on the Choreographer's own thread schedules
++// that vsync before it returns, and scheduling first drains the display
++// events already queued; a config-changed event among them is handed to
++// refresh_rate_callback right there (DisplayEventDispatcher::scheduleVsync ->
++// processPendingEvents -> Choreographer::dispatchConfigChanged). A mode
++// switch queues one while DisplayManager's refresh-rate update for the same
++// switch is already running refresh_rate_callback, so under the lock that
++// thread waited on itself: the attached vo stalled at its next sample read
++// and every later vo in the process at preinit (plezy#2465).
++//
+ // Safe from any thread: the Choreographer forwards a foreign-thread post to
+ // its own Looper. The callback receives no vo pointer; it reads the attached
+ // client under the lock, so a vo that detached before its callback fired is
+-// never touched.
+-static void post_vsync_callback(bool delayed)
++// never touched. The Choreographer and the entry points are fixed before
++// ready is set, and a reservation is only made once it is.
++static void issue_vsync_post(enum vsync_post post)
+ {
+-    const uint32_t delay_ms = delayed ? 500 : 0;
++    const uint32_t delay_ms = post == VSYNC_POST_RESAMPLE ? 500 : 0;
+ 
+-    // One resample may be outstanding; an urgent one may join it.
+-    if (!vsync_sampler.ready || (delayed && vsync_sampler.posted) ||
+-        vsync_sampler.posted > 1)
++    switch (post) {
++    case VSYNC_POST_NONE:
+         return;
+-    vsync_sampler.posted++;
++    case VSYNC_POST_TIMELINE:
++        vsync_sampler.post_timeline_callback(vsync_sampler.choreographer,
++                                             timeline_callback, NULL);
++        return;
++    case VSYNC_POST_NOW:
++    case VSYNC_POST_RESAMPLE:
++        break;
++    }
+     if (vsync_sampler.post_frame_callback_delayed64) {
+         if (delay_ms) {
+             vsync_sampler.post_frame_callback_delayed64(
+@@ -950,13 +999,16 @@ static MP_THREAD_VOID vsync_thread(void *arg)
+     }
+     vsync_sampler.choreographer = choreographer;
+     vsync_sampler.ready = true;
++    enum vsync_post post = vsync_sampler.client ? reserve_vsync_post(false)
++                                                : VSYNC_POST_NONE;
++    mp_mutex_unlock(&vsync_sampler.lock);
++
++    // Outside the lock like every Choreographer call (issue_vsync_post).
+     if (vsync_sampler.register_refresh_rate_callback) {
+         vsync_sampler.register_refresh_rate_callback(
+             choreographer, refresh_rate_callback, NULL);
+     }
+-    if (vsync_sampler.client)
+-        post_vsync_callback(false);
+-    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ 
+     // Process lifetime: the Looper and the Choreographer registered on it
+     // must outlive every vo, which is the whole point of this thread.
+@@ -1047,8 +1099,9 @@ static void init_vsync_sampler(struct vo *vo)
+     p->vsync_attached = true;
+     p->vsync_sample = 0;
+     vsync_sampler.vsync_spacing = 0;
+-    post_vsync_callback(false);
++    enum vsync_post post = reserve_vsync_post(false);
+     mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ }
+ 
+ static void uninit_vsync_sampler(struct vo *vo)
+@@ -2756,10 +2809,12 @@ static int64_t read_vsync_spacing(void)
+ // fresh one now rather than at the next 500 ms resample.
+ static void request_vsync_sample(struct vo *vo)
+ {
++    enum vsync_post post = VSYNC_POST_NONE;
+     mp_mutex_lock(&vsync_sampler.lock);
+     if (vsync_sampler.client == vo)
+-        post_vsync_callback(false);
++        post = reserve_vsync_post(false);
+     mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
+ }
+ 
+ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,

@@ -595,11 +595,18 @@ static struct {
     int64_t vsync_period, vsync_spacing;
     struct vo *client;
 } vsync_sampler;
+// The sampler's post, reserved under its lock and issued after it
+// (test_mediacodec_vsync.sh drives the real ones); every issued post counts.
+#include "mediacodec_timing_sampler.inc"
 static unsigned resamples;
-static void post_vsync_callback(bool delayed)
+static enum vsync_post reserve_vsync_post(bool delayed)
 {
-    (void)delayed;
-    resamples++;
+    return delayed ? VSYNC_POST_RESAMPLE : VSYNC_POST_NOW;
+}
+static void issue_vsync_post(enum vsync_post post)
+{
+    if (post != VSYNC_POST_NONE)
+        resamples++;
 }
 
 // Frames the VO reports to the core as dropped (vo_increment_drop_count).

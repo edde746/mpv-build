@@ -179,6 +179,23 @@ is matched back by presentation time and bucketed by vsync error, and a reset
 forgets intents but keeps the counters. Pass an already-patched source
 directory as the first argument to run offline.
 
+Run the vsync sampler regression with `bash scripts/test_mediacodec_vsync.sh`.
+It applies the full Android series and extracts vo_mediacodec's
+process-lifetime Choreographer sampler whole (its callbacks, its thread, and
+the attach, detach and fresh-sample requests the VO makes), then drives it
+against a model of Android 11's AChoreographer as first released
+(android-11.0.0_r1, which Fire OS 8 behaves like). That release reports a
+display mode switch twice, through DisplayManager and through SurfaceFlinger's
+config-changed event, and delivers the second from inside a frame callback
+posted for the next vsync on the Choreographer's own thread. Coverage: no
+Choreographer entry point is ever called with the sampler's lock held, a
+switch delivered from inside the first callback's post (and one already
+queued when the thread starts) keeps the last period reported and tells the
+vo about each, every reservation reaches the Choreographer and returns to one
+500 ms resample, the API 33 timeline resample and a VO request join it, and a
+detached vo is never sampled. Pass an already-patched source directory as the
+first argument to run offline.
+
 Run the OSD scheduler regression with `bash scripts/test_mediacodec_osd.sh`.
 It applies the full Android series and extracts the freestanding scheduler
 core and request dispatcher of the shared subtitle render-ahead pipeline

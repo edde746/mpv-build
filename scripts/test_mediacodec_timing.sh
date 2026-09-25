@@ -27,6 +27,10 @@ E="$root/scripts/extract.py"
 python3 "$E" region "$src" "$workdir/mediacodec_timing_core.inc" --start "mediacodec timing core"
 python3 "$E" region "$src" "$workdir/mediacodec_stats_core.inc" --start "mediacodec stats core"
 
+# The kinds of post the sampler hands the Choreographer; request_vsync_sample
+# reserves one and issues it.
+python3 "$E" type "$src" "$workdir/mediacodec_timing_sampler.inc" --name vsync_post
+
 # Preparation, draw and flip, not a parallel scheduling model: the defines the
 # driver reads, then each production function by name.
 python3 "$E" range "$src" "$workdir/mediacodec_timing_driver.inc" \
