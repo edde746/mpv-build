@@ -32,76 +32,76 @@
         "FFmpeg": {
           "frameworks": {
             "Libavcodec": {
-              "asset": "Libavcodec-21bab7544fef.xcframework.zip",
-              "checksum": "93345a3e1698ba98a6dec125c10e3523851276b4a848bd36c42245a2506e3a92"
+              "asset": "Libavcodec-e57848aae1c2.xcframework.zip",
+              "checksum": "d47183a1f78af4add64ea56711422c61a4f4f591d99fdc65f2dbdffb78c0b63f"
             },
             "Libavdevice": {
-              "asset": "Libavdevice-21bab7544fef.xcframework.zip",
-              "checksum": "427da9ecc92a778f03d54691fbf4022abc98af52fcb5ae488988b77e0382a66a"
+              "asset": "Libavdevice-e57848aae1c2.xcframework.zip",
+              "checksum": "1f535e4d47d0183a1f48e134e675e01ddeb00d837db06bf4e2d4f9036166a4bb"
             },
             "Libavfilter": {
-              "asset": "Libavfilter-21bab7544fef.xcframework.zip",
-              "checksum": "53389fb9804049d988e50f44d88a2b7c376b55cf19dd9d0a0cf70834d67fd9e6"
+              "asset": "Libavfilter-e57848aae1c2.xcframework.zip",
+              "checksum": "605c0ba462287f489e33bccd1b80a6f5d10ae36350cfdaa202c855f15513d29f"
             },
             "Libavformat": {
-              "asset": "Libavformat-21bab7544fef.xcframework.zip",
-              "checksum": "99814f9b56b5240133c947331ea0a631aa1b7e4fe877bd85cacb4c4443269eae"
+              "asset": "Libavformat-e57848aae1c2.xcframework.zip",
+              "checksum": "71f583da9b7e6ae8b1ea3d3dc17bca9e34800ade88cc00bb5c7d2e5df7f31a9a"
             },
             "Libavutil": {
-              "asset": "Libavutil-21bab7544fef.xcframework.zip",
-              "checksum": "7a06ea615a00b719f9f95c16633258eaa23f90a8e1831407d197e9c0c10d311d"
+              "asset": "Libavutil-e57848aae1c2.xcframework.zip",
+              "checksum": "5340a68b74dd5b3f0e6851e96599e2148353b0f96755f46612c1a3a3f572c092"
             },
             "Libswresample": {
-              "asset": "Libswresample-21bab7544fef.xcframework.zip",
-              "checksum": "793884e9e3b42e3f9c858058356b91c6c13e5faa9f382f3ab5436c38a8f10e57"
+              "asset": "Libswresample-e57848aae1c2.xcframework.zip",
+              "checksum": "2a510521f35406116575bb68cbf8b1d9b40338cf18fb833f02b8cb32a3ab0af4"
             },
             "Libswscale": {
-              "asset": "Libswscale-21bab7544fef.xcframework.zip",
-              "checksum": "ca9dd1c5a9740e0bf9f76e6628587ed31f3dddda3043d63643500a2091f34473"
+              "asset": "Libswscale-e57848aae1c2.xcframework.zip",
+              "checksum": "394b68b3aeed1c359e63538be4c547f16452a6d915d3c793113095ce14e1bc0c"
             }
           },
-          "key": "21bab7544fef",
+          "key": "e57848aae1c2",
           "prebuilt": {
-            "ios": "FFmpeg-all-21bab7544fef-ios.zip",
-            "isimulator": "FFmpeg-all-21bab7544fef-isimulator.zip",
-            "maccatalyst": "FFmpeg-all-21bab7544fef-maccatalyst.zip",
-            "macos": "FFmpeg-all-21bab7544fef-macos.zip",
-            "tvos": "FFmpeg-all-21bab7544fef-tvos.zip",
-            "tvsimulator": "FFmpeg-all-21bab7544fef-tvsimulator.zip"
+            "ios": "FFmpeg-all-e57848aae1c2-ios.zip",
+            "isimulator": "FFmpeg-all-e57848aae1c2-isimulator.zip",
+            "maccatalyst": "FFmpeg-all-e57848aae1c2-maccatalyst.zip",
+            "macos": "FFmpeg-all-e57848aae1c2-macos.zip",
+            "tvos": "FFmpeg-all-e57848aae1c2-tvos.zip",
+            "tvsimulator": "FFmpeg-all-e57848aae1c2-tvsimulator.zip"
           }
         },
         "libass": {
           "frameworks": {
             "Libass": {
-              "asset": "Libass-b06d6d4f1d02.xcframework.zip",
-              "checksum": "b96ff1b9b7c6299b97734f0a19564c7184abcc3cb134be93ff2c24807c87d066"
+              "asset": "Libass-928e8505c567.xcframework.zip",
+              "checksum": "1bb2216c578b3942fed8c295474c7137b112f1317e893613bd229ac2b232e87e"
             }
           },
-          "key": "b06d6d4f1d02",
+          "key": "928e8505c567",
           "prebuilt": {
-            "ios": "libass-all-b06d6d4f1d02-ios.zip",
-            "isimulator": "libass-all-b06d6d4f1d02-isimulator.zip",
-            "maccatalyst": "libass-all-b06d6d4f1d02-maccatalyst.zip",
-            "macos": "libass-all-b06d6d4f1d02-macos.zip",
-            "tvos": "libass-all-b06d6d4f1d02-tvos.zip",
-            "tvsimulator": "libass-all-b06d6d4f1d02-tvsimulator.zip"
+            "ios": "libass-all-928e8505c567-ios.zip",
+            "isimulator": "libass-all-928e8505c567-isimulator.zip",
+            "maccatalyst": "libass-all-928e8505c567-maccatalyst.zip",
+            "macos": "libass-all-928e8505c567-macos.zip",
+            "tvos": "libass-all-928e8505c567-tvos.zip",
+            "tvsimulator": "libass-all-928e8505c567-tvsimulator.zip"
           }
         },
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-e52a9c7ff4dd.xcframework.zip",
-              "checksum": "e169210ae065b687785962297d68728d83e887a44bd6ffb272e931517081f9c8"
+              "asset": "Libmpv-1d7086d6d9e5.xcframework.zip",
+              "checksum": "9372a31cedbb591a050c548e3e67dfbe816260267ddcfd9c2234e37be2844257"
             }
           },
-          "key": "e52a9c7ff4dd",
+          "key": "1d7086d6d9e5",
           "prebuilt": {
-            "ios": "libmpv-all-e52a9c7ff4dd-ios.zip",
-            "isimulator": "libmpv-all-e52a9c7ff4dd-isimulator.zip",
-            "maccatalyst": "libmpv-all-e52a9c7ff4dd-maccatalyst.zip",
-            "macos": "libmpv-all-e52a9c7ff4dd-macos.zip",
-            "tvos": "libmpv-all-e52a9c7ff4dd-tvos.zip",
-            "tvsimulator": "libmpv-all-e52a9c7ff4dd-tvsimulator.zip"
+            "ios": "libmpv-all-1d7086d6d9e5-ios.zip",
+            "isimulator": "libmpv-all-1d7086d6d9e5-isimulator.zip",
+            "maccatalyst": "libmpv-all-1d7086d6d9e5-maccatalyst.zip",
+            "macos": "libmpv-all-1d7086d6d9e5-macos.zip",
+            "tvos": "libmpv-all-1d7086d6d9e5-tvos.zip",
+            "tvsimulator": "libmpv-all-1d7086d6d9e5-tvsimulator.zip"
           }
         }
       }
