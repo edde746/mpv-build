@@ -173,6 +173,10 @@ private class BuildMPV: BaseBuild {
     override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
         var array = [
             "-Dlibmpv=true",
+            // No __DATE__/__TIME__ stamp: a rebuild of a published content key
+            // has to reproduce its bytes (keys.py publish-assets checks). The
+            // android and linux drivers pass the same flag.
+            "-Dbuild-date=false",
             "-Dgl=enabled",
             "-Dplain-gl=enabled",
             "-Diconv=enabled",

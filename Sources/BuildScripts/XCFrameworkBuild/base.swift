@@ -285,6 +285,7 @@ class BaseBuild {
         for platform in BaseBuild.platforms {
             for arch in architectures(platform) {
                 try build(platform: platform, arch: arch)
+                try Self.zeroSymbolTablePadding(inArchivesUnder: thinDir(platform: platform, arch: arch))
             }
         }
         try createXCFramework()
@@ -463,6 +464,10 @@ class BaseBuild {
             "LDFLAGS": ldFlags,
             "PKG_CONFIG_LIBDIR": pkgConfigPath + pkgConfigPathDefault,
             "PATH": BaseBuild.defaultPath,
+            // Apple's ar, ranlib and libtool stamp each member's mtime (and the
+            // symbol table's) into a static archive unless this is set; a
+            // rebuild of a published content key has to reproduce its bytes.
+            "ZERO_AR_DATE": "1",
         ]
     }
 
@@ -851,6 +856,94 @@ class BaseBuild {
             arguments: ["-c", "find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C sort | zip -q -X -y '\(zipFile.path)' -@"],
             currentDirectoryURL: currentDirectoryURL
         )
+    }
+
+    /// ZERO_AR_DATE settles an archive's dates, but cctools ranlib -- which `ar s`
+    /// and `libtool -static` run too -- pads the string table of the symbol table
+    /// with whatever its buffer held. Two builds of byte-identical objects then
+    /// differ in those bytes (libavcodec's x86_64 macOS slice did), so every
+    /// installed archive has that padding zeroed.
+    static func zeroSymbolTablePadding(inArchivesUnder root: URL) throws {
+        guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for case let url as URL in files where url.pathExtension == "a" {
+            var bytes = [UInt8](try Data(contentsOf: url))
+            if zeroSymbolTablePadding(&bytes) {
+                try Data(bytes).write(to: url)
+            }
+        }
+    }
+
+    /// Zeroes everything after the last referenced string in a BSD archive's
+    /// `__.SYMDEF[_64][ SORTED]` member, up to the end of that member. The
+    /// linker reads only the referenced strings. Returns whether a byte changed.
+    static func zeroSymbolTablePadding(_ bytes: inout [UInt8]) -> Bool {
+        guard bytes.count >= 68, bytes[0..<8].elementsEqual("!<arch>\n".utf8) else {
+            return false
+        }
+        func field(_ offset: Int, _ length: Int) -> String {
+            String(decoding: bytes[offset..<offset + length], as: UTF8.self).trimmingCharacters(in: .whitespaces)
+        }
+        guard let size = Int(field(8 + 48, 10)) else {
+            return false
+        }
+        var name = field(8, 16)
+        var body = 8 + 60
+        let end = body + size
+        guard end <= bytes.count else {
+            return false
+        }
+        if name.hasPrefix("#1/") {
+            guard let length = Int(name.dropFirst(3)), body + length <= end else {
+                return false
+            }
+            name = String(decoding: bytes[body..<body + length].prefix { $0 != 0 }, as: UTF8.self)
+            body += length
+        }
+        let word: Int
+        switch name {
+        case "__.SYMDEF", "__.SYMDEF SORTED":
+            word = 4
+        case "__.SYMDEF_64", "__.SYMDEF_64 SORTED":
+            word = 8
+        default:
+            return false
+        }
+        // Little-endian, as cctools writes them for arm64 and x86_64.
+        func read(_ offset: Int) -> Int? {
+            guard offset >= 0, offset + word <= end else {
+                return nil
+            }
+            return (0..<word).reversed().reduce(0) { $0 << 8 | Int(bytes[offset + $1]) }
+        }
+        guard let ranlibSize = read(body) else {
+            return false
+        }
+        let entries = body + word
+        guard let stringsSize = read(entries + ranlibSize) else {
+            return false
+        }
+        let strings = entries + ranlibSize + word
+        guard strings + stringsSize <= end else {
+            return false
+        }
+        var used = 0
+        for entry in stride(from: entries, to: entries + ranlibSize, by: 2 * word) {
+            guard var cursor = read(entry), cursor < stringsSize else {
+                return false
+            }
+            while cursor < stringsSize && bytes[strings + cursor] != 0 {
+                cursor += 1
+            }
+            used = max(used, min(cursor + 1, stringsSize))
+        }
+        var changed = false
+        for index in (strings + used)..<end where bytes[index] != 0 {
+            bytes[index] = 0
+            changed = true
+        }
+        return changed
     }
 
     func packagePkgConfigRelease() throws {
