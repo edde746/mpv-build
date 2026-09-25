@@ -275,13 +275,22 @@ static void jni_void(JNIEnv *env, jobject track, int method)
     mp_mutex_unlock(&gate);
 }
 
+// No Java exception is ever pending here. A call rather than a comma
+// expression: ao_audiotrack.c also uses the macro as a bare statement, which
+// gcc rejects as a statement with no effect under -Werror=unused-value.
+static int jni_exception_log(const void *ao)
+{
+    (void)ao;
+    return 0;
+}
+
 #define MP_JNI_GET_ENV(ao) (&environment)
 #define MP_JNI_CALL_INT(obj, method, ...) jni_int(env, obj, method, ##__VA_ARGS__)
 #define MP_JNI_CALL_VOID(obj, method) jni_void(env, obj, method)
 #define MP_JNI_CALL_OBJECT(obj, method) jni_clear(env, obj, method)
 #define MP_JNI_LOCAL_FREEP(obj) drop_ref(env, obj)
 #define MP_JNI_GLOBAL_FREEP(obj) drop_ref(env, obj)
-#define MP_JNI_EXCEPTION_LOG(ao) ((void)(ao), 0)
+#define MP_JNI_EXCEPTION_LOG(ao) jni_exception_log(ao)
 #define MP_JNI_CALL_BOOL(obj, method, stamp) jni_bool(env, obj, method, stamp)
 #define MP_JNI_GET_LONG(obj, field) jni_long(env, obj, field)
 
