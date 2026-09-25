@@ -310,6 +310,25 @@ is the oracle for every unit's last frame, and a stream the reader keeps
 refusing switches shedding off rather than logging per unit. Pass an
 already-patched source directory as the first argument to run offline.
 
+Run the presentation-order regression with
+`bash scripts/test_mediacodec_reorder.sh`. It compiles the production
+recovery (`libavcodec/mediacodec_reorder.c`, patch 0026) for the host and
+drives it with a model decoder that outputs frames in display order by the
+HEVC bumping process and echoes each frame's queued timestamp, as MediaCodec
+does, over x265-shaped streams (a four-frame B pyramid, open-GOP CRA anchors
+with RASL leading pictures). A container that stores B-frames without
+composition offsets queues decode-order timestamps: once the output steps
+backwards the frames are presented at the queued timestamps in increasing
+order, and every recovered frame lands on its display time. Seeks to a CRA
+keep that timeline: the RASL pictures a decoder skips are taken out when
+queued, or by the reorder bound when the access units are not visible, and a
+decoder that outputs them anyway has them counted back in. A frame the decoder
+drops is written off within the reorder bound; long sessions with seeks keep
+the bookkeeping bounded. Well-formed B-frame timestamps, a discontinuity, a
+missing timestamp and a stream the decoder never reorders all leave the
+codec's timestamps untouched. Pass an already-patched source directory as the
+first argument to run offline.
+
 Run the PGS palette regression with `bash scripts/test_pgs_palette.sh`. It
 compiles pgssubdec's palette cache -- `find_palette`, `flush_cache` and the
 palette segment parser -- and drives an epoch boundary across it: a palette

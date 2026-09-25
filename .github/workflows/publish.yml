@@ -106,6 +106,9 @@ jobs:
       - name: Test MediaCodec pre-decode frame shedding
         run: bash ./scripts/test_mediacodec_shed.sh
 
+      - name: Test MediaCodec presentation order for decode-order timestamps
+        run: bash ./scripts/test_mediacodec_reorder.sh
+
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
 

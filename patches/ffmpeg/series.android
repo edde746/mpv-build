@@ -16,3 +16,4 @@
 0012-mediacodec-async-decode-and-priority.patch
 0024-mediacodec-jni-async-and-feedback.patch
 0025-mediacodec-skip-flush-before-first-input.patch
+0026-mediacodec-recover-presentation-order.patch

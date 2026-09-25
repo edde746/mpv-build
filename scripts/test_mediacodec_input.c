@@ -116,6 +116,11 @@ static struct {
     uint32_t queued_flags;
     int flushed;
     uint8_t buffer[4 << 20];
+    // What presentation-order recovery was handed for the queued units.
+    int recorded;
+    int64_t recorded_pts;
+    const uint8_t *recorded_data;
+    int recorded_size;
 } codec;
 
 static ssize_t ff_AMediaCodec_dequeueInputBuffer(FFAMediaCodec *c, int64_t timeout)
@@ -156,6 +161,15 @@ static int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *
     s->draining = s->flushing = s->eos = 0;
     s->current_input_buffer = -1;
     return 1;
+}
+
+static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecContext *s,
+                                         int64_t pts, const uint8_t *data, int size)
+{
+    codec.recorded++;
+    codec.recorded_pts = pts;
+    codec.recorded_data = data;
+    codec.recorded_size = size;
 }
 
 #include "mediacodec_input.inc"
@@ -235,6 +249,19 @@ static void test_packet_that_fits_is_queued_whole(void)
           "pts is rescaled to microseconds with no flags");
     check(!codec.flushed && !errors, "a fitting packet neither flushes nor errors");
     check(ctx.current_input_buffer == -1, "the input buffer was used up");
+    // Recovery pairs frames with what was queued: the media time in
+    // microseconds, and the access unit read from the packet, which stays
+    // the caller's (the input buffer is the codec's once queued).
+    check(codec.recorded == 1 && codec.recorded_pts == 1000000 &&
+          codec.recorded_data == payload && codec.recorded_size == pkt.size,
+          "the queued access unit is recorded for presentation-order recovery");
+
+    // A packet without a timestamp is queued at 0 but recorded as having none.
+    reset(2 << 20);
+    pkt = packet(1 << 10, AV_NOPTS_VALUE);
+    ret = ff_mediacodec_dec_send(&avctx, &ctx, &pkt, false);
+    check(ret == pkt.size && codec.queued_pts == 0 && codec.recorded_pts == AV_NOPTS_VALUE,
+          "a missing timestamp is recorded as missing, not as 0");
 
     // A pre-dequeued buffer from the caller's poll is used without dequeuing.
     reset(2 << 20);
@@ -251,6 +278,7 @@ static void test_oversized_access_unit_is_dropped_whole(void)
     int ret = ff_mediacodec_dec_send(&avctx, &ctx, &pkt, false);
     check(ret == pkt.size, "an oversized access unit is reported consumed");
     check(codec.queued == 0, "no fragment of it reaches the decoder");
+    check(codec.recorded == 0, "the dropped access unit is not recorded");
     check(codec.flushed == 1, "the decoder is flushed to resync on a keyframe");
     check(errors == 1, "the drop is logged as an error");
     check(ctx.current_input_buffer == -1, "the flush reclaimed the input buffer");
@@ -278,6 +306,7 @@ static void test_end_of_stream_and_back_pressure(void)
           codec.queued_flags == EOS_FLAG && ctx.draining,
           "an empty packet queues end of stream");
     check(!codec.flushed, "end of stream is never mistaken for an oversized unit");
+    check(codec.recorded == 0, "end of stream is not recorded as a frame");
 
     reset(1 << 20);
     codec.next_index = TRY_AGAIN_LATER;

@@ -126,7 +126,19 @@ typedef struct MediaCodecDecContext {
     int async_generation;
     int64_t pending_drop_pts[8];
     int pending_drops;
+    // Presentation-order recovery (mediacodec_reorder.h) is not what this
+    // harness exercises; the send and flush it extracts reach it.
+    struct MediaCodecReorder { int unused; } reorder;
 } MediaCodecDecContext;
+
+static void ff_mediacodec_reorder_flush(struct MediaCodecReorder *r)
+{
+}
+
+static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecContext *s,
+                                         int64_t pts, const uint8_t *data, int size)
+{
+}
 
 typedef struct MediaCodecAsyncOutput {
     int32_t index;

@@ -100,6 +100,14 @@ static void av_fifo_reset2(AVFifo *f)
     f->head = f->count = 0;
 }
 
+// Presentation-order recovery (mediacodec_reorder.h), recorded: what the
+// production send hands it and how often the codec flush resets it.
+typedef struct MediaCodecReorder {
+    int flushes;
+    int recorded;
+    int64_t recorded_pts;
+} MediaCodecReorder;
+
 typedef struct MediaCodecDecContext {
     atomic_int refcount;
     atomic_int hw_buffer_count;
@@ -120,7 +128,20 @@ typedef struct MediaCodecDecContext {
     int async_error;
     int async_generation;
     int pending_drops;
+    MediaCodecReorder reorder;
 } MediaCodecDecContext;
+
+static void ff_mediacodec_reorder_flush(MediaCodecReorder *r)
+{
+    r->flushes++;
+}
+
+static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecContext *s,
+                                         int64_t pts, const uint8_t *data, int size)
+{
+    s->reorder.recorded++;
+    s->reorder.recorded_pts = pts;
+}
 
 // The wait on a notification: the test offers every slot ahead of the call
 // that takes it, so there is never anything to wait for.
@@ -319,8 +340,15 @@ static void test_back_to_back_seeks_flush_once(int async_mode)
         offer(0);
     checkf(send(1024, 180000) == 1024 && codec.queued == 2, async_mode,
            "the packet after the seeks is queued");
+    // The asynchronous codec is handed the new flush generation folded into
+    // the timestamp; the recovery sees the media time the codec echoes back
+    // once untagged.
+    checkf(ctx.reorder.recorded == 2 && ctx.reorder.recorded_pts == 2000000, async_mode,
+           "presentation-order recovery records the untagged media time");
     seek();
     checkf(codec.flushes == 2 && !errors, async_mode, "the seek after it flushes");
+    checkf(ctx.reorder.flushes == codec.flushes, async_mode,
+           "every codec flush resets presentation-order recovery");
 }
 
 static void test_dropped_access_unit_gives_its_slot_back(int async_mode)
