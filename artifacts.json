@@ -4,23 +4,23 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
       "libraries": {
         "libmpv-android": {
-          "key": "60fa334f0516",
+          "key": "8b45cc8deaa4",
           "prebuilt": {
             "arm64-v8a": {
-              "asset": "libmpv-android-60fa334f0516-arm64-v8a.tar.gz",
-              "checksum": "41b79a775ec353b1d0502971457d5276509550f7c1b4b540e43001fdab04d0d0"
+              "asset": "libmpv-android-8b45cc8deaa4-arm64-v8a.tar.gz",
+              "checksum": "da461a65e6c0f6b97ae959abd549d5dddaa7e333a27b3ffb29ac2b581b81e95e"
             },
             "armeabi-v7a": {
-              "asset": "libmpv-android-60fa334f0516-armeabi-v7a.tar.gz",
-              "checksum": "cb4c14aa9b7e886f7d89a1442a6c913e654146b4b025463d15ee4ed62b9ce397"
+              "asset": "libmpv-android-8b45cc8deaa4-armeabi-v7a.tar.gz",
+              "checksum": "0420f97f617add860a8f7bb37d1dd5e76fc5fbc6daaaa0ff76b39cdda223e8d7"
             },
             "x86": {
-              "asset": "libmpv-android-60fa334f0516-x86.tar.gz",
-              "checksum": "fb43accc29df394cc2e2341b757d00afa40ecd8f40dc9529e86d04eb1fad5798"
+              "asset": "libmpv-android-8b45cc8deaa4-x86.tar.gz",
+              "checksum": "73081457bf745d3a6abdedb0316b5c45f9e4a8913e401b7c610a8d979ee604c0"
             },
             "x86_64": {
-              "asset": "libmpv-android-60fa334f0516-x86_64.tar.gz",
-              "checksum": "dcb980c510b0c69c0d0fbd4900c7c350bba3dc312b9ddf50cf80c56a85ce1f84"
+              "asset": "libmpv-android-8b45cc8deaa4-x86_64.tar.gz",
+              "checksum": "6bf3a7fabb027fd1c02aae6a54301593de4565aedf1ddd6a8e4b4cd30a6d6c79"
             }
           }
         }
@@ -90,18 +90,18 @@
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-210e7414c188.xcframework.zip",
-              "checksum": "e01a418e6e047d6d871eaa376740189b945885f2e0d81a3a9d716137660614aa"
+              "asset": "Libmpv-e52a9c7ff4dd.xcframework.zip",
+              "checksum": "e169210ae065b687785962297d68728d83e887a44bd6ffb272e931517081f9c8"
             }
           },
-          "key": "210e7414c188",
+          "key": "e52a9c7ff4dd",
           "prebuilt": {
-            "ios": "libmpv-all-210e7414c188-ios.zip",
-            "isimulator": "libmpv-all-210e7414c188-isimulator.zip",
-            "maccatalyst": "libmpv-all-210e7414c188-maccatalyst.zip",
-            "macos": "libmpv-all-210e7414c188-macos.zip",
-            "tvos": "libmpv-all-210e7414c188-tvos.zip",
-            "tvsimulator": "libmpv-all-210e7414c188-tvsimulator.zip"
+            "ios": "libmpv-all-e52a9c7ff4dd-ios.zip",
+            "isimulator": "libmpv-all-e52a9c7ff4dd-isimulator.zip",
+            "maccatalyst": "libmpv-all-e52a9c7ff4dd-maccatalyst.zip",
+            "macos": "libmpv-all-e52a9c7ff4dd-macos.zip",
+            "tvos": "libmpv-all-e52a9c7ff4dd-tvos.zip",
+            "tvsimulator": "libmpv-all-e52a9c7ff4dd-tvsimulator.zip"
           }
         }
       }
