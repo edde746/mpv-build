@@ -1,0 +1,53 @@
+Subject: [PATCH] avformat/tcp: keep an IPv4 literal beside its NAT64 synthesis
+
+tcp_open() resolves with AF_UNSPEC and zero ai_flags. Apple's
+getaddrinfo() replaces zero flags with AI_DEFAULT (AI_V4MAPPED_CFG |
+AI_ADDRCONFIG), and on a NAT64 network it answers an IPv4 literal with
+addresses synthesized under the network's prefix (64:ff9b::/96). It adds
+the literal itself to that answer only when AI_ADDRCONFIG is clear
+(Libinfo _gai_nat64_synthesis()), so ffmpeg gets the synthesized
+addresses alone.
+
+That is wrong whenever the IPv4 address is reachable without the
+carrier's NAT64 gateway -- above all through a VPN that routes it, like
+Tailscale's 100.64.0.0/10. The synthesized destination leaves over
+cellular, never reaches the tunnel, and the connect hangs until the open
+timeout. Plezy hits this on iPhones on IPv6-only carriers with a
+Jellyfin server added by its Tailscale IP (edde746/plezy#2460): the
+app's own requests connect to the literal directly and work, while every
+mpv open times out before the first byte.
+
+Pass AI_NUMERICSERV, which the always-numeric portstr satisfies anyway.
+Nonzero flags keep AI_DEFAULT out, so the literal joins the synthesized
+addresses in the answer and ff_connect_parallel() races both families,
+starting the next attempt within 200 ms. Networks without a NAT64
+prefix still get the literal alone, and a public IPv4 literal on an
+IPv6-only network still reaches its synthesized address.
+
+Verified on n8.0.1 with a host ffprobe on macOS and Libinfo's NAT64 hook
+emulating a 64:ff9b::/96 network: an IPv4 literal served on the LAN
+resolved to 64:ff9b::c0a8:107 alone and failed without the patch, and
+resolved to both and connected over IPv4 with it; a literal reachable
+only through the emulated NAT64 path still connected through it. Apple
+only, since other resolvers do not rewrite zero flags. Not upstream
+yet.
+
+diff --git a/libavformat/tcp.c b/libavformat/tcp.c
+--- a/libavformat/tcp.c
++++ b/libavformat/tcp.c
+@@ -195,6 +195,15 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
+     hints.ai_family = AF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+     snprintf(portstr, sizeof(portstr), "%d", port);
++    /* portstr is always numeric. Saying so also keeps the flags nonzero:
++     * Apple's getaddrinfo() replaces zero flags with AI_DEFAULT, whose
++     * AI_ADDRCONFIG makes an IPv4 literal on a NAT64 network resolve to the
++     * synthesized 64:ff9b::/96 addresses alone. Those leave through the
++     * NAT64 gateway, never through a VPN that routes the IPv4 address itself
++     * (Tailscale's 100.64.0.0/10), and that connection hangs. Without
++     * AI_ADDRCONFIG the IPv4 address joins them in the list and
++     * ff_connect_parallel() races it against them. */
++    hints.ai_flags = AI_NUMERICSERV;
+     if (s->listen)
+         hints.ai_flags |= AI_PASSIVE;
+     if (!hostname[0])

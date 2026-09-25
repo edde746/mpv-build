@@ -18,3 +18,6 @@
 0014-videotoolbox-fall-back-to-plain-hevc-session.patch
 0015-hevc-downlevel-skipped-nal-log.patch
 0016-videotoolbox-forward-hevc-prefix-seis.patch
+# Apple's getaddrinfo() alone swaps zero flags for AI_DEFAULT, so only this
+# series carries it.
+0027-tcp-keep-ipv4-literal-beside-nat64-synthesis.patch
