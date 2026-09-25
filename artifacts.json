@@ -32,42 +32,42 @@
         "FFmpeg": {
           "frameworks": {
             "Libavcodec": {
-              "asset": "Libavcodec-e57848aae1c2.xcframework.zip",
-              "checksum": "d47183a1f78af4add64ea56711422c61a4f4f591d99fdc65f2dbdffb78c0b63f"
+              "asset": "Libavcodec-ac523adc6336.xcframework.zip",
+              "checksum": "a913358e5b257909f743cb62445afcc4c988c5e78638bab70101fc10d5d2495e"
             },
             "Libavdevice": {
-              "asset": "Libavdevice-e57848aae1c2.xcframework.zip",
-              "checksum": "1f535e4d47d0183a1f48e134e675e01ddeb00d837db06bf4e2d4f9036166a4bb"
+              "asset": "Libavdevice-ac523adc6336.xcframework.zip",
+              "checksum": "99a9efa1fdc412fee0f47bf062596abb63938dd44fe75092c61d5daffb057126"
             },
             "Libavfilter": {
-              "asset": "Libavfilter-e57848aae1c2.xcframework.zip",
-              "checksum": "605c0ba462287f489e33bccd1b80a6f5d10ae36350cfdaa202c855f15513d29f"
+              "asset": "Libavfilter-ac523adc6336.xcframework.zip",
+              "checksum": "186287f34a5832799379cac270deee9221c6a2a989b6cd5817eebd1fc6a07f91"
             },
             "Libavformat": {
-              "asset": "Libavformat-e57848aae1c2.xcframework.zip",
-              "checksum": "71f583da9b7e6ae8b1ea3d3dc17bca9e34800ade88cc00bb5c7d2e5df7f31a9a"
+              "asset": "Libavformat-ac523adc6336.xcframework.zip",
+              "checksum": "ddbfedc01c88982826da3d3c192cd0b84929cebbf6bac13066abcf3b6dbb481a"
             },
             "Libavutil": {
-              "asset": "Libavutil-e57848aae1c2.xcframework.zip",
-              "checksum": "5340a68b74dd5b3f0e6851e96599e2148353b0f96755f46612c1a3a3f572c092"
+              "asset": "Libavutil-ac523adc6336.xcframework.zip",
+              "checksum": "8723da967a99bf98df4a39e046ecb42720af61662422dcb5e8918f269b33a619"
             },
             "Libswresample": {
-              "asset": "Libswresample-e57848aae1c2.xcframework.zip",
-              "checksum": "2a510521f35406116575bb68cbf8b1d9b40338cf18fb833f02b8cb32a3ab0af4"
+              "asset": "Libswresample-ac523adc6336.xcframework.zip",
+              "checksum": "76189b3522061e2b8e9e32f344a9478bbe8bbd4ff385b81e2f33ffce49c5142e"
             },
             "Libswscale": {
-              "asset": "Libswscale-e57848aae1c2.xcframework.zip",
-              "checksum": "394b68b3aeed1c359e63538be4c547f16452a6d915d3c793113095ce14e1bc0c"
+              "asset": "Libswscale-ac523adc6336.xcframework.zip",
+              "checksum": "f575ffee4e538c982ac65c80cd7ad1edef197c2df82da927feb9bdb4583e5b9f"
             }
           },
-          "key": "e57848aae1c2",
+          "key": "ac523adc6336",
           "prebuilt": {
-            "ios": "FFmpeg-all-e57848aae1c2-ios.zip",
-            "isimulator": "FFmpeg-all-e57848aae1c2-isimulator.zip",
-            "maccatalyst": "FFmpeg-all-e57848aae1c2-maccatalyst.zip",
-            "macos": "FFmpeg-all-e57848aae1c2-macos.zip",
-            "tvos": "FFmpeg-all-e57848aae1c2-tvos.zip",
-            "tvsimulator": "FFmpeg-all-e57848aae1c2-tvsimulator.zip"
+            "ios": "FFmpeg-all-ac523adc6336-ios.zip",
+            "isimulator": "FFmpeg-all-ac523adc6336-isimulator.zip",
+            "maccatalyst": "FFmpeg-all-ac523adc6336-maccatalyst.zip",
+            "macos": "FFmpeg-all-ac523adc6336-macos.zip",
+            "tvos": "FFmpeg-all-ac523adc6336-tvos.zip",
+            "tvsimulator": "FFmpeg-all-ac523adc6336-tvsimulator.zip"
           }
         },
         "libass": {
