@@ -1,0 +1,112 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 20:00:00 +0200
+Subject: [PATCH] ao_avfoundation: apply the software volume to compressed
+ audio on macOS
+
+The compressed sink hands AC3/E-AC-3 to an AVPlayer, which decodes it
+locally on macOS - including E-AC-3 JOC, rendered as Dolby Atmos on
+AirPods and the built-in speakers of Apple silicon Macs (plezy#2477).
+mpv's --volume, --mute and replaygain reach an AO only as a software gain
+that ao_post_process_data() multiplies into PCM samples; spdif formats
+pass through unscaled, so the volume control did nothing while that path
+played.
+
+Hand the gain to the player instead, combined with --ao-volume, from the
+feed tick on the AO queue. macOS only: there coreaudio_exclusive takes
+any bitstream a device can carry before this AO is tried, so this sink
+always decodes locally. tvOS may be feeding Dolby MAT to a receiver here,
+and the hardware volume is the control on tvOS and iOS, so both keep the
+player at unity as before.
+---
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 797bef7..cc9a036 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -122,6 +122,12 @@ - (void)invalidate;
+     // dropouts over ~4 min fell from 21/min (Plezy 2.15) and 10.6/min
+     // (this AO at 2 s) to zero.
+     double opt_compressed_lead;
++#if TARGET_OS_OSX
++    // Player volume last applied by avp_apply_volume(); only touched on
++    // p->queue. The --ao-volume share is set from control() off the queue.
++    float avp_volume;
++    _Atomic float avp_ao_volume;
++#endif
+ #if TARGET_OS_OSX
+     // The bounded PCM lookahead is macOS-only. That is where --volume is
+     // driven from a slider or the keyboard and the lag is felt; on tvOS and
+@@ -194,6 +200,29 @@ static CMTime CMTimeFromNanoseconds(int64_t time)
+     return CMTimeMake(time, 1000000000);
+ }
+ 
++#if TARGET_OS_OSX
++// A bitstream has no samples for mpv's software gain (--volume, --mute,
++// replaygain) to scale: ao_post_process_data() passes it through untouched,
++// so the volume control would do nothing while the system decodes the
++// stream. Scale the player instead. On macOS this sink always decodes
++// locally -- coreaudio_exclusive takes the bitstream first wherever a
++// device can carry it. tvOS may be feeding a receiver here, and the
++// hardware volume is the control there and on iOS, so they keep the player
++// at unity. Runs on p->queue.
++static void avp_apply_volume(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    float gain = atomic_load_explicit(&ao->gain, memory_order_relaxed);
++    float volume = MPCLAMP(gain * atomic_load(&p->avp_ao_volume), 0.0f, 1.0f);
++    if (volume == p->avp_volume)
++        return;
++    [p->player setVolume:volume];
++    p->avp_volume = volume;
++    MP_VERBOSE(ao, "player volume: %.3f\n", volume);
++}
++#endif
++
+ static void avp_timer_idle(struct priv *p)
+ {
+     dispatch_source_set_timer(p->avp_timer, DISPATCH_TIME_FOREVER,
+@@ -526,6 +555,10 @@ static void feed_avp(struct ao *ao)
+     if (p->spdif_reload_requested || !p->item)
+         return;
+ 
++#if TARGET_OS_OSX
++    avp_apply_volume(ao);
++#endif
++
+     // surface player/item state transitions while diagnosing startup
+     int item_status = (int)[p->item status];
+     int tcs = (int)[p->player timeControlStatus];
+@@ -929,13 +962,22 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+             *(bool*)arg = [p->player isMuted];
+             return CONTROL_OK;
+         case AOCONTROL_GET_VOLUME:
++#if TARGET_OS_OSX
++            *(float*)arg = atomic_load(&p->avp_ao_volume) * 100;
++#else
+             *(float*)arg = [p->player volume] * 100;
++#endif
+             return CONTROL_OK;
+         case AOCONTROL_SET_MUTE:
+             [p->player setMuted:*(bool*)arg];
+             return CONTROL_OK;
+         case AOCONTROL_SET_VOLUME:
++#if TARGET_OS_OSX
++            // combined with the software gain by the next feed tick
++            atomic_store(&p->avp_ao_volume, *(float*)arg / 100);
++#else
+             [p->player setVolume:*(float*)arg / 100];
++#endif
+             return CONTROL_OK;
+         default:
+             return CONTROL_UNKNOWN;
+@@ -1132,6 +1174,10 @@ static int init(struct ao *ao)
+         // player must not second-guess it against a fake endless resource.
+         p->player.automaticallyWaitsToMinimizeStalling = NO;
+         p->player.allowsExternalPlayback = NO;
++#if TARGET_OS_OSX
++        p->avp_volume = 1.0f; // AVPlayer's own default
++        atomic_store(&p->avp_ao_volume, 1.0f);
++#endif
+         p->loader = [[AVPLoader alloc] initWithAO:ao];
+         if ((p->avp_timer = dispatch_source_create(
+                 DISPATCH_SOURCE_TYPE_TIMER, 0, 0, p->queue)) == NULL) {
