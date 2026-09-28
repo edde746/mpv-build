@@ -329,7 +329,7 @@
     },
     "libshaderc": {
       "kind": "prebuilt",
-      "version": "2025.5.0",
+      "version": "2026.1.0",
       "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
