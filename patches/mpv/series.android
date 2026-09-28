@@ -45,3 +45,4 @@
 0127-vo-mediacodec-render-through-the-shared-osd-pipeline.patch
 0128-vo-mediacodec-call-the-choreographer-outside-the-sampler-lock.patch
 0129-vo-mediacodec-itemize-late-frame-timing.patch
+0130-vo-mediacodec-split-late-frame-wait-between-core-and-vo.patch

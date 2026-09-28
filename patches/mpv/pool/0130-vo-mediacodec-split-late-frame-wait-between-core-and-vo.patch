@@ -1,0 +1,159 @@
+Subject: [PATCH] vo_mediacodec: split a late frame's wait between the core and the VO thread
+
+The frame-timing lines 0129 adds showed where a late frame's time went on an
+Amlogic S928X box playing 1080i50 at 25 Hz: 71 of 77 late frames left the
+decoder 12-253 ms before their deadline and reached this VO's preparation
+after it (Plezy #2485). The wait sits between the decoder hand-off and the
+VO, and the line cannot yet say whose it is: the core queues a frame only
+after the VO has taken the previous one out of its one-frame queue, and the
+VO thread then has to run to see it.
+
+Stamp each vo_frame, in mp_time_ns() units, with when the VO last took a
+frame out of its queue before this one was queued, when the core queued this
+one, and when the VO thread first ran its render pass with it queued; the
+frame-timing line reports them as freed, handoff and wake, on the same
+CLOCK_MONOTONIC scale as the other stages. Diagnostics only.
+
+diff --git a/video/out/vo.c b/video/out/vo.c
+index 8dd5b68..ec04b0c 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -160,6 +160,7 @@ struct vo_internal {
+ 
+     int64_t flip_queue_offset; // queue flip events at most this much in advance
+     int64_t timing_offset;     // same (but from options; not VO configured)
++    int64_t slot_free_ns;      // when render_frame last took frame_queued
+ 
+     int64_t delayed_count;
+     int64_t drop_count;
+@@ -882,6 +883,8 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame)
+            (!in->current_frame || in->current_frame->num_vsyncs < 1));
+     in->hasframe = true;
+     frame->frame_id = ++(in->current_frame_id);
++    frame->slot_free_ns = in->slot_free_ns;
++    frame->queued_ns = mp_time_ns();
+     in->frame_queued = frame;
+     in->wakeup_pts = frame->display_synced
+                    ? 0 : frame->pts + MPMAX(frame->duration, 0);
+@@ -960,10 +963,13 @@ static bool render_frame(struct vo *vo)
+     struct vo_frame *frame = NULL;
+     bool more_frames = false;
+ 
++    int64_t woke = mp_time_ns();
+     update_display_fps(vo);
+ 
+     mp_mutex_lock(&in->lock);
+ 
++    if (in->frame_queued && !in->frame_queued->woke_ns)
++        in->frame_queued->woke_ns = woke;
+     if (!prepare_queued_frame(vo))
+         goto done;
+ 
+@@ -971,6 +977,7 @@ static bool render_frame(struct vo *vo)
+         talloc_free(in->current_frame);
+         in->current_frame = in->frame_queued;
+         in->frame_queued = NULL;
++        in->slot_free_ns = mp_time_ns();
+     } else if (in->paused || !in->current_frame || !in->hasframe ||
+                (in->current_frame->display_synced && in->current_frame->num_vsyncs < 1) ||
+                !in->current_frame->display_synced)
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 17d96c4..9d340f7 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -288,6 +288,11 @@ struct vo_frame {
+     // drops or reconfigs will keep the guarantee.
+     // The ID is never 0 (unless num_frames==0). IDs are strictly monotonous.
+     uint64_t frame_id;
++    // Diagnostics, mp_time_ns() units, 0 unknown: when the VO last took a
++    // frame out of its queue before this one was queued (the slot this one
++    // took), when the core queued this one, and when the VO thread first ran
++    // its render pass with this one queued.
++    int64_t slot_free_ns, queued_ns, woke_ns;
+ };
+ 
+ // Presentation feedback. See get_vsync() for how backends should fill this
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 6d73c50..f63d786 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -746,9 +746,11 @@ struct priv {
+     struct stats_cadence present_cadence;
+     const char *present_source; // NULL until the first release
+     // When the VO first saw the prepared and the current frame
+-    // (CLOCK_MONOTONIC), and how many releases log_frame_timing has seen
+-    // and itemized as late.
++    // (CLOCK_MONOTONIC), the core's hand-off stamps of the current frame
++    // (struct vo_frame, mp_time_ns()), and how many releases
++    // log_frame_timing has seen and itemized as late.
+     int64_t prepared_seen_ns, cur_seen_ns;
++    int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
+     uint64_t timing_releases;
+     unsigned timing_late_logged;
+ 
+@@ -3084,6 +3086,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     p->cur_frame_id = frame->frame_id;
+     p->cur_duration = frame->duration;
+     p->cur_synthetic = synthetic;
++    p->cur_slot_free_ns = frame->slot_free_ns;
++    p->cur_queued_ns = frame->queued_ns;
++    p->cur_woke_ns = frame->woke_ns;
+     if (!synthetic && p->prepared_seq &&
+         p->prepared_frame_id == frame->frame_id)
+     {
+@@ -3156,15 +3161,27 @@ static const char *frame_timing_ms(char buf[16], int64_t t, int64_t deadline)
+     return buf;
+ }
+ 
++// The same for an mp_time_ns() instant, moved onto CLOCK_MONOTONIC by
++// mp_to_mono.
++static const char *frame_timing_mp_ms(char buf[16], int64_t t, int64_t mp_to_mono,
++                                      int64_t deadline)
++{
++    return frame_timing_ms(buf, t ? t + mp_to_mono : 0, deadline);
++}
++
+ // Where a timed frame's time went, from the codec's input queue to this
+ // release: each stage's CLOCK_MONOTONIC instant against the frame's deadline,
+ // in ms, negative ahead of it. input: its access unit was queued to the
+ // codec; output: the codec reported it decoded; dequeue: the decoder handed
+-// it to the player; vo: the core handed it to this VO; release: this
+-// release. queued is how many decoded buffers were still waiting behind it
+-// at dequeue, held how many the player already held. A late frame is
+-// itemized so a codec that decoded it late tells apart from a player that
+-// took, queued or released it late (plezy#2485).
++// it to the player; freed: the VO took the previous frame out of its
++// one-frame queue, the earliest this one could follow; handoff: the core
++// queued this one; wake: the VO thread first ran with it queued; vo: the
++// VO's preparation first looked at it, after its timing update; release:
++// this release. queued is how many decoded buffers were still waiting behind
++// it at dequeue, held how many the player already held. A late frame is
++// itemized so a codec that decoded it late tells apart from a core that
++// handed it over late and a VO thread that picked it up or released it late
++// (plezy#2485).
+ static void log_frame_timing(struct vo *vo, AVMediaCodecBuffer *buffer,
+                              struct release_target target)
+ {
+@@ -3183,13 +3200,20 @@ static void log_frame_timing(struct vo *vo, AVMediaCodecBuffer *buffer,
+     if (av_mediacodec_buffer_get_timing(buffer, &t) < 0)
+         t = (AVMediaCodecBufferTiming){0};
+     int64_t d = target.deadline;
+-    char input[16], output[16], dequeue[16], seen[16], release[16];
++    int64_t mono_now = monotonic_now_ns();
++    int64_t mp_to_mono = mono_now ? mono_now - mp_time_ns() : 0;
++    char input[16], output[16], dequeue[16], freed[16], handoff[16], woke[16],
++         seen[16], release[16];
+     MP_VERBOSE(vo, "frame-timing %s pts=%.3f input=%s output=%s dequeue=%s "
+-                   "vo=%s release=%s ms vs deadline, queued=%d held=%d\n",
++                   "freed=%s handoff=%s wake=%s vo=%s release=%s ms vs deadline, "
++                   "queued=%d held=%d\n",
+                target.late ? "late" : "sample", p->cur_image->pts,
+                frame_timing_ms(input, t.input_ns, d),
+                frame_timing_ms(output, t.output_ns, d),
+                frame_timing_ms(dequeue, t.dequeue_ns, d),
++               frame_timing_mp_ms(freed, p->cur_slot_free_ns, mp_to_mono, d),
++               frame_timing_mp_ms(handoff, p->cur_queued_ns, mp_to_mono, d),
++               frame_timing_mp_ms(woke, p->cur_woke_ns, mp_to_mono, d),
+                frame_timing_ms(seen, p->cur_seen_ns, d),
+                frame_timing_ms(release, target.now, d),
+                t.queued_outputs, t.held_buffers);

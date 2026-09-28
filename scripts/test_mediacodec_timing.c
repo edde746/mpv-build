@@ -546,6 +546,7 @@ struct vo_frame {
     int64_t pts;
     double duration;
     uint64_t frame_id;
+    int64_t slot_free_ns, queued_ns, woke_ns;
     struct mp_image *current;
 };
 
@@ -586,6 +587,7 @@ struct priv {
     struct present_stats present;
     const char *present_source;
     int64_t prepared_seen_ns, cur_seen_ns;
+    int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
 };
 
 // Stands in for the production process-lifetime sampler: its lock, the vsync
