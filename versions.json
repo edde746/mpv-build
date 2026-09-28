@@ -226,7 +226,7 @@
     },
     "libunibreak": {
       "kind": "prebuilt",
-      "version": "0.17.4",
+      "version": "0.17.5",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libunibreak-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
@@ -245,7 +245,7 @@
     },
     "libfreetype": {
       "kind": "prebuilt",
-      "version": "0.17.4",
+      "version": "0.17.5",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfreetype-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
@@ -254,7 +254,7 @@
     },
     "libfribidi": {
       "kind": "prebuilt",
-      "version": "0.17.4",
+      "version": "0.17.5",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfribidi-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
@@ -263,7 +263,7 @@
     },
     "libharfbuzz": {
       "kind": "prebuilt",
-      "version": "0.17.4",
+      "version": "0.17.5",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libharfbuzz-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
