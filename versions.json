@@ -347,7 +347,7 @@
     },
     "libplacebo": {
       "kind": "prebuilt",
-      "version": "7.351.0-2512",
+      "version": "7.360.1",
       "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/libplacebo-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
