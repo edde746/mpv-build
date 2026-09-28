@@ -46,3 +46,4 @@
 0128-vo-mediacodec-call-the-choreographer-outside-the-sampler-lock.patch
 0129-vo-mediacodec-itemize-late-frame-timing.patch
 0130-vo-mediacodec-split-late-frame-wait-between-core-and-vo.patch
+0131-player-hand-vo-mediacodec-a-frame-without-waiting-for-the-next.patch

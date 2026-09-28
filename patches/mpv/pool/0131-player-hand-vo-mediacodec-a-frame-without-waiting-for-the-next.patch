@@ -1,0 +1,151 @@
+Subject: [PATCH] player: hand vo_mediacodec a frame without waiting for the next one
+
+The core queues a video frame only once the frame after it is decoded, so it
+can compute the first one's duration. vo_mediacodec times every release from
+the frame's own pts and needs neither that duration nor the next frame first,
+but the wait still applies to it. On an Amlogic S928X box playing a 1080i50
+recording at 25 Hz, the decoder emits each frame only about 110 ms before its
+deadline, so the next frame usually arrives about 70 ms before the current
+one's deadline, and whenever the decoder ran later than that the current
+frame reached the codec after it: 0.3-0.6 late frames a second, a frame held
+a refresh too long each time. In 111 of 116 such frames, the frame itself had
+been decoded and its VO slot freed a median 124 ms before its deadline;
+ExoPlayer, which releases each frame on its own timestamp, kept every frame on
+the same decoder and mode (Plezy #2485).
+
+VO_CAP_OWN_TIMING declares that a VO times frames itself; vo_mediacodec sets
+it. For such a VO, get_queue_frames() lets one decoded frame go to the VO,
+while needs_new_frame() still has the decoder run get_req_frames() ahead, and
+video_output_image() keeps asking for that next frame in the pass that finds
+a frame already queueable, so the decoder is asked as early as before. A frame
+queued alone takes the spacing from the previous frame's pts as its duration
+(the stream's own cadence, where the container rate would be half that of a
+decoder splitting fields into frames), and that spacing also settles the
+previous frame's duration, which may have been such an estimate. A spacing of
+zero (a repeated timestamp) or of more than twice the previous estimate (a
+timestamp jump, which belongs to the previous frame) keeps the previous
+frame's estimate. The first frame after a reset, display-sync and every other
+VO keep the lookahead.
+
+diff --git a/player/video.c b/player/video.c
+index 0e1ac29..6f9aec7 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -453,11 +453,34 @@ static void add_new_frame(struct MPContext *mpctx, struct mp_image *frame)
+         handle_new_frame(mpctx);
+ }
+ 
++// Frames needed in mpctx->next_frames[] before the first may go to the VO.
++// Normally all get_req_frames() asks for, the second giving the first its
++// duration. A VO that times each frame from its own pts (VO_CAP_OWN_TIMING)
++// takes one as soon as it is decoded: waiting for the next one only delays
++// it, by however late the decoder is with that next one, and a MediaCodec
++// decoder that emits frames a little ahead of their deadline makes that the
++// difference between on time and late. calculate_frame_duration() then uses
++// the spacing just measured. Decoding still runs get_req_frames() ahead
++// (needs_new_frame), so the decoder is asked for the next frame as early as
++// before. The first frame after a reset (nothing measured yet) and
++// display-sync, which schedules vsyncs from each frame's duration, keep the
++// lookahead.
++static int get_queue_frames(struct MPContext *mpctx, bool eof)
++{
++    int req = get_req_frames(mpctx, eof);
++    if (req > 1 && (mpctx->video_out->driver->caps & VO_CAP_OWN_TIMING) &&
++        mpctx->video_pts != MP_NOPTS_VALUE && mpctx->num_past_frames >= 1 &&
++        !mpctx->display_sync_active &&
++        mpctx->video_out->opts->video_sync == VS_DEFAULT)
++        return 1;
++    return req;
++}
++
+ // Enough video filtered already to push one frame to the VO?
+ // Set eof to true if no new frames are to be expected.
+ static bool have_new_frame(struct MPContext *mpctx, bool eof)
+ {
+-    return mpctx->num_next_frames >= get_req_frames(mpctx, eof);
++    return mpctx->num_next_frames >= get_queue_frames(mpctx, eof);
+ }
+ 
+ // Fill mpctx->next_frames[] with a newly filtered or decoded image.
+@@ -487,7 +510,9 @@ static int video_output_image(struct MPContext *mpctx, bool *logical_eof)
+         hrseek = false;
+     }
+ 
+-    if (have_new_frame(mpctx, false))
++    // A frame may already be queueable while decoding runs a frame further
++    // ahead (get_queue_frames): keep asking for that one in the same pass.
++    if (have_new_frame(mpctx, false) && !needs_new_frame(mpctx))
+         return VD_NEW_FRAME;
+ 
+     // Get a new frame if we need one.
+@@ -990,6 +1015,37 @@ static void calculate_frame_duration(struct MPContext *mpctx)
+     // rounding error into the opposite direction.
+     double tolerance = 0.001 * 3 + 0.0001;
+ 
++    // A VO_CAP_OWN_TIMING VO gets a frame before the next one is decoded
++    // (get_queue_frames), so the previous frame's duration may have been a
++    // guess: this frame's pts settles it. Without a next frame, this frame
++    // takes that spacing: the stream's own cadence, which the container rate
++    // is not for a decoder that splits fields into frames (twice the rate).
++    // A spacing more than twice the previous frame's estimate is a jump in
++    // the timestamps (a broadcast recording's discontinuity), which belongs
++    // to the previous frame, not this one; so is a spacing of zero (a decoder
++    // that repeats a timestamp across a field pair). Either keeps the
++    // previous frame's estimate.
++    if ((mpctx->video_out->driver->caps & VO_CAP_OWN_TIMING) &&
++        mpctx->num_past_frames >= 2)
++    {
++        double pts0 = mpctx->past_frames[0].pts;
++        double prev = mpctx->past_frames[1].pts;
++        double prev_estimate = mpctx->past_frames[1].approx_duration;
++        double spacing = pts0 != MP_NOPTS_VALUE && prev != MP_NOPTS_VALUE
++                       ? pts0 - prev : -1;
++        if (spacing > 0)
++            mpctx->past_frames[1].duration = spacing;
++        if (mpctx->num_next_frames < 2) {
++            if (spacing > 0 && (prev_estimate <= 0 ||
++                                spacing <= 2 * prev_estimate + tolerance))
++            {
++                duration = spacing;
++            } else if (prev_estimate > 0) {
++                duration = prev_estimate;
++            }
++        }
++    }
++
+     double total = 0;
+     int num_dur = 0;
+     for (int n = 1; n < mpctx->num_past_frames; n++) {
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 9d340f7..ad48547 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -210,6 +210,10 @@ enum {
+     VO_CAP_FRAMEOWNER   = 1 << 5,
+     // VO does handle mp_image_params.vflip
+     VO_CAP_VFLIP        = 1 << 6,
++    // VO times every frame from that frame's own pts, and needs neither the
++    // next frame queued behind it nor the core to wait for one: the core may
++    // hand it a frame before the following one is decoded (vo_mediacodec).
++    VO_CAP_OWN_TIMING   = 1 << 7,
+ };
+ 
+ enum {
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index f63d786..da86096 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -3405,7 +3405,12 @@ const struct vo_driver video_out_mediacodec = {
+     // release call the drop buys no throughput and only empties the
+     // screen. A burst of late frames still collapses at the compositor,
+     // which shows the newest queued buffer per vsync.
+-    .caps = VO_CAP_FRAMEDROP,
++    //
++    // Every release is timed from the frame's own pts (get_release_target),
++    // so the frame after it is not needed first; OWN_TIMING lets the core
++    // hand a frame over as soon as it is decoded instead of once the next
++    // one is (player/video.c get_queue_frames).
++    .caps = VO_CAP_FRAMEDROP | VO_CAP_OWN_TIMING,
+     .preinit = preinit,
+     .query_format = query_format,
+     .prepare_frame = prepare_frame,

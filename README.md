@@ -372,6 +372,18 @@ it, and has a refused packet put back and retried; a decoder that wakes the
 filter itself and an ordinary libavcodec decoder are left alone. Pass an
 already-patched source directory to run offline.
 
+Run the frame-queue regression with `bash scripts/test_player_queue_frames.sh`.
+It compiles the core's frame-queue gate and frame-duration code
+(`player/video.c`) against a scripted decoder: `vo_mediacodec`, which times
+each frame from its own pts, gets a decoded frame without waiting for the next
+one while the decoder is still asked for that next frame; a frame queued alone
+lasts the spacing measured from the previous frame's pts (20 ms for a decoder
+splitting a 25 fps interlaced stream into fields), which also settles the
+previous frame's guessed duration, while a timestamp jump stays with the frame
+before it; and other VOs, the first frame after a reset, display-sync and EOF
+keep upstream behavior. Pass an already-patched source directory to run
+offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer

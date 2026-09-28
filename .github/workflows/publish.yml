@@ -112,6 +112,9 @@ jobs:
       - name: Test MediaCodec presentation order for decode-order timestamps
         run: bash ./scripts/test_mediacodec_reorder.sh
 
+      - name: Test the core's frame queue for a self-timed VO
+        run: bash ./scripts/test_player_queue_frames.sh
+
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
 
