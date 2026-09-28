@@ -8,14 +8,19 @@ codec's release call late for about one frame in eighteen while ExoPlayer,
 on the same codec and display mode, kept every frame (Plezy #2485).
 
 Stamp each output buffer, on CLOCK_MONOTONIC (the clock
-releaseOutputBuffer(int, long) takes), with when the access unit carrying
-its timestamp was queued to the codec, when the codec reported the decoded
-buffer (the asynchronous output callback, or the dequeue itself when the
-codec runs synchronously), and when the decoder handed it to the caller,
-together with how many decoded buffers were still queued behind it and how
-many the caller already held. av_mediacodec_buffer_get_timing() reads them
-back. The input instant is looked up by the tagged timestamp the codec
-echoes, in a 64-entry ring of recent access units that a flush clears.
+releaseOutputBuffer(int, long) takes), with when the access unit it came
+from was queued to the codec, when the codec reported the decoded buffer
+(the asynchronous output callback, or the dequeue itself when the codec runs
+synchronously), and when the decoder handed it to the caller, together with
+how many decoded buffers were still queued behind it and how many the caller
+already held. av_mediacodec_buffer_get_timing() reads them back.
+
+The input instant comes from a 64-entry ring of recent access units, keyed
+by the tagged timestamp the codec echoes and cleared by a flush. A decoder
+that deinterlaces by itself (Amlogic, Tegra, MediaTek) emits a second frame
+per access unit with a timestamp it synthesized half a frame later, so an
+output is matched to the newest access unit at or before its timestamp and
+less than 50 ms earlier.
 
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
 index 5bc0d96..ee8c6cd 100644
@@ -88,10 +93,10 @@ index 260bf3e..34b2b97 100644
   * One frame the surface has rendered, as reported by the platform's
   * frame-rendered callback: the presentation time it was queued with and the
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index f130825..7c6b5d4 100644
+index f130825..502299c 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -403,10 +403,40 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
+@@ -403,10 +403,53 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
      av_freep(&buffer);
  }
  
@@ -111,17 +116,30 @@ index f130825..7c6b5d4 100644
 +    s->input_times[slot].ns = mediacodec_monotonic_ns();
 +}
 +
-+// When the access unit an output echoes the timestamp of went in, newest
-+// first; 0 when it has aged out of the ring or never had a timestamp.
++// An output of a decoder that deinterlaces by itself (Amlogic, Tegra,
++// MediaTek) carries its access unit's timestamp on the first field and a
++// timestamp it synthesized half a frame later on the second, which no input
++// had. Such a frame came from the newest access unit at or before it, less
++// than a frame earlier.
++#define MEDIACODEC_INPUT_TIME_MAX_GAP_US 50000
++
++// When the access unit an output came from went in: the one with its
++// timestamp or, for a field the decoder split out, the one it follows; 0 when
++// that has aged out of the ring or never had a timestamp. Tagged timestamps
++// of one flush generation differ in microseconds.
 +static int64_t mediacodec_dec_input_time_find(const MediaCodecDecContext *s, int64_t pts)
 +{
 +    unsigned count = FFMIN(s->input_times_next, FF_MEDIACODEC_INPUT_TIMES);
++    int64_t best_pts = INT64_MIN, best_ns = 0;
 +    for (unsigned i = 1; i <= count; i++) {
 +        unsigned slot = (s->input_times_next - i) % FF_MEDIACODEC_INPUT_TIMES;
-+        if (s->input_times[slot].pts == pts)
-+            return s->input_times[slot].ns;
++        int64_t in = s->input_times[slot].pts;
++        if (in <= pts && pts - in < MEDIACODEC_INPUT_TIME_MAX_GAP_US && in > best_pts) {
++            best_pts = in;
++            best_ns = s->input_times[slot].ns;
++        }
 +    }
-+    return 0;
++    return best_ns;
 +}
 +
  static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
@@ -132,7 +150,7 @@ index f130825..7c6b5d4 100644
                                    AVFrame *frame)
  {
      int ret = 0;
-@@ -452,6 +482,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
+@@ -452,6 +495,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
  
      buffer->index = index;
      buffer->pts = info->presentationTimeUs;
@@ -140,7 +158,7 @@ index f130825..7c6b5d4 100644
  
      frame->data[3] = (uint8_t *)buffer;
  
-@@ -867,7 +898,9 @@ static void mediacodec_dec_on_output_available(FFAMediaCodec *codec, void *userd
+@@ -867,7 +911,9 @@ static void mediacodec_dec_on_output_available(FFAMediaCodec *codec, void *userd
                                                 FFAMediaCodecBufferInfo *info)
  {
      MediaCodecDecContext *s = userdata;
@@ -151,7 +169,7 @@ index f130825..7c6b5d4 100644
  
      ff_mutex_lock(&s->async_lock);
      if (av_fifo_write(s->async_output, &output, 1) < 0 && !s->async_error)
-@@ -1041,9 +1074,11 @@ enum {
+@@ -1041,9 +1087,11 @@ enum {
  };
  
  // The next output event: 0 with *index and *info filled for a buffer, one of
@@ -164,7 +182,7 @@ index f130825..7c6b5d4 100644
                                           int64_t timeout_us)
  {
      MediaCodecAsyncOutput output;
-@@ -1054,6 +1089,8 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1054,6 +1102,8 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
          ssize_t idx = ff_AMediaCodec_dequeueOutputBuffer(codec, info, timeout_us);
          if (idx >= 0) {
              *index = idx;
@@ -173,7 +191,7 @@ index f130825..7c6b5d4 100644
              return 0;
          }
          if (ff_AMediaCodec_infoOutputFormatChanged(codec, idx))
-@@ -1067,11 +1104,15 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1067,11 +1117,15 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
      }
  
      for (;;) {
@@ -189,7 +207,7 @@ index f130825..7c6b5d4 100644
          if (ret)
              return ret;
          if (output.index == MEDIACODEC_ASYNC_FORMAT_CHANGED)
-@@ -1096,6 +1137,7 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1096,6 +1150,7 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
      }
      *index = output.index;
      *info = output.info;
@@ -197,7 +215,7 @@ index f130825..7c6b5d4 100644
      return 0;
  }
  
-@@ -1116,6 +1158,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -1116,6 +1171,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      // Every shed frame the codec had yet to pass is moot after a flush.
      s->pending_drops = 0;
      ff_mediacodec_reorder_flush(&s->reorder);
@@ -205,7 +223,7 @@ index f130825..7c6b5d4 100644
  
      status = ff_AMediaCodec_flush(codec);
      if (status < 0) {
-@@ -1475,6 +1518,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1475,6 +1531,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
              av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
              return AVERROR_EXTERNAL;
          }
@@ -213,7 +231,7 @@ index f130825..7c6b5d4 100644
          // The input buffer is the codec's once queued; read the packet's copy.
          mediacodec_dec_reorder_input(avctx, s, media_pts, pkt->data + offset - size, size);
  
-@@ -1496,6 +1540,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1496,6 +1553,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
      size_t size;
      FFAMediaCodec *codec = s->codec;
      FFAMediaCodecBufferInfo info = { 0 };
@@ -221,7 +239,7 @@ index f130825..7c6b5d4 100644
      int status;
      int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
  
-@@ -1514,7 +1559,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1514,7 +1572,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          output_dequeue_timeout_us = 0;
      }
  
@@ -230,7 +248,7 @@ index f130825..7c6b5d4 100644
      if (ret < 0)
          return ret;
      if (ret == 0) {
-@@ -1543,7 +1588,10 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1543,7 +1601,10 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
  
          if (info.size) {
              if (s->surface) {
