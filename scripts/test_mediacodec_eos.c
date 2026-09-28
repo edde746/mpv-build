@@ -105,6 +105,11 @@ static void av_fifo_reset2(AVFifo *f)
     f->head = f->count = 0;
 }
 
+static size_t av_fifo_can_read(const AVFifo *f)
+{
+    return f->count;
+}
+
 typedef struct MediaCodecDecContext {
     atomic_int hw_buffer_count;
     FFAMediaCodec *codec;
@@ -129,6 +134,7 @@ typedef struct MediaCodecDecContext {
     // Presentation-order recovery (mediacodec_reorder.h) is not what this
     // harness exercises; the send and flush it extracts reach it.
     struct MediaCodecReorder { int unused; } reorder;
+    unsigned input_times_next; // diagnostic input-time ring (0028)
 } MediaCodecDecContext;
 
 static void ff_mediacodec_reorder_flush(struct MediaCodecReorder *r)
@@ -143,7 +149,29 @@ static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecCon
 typedef struct MediaCodecAsyncOutput {
     int32_t index;
     FFAMediaCodecBufferInfo info;
+    int64_t output_ns;
 } MediaCodecAsyncOutput;
+
+// Diagnostic timing (0028) is not what this harness exercises; send and
+// receive stamp it on the way.
+typedef struct AVMediaCodecBufferTiming {
+    int64_t input_ns, output_ns, dequeue_ns;
+    int queued_outputs, held_buffers;
+} AVMediaCodecBufferTiming;
+
+static int64_t mediacodec_monotonic_ns(void)
+{
+    return 0;
+}
+
+static void mediacodec_dec_input_time_record(MediaCodecDecContext *s, int64_t pts)
+{
+}
+
+static int64_t mediacodec_dec_input_time_find(const MediaCodecDecContext *s, int64_t pts)
+{
+    return 0;
+}
 
 // The wait on a notification: the test queues every notification ahead of
 // the call it answers, so there is never anything to wait for.
@@ -320,6 +348,7 @@ static int64_t mediacodec_dec_untag_pts(const MediaCodecDecContext *s, int64_t t
 
 static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx, MediaCodecDecContext *s,
                                      ssize_t index, FFAMediaCodecBufferInfo *info,
+                                     const AVMediaCodecBufferTiming *timing,
                                      AVFrame *frame)
 {
     if (codec.frames == 8) {

@@ -129,6 +129,7 @@ typedef struct MediaCodecDecContext {
     int async_generation;
     int pending_drops;
     MediaCodecReorder reorder;
+    unsigned input_times_next; // diagnostic input-time ring (0028)
 } MediaCodecDecContext;
 
 static void ff_mediacodec_reorder_flush(MediaCodecReorder *r)
@@ -141,6 +142,11 @@ static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecCon
 {
     s->reorder.recorded++;
     s->reorder.recorded_pts = pts;
+}
+
+// Diagnostic timing (0028) is not what this harness exercises.
+static void mediacodec_dec_input_time_record(MediaCodecDecContext *s, int64_t pts)
+{
 }
 
 // The wait on a notification: the test offers every slot ahead of the call

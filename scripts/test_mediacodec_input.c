@@ -172,6 +172,11 @@ static void mediacodec_dec_reorder_input(AVCodecContext *avctx, MediaCodecDecCon
     codec.recorded_size = size;
 }
 
+// Diagnostic timing (0028) is not what this harness exercises.
+static void mediacodec_dec_input_time_record(MediaCodecDecContext *s, int64_t pts)
+{
+}
+
 #include "mediacodec_input.inc"
 
 // --- harness

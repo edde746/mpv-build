@@ -585,6 +585,7 @@ struct priv {
     unsigned stats_frames;
     struct present_stats present;
     const char *present_source;
+    int64_t prepared_seen_ns, cur_seen_ns;
 };
 
 // Stands in for the production process-lifetime sampler: its lock, the vsync
@@ -761,6 +762,8 @@ static void osd_ahead_invalidate(struct osd_ahead *s, double pts)
     s->epoch++;
 }
 static void stats_tick(struct vo *vo) { (void)vo; }
+// Diagnostic logging only; what it reads is set by the functions under test.
+#define log_frame_timing(vo, buffer, target) ((void)0)
 
 #include "mediacodec_timing_driver.inc"
 #include "mediacodec_timing_admission.inc"

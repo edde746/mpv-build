@@ -1,0 +1,145 @@
+Subject: [PATCH] vo_mediacodec: itemize where a late frame's time went
+
+The video-present line counts frames released after their deadline, and
+nothing says why: a codec that decoded the frame late, a player that took
+it from the decoder late, a core that handed it to the VO late, and a VO
+thread that woke late all look the same. An Amlogic S928X box at 25 Hz
+released about one frame in eighteen late on a 1080i50 recording that
+ExoPlayer kept whole on the same codec and mode (Plezy #2485).
+
+For each late frame, up to 600 per VO, log one frame-timing line: the
+instant its access unit was queued to the codec, the codec reported it
+decoded, the decoder handed it over (av_mediacodec_buffer_get_timing), the
+core handed it to this VO, and it was released, each in ms against the
+frame's deadline, plus how many decoded buffers were queued behind it and
+how many the player held. One release in 250 is itemized as a sample
+whether late or not, so a late frame reads against an ordinary one. Verbose
+only, like the stats lines.
+
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index a68fadb..6d73c50 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -745,6 +745,12 @@ struct priv {
+     struct present_stats present;
+     struct stats_cadence present_cadence;
+     const char *present_source; // NULL until the first release
++    // When the VO first saw the prepared and the current frame
++    // (CLOCK_MONOTONIC), and how many releases log_frame_timing has seen
++    // and itemized as late.
++    int64_t prepared_seen_ns, cur_seen_ns;
++    uint64_t timing_releases;
++    unsigned timing_late_logged;
+ 
+     // Choreographer vsync sampler (shared, see vsync_sampler); these are
+     // owned by that sampler's lock while attached.
+@@ -2775,6 +2781,8 @@ struct release_target {
+     int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
+     int64_t vsync;     // the vsync the timestamp targets, 0 when not snapped
+     bool late;         // due before it reached the codec: shown a vsync late
++    int64_t deadline;  // CLOCK_MONOTONIC the frame was due, 0 untimed
++    int64_t now;       // CLOCK_MONOTONIC when the release was decided
+ };
+ 
+ static int64_t read_vsync_sample(struct priv *p)
+@@ -2911,6 +2919,8 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
+     if (result.timestamp && sample && raw_target > mono_now)
+         result.vsync = result.timestamp + p->queue_period * 8 / 10;
+     result.late = mono_now > 0 && raw_target <= mono_now;
++    result.deadline = raw_target;
++    result.now = mono_now;
+     return result;
+ }
+ 
+@@ -3033,6 +3043,9 @@ static int64_t prepare_frame(struct vo *vo, struct vo_frame *frame)
+     // Called on each event-loop wake, including after refresh-rate changes.
+     // Never rely on the offset the core observed before this frame was drawn.
+     update_queue_timing(vo, frame->duration);
++    // The first wake for a queued frame is when the core handed it over.
++    if (p->prepared_frame_id != frame->frame_id)
++        p->prepared_seen_ns = monotonic_now_ns();
+     // Only this VO thread changes epoch; OSD workers only read it under lock.
+     if (!p->prepared_seq || p->prepared_frame_id != frame->frame_id ||
+         p->prepared_epoch != p->osd.epoch)
+@@ -3075,10 +3088,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         p->prepared_frame_id == frame->frame_id)
+     {
+         p->cur_seq = p->prepared_seq;
++        p->cur_seen_ns = p->prepared_seen_ns;
+     } else {
+         if (!synthetic)
+             update_queue_timing(vo, frame->duration);
+         p->cur_seq = prepare_osd(vo, frame, synthetic);
++        p->cur_seen_ns = monotonic_now_ns();
+     }
+     return VO_TRUE;
+ }
+@@ -3126,6 +3141,60 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
+         vo_increment_drop_count(vo, missed);
+ }
+ 
++// At most this many late frames are itemized per VO; the video-present late
++// counter keeps counting past it.
++#define FRAME_TIMING_LATE_LOG_LIMIT 600
++// One release in this many is itemized late or not, so a late frame can be
++// read against how far ahead an ordinary one moves (10 s at 25 fps).
++#define FRAME_TIMING_SAMPLE_INTERVAL 250
++
++static const char *frame_timing_ms(char buf[16], int64_t t, int64_t deadline)
++{
++    if (!t)
++        return "n/a";
++    snprintf(buf, 16, "%+.1f", (t - deadline) / 1e6);
++    return buf;
++}
++
++// Where a timed frame's time went, from the codec's input queue to this
++// release: each stage's CLOCK_MONOTONIC instant against the frame's deadline,
++// in ms, negative ahead of it. input: its access unit was queued to the
++// codec; output: the codec reported it decoded; dequeue: the decoder handed
++// it to the player; vo: the core handed it to this VO; release: this
++// release. queued is how many decoded buffers were still waiting behind it
++// at dequeue, held how many the player already held. A late frame is
++// itemized so a codec that decoded it late tells apart from a player that
++// took, queued or released it late (plezy#2485).
++static void log_frame_timing(struct vo *vo, AVMediaCodecBuffer *buffer,
++                             struct release_target target)
++{
++    struct priv *p = vo->priv;
++    if (!target.deadline)
++        return;
++    bool sample = ++p->timing_releases % FRAME_TIMING_SAMPLE_INTERVAL == 0;
++    bool late = target.late && p->timing_late_logged < FRAME_TIMING_LATE_LOG_LIMIT;
++    if (!late && !sample)
++        return;
++    if (late && ++p->timing_late_logged == FRAME_TIMING_LATE_LOG_LIMIT) {
++        MP_VERBOSE(vo, "frame-timing: %d late frames itemized; later ones are "
++                       "only counted.\n", FRAME_TIMING_LATE_LOG_LIMIT);
++    }
++    AVMediaCodecBufferTiming t = {0};
++    if (av_mediacodec_buffer_get_timing(buffer, &t) < 0)
++        t = (AVMediaCodecBufferTiming){0};
++    int64_t d = target.deadline;
++    char input[16], output[16], dequeue[16], seen[16], release[16];
++    MP_VERBOSE(vo, "frame-timing %s pts=%.3f input=%s output=%s dequeue=%s "
++                   "vo=%s release=%s ms vs deadline, queued=%d held=%d\n",
++               target.late ? "late" : "sample", p->cur_image->pts,
++               frame_timing_ms(input, t.input_ns, d),
++               frame_timing_ms(output, t.output_ns, d),
++               frame_timing_ms(dequeue, t.dequeue_ns, d),
++               frame_timing_ms(seen, p->cur_seen_ns, d),
++               frame_timing_ms(release, target.now, d),
++               t.queued_outputs, t.held_buffers);
++}
++
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -3159,6 +3228,7 @@ static void flip_page(struct vo *vo)
+             : av_mediacodec_release_buffer(buffer, 1);
+     if (ret >= 0)
+         p->submitted_frame_id = p->cur_frame_id;
++    log_frame_timing(vo, buffer, target);
+     present_feedback(vo, buffer, target);
+     mp_image_unrefp(&p->cur_image);
+     p->cur_pts = 0;
