@@ -111,6 +111,7 @@ shaderc_version="6.6.6"
 libplacebo_version="7.7.7"
 libass_version="4.4.4"
 mpv_version="8.8.8"
+nv_codec_headers_version="5.5.5"
 
 # Each stub records the vector it was called with, one argument per line, plus
 # the directory it ran in - which is what tells mpv's meson call apart from
@@ -197,6 +198,16 @@ git -C "$libplacebo_repository" commit --quiet -m libplacebo
 git -C "$libplacebo_repository" -c tag.gpgsign=false tag release
 libplacebo_commit="$(git -C "$libplacebo_repository" rev-parse HEAD)"
 
+# nv-codec-headers is a Makefile that only installs headers and a .pc file;
+# the recording make stub stands in for it.
+nv_codec_headers_repository="$temporary/nv-codec-headers-source"
+init_repository "$nv_codec_headers_repository"
+printf 'stub nv-codec-headers\n' >"$nv_codec_headers_repository/Makefile"
+git -C "$nv_codec_headers_repository" add Makefile
+git -C "$nv_codec_headers_repository" commit --quiet -m nv-codec-headers
+git -C "$nv_codec_headers_repository" -c tag.gpgsign=false tag release
+nv_codec_headers_commit="$(git -C "$nv_codec_headers_repository" rev-parse HEAD)"
+
 # libass builds autotools-style out of its fork checkout: the committed
 # autogen.sh stands in for autoreconf and plants the recording configure stub,
 # which is exactly the sequence the real build runs.
@@ -250,6 +261,13 @@ cat >"$manifest" <<JSON
           "commit": "$dav1d_commit"
         }
       }
+    },
+    "nv-codec-headers": {
+      "kind": "git",
+      "version": "$nv_codec_headers_version",
+      "url": "file://$nv_codec_headers_repository",
+      "ref": "release",
+      "commit": "$nv_codec_headers_commit"
     },
     "shaderc": {
       "kind": "git",
@@ -381,7 +399,14 @@ assert_argument "$mpv_meson" "-Ddrm=enabled" "mpv's meson setup"
 assert_argument "$mpv_meson" "-Dvaapi-drm=enabled" "mpv's meson setup"
 assert_argument "$mpv_meson" "-Dvaapi-wayland=enabled" "mpv's meson setup"
 
-# vaapi has to reach ffmpeg too, or mpv's hwdec has no decoder behind it. And
+# NVIDIA GPUs have no VA driver out of the box, so nvdec is their only hardware
+# decoder. Both features need ffnvcodec and quietly resolve to disabled without
+# it, which lands every NVIDIA machine on software decoding.
+assert_argument "$mpv_meson" "-Dcuda-hwaccel=enabled" "mpv's meson setup"
+assert_argument "$mpv_meson" "-Dcuda-interop=enabled" "mpv's meson setup"
+
+# vaapi and nvdec have to reach ffmpeg too, or mpv's hwdec has no decoder
+# behind them (nvdec additionally needs ffnvcodec itself enabled). And
 # the bundled ffmpeg needs a software AV1 decoder: its native av1 codec is
 # hardware-accelerated only, so without dav1d an AV1 source on a machine whose
 # GPU cannot decode it fails every packet and plays black video with audio.
@@ -389,6 +414,15 @@ ffmpeg_configure="$(recorded_call configure "ffmpeg-$ffmpeg_version")" ||
   fail "the build plan never configured ffmpeg"
 assert_argument "$ffmpeg_configure" "--enable-vaapi" "ffmpeg's configure"
 assert_argument "$ffmpeg_configure" "--enable-libdav1d" "ffmpeg's configure"
+assert_argument "$ffmpeg_configure" "--enable-ffnvcodec" "ffmpeg's configure"
+assert_argument "$ffmpeg_configure" "--enable-nvdec" "ffmpeg's configure"
+
+# ffnvcodec is header-only: it must land in the prefix that ffmpeg's configure
+# and mpv's meson resolve pkg-config against.
+nv_codec_headers_make="$(recorded_call make "nv-codec-headers-$nv_codec_headers_version")" ||
+  fail "the build plan never installed nv-codec-headers"
+assert_argument "$nv_codec_headers_make" "PREFIX=$(realpath "$temporary/prefix")" "nv-codec-headers' make"
+assert_argument "$nv_codec_headers_make" "install" "nv-codec-headers' make"
 
 # dav1d must be built static so ffmpeg absorbs it into the bundled libmpv:
 # a shared dav1d would have to travel in the bundle and be kept version-true

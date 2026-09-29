@@ -8,7 +8,7 @@
   ],
   "artifacts": {
     "libmpv-linux": {
-      "components": ["mpv", "ffmpeg", "libass", "libplacebo", "dav1d", "shaderc"],
+      "components": ["mpv", "ffmpeg", "libass", "libplacebo", "dav1d", "shaderc", "nv-codec-headers"],
       "variants": ["x86_64", "aarch64"],
       "assetPattern": "libmpv-linux-{key}-{variant}.tar.zst"
     }

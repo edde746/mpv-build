@@ -27,10 +27,11 @@ if [ -z "$image" ]; then
   exit 1
 fi
 
-# Everything the six build steps need, and nothing for the Flutter runner:
+# Everything the seven build steps need, and nothing for the Flutter runner:
 #   toolchain      build-essential git curl ca-certificates python3 pkg-config
 #                  cmake meson ninja-build nasm autoconf automake libtool
-#                  xz-utils (ffmpeg tarball) zstd (packaging)
+#                  xz-utils (ffmpeg tarball) zstd (packaging); nv-codec-headers
+#                  is header-only and needs nothing beyond make
 #   libass         libfreetype-dev libfribidi-dev libharfbuzz-dev
 #                  libfontconfig-dev (host text stack; see toolchain/linux.txt)
 #   ffmpeg         libgnutls28-dev libva-dev

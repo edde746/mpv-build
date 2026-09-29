@@ -4,8 +4,9 @@ set -euo pipefail
 # Linux libmpv build driver.
 #
 # Builds the bundled libmpv.so for the linux platform group: dav1d, ffmpeg,
-# shaderc and libplacebo static into an install prefix, our patched libass
-# static on top, then mpv as a shared libmpv linked against all of them.
+# shaderc and libplacebo static into an install prefix (with nv-codec-headers'
+# header-only ffnvcodec feeding ffmpeg), our patched libass static on top,
+# then mpv as a shared libmpv linked against all of them.
 # Every pin comes from the repo-root versions.json with `overrides.linux`
 # folded in; a missing pin is fatal, never defaulted.
 #
@@ -67,6 +68,10 @@ LIBASS_COMMIT libass commit
 MPV_VERSION mpv version
 MPV_URL mpv url
 MPV_SHA256 mpv sha256
+NV_CODEC_HEADERS_VERSION nv-codec-headers version
+NV_CODEC_HEADERS_URL nv-codec-headers url
+NV_CODEC_HEADERS_REF nv-codec-headers ref
+NV_CODEC_HEADERS_COMMIT nv-codec-headers commit
 """.strip().splitlines()
 
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -103,7 +108,7 @@ PY
   done <<< "$dump"
 }
 
-resolve_pins dav1d:git ffmpeg:archive shaderc:git libplacebo:git libass:git mpv:archive
+resolve_pins dav1d:git nv-codec-headers:git ffmpeg:archive shaderc:git libplacebo:git libass:git mpv:archive
 
 sha256_file() {
   sha256sum "$1" | cut -d ' ' -f 1
@@ -279,7 +284,28 @@ main() {
   ninja -C build install
   finish_step dav1d
 
-  # ─── Step 2: ffmpeg (static libraries) ─────────────────────────────────────
+  # ─── Step 2: nv-codec-headers (ffnvcodec, headers only) ────────────────────
+  # NVIDIA hardware decoding (ffmpeg's nvdec hwaccel, mpv's cuda hwdec and its
+  # GL interop) compiles against ffnvcodec: headers plus a pkg-config file,
+  # nothing to link. Its loader dlopen()s libcuda.so.1 and libnvcuvid.so.1 at
+  # runtime, so the bundle gains no link-time dependency and a machine without
+  # the NVIDIA driver simply has no CUDA hwdec - `hwdec=auto` moves on. It
+  # installs into the prefix ahead of ffmpeg, whose configure and mpv's meson
+  # both resolve `ffnvcodec` through pkg-config.
+  echo "==> Installing nv-codec-headers $NV_CODEC_HEADERS_VERSION..."
+  checkout_verified_ref \
+    "$NV_CODEC_HEADERS_URL" "$NV_CODEC_HEADERS_REF" "$NV_CODEC_HEADERS_COMMIT" \
+    "$srcdir/nv-codec-headers-${NV_CODEC_HEADERS_VERSION}"
+  apply_patch_series nv-codec-headers "$srcdir/nv-codec-headers-${NV_CODEC_HEADERS_VERSION}"
+  cd "nv-codec-headers-${NV_CODEC_HEADERS_VERSION}"
+
+  make PREFIX="$prefix" install
+  finish_step nv-codec-headers
+
+  # ─── Step 3: ffmpeg (static libraries) ─────────────────────────────────────
+  # vaapi, ffnvcodec and nvdec are all autodetected, and each one missing still
+  # configures, builds and plays - on the CPU. Enabling them explicitly turns a
+  # missing header into a configure failure instead.
   echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoder-only)..."
   download_verified "$FFMPEG_URL" "$FFMPEG_SHA256" "$srcdir/ffmpeg.tar.xz"
   tar -xJf "$srcdir/ffmpeg.tar.xz"
@@ -305,6 +331,8 @@ main() {
     --enable-filter=aformat,aresample,bwdif,format,loudnorm,null,scale \
     --enable-gnutls \
     --enable-vaapi \
+    --enable-ffnvcodec \
+    --enable-nvdec \
     --enable-libdav1d \
     --disable-vdpau \
     --disable-debug \
@@ -314,7 +342,7 @@ main() {
   make install
   finish_step ffmpeg
 
-  # ─── Step 3: shaderc (static library) ───────────────────────────────────────
+  # ─── Step 4: shaderc (static library) ───────────────────────────────────────
   echo "==> Building shaderc $SHADERC_VERSION (static)..."
   checkout_verified_ref \
     "$SHADERC_URL" "$SHADERC_REF" "$SHADERC_COMMIT" \
@@ -336,7 +364,7 @@ main() {
   cmake --install build
   finish_step shaderc
 
-  # ─── Step 4: libplacebo (static library) ───────────────────────────────────
+  # ─── Step 5: libplacebo (static library) ───────────────────────────────────
   echo "==> Building libplacebo $LIBPLACEBO_VERSION (static)..."
   checkout_verified_ref \
     "$LIBPLACEBO_URL" "$LIBPLACEBO_REF" "$LIBPLACEBO_COMMIT" \
@@ -357,7 +385,7 @@ main() {
   ninja -C build install
   finish_step libplacebo
 
-  # ─── Step 5: libass (static library, our fork) ─────────────────────────────
+  # ─── Step 6: libass (static library, our fork) ─────────────────────────────
   # mpv would happily take the distro's libass, but the whole point of the
   # fork pin is that every platform renders subtitles with the same patched
   # libass. Built static for the same reason dav1d is: a shared fork of a
@@ -389,7 +417,7 @@ main() {
   make install
   finish_step libass
 
-  # ─── Step 6: mpv (shared libmpv) ───────────────────────────────────────────
+  # ─── Step 7: mpv (shared libmpv) ───────────────────────────────────────────
   echo "==> Building mpv $MPV_VERSION (shared libmpv only)..."
   download_verified "$MPV_URL" "$MPV_SHA256" "$srcdir/mpv.tar.gz"
   tar -xzf "$srcdir/mpv.tar.gz"
@@ -408,6 +436,12 @@ main() {
   # that build quietly lands every source on software decoding (the 2.13.0
   # Fedora report). Enabled means the configure fails when the pieces are
   # absent instead of degrading in silence.
+  #
+  # cuda-hwaccel/cuda-interop are pinned for the same reason: they need
+  # ffnvcodec and resolve to disabled without it. They give NVIDIA GPUs the
+  # nvdec/nvdec-copy hwdecs, which libva cannot serve there without a
+  # third-party VA driver, and the CUDA GL interop that takes nvdec zero-copy
+  # through any GL context, EGL or not.
   meson setup build \
     --prefix="$prefix" \
     -Dlibmpv=true \
@@ -426,6 +460,8 @@ main() {
     -Dvaapi=enabled \
     -Dvaapi-drm=enabled \
     -Dvaapi-wayland=enabled \
+    -Dcuda-hwaccel=enabled \
+    -Dcuda-interop=enabled \
     -Dalsa=enabled \
     -Dpulse=enabled \
     -Dpipewire=enabled \
