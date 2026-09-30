@@ -1,0 +1,16 @@
+diff --git a/player/audio.c b/player/audio.c
+index b3e975d..c7e5650 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -776,6 +776,11 @@ void reload_audio_output(struct MPContext *mpctx)
+     if (ao_c) {
+         reset_audio_state(mpctx);
+         mp_output_chain_reset_harder(ao_c->filter);
++        // A frame the chain already handed over for the old AO would stay in
++        // the ao filter's input. Without a queue, ao_process() only peeks at
++        // it, so no request reaches the chain and the next AO never opens.
++        mp_filter_reset(ao_c->ao_filter);
++        mp_filter_wakeup(ao_c->ao_filter);
+     }
+ 
+     // Whether we can use spdif might have changed. If we failed to use spdif
