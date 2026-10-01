@@ -115,6 +115,9 @@ jobs:
       - name: Test the core's frame queue for a self-timed VO
         run: bash ./scripts/test_player_queue_frames.sh
 
+      - name: Test the audio output reload with a frame held for the old AO
+        run: bash ./scripts/test_audio_reload_held_frame.sh
+
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
 

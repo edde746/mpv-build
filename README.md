@@ -384,6 +384,14 @@ before it; and other VOs, the first frame after a reset, display-sync and EOF
 keep upstream behavior. Pass an already-patched source directory to run
 offline.
 
+Run the audio-reload regression with `bash scripts/test_audio_reload_held_frame.sh`.
+It compiles `reload_audio_output()` and the ao filter's `ao_process()`
+(`player/audio.c`, patch 0034) against pins that behave like `filters/filter.c`:
+a reload while the ao filter still holds a frame meant for the old AO releases
+that frame once, wakes the ao filter, and leaves the output chain asked for data,
+so the next AO opens; a reload with nothing held keeps the chain asked and drops
+nothing. Pass an already-patched source directory to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer
