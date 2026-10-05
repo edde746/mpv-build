@@ -355,6 +355,19 @@ of keeping the previous epoch's colours (the stale entry that drew an opaque
 box behind PGS subtitles). Pass an already-patched source directory to run
 offline.
 
+Run the TCP hostname-lookup regression with
+`bash scripts/test_tcp_family_lookup.sh`. It compiles tcp.c's per-family
+lookup (patch 0029) under ASan and UBSan against a scripted resolver and
+connection race. A family whose lookup never answers -- the AAAA query a
+broken resolver drops -- holds nothing up: the race starts with the other
+family 50 ms after it answered, a family that answers later joins a race
+stuck on a blackholed address or is raced alone once every earlier address
+failed, IPv6 is listed first, a failed lookup never ends the open while the
+other is pending, and the caller's interrupt ends any wait without being
+taken for a late answer. Every lookup the open left behind frees what it
+shares, and literals keep the single AF_UNSPEC lookup. Pass an
+already-patched source directory to run offline.
+
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers
 exactly the render's margins in surface pixels, rounds a scaled plane outward,

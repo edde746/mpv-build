@@ -1,0 +1,434 @@
+Subject: [PATCH] avformat/tcp: resolve each address family on its own thread
+
+tcp_open() resolves a hostname with one AF_UNSPEC getaddrinfo(), which
+returns only once both the A and the AAAA query have settled. A resolver
+that never answers AAAA queries -- TELUS's IPv6 resolver does that for
+plex.direct names -- makes every connection wait out the resolver's
+retries, 5 s per try on Android, glibc and Windows, although the IPv4
+address was known within milliseconds. mpv opens a new connection for
+every seek, so the stall repeats: Plezy on an NVIDIA Shield waited 18 s
+for the first byte of a LAN server, 10 s more for the seek to the Cues,
+and gave up on the open at 30 s (edde746/plezy discussion #2566).
+
+Resolve AAAA and A on two detached threads (RFC 8305 section 3). The
+connection race starts once both have answered, or 50 ms after one
+answered with addresses; IPv6 is listed first, and
+ff_connect_parallel() alternates the families from there. A family
+that answers after the race started still joins it: the race runs
+under an interrupt callback that fires when that family has addresses,
+and is then restarted with both. When every address in the race has
+failed first, the late family is awaited and raced alone, which is
+where the AF_UNSPEC lookup would still be. A lookup tcp_open() stopped
+waiting for finishes in the background and frees the shared state.
+The waits poll the caller's interrupt callback, so closing a stream
+no longer blocks on a stalled resolver.
+
+Literal addresses, listen mode and builds without pthreads or Win32
+threads keep the single AF_UNSPEC lookup, so platform handling of
+literals (NAT64 synthesis, 0027 on Apple) is unchanged. On Apple, the
+AI_NUMERICSERV that 0027 adds also keeps AI_DEFAULT's AI_V4MAPPED_CFG
+out of the AF_INET6 lookup, which would otherwise return IPv4-mapped
+copies of the A records.
+
+Verified with ffprobe built from the linux pin (7.1) on glibc, its
+resolver pointed at a local server that never answers one record type.
+With AAAA dropped, opening http://media.test:8000/ took 15.0 s before
+and 62 ms after, over IPv4. With A dropped, it failed after 15.0 s
+("Temporary failure in name resolution") before and connected over IPv6
+in 61 ms after. With both answered: 9 ms before, 6 ms after, IPv6 both
+times. scripts/test_tcp_family_lookup.sh covers the race restart for a
+late family, the fallback after a failed race, interrupts and the
+cleanup of abandoned lookups. Not upstream yet.
+
+diff --git a/libavformat/tcp.c b/libavformat/tcp.c
+--- a/libavformat/tcp.c
++++ b/libavformat/tcp.c
+@@ -20,6 +20,7 @@
+  */
+ #include "avformat.h"
+ #include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/parseutils.h"
+ #include "libavutil/opt.h"
+@@ -31,6 +32,10 @@
+ #if HAVE_POLL_H
+ #include <poll.h>
+ #endif
++#include "libavutil/thread.h"
++
++/* Lookups need a thread that can be left behind (see tcp_open_by_family()). */
++#define TCP_SPLIT_LOOKUP (HAVE_PTHREADS || HAVE_W32THREADS)
+ 
+ typedef struct TCPContext {
+     const AVClass *class;
+@@ -136,6 +141,357 @@ static int customize_fd(void *ctx, int fd, int family)
+     return 0;
+ }
+ 
++#if TCP_SPLIT_LOOKUP
++/*
++ * A hostname is resolved one address family at a time, each lookup on its
++ * own thread, and the connection race starts with whichever family answers
++ * (RFC 8305 section 3). With AF_UNSPEC, getaddrinfo() returns only once both
++ * the A and the AAAA query have settled, so a resolver that drops AAAA
++ * queries -- some ISP and router resolvers do -- costs every connection its
++ * full retry timeout (5 s per try on Android, glibc and Windows) although
++ * the IPv4 address was known within milliseconds.
++ */
++
++/* How long the family that answers first waits for the other before the
++ * race starts without it: RFC 8305's Resolution Delay. It applies both ways
++ * because a family that answers later has to restart the race to join it. */
++#define LOOKUP_DELAY_US 50000
++/* Longest wait between interrupt checks, as in ff_poll_interrupt(). */
++#define LOOKUP_POLL_US 100000
++
++/* IPv6 first: ff_connect_parallel() alternates families starting with the
++ * family of the first address, the order RFC 8305 section 4 asks for. */
++enum { LOOKUP_IPV6, LOOKUP_IPV4, LOOKUP_FAMILIES };
++
++typedef struct HostLookup HostLookup;
++
++typedef struct FamilyLookup {
++    HostLookup *owner;
++    int family;
++    int done;                   /* the rest is valid once done, under owner->lock */
++    int err;                    /* getaddrinfo() result */
++    struct addrinfo *res;       /* NULL unless the lookup succeeded */
++} FamilyLookup;
++
++/* Shared by tcp_open() and the lookup threads. The last reference frees it,
++ * so tcp_open() can return while a lookup still waits on the resolver. */
++struct HostLookup {
++    AVMutex lock;
++    AVCond cond;
++    int refs;
++    char host[1024];
++    char port[10];
++    struct addrinfo hints;
++    FamilyLookup family[LOOKUP_FAMILIES];
++};
++
++/* A copied address. The race owns its list: ff_connect_parallel() relinks
++ * it, and two getaddrinfo() results cannot be spliced and freed portably. */
++typedef struct AddrCopy {
++    struct addrinfo ai;         /* first, so freeing the addrinfo frees the copy */
++    struct sockaddr_storage addr;
++} AddrCopy;
++
++/* A family that had not answered when the race started. */
++typedef struct LateFamily {
++    HostLookup *lookup;
++    const FamilyLookup *family;
++    AVIOInterruptCB caller;
++    int arrived;
++} LateFamily;
++
++static void lookup_unref(HostLookup *lookup)
++{
++    int i, last;
++
++    ff_mutex_lock(&lookup->lock);
++    last = !--lookup->refs;
++    ff_mutex_unlock(&lookup->lock);
++    if (!last)
++        return;
++    for (i = 0; i < LOOKUP_FAMILIES; i++)
++        if (lookup->family[i].res)
++            freeaddrinfo(lookup->family[i].res);
++    ff_cond_destroy(&lookup->cond);
++    ff_mutex_destroy(&lookup->lock);
++    av_free(lookup);
++}
++
++static void lookup_run(FamilyLookup *fl)
++{
++    HostLookup *lookup = fl->owner;
++    struct addrinfo hints = lookup->hints, *res = NULL;
++    int err;
++
++    hints.ai_family = fl->family;
++    err = getaddrinfo(lookup->host, lookup->port, &hints, &res);
++
++    ff_mutex_lock(&lookup->lock);
++    fl->err  = err;
++    fl->res  = err ? NULL : res;
++    fl->done = 1;
++    ff_cond_broadcast(&lookup->cond);
++    ff_mutex_unlock(&lookup->lock);
++    lookup_unref(lookup);
++}
++
++#if HAVE_PTHREADS
++static void *lookup_thread(void *arg)
++{
++    lookup_run(arg);
++    return NULL;
++}
++#else
++static THREADFUNC_RETTYPE __stdcall lookup_thread(void *arg)
++{
++    lookup_run(arg);
++    return 0;
++}
++#endif
++
++/* Detached: nobody joins a lookup tcp_open() stopped waiting for, and
++ * compat/w32pthreads.h has no pthread_detach(). */
++static int lookup_start(FamilyLookup *fl)
++{
++#if HAVE_PTHREADS
++    pthread_t thread;
++
++    if (pthread_create(&thread, NULL, lookup_thread, fl))
++        return AVERROR(EAGAIN);
++    pthread_detach(thread);
++#else
++    HANDLE thread;
++
++#if HAVE_WINRT
++    thread = CreateThread(NULL, 0, lookup_thread, fl, 0, NULL);
++#else
++    thread = (HANDLE)_beginthreadex(NULL, 0, lookup_thread, fl, 0, NULL);
++#endif
++    if (!thread)
++        return AVERROR(EAGAIN);
++    CloseHandle(thread);
++#endif
++    return 0;
++}
++
++static HostLookup *lookup_create(const char *host, const char *port,
++                                 const struct addrinfo *hints)
++{
++    static const int families[LOOKUP_FAMILIES] = { AF_INET6, AF_INET };
++    HostLookup *lookup = av_mallocz(sizeof(*lookup));
++    int i;
++
++    if (!lookup)
++        return NULL;
++    if (ff_mutex_init(&lookup->lock, NULL)) {
++        av_free(lookup);
++        return NULL;
++    }
++    if (ff_cond_init(&lookup->cond, NULL)) {
++        ff_mutex_destroy(&lookup->lock);
++        av_free(lookup);
++        return NULL;
++    }
++    av_strlcpy(lookup->host, host, sizeof(lookup->host));
++    av_strlcpy(lookup->port, port, sizeof(lookup->port));
++    lookup->hints = *hints;
++    lookup->refs  = 1 + LOOKUP_FAMILIES;
++    for (i = 0; i < LOOKUP_FAMILIES; i++) {
++        lookup->family[i].owner  = lookup;
++        lookup->family[i].family = families[i];
++    }
++    for (i = 0; i < LOOKUP_FAMILIES; i++)
++        if (lookup_start(&lookup->family[i]) < 0)
++            lookup_run(&lookup->family[i]); /* no thread: block here, as before */
++    return lookup;
++}
++
++static int lookup_has_addresses(const FamilyLookup *fl)
++{
++    return fl->done && fl->res;
++}
++
++/* With lookup->lock held: waits until `only` has answered or, without
++ * `only`, until both families have, or one answered with addresses
++ * LOOKUP_DELAY_US ago. Polls the caller's interrupt callback meanwhile,
++ * which a blocking getaddrinfo() never could. */
++static int lookup_wait(URLContext *h, HostLookup *lookup, const FamilyLookup *only)
++{
++    const FamilyLookup *v6 = &lookup->family[LOOKUP_IPV6];
++    const FamilyLookup *v4 = &lookup->family[LOOKUP_IPV4];
++    int64_t deadline = INT64_MAX;
++
++    for (;;) {
++        int64_t now, wake;
++        struct timespec ts;
++
++        if (only ? only->done : v6->done && v4->done)
++            return 0;
++        now = av_gettime_relative();
++        if (!only && deadline == INT64_MAX &&
++            (lookup_has_addresses(v6) || lookup_has_addresses(v4)))
++            deadline = now + LOOKUP_DELAY_US;
++        if (now >= deadline)
++            return 0;
++        if (ff_check_interrupt(&h->interrupt_callback))
++            return AVERROR_EXIT;
++        wake = av_gettime() + FFMIN(deadline - now, LOOKUP_POLL_US);
++        ts.tv_sec  = wake / 1000000;
++        ts.tv_nsec = wake % 1000000 * 1000;
++        ff_cond_timedwait(&lookup->cond, &lookup->lock, &ts);
++    }
++}
++
++/* With lookup->lock held: copies every address the families in `mask`
++ * resolved into a new list, IPv6 first. */
++static int lookup_addresses(HostLookup *lookup, unsigned mask, struct addrinfo **list)
++{
++    struct addrinfo **tail = list;
++    int i;
++
++    *list = NULL;
++    for (i = 0; i < LOOKUP_FAMILIES; i++) {
++        const struct addrinfo *ai;
++
++        if (!(mask & 1U << i) || !lookup_has_addresses(&lookup->family[i]))
++            continue;
++        for (ai = lookup->family[i].res; ai; ai = ai->ai_next) {
++            AddrCopy *copy;
++
++            if (ai->ai_addrlen > sizeof(copy->addr))
++                continue;
++            copy = av_mallocz(sizeof(*copy));
++            if (!copy)
++                return AVERROR(ENOMEM);
++            copy->ai.ai_family   = ai->ai_family;
++            copy->ai.ai_socktype = ai->ai_socktype;
++            copy->ai.ai_protocol = ai->ai_protocol;
++            copy->ai.ai_addrlen  = ai->ai_addrlen;
++            copy->ai.ai_addr     = (struct sockaddr *)&copy->addr;
++            memcpy(&copy->addr, ai->ai_addr, ai->ai_addrlen);
++            *tail = &copy->ai;
++            tail  = &copy->ai.ai_next;
++        }
++    }
++    return 0;
++}
++
++static void free_addresses(struct addrinfo *list)
++{
++    while (list) {
++        struct addrinfo *next = list->ai_next;
++        av_free(list);
++        list = next;
++    }
++}
++
++/* Stops the race as soon as the late family has addresses, so they can
++ * join it. */
++static int late_family_interrupt(void *opaque)
++{
++    LateFamily *late = opaque;
++
++    if (ff_check_interrupt(&late->caller))
++        return 1;
++    ff_mutex_lock(&late->lookup->lock);
++    late->arrived = lookup_has_addresses(late->family);
++    ff_mutex_unlock(&late->lookup->lock);
++    return late->arrived;
++}
++
++static const char *family_name(const FamilyLookup *fl)
++{
++    return fl->family == AF_INET6 ? "IPv6" : "IPv4";
++}
++
++/* Resolves `hostname` one family at a time and connects. A family that
++ * answers after the race started joins it: the race is interrupted and
++ * restarted with both, or, when every address in it already failed, run
++ * again with the late family alone -- where an AF_UNSPEC lookup would still
++ * be waiting. Returns 1 for a hostname tcp_open() resolves itself. */
++static int tcp_open_by_family(URLContext *h, const char *hostname,
++                              const char *portstr, const struct addrinfo *hints)
++{
++    TCPContext *s = h->priv_data;
++    struct addrinfo numeric = { 0 }, *ai, *list = NULL;
++    const FamilyLookup *late = NULL;
++    HostLookup *lookup;
++    int fd = -1, ret, i;
++
++    /* A literal needs no DNS, and resolving it with AF_UNSPEC keeps what the
++     * platform does to literals (NAT64 synthesis). */
++    numeric.ai_flags    = AI_NUMERICHOST;
++    numeric.ai_socktype = SOCK_STREAM;
++    if (!getaddrinfo(hostname, portstr, &numeric, &ai)) {
++        freeaddrinfo(ai);
++        return 1;
++    }
++    lookup = lookup_create(hostname, portstr, hints);
++    if (!lookup)
++        return 1;
++
++    ff_mutex_lock(&lookup->lock);
++    ret = lookup_wait(h, lookup, NULL);
++    if (ret >= 0) {
++        for (i = 0; i < LOOKUP_FAMILIES; i++)
++            if (!lookup->family[i].done)
++                late = &lookup->family[i];
++        ret = lookup_addresses(lookup, ~0U, &list);
++    }
++    if (ret >= 0 && !list) {
++        av_log(h, AV_LOG_ERROR, "Failed to resolve hostname %s: %s\n",
++               hostname, gai_strerror(lookup->family[LOOKUP_IPV4].err));
++        ret = AVERROR(EIO);
++    }
++    ff_mutex_unlock(&lookup->lock);
++    if (ret >= 0 && late)
++        av_log(h, AV_LOG_VERBOSE, "Connecting to %s before its %s lookup answered\n",
++               hostname, family_name(late));
++
++    while (ret >= 0) {
++        LateFamily watch = { lookup, late, h->interrupt_callback, 0 };
++        int connect_err;
++
++        if (late) {
++            h->interrupt_callback.callback = late_family_interrupt;
++            h->interrupt_callback.opaque   = &watch;
++        }
++        ret = ff_connect_parallel(list, s->open_timeout / 1000, 3, h, &fd,
++                                  customize_fd, s);
++        if (late)
++            h->interrupt_callback = watch.caller;
++        if (ret >= 0 || !late || (ret == AVERROR_EXIT && !watch.arrived))
++            break;
++
++        connect_err = ret;
++        free_addresses(list);
++        list = NULL;
++        ff_mutex_lock(&lookup->lock);
++        if (watch.arrived) {
++            av_log(h, AV_LOG_VERBOSE, "%s addresses of %s joined the connection race\n",
++                   family_name(late), hostname);
++            ret = lookup_addresses(lookup, ~0U, &list);
++        } else {
++            ret = lookup_wait(h, lookup, late);
++            if (ret >= 0)
++                ret = lookup_addresses(lookup, 1U << (late - lookup->family), &list);
++            if (ret >= 0 && !list)
++                ret = connect_err;
++        }
++        ff_mutex_unlock(&lookup->lock);
++        late = NULL;
++    }
++
++    free_addresses(list);
++    lookup_unref(lookup);
++    if (ret < 0)
++        return ret;
++    h->is_streamed = 1;
++    s->fd = fd;
++    return 0;
++}
++#endif /* TCP_SPLIT_LOOKUP */
++
+ /* return non zero if error */
+ static int tcp_open(URLContext *h, const char *uri, int flags)
+ {
+@@ -199,6 +555,11 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
+         hints.ai_flags |= AI_PASSIVE;
+     if (!hostname[0])
+         ret = getaddrinfo(NULL, portstr, &hints, &ai);
++#if TCP_SPLIT_LOOKUP
++    else if (!s->listen &&
++             (ret = tcp_open_by_family(h, hostname, portstr, &hints)) <= 0)
++        return ret;
++#endif
+     else
+         ret = getaddrinfo(hostname, portstr, &hints, &ai);
+     if (ret) {

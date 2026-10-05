@@ -121,6 +121,9 @@ jobs:
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
 
+      - name: Test TCP hostname lookup by address family
+        run: bash ./scripts/test_tcp_family_lookup.sh
+
       - name: Test Android AudioTrack deadline timing
         run: bash ./scripts/test_audiotrack_timing.sh
 
