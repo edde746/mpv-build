@@ -1,0 +1,89 @@
+Subject: [PATCH] avcodec/mediacodec: shed only AV1 temporal units that hold a single frame
+
+av1_shed truncated a temporal unit to the OBUs before its last frame when
+that frame was shown and refreshed no reference slot, so a unit carrying a
+hidden alt-ref beside a non-reference shown frame went to the codec with
+only the hidden frame. Every AV1 temporal unit has to show exactly one
+frame; a unit without one is not a valid input.
+
+The MediaTek decoder on a Fire TV Stick 4K Max (OMX.MTK.VIDEO.DECODER.AV1)
+stops producing output once it is handed such units. Shedding runs while
+mpv decodes up to an hr-seek target (AVDISCARD_NONREF), so resuming a 4K
+AV1 film mid-file showed no frame and the player gave up after 30 s, three
+times in a row; starting from the beginning, with hr-seek=no or with
+hr-seek-framedrop=no, it played at once. In the 25 s around the resume
+point (SVT-AV1 encode, 673 temporal units) 167 units were of that shape and
+167 more held only the shed frame.
+
+Keep a unit whole when anything besides its shed frame carries a frame or
+sequence header; units that hold only the shed frame are still dropped.
+VP9 superframe truncation is unchanged.
+
+diff --git a/libavcodec/mediacodec_shed.c b/libavcodec/mediacodec_shed.c
+index a269df4..a8269fb 100644
+--- a/libavcodec/mediacodec_shed.c
++++ b/libavcodec/mediacodec_shed.c
+@@ -342,16 +342,16 @@ static int av1_read(MediaCodecShedContext *sh, AVCodecContext *avctx,
+     return 0;
+ }
+ 
+-// Shed the temporal unit's last frame when it is shown and refreshes no
+-// reference slot. Earlier OBUs -- the temporal delimiter, hidden reference
+-// frames, a sequence header -- are kept, so the decoder still consumes a
+-// valid (if now frame-less) temporal unit; a unit that held nothing but the
+-// shed frame is emptied instead.
++// Shed a temporal unit whose only frame is shown and refreshes no reference
++// slot. A unit that also carries a hidden reference frame or a sequence
++// header is kept whole: without its shown frame it would break the rule that
++// every temporal unit shows exactly one frame, and a MediaTek AV1 decoder
++// handed such a unit stops producing output.
+ static int av1_shed(MediaCodecShedContext *sh, AVCodecContext *avctx, AVPacket *pkt)
+ {
+     CodedBitstreamFragment *frag = sh->frag;
+     const AV1RawFrameHeader *hdr = NULL;
+-    int last = -1, keep_units = 0, offset;
++    int last = -1;
+ 
+     if (av1_read(sh, avctx, pkt) < 0)
+         return 0;
+@@ -374,20 +374,15 @@ static int av1_shed(MediaCodecShedContext *sh, AVCodecContext *avctx, AVPacket *
+         hdr->frame_type == AV1_FRAME_KEY || hdr->frame_type == AV1_FRAME_SWITCH)
+         goto keep;
+ 
+-    offset = (int)(frag->units[last].data - frag->data);
+-    if (offset < 0 || offset > pkt->size)
+-        goto keep;
+     for (int i = 0; i < last; i++) {
+         CodedBitstreamUnitType type = frag->units[i].type;
+         if (type == AV1_OBU_FRAME || type == AV1_OBU_FRAME_HEADER ||
+             type == AV1_OBU_TILE_GROUP || type == AV1_OBU_TILE_LIST ||
+             type == AV1_OBU_SEQUENCE_HEADER)
+-            keep_units = 1;
++            goto keep;
+     }
+     ff_cbs_fragment_reset(frag);
+-    // The buffer may be shared with the demuxer's cache: shorten the view,
+-    // never write past it.
+-    pkt->size = keep_units ? offset : 0;
++    pkt->size = 0;
+     return 1;
+ 
+ keep:
+diff --git a/libavcodec/mediacodec_shed.h b/libavcodec/mediacodec_shed.h
+index 41ceb2a..d0cf441 100644
+--- a/libavcodec/mediacodec_shed.h
++++ b/libavcodec/mediacodec_shed.h
+@@ -37,9 +37,10 @@
+  * corrupt anything that follows; that is the whole safety argument, so
+  * every helper fails open: anything it does not fully understand is kept.
+  *
+- * Reference frames that share an access unit with the shed frame (an AV1
+- * hidden alt-ref, a VP9 superframe's hidden frames) stay in the packet; the
+- * packet is truncated to them, never reordered.
++ * Hidden frames that share a VP9 superframe with the shed frame stay in the
++ * packet, which is truncated to them, never reordered. An AV1 temporal unit
++ * with a hidden frame beside its shown one is kept whole: every temporal unit
++ * has to show a frame.
+  */
+ 
+ typedef struct MediaCodecShedContext {

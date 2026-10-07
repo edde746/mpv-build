@@ -18,3 +18,4 @@
 0025-mediacodec-skip-flush-before-first-input.patch
 0026-mediacodec-recover-presentation-order.patch
 0028-mediacodec-output-buffer-timing.patch
+0030-mediacodec-av1-shed-only-single-frame-temporal-units.patch
