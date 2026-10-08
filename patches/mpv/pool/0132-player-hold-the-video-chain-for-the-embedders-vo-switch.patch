@@ -1,0 +1,176 @@
+Subject: [PATCH] player: hold the video chain for the embedder's vo switch when vo_mediacodec rejects a format
+
+vo_mediacodec displays MediaCodec buffers only. A stream that decodes any
+other way -- a codec outside hwdec-codecs such as MPEG-4 ASP (Xvid/DivX)
+or MPEG-2, or a per-file fallback to mediacodec-copy or software -- fails
+the output conversion on its first frame, and write_video() deselects the
+video track ("Could not initialize video chain."). The embedder then
+switches to a GL VO, but by then nothing is left for that switch to
+rebuild: it has to select the track again, racing a core that has already
+started audio alone. On an Android TV box an Xvid/MP3 AVI never showed a
+frame and its open timed out (Plezy #2602); on an emulator 10 of 16 such
+opens started audio-only before the track came back. A file without audio
+cannot recover at all: losing its only stream ends it.
+
+VO_CAP_CLIENT_FALLBACK declares a VO whose embedder replaces it when it
+cannot display a stream; vo_mediacodec sets it. For such a VO a failed
+output conversion (after the hwdec fallback had its turn) keeps the chain
+and its track, sets the new read-only vo-format-rejected property and
+waits: video stays where it was, so in an open or a seek it never reaches
+STATUS_READY and audio does not start without it, and the failed
+conversion pulls no more input. The embedder's --vo change then takes the
+ordinary UPDATE_VO path, which rebuilds the chain for the still-selected
+track and seeks to the current position; the rebuild resets the property.
+Every other VO keeps failing the track as before.
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 25b42c1..871b145 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -3664,6 +3664,15 @@ Property list
+     the video window is visible. If the ``--force-window`` option is used, this
+     usually always returns ``yes``/true.
+ 
++``vo-format-rejected``
++    Whether the video is waiting for a ``--vo`` change because the current VO
++    cannot display the decoded format. Only VOs that rely on their embedder to
++    replace them do this (``--vo=mediacodec``); with any other VO a failed
++    output conversion disables the video track. While waiting, the video track
++    stays selected and, during a file start or a seek, audio does not start
++    without it. Changing ``--vo`` rebuilds the video chain and seeks to the
++    current position, which resets this to ``no``.
++
+ ``vo-passes``
+     Contains introspection about the VO's active render passes and their
+     execution times. Not implemented by all VOs.
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 70c9067..5a5823e 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -731,7 +731,9 @@ Available video output drivers are:
+     ``--vo-mediacodec-osd-surface=(uintptr_t)(*android.view.Surface)``.
+     Hardware sessions require ``--hwdec=mediacodec`` (not ``-copy``); software
+     frames are rejected, since copying them in would connect the Surface as a
+-    CPU producer and prevent a GL VO from binding it later.
++    CPU producer and prevent a GL VO from binding it later. A stream that
++    decodes to anything else holds its video chain and sets
++    ``vo-format-rejected`` until the embedder switches ``--vo``.
+ 
+     The embedder owns geometry: the video Surface must be sized to the
+     aspect-corrected video rectangle (decoded buffers are scaled to the whole
+diff --git a/player/command.c b/player/command.c
+index fe22c09..908d2fc 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2933,6 +2933,16 @@ static int mp_property_vo_configured(void *ctx, struct m_property *prop,
+                         mpctx->video_out && mpctx->video_out->config_ok);
+ }
+ 
++// Whether the video chain is waiting for a --vo change because the current
++// VO cannot display the decoded format (player/video.c, write_video).
++static int mp_property_vo_format_rejected(void *ctx, struct m_property *prop,
++                                          int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    return m_property_bool_ro(action, arg,
++                        mpctx->vo_chain && mpctx->vo_chain->format_rejected);
++}
++
+ static void get_frame_perf(struct mpv_node *node, struct mp_frame_perf *perf)
+ {
+     for (int i = 0; i < perf->count; i++) {
+@@ -4487,6 +4497,7 @@ static const struct m_property mp_properties_base[] = {
+     M_PROPERTY_ALIAS("height", "video-params/h"),
+     {"current-window-scale", mp_property_current_window_scale},
+     {"vo-configured", mp_property_vo_configured},
++    {"vo-format-rejected", mp_property_vo_format_rejected},
+     {"vo-passes", mp_property_vo_passes},
+     {"perf-info", mp_property_perf_info},
+     {"current-vo", mp_property_vo},
+@@ -4629,7 +4640,7 @@ static const char *const *const mp_event_property_change[] = {
+       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
+       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
+       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
+-      "window-id", "track-list", "current-tracks"),
++      "window-id", "track-list", "current-tracks", "vo-format-rejected"),
+     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",
+       "samplerate", "channels", "audio", "volume", "volume-gain", "mute",
+       "current-ao", "audio-codec-name", "audio-params", "track-list", "current-tracks",
+diff --git a/player/core.h b/player/core.h
+index eb7f508..489527d 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -174,6 +174,10 @@ struct vo_chain {
+ 
+     bool underrun;
+     bool underrun_signaled;
++
++    // The VO cannot display the decoded format and the chain is waiting for
++    // the client's --vo change (VO_CAP_CLIENT_FALLBACK).
++    bool format_rejected;
+ };
+ 
+ // Like vo_chain, for audio.
+diff --git a/player/video.c b/player/video.c
+index 6f9aec7..ab5d9eb 100644
+--- a/player/video.c
++++ b/player/video.c
+@@ -1153,8 +1153,23 @@ void write_video(struct MPContext *mpctx)
+             handle_force_window(mpctx, true);
+             return;
+         }
+-        if (vo_c->filter->failed_output_conversion)
+-            goto error;
++        if (vo_c->filter->failed_output_conversion) {
++            if (!(vo->driver->caps & VO_CAP_CLIENT_FALLBACK))
++                goto error;
++            // The stream decodes fine; this VO cannot display it. Keep the
++            // chain and its track instead of playing on without video: in
++            // an open or a seek, video stays short of STATUS_READY, so audio
++            // does not start alone. The client's --vo change rebuilds the
++            // chain and seeks (command.c, UPDATE_VO). The failed conversion
++            // pulls no more input meanwhile.
++            if (!vo_c->format_rejected) {
++                MP_WARN(mpctx, "The video output cannot display this stream, "
++                        "waiting for a --vo change.\n");
++                vo_c->format_rejected = true;
++                mp_notify_property(mpctx, "vo-format-rejected");
++            }
++            return;
++        }
+ 
+         mpctx->delay = 0;
+         mpctx->last_av_difference = 0;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index ad48547..916a23c 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -214,6 +214,11 @@ enum {
+     // next frame queued behind it nor the core to wait for one: the core may
+     // hand it a frame before the following one is decoded (vo_mediacodec).
+     VO_CAP_OWN_TIMING   = 1 << 7,
++    // VO displays only its own hardware frames, and its client replaces it
++    // with a VO that takes anything when a stream decodes to another format
++    // (vo_mediacodec): a failed output conversion waits for that --vo change
++    // instead of failing the video track (see vo-format-rejected).
++    VO_CAP_CLIENT_FALLBACK = 1 << 8,
+ };
+ 
+ enum {
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index da86096..f8a4b40 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -3410,7 +3410,11 @@ const struct vo_driver video_out_mediacodec = {
+     // so the frame after it is not needed first; OWN_TIMING lets the core
+     // hand a frame over as soon as it is decoded instead of once the next
+     // one is (player/video.c get_queue_frames).
+-    .caps = VO_CAP_FRAMEDROP | VO_CAP_OWN_TIMING,
++    //
++    // query_format takes MediaCodec buffers only. A stream decoded any other
++    // way is the embedder's cue to switch to a GL VO, so CLIENT_FALLBACK
++    // holds the chain for that switch instead of dropping the video track.
++    .caps = VO_CAP_FRAMEDROP | VO_CAP_OWN_TIMING | VO_CAP_CLIENT_FALLBACK,
+     .preinit = preinit,
+     .query_format = query_format,
+     .prepare_frame = prepare_frame,

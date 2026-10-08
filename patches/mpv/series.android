@@ -47,3 +47,4 @@
 0129-vo-mediacodec-itemize-late-frame-timing.patch
 0130-vo-mediacodec-split-late-frame-wait-between-core-and-vo.patch
 0131-player-hand-vo-mediacodec-a-frame-without-waiting-for-the-next.patch
+0132-player-hold-the-video-chain-for-the-embedders-vo-switch.patch
