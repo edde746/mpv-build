@@ -1,0 +1,124 @@
+demux: publish the DTS profile of every audio track at load
+
+codec-profile on the track list was decoder-supplied, so a client learned
+it only for the selected track, and only after its decoder opened. DTS
+carries its extensions (XLL, XBR, LBR) in the bitstream rather than in
+CodecPrivate, so a DTS-HD MA track and the lossy DTS core muxed beside it
+both read "dts" until then, and a track picker cannot tell them apart
+(plezy#2603).
+
+demux_mkv runs libavcodec's DTS parser, the one ad_spdif already uses to
+probe passthrough, over the first block of each DTS track, found in the
+same bounded block queue probe_x264_garbage() reads. demux_lavf publishes
+the profile its stream probing already parsed into codecpar for audio
+streams (MPEG-TS and the other formats it probes). The decoder still
+replaces either with its own answer once it runs.
+
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..af067bd 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -705,6 +705,11 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+         sh->codec->samplerate = codec->sample_rate;
+         sh->codec->bitrate = codec->bit_rate;
+         sh->codec->format_name = talloc_strdup(sh, av_get_sample_fmt_name(codec->format));
++        // Stream probing parsed a frame already (DTS-HD MA vs. its lossy
++        // core): publish that for every track, not only once a decoder
++        // opens the selected one. A decoder still replaces it.
++        if (codec->profile != AV_PROFILE_UNKNOWN)
++            sh->codec->codec_profile = avcodec_profile_name(codec->codec_id, codec->profile);
+ 
+         double delay = 0;
+         if (codec->sample_rate > 0)
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index 501d20e..97508a4 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -2313,6 +2313,79 @@ static void probe_x264_garbage(demuxer_t *demuxer)
+     }
+ }
+ 
++// One DTS frame through libavcodec's parser, which reads the core header and
++// the extension substream (XLL, XBR, LBR) without a decoder. NULL if unknown.
++static const char *dts_profile_from_frame(bstr frame)
++{
++    const char *profile = NULL;
++    AVCodecParserContext *parser = av_parser_init(AV_CODEC_ID_DTS);
++    AVCodecContext *ctx = avcodec_alloc_context3(NULL);
++    // Parsers may read past the input like decoders do; pad it the same way.
++    uint8_t *data = talloc_zero_size(NULL, frame.len + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (parser && ctx) {
++        memcpy(data, frame.start, frame.len);
++        // A block holds a whole frame; do not wait for the next one.
++        parser->flags |= PARSER_FLAG_COMPLETE_FRAMES;
++        uint8_t *out = NULL;
++        int out_size = 0;
++        av_parser_parse2(parser, ctx, &out, &out_size, data, frame.len,
++                         AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
++        if (ctx->profile != AV_PROFILE_UNKNOWN)
++            profile = avcodec_profile_name(AV_CODEC_ID_DTS, ctx->profile);
++    }
++    talloc_free(data);
++    avcodec_free_context(&ctx);
++    if (parser)
++        av_parser_close(parser);
++    return profile;
++}
++
++// DTS carries its extensions in the bitstream, not in CodecPrivate, so a
++// DTS-HD MA track and its lossy core look identical until a decoder opens,
++// and only the selected track ever gets one. Publish codec_profile for every
++// DTS track from its first block so a client can tell them apart at load.
++// A decoder still replaces it with its own answer once it runs.
++static void probe_dts_profile(demuxer_t *demuxer)
++{
++    mkv_demuxer_t *mkv_d = demuxer->priv;
++
++    for (int n = 0; n < mkv_d->num_tracks; n++) {
++        mkv_track_t *track = mkv_d->tracks[n];
++        struct sh_stream *sh = track->stream;
++
++        if (!sh || sh->type != STREAM_AUDIO || !sh->codec->codec ||
++            strcmp(sh->codec->codec, "dts") != 0)
++            continue;
++
++        struct block_info *block = NULL;
++
++        // Same queue and bound as probe_x264_garbage().
++        for (int i = 0; i < 100; i++) {
++            if (i >= mkv_d->num_blocks && read_next_block_into_queue(demuxer) < 1)
++                break;
++            if (mkv_d->blocks[i].track == track) {
++                block = &mkv_d->blocks[i];
++                break;
++            }
++        }
++
++        if (!block || block->num_laces < 1)
++            continue;
++
++        bstr sblock = {block->laces[0]->data, block->laces[0]->size};
++        bstr nblock = demux_mkv_decode(demuxer->log, track, sblock, 1);
++        if (!nblock.len)
++            continue;
++
++        const char *profile = dts_profile_from_frame(nblock);
++        if (profile)
++            sh->codec->codec_profile = profile;
++
++        if (nblock.start != sblock.start)
++            talloc_free(nblock.start);
++    }
++}
++
+ static int read_ebml_header(demuxer_t *demuxer)
+ {
+     mkv_demuxer_t *mkv_d = demuxer->priv;
+@@ -2524,6 +2597,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+     if (mkv_d->opts->probe_duration)
+         probe_last_timestamp(demuxer, start_pos);
+     probe_x264_garbage(demuxer);
++    probe_dts_profile(demuxer);
+     probe_if_image(demuxer);
+ 
+     return 0;

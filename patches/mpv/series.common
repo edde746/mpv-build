@@ -6,3 +6,4 @@
 0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch
 0102-f-output-chain-wake-after-reset-harder.patch
 0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
+0035-demux-dts-codec-profile-at-load.patch
