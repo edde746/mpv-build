@@ -41,10 +41,12 @@ versions.json resolved pins (overrides.windows folded in):
 
 The rewrite is idempotent: previously injected keyword lines and previously
 staged <c>-*.patch files are dropped before injecting fresh ones. That is
-safe because the pristine package files carry none of the injected keywords
-and the pinned winbuild commit ships no packages/<c>-*.patch for these
-components (both facts are asserted by test_pin_packages.py against fixture
-copies in testdata/).
+safe because the pristine payload package files carry none of the injected
+keywords and the pinned winbuild commit ships no packages/<c>-*.patch for
+these components (both facts are asserted by test_pin_packages.py against
+fixture copies in testdata/). An extra package's pristine file may carry
+upstream's own pin and patch keywords; the rewrite replaces those (see
+EXTRA_COMPONENTS and upstream_patch_step()).
 
 This script is also the one place that resolves the windows pin: `--print-pins`
 emits the pinned-source inventory build.sh invalidates against, and
@@ -72,8 +74,9 @@ from pathlib import Path
 COMPONENTS = ("mpv", "ffmpeg", "libass")
 # Additional pinned packages, component -> cmake file inside the winbuild
 # checkout. These pin through the same strip-before-inject rewrite but carry
-# no patch series (the staged-patch glob is anchored to packages/ payload
-# names). Why each is pinned:
+# no patch series of ours (the staged-patch glob is anchored to packages/
+# payload names); upstream's own patch step survives, converted by
+# upstream_patch_step(). Why each is pinned:
 #   mingw-w64: cloned at toolchain-bootstrap time, defines the target ABI;
 #     the 2026-08-29 secure-API restructure broke libvpl mid-day.
 #   llvm: the toolchain's other live-fetch (a moving release branch; its
@@ -84,11 +87,17 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 #     with a release ffmpeg.
 #   nv-codec-headers: same shape; the 13.1 in-dev tip reshapes
 #     NV_ENC_CLOCK_TIMESTAMP_SET, which n8.0.1's nvenc wrapper still uses.
+#   openssl: winbuild pins an unreleased master snapshot (GIT_RESET, which
+#     the rewrite replaces). Its 4.1-dev TLS defaults offer 34 signature
+#     algorithms, and LibreSSL servers reject a ClientHello with more than
+#     32 with a decode_error alert, so ffmpeg's https could not reach them
+#     (edde746/plezy#2604). Pinned to a release.
 EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
     "svt-av1": "packages/svtav1.cmake",
     "nv-codec-headers": "packages/nvcodec-headers.cmake",
+    "openssl": "packages/openssl.cmake",
 }
 GROUP = "windows"
 # The meta-build checkout build.sh fetches: its commit pins the whole
@@ -189,13 +198,38 @@ def indent_of(line):
     return line[: len(line) - len(line.lstrip())]
 
 
+def first_word(line):
+    return line.strip().split(" ", 1)[0] if line.strip() else ""
+
+
+def upstream_patch_step(text, component):
+    """Whether an extra package's file applies upstream's own patches.
+
+    winbuild patches some packages it pins itself (openssl) with
+    `git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/<pkg>-*.patch`. git am commits,
+    and build.sh treats a source whose HEAD is not the pinned commit as stale,
+    so a kept git am step would reset and rebuild the package and its
+    dependents on every warm run. The rewrite instead injects the payload
+    packages' reset + `git apply` step over the same glob: upstream's patches
+    still apply and HEAD stays at the pin. Any other step shape fails, so a
+    winbuild bump that reshapes it is audited instead of silently dropped.
+    Also true for an already-rewritten file, so re-runs converge.
+    """
+    steps = [line for line in text.splitlines() if first_word(line) == "PATCH_COMMAND"]
+    if not steps:
+        return False
+    glob = f"${{CMAKE_CURRENT_SOURCE_DIR}}/{component}-*.patch"
+    if len(steps) != 1 or glob not in steps[0]:
+        fail(f"{component}: unrecognized upstream PATCH_COMMAND {steps!r}; audit it before pinning")
+    return True
+
+
 def rewrite(text, component, pins, have_patches):
     """The pinned package file text; pure so the tests can hammer it."""
     lines = []
     for line in text.splitlines():
-        word = line.strip().split(" ", 1)[0] if line.strip() else ""
-        if word in INJECTED_KEYWORDS:
-            continue  # previously injected by us; the pristine files have none
+        if first_word(line) in INJECTED_KEYWORDS:
+            continue  # ours from a previous run, or an extra's upstream pin/patch step
         lines.append(line)
 
     repo_lines = [i for i, l in enumerate(lines) if l.strip().startswith("GIT_REPOSITORY ")]
@@ -417,10 +451,12 @@ def main(argv):
         if not toolchain_file.is_file():
             fail(f"{toolchain_file}: missing")
         text = toolchain_file.read_text(encoding="utf-8")
-        pinned = rewrite(text, component, pins, have_patches=False)
+        patched = upstream_patch_step(text, component)
+        pinned = rewrite(text, component, pins, have_patches=patched)
         if pinned != text:
             toolchain_file.write_text(pinned, encoding="utf-8")
-        print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}")
+        converted = ", upstream patch step converted to git apply" if patched else ""
+        print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{converted}")
 
     custom_steps = winbuild / "cmake" / "custom_steps.cmake"
     if not custom_steps.is_file():

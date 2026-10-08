@@ -16,7 +16,8 @@
         "mingw-w64",
         "llvm",
         "svt-av1",
-        "nv-codec-headers"
+        "nv-codec-headers",
+        "openssl"
       ],
       "variants": [
         "x86_64",

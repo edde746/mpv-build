@@ -113,14 +113,22 @@ class PinPackagesTest(unittest.TestCase):
                 blob = (TESTDATA / name).read_bytes()
                 self.assertEqual(hashlib.sha256(blob).hexdigest(), digest)
         for name in CHECKOUT_FILES:
-            # Nothing this script injects is already in the file: a GIT_RESET
-            # or PATCH_COMMAND would survive a strip and skew the rewrite
-            # (llvm carries only upstream's own GIT_REMOTE_NAME/GIT_TAG, which
-            # the strip removes; mbedtls is the idiom, not a rewritten file).
-            words = keyword_sequence((TESTDATA / name).read_text(encoding="utf-8"),
-                                     set(pin_packages.INJECTED_KEYWORDS))
-            self.assertNotIn("GIT_RESET", words)
-            self.assertNotIn("PATCH_COMMAND", words)
+            # Nothing this script injects is already in a payload file, and an
+            # extra's own pin/patch keywords are single lines the strip removes
+            # whole (llvm carries upstream's GIT_REMOTE_NAME/GIT_TAG, openssl
+            # its GIT_REMOTE_NAME/GIT_RESET and git am PATCH_COMMAND; mbedtls
+            # is the idiom, not a rewritten file). A continuation line would
+            # survive the strip and skew the rewrite.
+            text = (TESTDATA / name).read_text(encoding="utf-8")
+            words = keyword_sequence(text, set(pin_packages.INJECTED_KEYWORDS))
+            if name in {f"{c}.cmake" for c in pin_packages.COMPONENTS}:
+                self.assertNotIn("GIT_RESET", words)
+                self.assertNotIn("PATCH_COMMAND", words)
+            lines = text.splitlines()
+            for index, line in enumerate(lines):
+                if first_word(line) in pin_packages.INJECTED_KEYWORDS:
+                    with self.subTest(fixture=name, line=line):
+                        self.assertTrue(first_word(lines[index + 1]).isupper())
 
     def test_rewrite_pins_every_component_to_its_resolved_commit(self):
         for component, fixture in COMPONENT_FILES.items():
@@ -195,7 +203,13 @@ class PinPackagesTest(unittest.TestCase):
                 )
                 self.assertEqual("PATCH_COMMAND" in self.package_text(component), bool(entries))
         for component in pin_packages.EXTRA_COMPONENTS:
-            self.assertNotIn("PATCH_COMMAND", self.package_text(component))
+            with self.subTest(extra=component):
+                pinned = self.package_text(component)
+                upstream = (TESTDATA / COMPONENT_FILES[component]).read_text(encoding="utf-8")
+                # An extra's own patch step survives as git apply over the
+                # same glob; one without a patch step gains none.
+                self.assertEqual("PATCH_COMMAND" in pinned, "PATCH_COMMAND" in upstream)
+                self.assertNotIn("git am", pinned)
         # The two gates main() applies on top of the rewrite: dropping either
         # call ships a configure failure (ffmpeg aarch64 cuda) or a silently
         # disabled feature (vapoursynth).
@@ -215,6 +229,40 @@ class PinPackagesTest(unittest.TestCase):
         (self.winbuild / "packages" / "mpv-9999-stale.patch").write_text(PATCH)
         self.assertEqual(self.run_main(), 0)
         self.assertEqual(first, read_tree(self.winbuild))
+
+    def test_upstream_git_am_step_becomes_a_pinned_git_apply(self):
+        # winbuild patches openssl with `git am`, which commits: build.sh would
+        # read the patched HEAD as a stale pin and rebuild openssl and every
+        # dependent on each warm run. The converted step keeps HEAD at the pin
+        # and still applies upstream's openssl-*.patch files.
+        text = (TESTDATA / "openssl.cmake").read_text(encoding="utf-8")
+        self.assertIn("git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/openssl-*.patch", text)
+        self.assertTrue(pin_packages.upstream_patch_step(text, "openssl"))
+        pins = self.pins["openssl"]
+        pinned = pin_packages.rewrite(text, "openssl", pins, True)
+        self.assertIn(
+            "    PATCH_COMMAND ${EXEC} "
+            f'"git reset --hard {pins["commit"]} -q '
+            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/openssl-*.patch"\n'
+            '    UPDATE_COMMAND ""\n'
+            "    GIT_REMOTE_NAME origin\n"
+            f"    GIT_TAG {pins['commit']}\n"
+            f"    GIT_RESET {pins['commit']} # {pins['ref']} {pins['version']}\n",
+            pinned,
+        )
+        # upstream's master-snapshot GIT_RESET is gone, not doubled
+        self.assertEqual(keyword_sequence(pinned, {"GIT_RESET"}), ["GIT_RESET"])
+        self.assertTrue(pin_packages.upstream_patch_step(pinned, "openssl"))
+        self.assertEqual(pin_packages.rewrite(pinned, "openssl", pins, True), pinned)
+
+    def test_unrecognized_upstream_patch_step_fails(self):
+        # A winbuild bump that reshapes an extra's patch step must be audited,
+        # not silently dropped by the strip.
+        for step in ('    PATCH_COMMAND ${EXEC} sed -i s/a/b/ <SOURCE_DIR>/x.c\n',
+                     '    PATCH_COMMAND ${EXEC} git am ${CMAKE_CURRENT_SOURCE_DIR}/other-*.patch\n'):
+            with self.subTest(step=step), self.assertRaises(SystemExit):
+                pin_packages.upstream_patch_step(step, "openssl")
+        self.assertFalse(pin_packages.upstream_patch_step('    UPDATE_COMMAND ""\n', "openssl"))
 
     def test_check_git_fixture_matches_audited_idiom(self):
         # neutralize_check_git string-matches the exact upstream injection

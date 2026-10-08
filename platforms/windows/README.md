@@ -12,7 +12,9 @@ to rewrite every source winbuild builds onto the versions.json pins -- the
 payload packages (`packages/{mpv,ffmpeg,libass}.cmake`, whose upstream tracks
 master) plus winbuild's live-fetch toolchain and ffmpeg-side packages
 (`toolchain/mingw-w64.cmake`, `toolchain/llvm/llvm.cmake`,
-`packages/svtav1.cmake`, `packages/nvcodec-headers.cmake`) -- using upstream's
+`packages/svtav1.cmake`, `packages/nvcodec-headers.cmake`) and OpenSSL
+(`packages/openssl.cmake`, which winbuild pins to an unreleased master
+snapshot) -- using upstream's
 own `GIT_REMOTE_NAME origin` / `GIT_TAG` / `GIT_RESET` idiom from
 `packages/mbedtls.cmake`, then
 configures with `-DCOMPILER_TOOLCHAIN=clang` (mandatory for aarch64),
@@ -30,9 +32,9 @@ sets `-Dgl=disabled -Degl-angle=disabled` for that target.
 ## Key coarseness
 
 `group.json` lists components `mpv`, `ffmpeg`, `libass`,
-`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1` and `nv-codec-headers`
-(the last four being the live-fetch packages `pin_packages.EXTRA_COMPONENTS`
-pins). The winbuild graph builds ~60 more dependencies (freetype,
+`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1`, `nv-codec-headers`
+and `openssl` (the last five being the packages
+`pin_packages.EXTRA_COMPONENTS` pins). The winbuild graph builds ~60 more dependencies (freetype,
 harfbuzz, x264, dav1d, ...). Those are deliberately NOT individual
 versions.json components: they track whatever `GIT_RESET`/URL pins the
 winbuild commit carries, so they are keyed -- coarsely but honestly --

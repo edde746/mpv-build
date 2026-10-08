@@ -8,8 +8,9 @@
 #      versions.json component `mpv-winbuild-cmake`
 #   2. pin every source winbuild builds to versions.json (pin_packages.py):
 #      the payload packages, its live-fetch toolchain packages (mingw-w64,
-#      llvm) and the ffmpeg-side packages whose upstream tip cannot build
-#      against the pinned release ffmpeg, then stage the resolved windows
+#      llvm), the ffmpeg-side packages whose upstream tip cannot build
+#      against the pinned release ffmpeg and openssl (winbuild pins an
+#      unreleased master snapshot), then stage the resolved windows
 #      patch series and neutralize the check-git cache cascade
 #   3. cmake configure with the clang toolchain (aarch64 REQUIRES clang:
 #      gcc + aarch64 is a configure-time FATAL_ERROR upstream) and ccache

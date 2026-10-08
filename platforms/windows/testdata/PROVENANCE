@@ -10,7 +10,8 @@
 # Fetched: 2026-09-01, raw.githubusercontent.com/<repo>/<commit>/packages/<f>
 # (custom_steps.cmake, mingw-w64.cmake and llvm.cmake: same commit, cmake/,
 # toolchain/ and toolchain/llvm/ respectively, copied from a verified local
-# checkout at the pin 2026-09-01)
+# checkout at the pin 2026-09-01; openssl.cmake: same commit, packages/,
+# fetched 2026-10-08)
 #
 # sha256 of each fixture as fetched:
 #   359c9c7da360f57d3a438e6fe117af6169cbd9aa3672751fd2bfc31e02be8fff  ffmpeg.cmake
@@ -22,14 +23,18 @@
 #   a1168b87c9ef663c40ce08f666219e3f668efb328429e4cea8704741b8cb31db  llvm.cmake
 #   4649b91fa340471263d52ef23fcd5dd0ff520dc60e91df564ce1059c4be27c9e  svtav1.cmake
 #   ada268ec2e56867a085e66f491e4bdce80bc2ccf84e591ecef75030ee04cab9f  nvcodec-headers.cmake
+#   79cd848d11ebb59ccc55db4fa237e94d600428bbd9ae255c9abeb613ca4be8fc  openssl.cmake
 #
 # mpv/ffmpeg/libass are the files pin_packages.py rewrites (pristine upstream:
 # no GIT_TAG, no GIT_RESET, no PATCH_COMMAND -- they track master).
-# mingw-w64.cmake, llvm.cmake, svtav1.cmake and nvcodec-headers.cmake are the extra pinned packages
-# (see pin_packages.EXTRA_COMPONENTS; mingw-w64 pristine has no GIT_TAG at
+# mingw-w64.cmake, llvm.cmake, svtav1.cmake, nvcodec-headers.cmake and
+# openssl.cmake are the extra pinned packages (see
+# pin_packages.EXTRA_COMPONENTS; mingw-w64 pristine has no GIT_TAG at
 # all, llvm pristine carries upstream's own moving-branch GIT_TAG, which the
-# rewrite replaces, and svtav1 tracks the default branch). ffmpeg.cmake is
-# also the fixture for the aarch64 cuda gate rewrite.
+# rewrite replaces, svtav1 tracks the default branch, and openssl pristine
+# carries upstream's own master-snapshot GIT_RESET, which the rewrite
+# replaces, and a git am PATCH_COMMAND, which it converts to git apply).
+# ffmpeg.cmake is also the fixture for the aarch64 cuda gate rewrite.
 # mbedtls.cmake is upstream's own pinning idiom and is the reference the tests
 # compare the injected block's shape against; it is never rewritten.
 # custom_steps.cmake carries the check-git step whose injection
@@ -37,5 +42,5 @@
 # tests assert the audited idiom still matches and that the rewrite converges.
 #
 # When bumping the mpv-winbuild-cmake pin in versions.json, refresh these
-# nine fixtures from the new commit and update the hashes above;
+# ten fixtures from the new commit and update the hashes above;
 # test_pin_packages.py asserts them, so a stale fixture fails the suite.

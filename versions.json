@@ -286,8 +286,19 @@
       "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
-        "apple"
-      ]
+        "apple",
+        "windows"
+      ],
+      "overrides": {
+        "windows": {
+          "kind": "git",
+          "version": "4.0.3",
+          "url": "https://github.com/openssl/openssl",
+          "ref": "openssl-4.0.3",
+          "commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
+          "provenance": "TLS backend of the windows ffmpeg. winbuild pins an unreleased master snapshot (d8bf6cdd, 4.1.0-dev); since openssl/openssl 4a08aa1346 added the SLH-DSA TLS 1.3 schemes, its default ClientHello offers 34 signature algorithms, and LibreSSL servers answer more than 32 with a decode_error alert, so playback from them failed (edde746/plezy#2604). 4.0.3 offers 22. Official openssl/openssl GitHub annotated tag object ae89995a4fdd66c460a916dce3950948a0b5a8e6 (openssl-4.0.3, tagged by openssl-machine 2026-09-29) dereferences to this commit; GitHub does not know the signing key, so the tag signature is unverified here. Resolved 2026-10-08 from the GitHub git refs API. Its gitlinks are test-only (pyca-cryptography, krb5, gost-engine, wycheproof, tlsfuzzer, python-ecdsa, tlslite-ng, oqs-provider, cloudflare-quiche, fuzz/corpora) and winbuild clones with GIT_SUBMODULES \"\". 4.0.3 already carries winbuild's MinGW SIO_UDP_NETRESET workaround; winbuild's openssl-0001 patch still applies cleanly and is redundant."
+        }
+      }
     },
     "libuavs3d": {
       "kind": "prebuilt",
