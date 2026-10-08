@@ -132,10 +132,10 @@ index 14e3e6f..4c67672 100644
   * at `surface` (an android.view.Surface jobject) without recreating it, and
 diff --git a/libavcodec/mediacodec_shed.c b/libavcodec/mediacodec_shed.c
 new file mode 100644
-index 0000000..a269df4
+index 0000000..9e6f7e6
 --- /dev/null
 +++ b/libavcodec/mediacodec_shed.c
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,491 @@
 +/*
 + * Android MediaCodec pre-decode frame shedding
 + *
@@ -480,16 +480,17 @@ index 0000000..a269df4
 +    return 0;
 +}
 +
-+// Shed the temporal unit's last frame when it is shown and refreshes no
-+// reference slot. Earlier OBUs -- the temporal delimiter, hidden reference
-+// frames, a sequence header -- are kept, so the decoder still consumes a
-+// valid (if now frame-less) temporal unit; a unit that held nothing but the
-+// shed frame is emptied instead.
++// Shed a temporal unit whose only frame is shown and refreshes no reference
++// slot; the unit is emptied. Every temporal unit has to show exactly one
++// frame, so a unit that carries anything besides that frame -- a hidden
++// reference frame, a sequence header -- goes to the codec whole: cut down to
++// its hidden frames it would show none, and a MediaTek AV1 decoder
++// (OMX.MTK.VIDEO.DECODER.AV1) fed such units stops producing output.
 +static int av1_shed(MediaCodecShedContext *sh, AVCodecContext *avctx, AVPacket *pkt)
 +{
 +    CodedBitstreamFragment *frag = sh->frag;
 +    const AV1RawFrameHeader *hdr = NULL;
-+    int last = -1, keep_units = 0, offset;
++    int last = -1;
 +
 +    if (av1_read(sh, avctx, pkt) < 0)
 +        return 0;
@@ -512,20 +513,15 @@ index 0000000..a269df4
 +        hdr->frame_type == AV1_FRAME_KEY || hdr->frame_type == AV1_FRAME_SWITCH)
 +        goto keep;
 +
-+    offset = (int)(frag->units[last].data - frag->data);
-+    if (offset < 0 || offset > pkt->size)
-+        goto keep;
 +    for (int i = 0; i < last; i++) {
 +        CodedBitstreamUnitType type = frag->units[i].type;
 +        if (type == AV1_OBU_FRAME || type == AV1_OBU_FRAME_HEADER ||
 +            type == AV1_OBU_TILE_GROUP || type == AV1_OBU_TILE_LIST ||
 +            type == AV1_OBU_SEQUENCE_HEADER)
-+            keep_units = 1;
++            goto keep;
 +    }
 +    ff_cbs_fragment_reset(frag);
-+    // The buffer may be shared with the demuxer's cache: shorten the view,
-+    // never write past it.
-+    pkt->size = keep_units ? offset : 0;
++    pkt->size = 0;
 +    return 1;
 +
 +keep:
@@ -633,7 +629,7 @@ index 0000000..a269df4
 +}
 diff --git a/libavcodec/mediacodec_shed.h b/libavcodec/mediacodec_shed.h
 new file mode 100644
-index 0000000..41ceb2a
+index 0000000..a68c5e0
 --- /dev/null
 +++ b/libavcodec/mediacodec_shed.h
 @@ -0,0 +1,89 @@
@@ -676,9 +672,9 @@ index 0000000..41ceb2a
 + * corrupt anything that follows; that is the whole safety argument, so
 + * every helper fails open: anything it does not fully understand is kept.
 + *
-+ * Reference frames that share an access unit with the shed frame (an AV1
-+ * hidden alt-ref, a VP9 superframe's hidden frames) stay in the packet; the
-+ * packet is truncated to them, never reordered.
++ * A VP9 superframe's hidden frames stay in the packet when its shown frame
++ * is shed: the packet is truncated to them, never reordered. AV1 is shed by
++ * whole temporal units only (see av1_shed).
 + */
 +
 +typedef struct MediaCodecShedContext {
@@ -709,8 +705,8 @@ index 0000000..41ceb2a
 +/**
 + * Remove the shown non-reference frame from pkt when there is one. On
 + * return pkt->size is 0 when the whole access unit was that frame, smaller
-+ * when reference frames sharing it were kept, unchanged when nothing could
-+ * be shed.
++ * when a VP9 superframe's hidden frames were kept, unchanged when nothing
++ * could be shed.
 + *
 + * @return 1 when a frame was shed, 0 when the packet is untouched, < 0 on an
 + *         allocation failure (pkt untouched).

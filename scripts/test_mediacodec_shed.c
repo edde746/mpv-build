@@ -7,10 +7,11 @@
 // The safety property under test is "never lose a frame anything later
 // references": H.264 by nal_ref_idc, HEVC by sub-layer non-reference type
 // at the highest temporal sub-layer, VP9 and AV1 by refresh_frame_flags,
-// with reference frames that share the packet (a VP9 superframe's hidden
-// frames, an AV1 hidden alt-ref) kept in place. The AV1 corpus is a real
-// SVT-AV1 stream; the coded-bitstream reader is the oracle for what each
-// temporal unit's last frame is, and the shed decision must match it.
+// with a VP9 superframe's hidden frames kept in place. AV1 sheds whole
+// temporal units only: a unit that also carries a hidden frame keeps its
+// shown one, since every temporal unit has to show a frame. The AV1 corpus
+// is a real SVT-AV1 stream; the coded-bitstream reader is the oracle for what
+// each temporal unit holds, and the shed decision must match it.
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -278,7 +279,7 @@ static int split_temporal_units(const uint8_t *data, int size, int *starts, int 
 }
 
 typedef struct LastFrame {
-    int present, show_existing, show_frame, frame_type, refresh, offset, only_delimiter_before;
+    int present, show_existing, show_frame, frame_type, refresh, only_delimiter_before;
 } LastFrame;
 
 // What the oracle says about the temporal unit's last frame.
@@ -303,7 +304,6 @@ static int oracle(CodedBitstreamContext *cbs, CodedBitstreamFragment *frag,
             lf->show_frame = h->show_frame;
             lf->frame_type = h->frame_type;
             lf->refresh = h->refresh_frame_flags;
-            lf->offset = (int)(u->data - frag->data);
         } else if (u->type != AV1_OBU_TEMPORAL_DELIMITER && u->type != AV1_OBU_TILE_GROUP &&
                    u->type != AV1_OBU_PADDING && u->type != AV1_OBU_METADATA) {
             if (!lf->present)
@@ -323,7 +323,7 @@ static void test_av1(void)
     CodedBitstreamContext *cbs = NULL;
     CodedBitstreamFragment frag = {0};
     AVPacket *pkt = av_packet_alloc();
-    int shed = 0, kept_with_refs = 0, emptied = 0, show_existing_units = 0;
+    int shed = 0, kept_whole = 0, show_existing_units = 0;
 
     CHECK(n > 10, "av1: corpus splits into temporal units (%d)", n);
     CHECK(ff_mediacodec_shed_init(&sh, &avctx) == 0 && sh.cbs, "av1: shed context has a reader");
@@ -333,7 +333,7 @@ static void test_av1(void)
         int start = starts[i];
         int end = i + 1 < n ? starts[i + 1] : (int)sizeof(av1_sample);
         LastFrame lf;
-        int expect_shed, ret, original_size = end - start;
+        int nonref_shown, expect_shed, ret, original_size = end - start;
 
         av_packet_unref(pkt);
         av_new_packet(pkt, original_size);
@@ -342,8 +342,11 @@ static void test_av1(void)
         pkt->pts = i;
 
         CHECK(oracle(cbs, &frag, pkt, &lf) == 0 && lf.present, "av1: unit %d decomposes", i);
-        expect_shed = i > 0 && !lf.show_existing && lf.show_frame && lf.refresh == 0 &&
-                      lf.frame_type != AV1_FRAME_KEY;
+        nonref_shown = i > 0 && !lf.show_existing && lf.show_frame && lf.refresh == 0 &&
+                       lf.frame_type != AV1_FRAME_KEY;
+        // Without its shown frame a unit that also holds a hidden frame
+        // would show none: only a unit of the shed frame alone goes.
+        expect_shed = nonref_shown && lf.only_delimiter_before;
         show_existing_units += lf.show_existing;
 
         // The production reader follows the stream through observe() when
@@ -360,29 +363,14 @@ static void test_av1(void)
               i, ret, expect_shed, lf.show_existing, lf.show_frame, lf.refresh, lf.frame_type);
         if (ret == 1) {
             shed++;
-            if (lf.only_delimiter_before) {
-                emptied++;
-                CHECK(pkt->size == 0, "av1: unit %d held only the shed frame, expected empty, got %d", i, pkt->size);
-            } else {
-                AVPacket *rest = av_packet_alloc();
-                LastFrame rl;
-                kept_with_refs++;
-                CHECK(pkt->size == lf.offset, "av1: unit %d truncated at %d, expected the frame's offset %d", i, pkt->size, lf.offset);
-                // What stays is a temporal unit the oracle still reads,
-                // ending in a frame that is not shown.
-                av_new_packet(rest, pkt->size);
-                memcpy(rest->data, pkt->data, pkt->size);
-                CHECK(oracle(cbs, &frag, rest, &rl) == 0 && rl.present && !rl.show_frame,
-                      "av1: unit %d's remainder is a valid unit of hidden frames", i);
-                av_packet_free(&rest);
-            }
+            CHECK(pkt->size == 0, "av1: unit %d held only the shed frame, expected empty, got %d", i, pkt->size);
         } else {
+            kept_whole += nonref_shown;
             CHECK(pkt->size == original_size, "av1: unit %d untouched", i);
         }
     }
     CHECK(shed >= 3, "av1: corpus exercised shedding (%d shed)", shed);
-    CHECK(kept_with_refs >= 1, "av1: at least one unit kept its hidden reference frames (%d)", kept_with_refs);
-    CHECK(emptied >= 1, "av1: at least one unit was emptied (%d)", emptied);
+    CHECK(kept_whole >= 1, "av1: a non-reference shown frame beside a hidden frame keeps its unit whole (%d)", kept_whole);
     CHECK(show_existing_units >= 1, "av1: corpus has show_existing_frame units (%d)", show_existing_units);
 
     // A key-frame packet is never touched, however the flags read.
