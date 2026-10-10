@@ -36,3 +36,4 @@
 0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
 0032-avfoundation-render-subtitles-through-the-shared-osd-pipeline.patch
 0033-avfoundation-compressed-software-volume.patch
+0036-avfoundation-restart-only-a-running-pcm-sink.patch

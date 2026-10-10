@@ -1,0 +1,173 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 14:47:40 +0200
+Subject: [PATCH] ao_avfoundation: restart only a PCM sink the core has running
+
+AVSampleBufferAudioRenderer posts OutputConfigurationDidChange and
+WasFlushedAutomatically when the output route changes (AirPods
+connecting, the default device switching), and the observer answered
+both with stop() and start() whatever the core had left the sink doing.
+start() puts the synchronizer's rate back to 1 and arms the media-data
+request. On a sink the core had paused, or one past EOF, ao_read_data()
+then returns nothing, feed() enqueues nothing, the renderer stays ready
+for more and calls feed() again at once: a core at 100% until playback
+resumes, under a clock that runs while the player is paused. A paused
+Mac player (macOS 27, ao=avfoundation) spent 63 min of CPU on one
+thread in the hour after a single such notification.
+
+The sink now records what the core asked of it: started by start(),
+ended by stop() and by EOF in feed(), paused by set_pause(). Each of
+these runs on p->queue, as stop() already did, so the observer never
+sees a change half made. The observer restarts a running sink as
+before. A paused one is flushed and stays stopped, and set_pause(false)
+starts it afresh; a stopped one waits for the core's start().
+
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index cc9a036..6e93a4e 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -59,6 +59,11 @@ - (void)invalidate;
+     CMAudioFormatDescriptionRef format_description;
+     AVObserver *observer;
+     int64_t end_time_av;
++    // What the core last asked of the PCM sink, for the restart a system
++    // notification asks for: started by start(), ended by stop() and by EOF
++    // in feed(), paused by set_pause(). Only touched on p->queue.
++    bool pcm_started;
++    bool pcm_paused;
+ 
+     // Compressed AC3/EAC3 sink. The raw elementary stream is served to an
+     // AVPlayer through an AVAssetResourceLoader; the system's own Dolby
+@@ -782,6 +787,7 @@ static void feed(struct ao *ao)
+     int real_sample_count = ao_read_data(ao, data, request_sample_count, end_time_av - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
+     if (eof) {
+         [p->renderer stopRequestingMediaData];
++        p->pcm_started = false;
+         ao_stop_streaming(ao);
+     }
+     if (real_sample_count == 0) {
+@@ -863,19 +869,28 @@ static void start(struct ao *ao)
+         return;
+     }
+ 
+-    p->end_time_av = -1;
+-    [p->synchronizer setRate:1];
++    // On p->queue, like stop() and set_pause(), so a restart notification
++    // (handleRestartNotification) never sees the sink's state half changed.
++    void (^pcm_start_block)(void) = ^{
++        p->pcm_started = true;
++        p->pcm_paused = false;
++        p->end_time_av = -1;
++        [p->synchronizer setRate:1];
+ #if TARGET_OS_OSX
+-    // With no bound there is nothing to gate, so arm exactly as before rather
+-    // than routing the first arm through the queue.
+-    if (p->pcm_lookahead_ns) {
+-        pcm_set_feeding(ao, true);
+-        return;
+-    }
++        // With no bound there is nothing to gate, so arm exactly as before.
++        if (p->pcm_lookahead_ns) {
++            pcm_set_feeding(ao, true);
++            return;
++        }
+ #endif
+-    [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+-        feed(ao);
+-    }];
++        [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
++            feed(ao);
++        }];
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        pcm_start_block();
++    else
++        dispatch_sync(p->queue, pcm_start_block);
+ }
+ 
+ static void stop(struct ao *ao)
+@@ -892,6 +907,7 @@ static void stop(struct ao *ao)
+         [p->renderer stopRequestingMediaData];
+         [p->renderer flush];
+         [p->synchronizer setRate:0];
++        p->pcm_started = false;
+ #if TARGET_OS_OSX
+         // A frozen clock never drains the queue, so leave nothing scheduled;
+         // start() turns feeding back on.
+@@ -932,23 +948,35 @@ static bool set_pause(struct ao *ao, bool paused)
+         return true;
+     }
+ 
+-    if (paused) {
+-        [p->synchronizer setRate:0];
++    void (^pcm_pause_block)(void) = ^{
++        p->pcm_paused = paused;
++        if (!paused && !p->pcm_started) {
++            // A restart notification stopped the sink while it was paused
++            // (handleRestartNotification), so resuming starts it afresh.
++            start(ao);
++            return;
++        }
++        if (paused) {
++            [p->synchronizer setRate:0];
+ #if TARGET_OS_OSX
+-        // The clock is stopped, so the bound can never be undercut again on
+-        // its own. Stop asking rather than waking every half-bound to
+-        // rediscover that.
+-        if (p->pcm_lookahead_ns)
+-            pcm_set_feeding(ao, false);
++            // The clock is stopped, so the bound can never be undercut again
++            // on its own. Stop asking rather than waking every half-bound to
++            // rediscover that.
++            if (p->pcm_lookahead_ns)
++                pcm_set_feeding(ao, false);
+ #endif
+-    } else {
++        } else {
+ #if TARGET_OS_OSX
+-        if (p->pcm_lookahead_ns)
+-            pcm_set_feeding(ao, true);
++            if (p->pcm_lookahead_ns)
++                pcm_set_feeding(ao, true);
+ #endif
+-        [p->synchronizer setRate:1];
+-    }
+-
++            [p->synchronizer setRate:1];
++        }
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        pcm_pause_block();
++    else
++        dispatch_sync(p->queue, pcm_pause_block);
+     return true;
+ }
+ 
+@@ -1011,12 +1039,26 @@ - (instancetype)initWithAO:(struct ao*)_ao {
+     return self;
+ }
+ - (void)handleRestartNotification:(NSNotification*)notification {
++    struct priv *p = ao->priv;
+     char *name = cfstr_get_cstr((CFStringRef)notification.name);
+     MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
+     MP_VERBOSE(ao, "notification name: %s\n", name);
+     talloc_free(name);
+-    stop(ao);
+-    start(ao);
++    // Start again only a sink the core has running. One it paused, or that
++    // reached EOF, has nothing to read: feed() would enqueue nothing, so the
++    // renderer would stay ready and call it again at once, spinning a core
++    // until playback resumed. A paused sink starts again on resume
++    // (set_pause()), a stopped one when the core starts it.
++    void (^restart_block)(void) = ^{
++        bool running = p->pcm_started && !p->pcm_paused;
++        stop(ao);
++        if (running)
++            start(ao);
++    };
++    if (dispatch_get_specific(&avfoundation_queue_key) == p)
++        restart_block();
++    else
++        dispatch_sync(p->queue, restart_block);
+ }
+ @end
+ 
