@@ -90,18 +90,18 @@
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-fdb0c308c1ce.xcframework.zip",
-              "checksum": "6deed13c9d950a95715f9f6d3ace3891453b9a2d1bc243327b51f82bc2df08c7"
+              "asset": "Libmpv-7c5bf9b8104e.xcframework.zip",
+              "checksum": "e92eb8597e7801e69d7eee7698b34e28d01f410dc55acdae875870305871d764"
             }
           },
-          "key": "fdb0c308c1ce",
+          "key": "7c5bf9b8104e",
           "prebuilt": {
-            "ios": "libmpv-all-fdb0c308c1ce-ios.zip",
-            "isimulator": "libmpv-all-fdb0c308c1ce-isimulator.zip",
-            "maccatalyst": "libmpv-all-fdb0c308c1ce-maccatalyst.zip",
-            "macos": "libmpv-all-fdb0c308c1ce-macos.zip",
-            "tvos": "libmpv-all-fdb0c308c1ce-tvos.zip",
-            "tvsimulator": "libmpv-all-fdb0c308c1ce-tvsimulator.zip"
+            "ios": "libmpv-all-7c5bf9b8104e-ios.zip",
+            "isimulator": "libmpv-all-7c5bf9b8104e-isimulator.zip",
+            "maccatalyst": "libmpv-all-7c5bf9b8104e-maccatalyst.zip",
+            "macos": "libmpv-all-7c5bf9b8104e-macos.zip",
+            "tvos": "libmpv-all-7c5bf9b8104e-tvos.zip",
+            "tvsimulator": "libmpv-all-7c5bf9b8104e-tvsimulator.zip"
           }
         }
       }
