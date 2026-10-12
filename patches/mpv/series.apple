@@ -37,3 +37,4 @@
 0032-avfoundation-render-subtitles-through-the-shared-osd-pipeline.patch
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
+0037-ao-spatial-hand-truehd-and-dts-hd-passthrough-to-the-host.patch
