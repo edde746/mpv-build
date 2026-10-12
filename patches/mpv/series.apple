@@ -39,3 +39,4 @@
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
 0037-avfoundation-skip-redundant-per-frame-metadata.patch
 0038-avfoundation-wait-for-renderer-readiness.patch
+0037-ao-spatial-hand-truehd-and-dts-hd-passthrough-to-the-host.patch
