@@ -453,6 +453,15 @@ that frame once, wakes the ao filter, and leaves the output chain asked for data
 so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
+Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
+(macOS). It compiles `audio/out/ao_spatial.m` (patch 0037) against a real
+`AVSampleBufferRenderSynchronizer` and a fake host sink: TrueHD and DTS-HD
+bursts reach the host unchanged, the clock waits until the host is ready and
+then runs in real time, pause, seek, underrun and end of stream each keep or
+begin the right timeline, and a host failure latches the format so the reopen
+refuses it and mpv decodes the track, until a PCM output clears the latch.
+Pass an already-patched source directory to run offline.
+
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
 applies the Android series, and exercises the production clock and audio-buffer
