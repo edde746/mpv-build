@@ -58,6 +58,9 @@ jobs:
       - name: Test AO probe refusal
         run: ./scripts/test_ao_probe_refusal.sh
 
+      - name: Test spatial audio output
+        run: bash ./scripts/test_ao_spatial.sh
+
       - name: Test AVFoundation timebase servo
         run: ./scripts/test_avf_timebase_servo.sh
 
