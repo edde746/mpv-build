@@ -19,3 +19,5 @@
 0026-mediacodec-recover-presentation-order.patch
 0028-mediacodec-output-buffer-timing.patch
 0032-mediacodec-keep-codec-errors-across-a-flush.patch
+# Shared with series.apple and series.windows (see series.apple).
+0035-tls-openssl-read-ahead.patch

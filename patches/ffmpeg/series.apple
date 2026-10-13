@@ -23,3 +23,9 @@
 0027-tcp-keep-ipv4-literal-beside-nat64-synthesis.patch
 0030-hevc-skip-software-tables-under-hwaccel.patch
 0031-videotoolbox-cache-the-derived-colour-space.patch
+0033-videotoolbox-skip-the-wait-after-a-synchronous-decode.patch
+0034-videotoolbox-leave-matching-attachments-alone.patch
+# OpenSSL is the TLS backend here, on android and on windows. Linux builds
+# GnuTLS from the 7.1 tree, which this does not apply to, so the three
+# OpenSSL series list it instead of series.common.
+0035-tls-openssl-read-ahead.patch

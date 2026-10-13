@@ -1,0 +1,38 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:10:24 +0200
+Subject: [PATCH] avformat/tls_openssl: read ahead
+
+Without read-ahead OpenSSL reads each TLS record off the socket in two
+reads through the TCP protocol, one for the 5-byte header and one for
+the body, and each is a poll() and a recv(). Streaming a 38 Mbit/s file
+over HTTPS on an Apple TV, those reads averaged 7.6 KB and mpv's demuxer
+thread spent 2.7% of a core under SSL_read().
+
+Turn read-ahead on with a 64 KiB buffer, so one read takes whatever
+records have arrived. On the same stream the reads average about 25 KB
+and the demuxer thread uses about a quarter less CPU. Only TLS changes;
+DTLS reads whole datagrams already.
+
+Data read ahead waits in OpenSSL instead of the socket. FFmpeg's own
+reads go through SSL_read() and get it first, but a caller that polls
+the socket before reading, as RTSP does for its control connection
+while the media runs over UDP, can miss a message queued behind another
+one until more data arrives. The unread rest of a record already waited
+in OpenSSL the same way before.
+
+diff --git a/libavformat/tls_openssl.c b/libavformat/tls_openssl.c
+index 75229ea..16783e3 100644
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -947,6 +947,11 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
+         goto fail;
+     }
+     SSL_set_ex_data(p->ssl, 0, p);
++    // Without read-ahead OpenSSL reads each record off the socket in two
++    // reads through the TCP protocol, the 5-byte header and then the body.
++    // With it, one read takes whatever records have arrived, up to 64 KiB.
++    SSL_set_read_ahead(p->ssl, 1);
++    SSL_set_default_read_buffer_len(p->ssl, 64 * 1024);
+     SSL_CTX_set_info_callback(p->ctx, openssl_info_callback);
+     init_bio_method(h);
+     if (!c->listen && !c->numerichost) {

@@ -1,0 +1,43 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:10:24 +0200
+Subject: [PATCH] videotoolbox: skip the wait after a synchronous decode
+
+videotoolbox_session_decode_frame() called
+VTDecompressionSessionWaitForAsynchronousFrames() after every frame. It
+passes no decode flags, so the session decodes synchronously: the output
+callback has run by the time VTDecompressionSessionDecodeFrame() returns,
+and the wait finds nothing pending. The decoder runs in another process
+on Apple platforms, so the wait was still a round trip to it for every
+frame.
+
+Ask the session for its info flags and wait only when it reports the
+decode as asynchronous (kVTDecodeInfo_Asynchronous).
+
+diff --git a/libavcodec/videotoolbox.c b/libavcodec/videotoolbox.c
+index 2d2f7a2..d2c10f9 100644
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -759,6 +759,7 @@ static void videotoolbox_decoder_callback(void *opaque,
+ static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx)
+ {
+     OSStatus status;
++    VTDecodeInfoFlags info_flags = 0;
+     CMSampleBufferRef sample_buf;
+     AVVideotoolboxContext *videotoolbox = videotoolbox_get_context(avctx);
+     VTContext *vtctx = avctx->internal->hwaccel_priv_data;
+@@ -774,8 +775,13 @@ static OSStatus videotoolbox_session_decode_frame(AVCodecContext *avctx)
+                                                sample_buf,
+                                                0,       // decodeFlags
+                                                NULL,    // sourceFrameRefCon
+-                                               0);      // infoFlagsOut
+-    if (status == noErr)
++                                               &info_flags);
++    // With no decode flags the session decodes synchronously: the output
++    // callback has run by the time DecodeFrame returns, and the session
++    // leaves kVTDecodeInfo_Asynchronous clear to say so. Waiting after such
++    // a decode only costs a round trip to the decoder process, so wait only
++    // when the session reports the decode as asynchronous.
++    if (status == noErr && (info_flags & kVTDecodeInfo_Asynchronous))
+         status = VTDecompressionSessionWaitForAsynchronousFrames(videotoolbox->session);
+ 
+     CFRelease(sample_buf);
