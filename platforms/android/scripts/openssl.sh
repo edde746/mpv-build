@@ -46,5 +46,11 @@ cd _build$ndk_suffix
 	no-camellia no-aria no-seed no-idea no-cast no-bf no-rc2 no-rc4 \
 	no-sm2 no-sm3 no-sm4
 
-make -j$cores build_sw
+# OpenSSL stamps "built on: <date>" into libcrypto (OpenSSL_version), and
+# libavformat links it statically, so every rebuild of a published key gave
+# different bytes: lld places merged strings by content hash, so that one
+# string moved most of .rodata and every reference to it. Its buildinf.h
+# generator takes SOURCE_DATE_EPOCH instead of the clock; 2020-01-01 is the
+# mtime the packaged archives carry.
+SOURCE_DATE_EPOCH=1577836800 make -j$cores build_sw
 make DESTDIR="$prefix_dir" install_sw
