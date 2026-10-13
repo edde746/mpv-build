@@ -67,6 +67,8 @@ targets:
     sources: [Consumer]
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: test.mpv.spatial.ios
+      LD_GENERATE_MAP_FILE: YES
+      LD_MAP_FILE_PATH: '$(SRCROOT)/$(TARGET_NAME).map'
     dependencies:
       - package: MPVKit
         product: MPVKit
@@ -77,6 +79,8 @@ targets:
     sources: [Consumer]
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: test.mpv.spatial.tvos
+      LD_GENERATE_MAP_FILE: YES
+      LD_MAP_FILE_PATH: '$(SRCROOT)/$(TARGET_NAME).map'
     dependencies:
       - package: MPVKit
         product: MPVKit
@@ -86,8 +90,7 @@ for platform in iOS tvOS; do
     link_map="$work/Consumer-$platform.map"
     xcodebuild -project "$work/SpatialConsumer.xcodeproj" -scheme "Consumer-$platform" \
         -configuration Release -destination "generic/platform=$platform" \
-        -derivedDataPath "$work/DerivedData" CODE_SIGNING_ALLOWED=NO \
-        LD_GENERATE_MAP_FILE=YES "LD_MAP_FILE_PATH=$link_map" build
+        -derivedDataPath "$work/DerivedData" CODE_SIGNING_ALLOWED=NO build
     case "$platform" in iOS) sdk=iphoneos ;; tvOS) sdk=appletvos ;; esac
     binary="$work/DerivedData/Build/Products/Release-$sdk/Consumer-$platform.app/Consumer-$platform"
     # The private Swift entry point need not stay globally visible in a Release
