@@ -123,6 +123,10 @@ tree at all, and `test_patches.sh`, `test_extract.sh` and `test_keys.sh` are
 regression tests of the Python tools themselves rather than of a source tree:
 `patches.py`'s series rules and archive fetching, `extract.py`'s slicing and
 hunk parsing over the whole pool, and `keys.py`'s content keys and gates.
+`test_apple_merge.sh` (macOS with Xcode) runs the publish job's XCFramework
+merge, `scripts/merge_xcframeworks.py`, twice over the same tiny per-platform
+frameworks and requires byte-identical zips: a rebuilt apple key has to
+reproduce the merged assets already published under its name.
 
 ## How to build
 

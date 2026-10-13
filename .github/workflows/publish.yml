@@ -41,7 +41,8 @@ jobs:
     permissions:
       contents: read
     # The harnesses need only bash, python3 and cc (plus libass's host
-    # dependencies for one of them), but not a Linux cc:
+    # dependencies for one of them, and Xcode for the apple merge test), but
+    # not a Linux cc:
     # test_avf_timebase_servo.c uses M_PI under -std=c11, which glibc hides in
     # strict ISO mode (gcc 13 on ubuntu-24.04: "'M_PI' undeclared"), while
     # Apple libc exposes it. Keep them on the compiler they are written for.
@@ -149,6 +150,9 @@ jobs:
 
       - name: Test content keys
         run: ./scripts/test_keys.sh
+
+      - name: Test apple XCFramework merge reproducibility
+        run: ./scripts/test_apple_merge.sh
 
   plan:
     name: Plan
