@@ -410,6 +410,17 @@
       "platforms": [
         "apple"
       ]
+    },
+    "spatialaudiobridge": {
+      "kind": "git",
+      "version": "1.6.1",
+      "url": "https://github.com/kristofferR/SpatialAudioBridge",
+      "ref": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
+      "commit": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
+      "provenance": "Source of 1.6.1, before the release-only binary Package.swift. Includes the DTS-HD seek fix; Cargo.lock pins both decoder repositories and every crate. Built with Rust 1.99.0.",
+      "platforms": [
+        "apple"
+      ]
     }
   }
 }

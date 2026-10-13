@@ -1,7 +1,7 @@
 // Unit test for the "spatial" audio output
 // (patches/mpv/pool/0037-ao-spatial-hand-truehd-and-dts-hd-passthrough-to-the-host.patch).
 // It drives the driver the way mpv's push thread does, against a real
-// synchronizer and a fake host sink. Run scripts/test_ao_spatial.sh, which
+// synchronizer and a fake renderer. Run scripts/test_ao_spatial.sh, which
 // builds it against the patched mpv source.
 
 #include <math.h>
@@ -23,12 +23,10 @@ void ao_wakeup(struct ao *ao) { atomic_fetch_add(&wakeups, 1); }
 void ao_request_reload(struct ao *ao) { reloads++; }
 bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < AF_FORMAT_COUNT; }
 const char *af_fmt_to_str(int format) { return "spdif"; }
-const m_option_type_t m_option_type_int64;
 
 struct fake_sink {
-    mpv_spatial_audio_sink sink;
     bool refuse, ready, failed;
-    mpv_spatial_audio_codec codec;
+    int codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, closes, ends, volumes;
     float volume;
@@ -36,35 +34,38 @@ struct fake_sink {
     NSMutableData *received;
 };
 
-static bool sink_open(void *ctx, mpv_spatial_audio_codec codec, void *synchronizer)
+static struct fake_sink *opening_sink;
+
+void *mp_spatial_create(int codec, void *synchronizer)
 {
-    struct fake_sink *s = ctx;
+    struct fake_sink *s = opening_sink;
+    if (!s) return NULL;
     s->codec = codec;
     s->synchronizer = synchronizer;
-    return !s->refuse;
+    return s->refuse ? NULL : s;
 }
-static void sink_begin(void *ctx, int64_t time)
+void mp_spatial_begin(void *ctx, int64_t time)
 {
     struct fake_sink *s = ctx;
     s->begins++;
     s->begin_time = time;
     [s->received setLength:0];
 }
-static void sink_write(void *ctx, const void *data, size_t size)
+void mp_spatial_write(void *ctx, const void *data, size_t size)
 {
     [((struct fake_sink *)ctx)->received appendBytes:data length:size];
 }
-static bool sink_is_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
-static bool sink_has_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
-static void sink_close(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
-static void sink_set_volume(void *ctx, float volume)
+bool mp_spatial_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
+bool mp_spatial_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
+void mp_spatial_destroy(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
+void mp_spatial_volume(void *ctx, float volume)
 {
     struct fake_sink *s = ctx;
     s->volumes++;
     s->volume = volume;
 }
-// The real host flushes its renderer here, then reports ready.
-static void sink_end(void *ctx)
+// The real renderer flushes its renderer here, then reports ready.
+void mp_spatial_end(void *ctx)
 {
     struct fake_sink *s = ctx;
     s->ends++;
@@ -79,12 +80,6 @@ static int failures;
 static struct fake_sink *new_sink(void)
 {
     struct fake_sink *s = calloc(1, sizeof(*s));
-    s->sink = (mpv_spatial_audio_sink){
-        .version = MPV_SPATIAL_AUDIO_SINK_VERSION, .ctx = s,
-        .open = sink_open, .begin = sink_begin, .write = sink_write,
-        .is_ready = sink_is_ready, .has_failed = sink_has_failed, .close = sink_close,
-        .end = sink_end, .set_volume = sink_set_volume,
-    };
     s->received = [[NSMutableData alloc] init];
     return s;
 }
@@ -94,7 +89,7 @@ static struct ao *new_ao(struct fake_sink *s, int format)
 {
     struct ao *ao = calloc(1, sizeof(*ao));
     struct priv *p = calloc(1, sizeof(*p));
-    p->sink_address = s ? (int64_t)(intptr_t)&s->sink : 0;
+    opening_sink = s;
     ao->priv = p;
     ao->format = format;
     ao->samplerate = 192000;
@@ -128,7 +123,7 @@ int main(void)
         struct fake_sink *early = new_sink();
         struct ao *unopened = new_ao(early, AF_FORMAT_S_TRUEHD);
         audio_out_spatial.set_gain(unopened, 1.0f);
-        CHECK(early->volumes == 0, "a gain set before init() reaches no host");
+        CHECK(early->volumes == 0, "a gain set before init() reaches no renderer");
 
         // Without a sink, or for PCM, the output refuses, so mpv uses the next one.
         struct ao *none = new_ao(NULL, AF_FORMAT_S_TRUEHD);
@@ -141,12 +136,12 @@ int main(void)
 
         s->refuse = true;
         struct ao *refused = new_ao(s, AF_FORMAT_S_TRUEHD);
-        CHECK(init(refused) < 0, "init must fail when the host refuses");
-        CHECK(s->codec == MPV_SPATIAL_AUDIO_CODEC_TRUEHD, "open gets the codec");
+        CHECK(init(refused) < 0, "init must fail when the renderer refuses");
+        CHECK(s->codec == 1, "open gets the codec");
         s->refuse = false;
 
         struct ao *dts = new_ao(s, AF_FORMAT_S_DTSHD);
-        CHECK(init(dts) == 0 && s->codec == MPV_SPATIAL_AUDIO_CODEC_DTSHD, "DTS-HD opens as DTS-HD");
+        CHECK(init(dts) == 0 && s->codec == 2, "DTS-HD opens as DTS-HD");
         uninit(dts);
 
         // TrueHD: opened with the synchronizer the clock runs on, at rate 0.
@@ -159,26 +154,26 @@ int main(void)
         CHECK(s->begins == 1, "init begins a timeline");
         CHECK(ao->device_buffer == 192000 * 3, "mpv may queue 3 s");
         CHECK(p->synchronizer.rate == 0, "the clock waits at rate 0");
-        // mpv cannot scale a bitstream, so its volume and mute go to the host
+        // mpv cannot scale a bitstream, so its volume and mute go to the renderer
         // as mpv sets them (ao_set_gain() calls the driver), paused or not.
-        CHECK(s->volumes == 1 && s->volume == 1.0f, "open hands the host mpv's volume");
+        CHECK(s->volumes == 1 && s->volume == 1.0f, "open hands the renderer mpv's volume");
         set_pause(ao, true);
         audio_out_spatial.set_gain(ao, 0.0f);
-        CHECK(s->volumes == 2 && s->volume == 0.0f, "a change reaches the host at once, paused too, mute as 0");
+        CHECK(s->volumes == 2 && s->volume == 0.0f, "a change reaches the renderer at once, paused too, mute as 0");
         state_of(ao);
         CHECK(s->volumes == 2, "reading the state sends nothing more");
         set_pause(ao, false);
         audio_out_spatial.set_gain(ao, 1.0f);
 
-        // Bursts reach the host unchanged, before and after start().
+        // Bursts reach the renderer unchanged, before and after start().
         write_burst(ao, 0x5a);
         start(ao);
         for (int n = 0; n < 9; n++)
             write_burst(ao, (uint8_t)n);
-        CHECK(s->received.length == 10 * 3840 * 16, "every byte reaches the host (%lu)", (unsigned long)s->received.length);
+        CHECK(s->received.length == 10 * 3840 * 16, "every byte reaches the renderer (%lu)", (unsigned long)s->received.length);
         CHECK(((const uint8_t *)s->received.bytes)[0] == 0x5a, "bytes arrive unchanged");
 
-        // While the host is not ready, the clock holds and everything counts as queued.
+        // While the renderer is not ready, the clock holds and everything counts as queued.
         struct mp_pcm_state st = state_of(ao);
         CHECK(st.playing, "reports playing while the clock waits, or mpv sees an underrun");
         CHECK(fabs(st.delay - 0.2) < 0.001, "delay is all written audio while waiting (%f)", st.delay);
@@ -194,7 +189,7 @@ int main(void)
         s->ready = true;
         st = state_of(ao);
         CFTimeInterval started = CACurrentMediaTime();
-        CHECK(p->synchronizer.rate == 1, "the clock starts when the host is ready");
+        CHECK(p->synchronizer.rate == 1, "the clock starts when the renderer is ready");
         usleep(50 * 1000);
         double delay = state_of(ao).delay;
         double expected = MPMAX(0.2 - (CACurrentMediaTime() - started), 0);
@@ -219,17 +214,17 @@ int main(void)
         CHECK(!st.playing && st.delay == 0, "all audio played ends playback (%f)", st.delay);
 
         // Audio after an underrun would land in the past on the old timeline,
-        // so it starts a new one, which waits for the host again.
+        // so it starts a new one, which waits for the renderer again.
         int begins = s->begins;
         s->ready = false;
         write_burst(ao, 2);
         CHECK(s->begins == begins + 1, "a write after an underrun begins a new timeline");
-        CHECK(!p->clock_running && p->synchronizer.rate == 0, "the new timeline waits for the host");
+        CHECK(!p->clock_running && p->synchronizer.rate == 0, "the new timeline waits for the renderer");
         // mpv may not have seen the underrun, and then calls no start().
         CHECK(p->playing && atomic_load(&p->waiting), "playback stays active across the new timeline");
         CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "only the new audio is queued");
 
-        // A seek begins a new timeline at the current time and waits for the host again.
+        // A seek begins a new timeline at the current time and waits for the renderer again.
         begins = s->begins;
         reset(ao);
         CHECK(s->begins == begins + 1 && s->received.length == 0, "reset begins a new timeline");
@@ -240,12 +235,12 @@ int main(void)
         start(ao);
         CHECK(fabs(state_of(ao).delay - 0.06) < 0.001, "delay restarts from the new timeline");
 
-        // At the end the host lets go of what it holds back, so audio shorter
+        // At the end the renderer lets go of what it holds back, so audio shorter
         // than its startup buffer still plays.
         end_of_stream(ao);
-        CHECK(s->ends == 1, "the host hears the end");
+        CHECK(s->ends == 1, "the renderer hears the end");
         state_of(ao);
-        CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the host has flushed");
+        CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the renderer has flushed");
         CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");
         set_pause(ao, true);
         state_of(ao);
@@ -269,7 +264,7 @@ int main(void)
         p->written = INT64_C(192000) * 14 * 3600 + 19200; // and 0.1 s still to play
         CHECK(fabs(state_of(ao).delay - 0.1) < 0.001, "a 14 h timeline keeps its delay (%f)", state_of(ao).delay);
 
-        // A host failure asks mpv to reopen the output, once.
+        // A renderer failure asks mpv to reopen the output, once.
         s->failed = true;
         state_of(ao);
         state_of(ao);
@@ -281,13 +276,13 @@ int main(void)
         usleep(30 * 1000);
         CHECK(atomic_load(&wakeups) == before, "no wakeups after uninit");
 
-        // The reopen refuses the failed format without asking the host, so
+        // The reopen refuses the failed format without asking the renderer, so
         // mpv falls back to decoding it.
         s->failed = false;
         s->codec = 0;
         struct ao *reopened = new_ao(s, AF_FORMAT_S_TRUEHD);
         CHECK(init(reopened) < 0, "the reopen after a failure refuses TrueHD");
-        CHECK(s->codec == 0, "and does not offer it to the host");
+        CHECK(s->codec == 0, "and does not offer it to the renderer");
         struct ao *other = new_ao(s, AF_FORMAT_S_DTSHD);
         CHECK(init(other) == 0, "DTS-HD is not latched by a TrueHD failure");
         uninit(other);
@@ -295,13 +290,13 @@ int main(void)
         CHECK(init(ac3) < 0, "AC-3 goes to the next output");
         s->codec = 0;
         CHECK(init(new_ao(s, AF_FORMAT_S_TRUEHD)) < 0, "another passthrough format leaves the latch");
-        CHECK(s->codec == 0, "and the host still is not asked");
+        CHECK(s->codec == 0, "and the renderer still is not asked");
 
         // Once the decoded track opens a PCM output, the next track tries the
-        // host again.
+        // renderer again.
         CHECK(init(new_ao(s, AF_FORMAT_FLOAT)) < 0, "PCM goes to the next output");
         struct ao *retried = new_ao(s, AF_FORMAT_S_TRUEHD);
-        CHECK(init(retried) == 0 && s->codec == MPV_SPATIAL_AUDIO_CODEC_TRUEHD,
+        CHECK(init(retried) == 0 && s->codec == 1,
               "a PCM initialization clears the latch");
         uninit(retried);
     }

@@ -20,6 +20,7 @@ let package = Package(
             ],
             path: "Sources/_MPVKit",
             linkerSettings: [
+                .linkedFramework("Accelerate"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("CoreMedia"),

@@ -2,7 +2,7 @@
 # Unit test for the "spatial" audio output
 # (patches/mpv/pool/0037-ao-spatial-hand-truehd-and-dts-hd-passthrough-to-the-host.patch):
 # test_ao_spatial.m includes the patched audio/out/ao_spatial.m and drives it
-# against a real AVSampleBufferRenderSynchronizer and a fake host sink,
+# against a real AVSampleBufferRenderSynchronizer and a fake private renderer,
 # including the latch that makes a failed stream fall back to PCM. macOS only.
 # Pass an already-patched mpv tree for offline use; otherwise fetch and patch
 # the pinned source.
