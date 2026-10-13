@@ -73,11 +73,11 @@
     },
     "mpv-winbuild-cmake": {
       "kind": "git",
-      "version": "master-2026-09-01",
+      "version": "master-2026-09-19",
       "url": "https://github.com/shinchiro/mpv-winbuild-cmake",
       "ref": "master",
-      "commit": "cd1edc11dc6887a50f705717619d879f5a93a488",
-      "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the master tip was resolved 2026-09-01 with `git ls-remote https://github.com/shinchiro/mpv-winbuild-cmake refs/heads/master` and frozen by commit; its internal dependency pins are keyed through this commit (see platforms/windows/README.md).",
+      "commit": "87e22100409984f2e46fc1895e3265a64f999893",
+      "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the pin is a master commit frozen by its hash; its internal dependency pins are keyed through this commit (see platforms/windows/README.md). First resolved 2026-09-01 as the master tip cd1edc11; moved 2026-10-13 to 87e22100 (\"curl: fix build with current libssh\", the next master commit after cd1edc11), because libssh master moved the SCP declarations out of libssh.h and curl stopped compiling. The master commits after it (llvm release/23.x, libvpl, libaribcaption, angle-headers) are deliberately not taken.",
       "platforms": [
         "windows"
       ],
