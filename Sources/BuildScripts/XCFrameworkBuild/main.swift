@@ -177,9 +177,8 @@ private class BuildMPV: BaseBuild {
         case (.isimulator, .x86_64): return "x86_64-apple-ios"
         case (.tvos, .arm64): return "aarch64-apple-tvos"
         case (.tvsimulator, .arm64): return "aarch64-apple-tvos-sim"
-        case (.macos, .arm64): return "aarch64-apple-darwin"
-        case (.macos, .x86_64): return "x86_64-apple-darwin"
-        default: return nil // No stable Rust std for arm64e/Intel tvOS; Catalyst keeps PCM.
+        // macOS includes LuaJIT; adding Rust exceeds its unwind personality limit.
+        default: return nil // macOS, Catalyst and unsupported Rust targets keep PCM.
         }
     }
 

@@ -1,5 +1,5 @@
 // Unit test for the "spatial" audio output
-// (patches/mpv/pool/0037-ao-spatial-hand-truehd-and-dts-hd-passthrough-to-the-host.patch).
+// (patches/mpv/pool/0039-ao-spatial-render-truehd-atmos-and-dts-x.patch).
 // It drives the driver the way mpv's push thread does, against a real
 // synchronizer and a fake renderer. Run scripts/test_ao_spatial.sh, which
 // builds it against the patched mpv source.

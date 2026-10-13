@@ -9,14 +9,85 @@ import argparse
 import base64
 import os
 from pathlib import Path
+import re
 import shutil
+import struct
 import subprocess
+import tempfile
 
 import patches
 
 
 def run(*args, **kwargs):
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def weaken_personality(path):
+    """Mark the sole external personality definition weak in a thin Mach-O."""
+    data = bytearray(path.read_bytes())
+    if struct.unpack_from("<I", data)[0] != 0xFEEDFACF:
+        raise ValueError(f"{path}: expected a thin 64-bit Mach-O object")
+    offset = 32
+    matches = []
+    for _ in range(struct.unpack_from("<I", data, 16)[0]):
+        command, size = struct.unpack_from("<II", data, offset)
+        if command == 2:  # LC_SYMTAB
+            symbols, count, strings, _ = struct.unpack_from("<IIII", data, offset + 8)
+            for index in range(count):
+                entry = symbols + index * 16
+                name, kind, _, flags = struct.unpack_from("<IBBH", data, entry)
+                start = strings + name
+                if data[start:data.index(0, start)] != b"_rust_eh_personality":
+                    continue
+                if kind & 0x0F != 0x0F:  # N_EXT | N_SECT
+                    raise ValueError("rust_eh_personality is not an external definition")
+                matches.append((entry + 6, flags))
+        offset += size
+    if len(matches) != 1:
+        raise ValueError(f"{path}: expected one personality definition, found {len(matches)}")
+    entry, flags = matches[0]
+    struct.pack_into("<H", data, entry, flags | 0x0080)  # N_WEAK_DEF
+    path.write_bytes(data)
+
+
+def prelink_core(archive, output, target, sdk, environment):
+    # LibTrueHD's build.sh uses this approach to coexist with libdovi: localize
+    # Rust/std globals, but share a weak personality so compact unwind needs
+    # only one Rust personality alongside Objective-C and C++. SAB catches
+    # decoder panics inside its FFI boundary; its sources are not modified.
+    match = re.fullmatch(r"(arm64|x86_64)-apple-(macos|ios|tvos)([\d.]+)(-simulator)?", target)
+    if not match:
+        raise ValueError(f"Unsupported spatial target: {target}")
+    arch, platform, minimum, simulator = match.groups()
+    platform += simulator or ""
+    version = subprocess.check_output(["xcrun", "--sdk", str(sdk), "--show-sdk-version"], text=True).strip()
+    members = subprocess.check_output(["xcrun", "ar", "-t", str(archive)], text=True).splitlines()
+    if len(members) != len(set(members)):
+        raise ValueError(f"{archive}: duplicate archive member names would lose objects during extraction")
+    with tempfile.TemporaryDirectory(prefix="prelink-", dir=output) as temporary:
+        work = Path(temporary)
+        objects = work / "objects"
+        objects.mkdir()
+        run("xcrun", "ar", "-x", archive, cwd=objects)
+        exports = work / "exports.txt"
+        exports.write_text("_sab_*\n_rust_eh_personality\n")
+        combined = work / "SpatialAudioCore.o"
+        run("xcrun", "ld", "-r", "-arch", arch, "-platform_version", platform, minimum, version,
+            "-exported_symbols_list", exports, "-o", combined, *sorted(objects.glob("*.o")))
+        run("xcrun", "strip", "-S", combined)
+        run("xcrun", "vtool", "-show-build", combined)
+        weaken_personality(combined)
+        destination = output / "libspatial_audio_core.a"
+        run("xcrun", "libtool", "-static", "-o", destination, combined, env=environment)
+        exported = subprocess.check_output(["xcrun", "nm", "-gUj", str(combined)], text=True).splitlines()
+    symbols = subprocess.check_output(["xcrun", "nm", "-m", str(destination)], text=True)
+    if not re.search(r"weak external (?:\[no dead strip\] )?_rust_eh_personality$", symbols, re.MULTILINE):
+        raise ValueError(f"{target}: missing weak external rust_eh_personality")
+    if not any(name.startswith("_sab_") for name in exported) or any(
+        not name.startswith("_sab_") and name != "_rust_eh_personality" for name in exported
+    ):
+        raise ValueError(f"{target}: unexpected exported Rust symbols: {exported}")
+    print(f"{target}: prelinked core exports {', '.join(exported)}; personality is weak", flush=True)
 
 
 def build(root, source, output, mpv, target, sdk, rust_target):
@@ -37,6 +108,7 @@ def build(root, source, output, mpv, target, sdk, rust_target):
     cargo_target = output / "cargo-target"
     manifest = source / "Rust/SpatialAudioCore/Cargo.toml"
     environment = dict(os.environ, CARGO_TARGET_DIR=str(cargo_target),
+                       CARGO_PROFILE_RELEASE_LTO="fat",
                        MACOSX_DEPLOYMENT_TARGET="11.0", IPHONEOS_DEPLOYMENT_TARGET="14.0",
                        TVOS_DEPLOYMENT_TARGET="14.0", SDKROOT=str(sdk), ZERO_AR_DATE="1")
     environment.pop("RUSTFLAGS", None)
@@ -47,9 +119,13 @@ def build(root, source, output, mpv, target, sdk, rust_target):
         f"--remap-path-prefix={sysroot}=/rust",
     ])
     try:
-        run(rustup, "run", rust, "cargo", "build", "--locked", "--release", "-j", "2",
+        # Building the staticlib alone enables LTO; also emitting an rlib skips
+        # it and leaves Rust bitcode that Apple's prelinker cannot consume.
+        run(rustup, "run", rust, "cargo", "rustc", "--lib", "--crate-type", "staticlib",
+            "--locked", "--release", "-j", "2",
             "--manifest-path", manifest, "--target", rust_target, env=environment)
-        shutil.copy2(cargo_target / rust_target / "release/libspatial_audio_core.a", output)
+        prelink_core(cargo_target / rust_target / "release/libspatial_audio_core.a",
+                     output, target, sdk, environment)
     finally:
         shutil.rmtree(cargo_target, ignore_errors=True)
 
