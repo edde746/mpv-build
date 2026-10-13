@@ -21,3 +21,4 @@
 # Apple's getaddrinfo() alone swaps zero flags for AI_DEFAULT, so only this
 # series carries it.
 0027-tcp-keep-ipv4-literal-beside-nat64-synthesis.patch
+0030-hevc-skip-software-tables-under-hwaccel.patch

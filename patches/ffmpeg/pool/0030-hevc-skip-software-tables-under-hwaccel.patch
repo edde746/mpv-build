@@ -1,0 +1,89 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 12:30:00 +0200
+Subject: [PATCH] hevc: leave the software-only tables alone under a hwaccel
+
+Every HEVC frame took a motion vector field from the layer's tab_mvf
+pool, and every frame start cleared the deblocking boundary strengths,
+the luma CBF and PCM maps and the slice address table. Only the
+software decoder reads or writes any of them: the hwaccels get their
+reference lists from rpl_tab and refPicList, and nothing outside
+libavcodec/hevc touches tab_mvf.
+
+The motion vector field is the expensive part. It is one MvField per
+4x4 block, 4.95 MB for a 3840x1714 picture and 6.2 MB at 3840x2160,
+and the pool zeroes each entry when it allocates it, so every buffer
+counts against the process footprint for the life of the decoder. With
+mpv's default hwdec-threads=4 the DPB plus the frames in flight across
+the frame threads held a dozen of them: about 57 MB of zeroed memory on
+a 4K HDR10 file decoded by VideoToolbox, more than the rest of libmpv's
+heap growth during playback. The clears add about 2.6 MB of memset per
+4K frame.
+
+Skip both while avctx->hwaccel is set. avctx->hwaccel only changes in
+get_format() on a new SPS, and the SPS change clears the references
+first, so a software-decoded frame never meets a reference frame that
+has no motion vector field. hevc_ref_frame(), which copies the DPB into
+the next frame thread, now passes the NULL field through instead of
+taking a reference to it.
+---
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 2cbd3ae..e916a1a 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3277,11 +3277,16 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+         }
+     }
+ 
+-    memset(l->horizontal_bs, 0, l->bs_width * l->bs_height);
+-    memset(l->vertical_bs,   0, l->bs_width * l->bs_height);
+-    memset(l->cbf_luma,      0, sps->min_tb_width * sps->min_tb_height);
+-    memset(l->is_pcm,        0, (sps->min_pu_width + 1) * (sps->min_pu_height + 1));
+-    memset(l->tab_slice_address, -1, pic_size_in_ctb * sizeof(*l->tab_slice_address));
++    /* Deblocking and slice-address tables only the software decoder
++     * reads; a hwaccel never touches them, and at 4K clearing them costs
++     * ~2.6 MB of memset per frame. */
++    if (!s->avctx->hwaccel) {
++        memset(l->horizontal_bs, 0, l->bs_width * l->bs_height);
++        memset(l->vertical_bs,   0, l->bs_width * l->bs_height);
++        memset(l->cbf_luma,      0, sps->min_tb_width * sps->min_tb_height);
++        memset(l->is_pcm,        0, (sps->min_pu_width + 1) * (sps->min_pu_height + 1));
++        memset(l->tab_slice_address, -1, pic_size_in_ctb * sizeof(*l->tab_slice_address));
++    }
+ 
+     if (IS_IDR(s))
+         ff_hevc_clear_refs(l);
+@@ -3903,7 +3908,7 @@ static int hevc_ref_frame(HEVCFrame *dst, const HEVCFrame *src)
+     }
+ 
+     dst->pps     = av_refstruct_ref_c(src->pps);
+-    dst->tab_mvf = av_refstruct_ref(src->tab_mvf);
++    dst->tab_mvf = src->tab_mvf ? av_refstruct_ref(src->tab_mvf) : NULL;
+     dst->rpl_tab = av_refstruct_ref(src->rpl_tab);
+     dst->rpl = av_refstruct_ref(src->rpl);
+     dst->nb_rpl_elems = src->nb_rpl_elems;
+diff --git a/libavcodec/hevc/refs.c b/libavcodec/hevc/refs.c
+index 15f37bf..cfcd1eb 100644
+--- a/libavcodec/hevc/refs.c
++++ b/libavcodec/hevc/refs.c
+@@ -167,9 +167,18 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
+             goto fail;
+         frame->nb_rpl_elems = s->pkt.nb_nals;
+ 
+-        frame->tab_mvf = av_refstruct_pool_get(l->tab_mvf_pool);
+-        if (!frame->tab_mvf)
+-            goto fail;
++        /* Only the software decoder reads or writes the motion vector
++         * field; a hwaccel keeps its own. At 4K the table is ~6 MB per
++         * frame, zeroed on allocation, so skipping it keeps the whole
++         * DPB's worth out of memory. avctx->hwaccel only changes in
++         * get_format() on a new SPS, which clears the references first,
++         * so a software-decoded frame never meets a reference without
++         * one. */
++        if (!s->avctx->hwaccel) {
++            frame->tab_mvf = av_refstruct_pool_get(l->tab_mvf_pool);
++            if (!frame->tab_mvf)
++                goto fail;
++        }
+ 
+         frame->rpl_tab = av_refstruct_pool_get(l->rpl_tab_pool);
+         if (!frame->rpl_tab)
