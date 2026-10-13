@@ -25,6 +25,7 @@ bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < 
 const char *af_fmt_to_str(int format) { return "spdif"; }
 
 struct fake_sink {
+    struct mpv_global player;
     bool refuse, ready, failed;
     int codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
@@ -80,6 +81,8 @@ static int failures;
 static struct fake_sink *new_sink(void)
 {
     struct fake_sink *s = calloc(1, sizeof(*s));
+    for (int i = 0; i < 2; i++)
+        atomic_init(&s->player.spatial_format_latch[i], false);
     s->received = [[NSMutableData alloc] init];
     return s;
 }
@@ -90,6 +93,8 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     struct ao *ao = calloc(1, sizeof(*ao));
     struct priv *p = calloc(1, sizeof(*p));
     opening_sink = s;
+    static struct mpv_global no_sink_player;
+    ao->global = s ? &s->player : &no_sink_player;
     ao->priv = p;
     ao->format = format;
     ao->samplerate = 192000;
@@ -275,6 +280,15 @@ int main(void)
         before = atomic_load(&wakeups);
         usleep(30 * 1000);
         CHECK(atomic_load(&wakeups) == before, "no wakeups after uninit");
+
+        // A second player neither inherits the failure nor clears it when
+        // it probes PCM. The first player's new AO must still refuse TrueHD.
+        struct fake_sink *independent = new_sink();
+        struct ao *independent_ao = new_ao(independent, AF_FORMAT_S_TRUEHD);
+        CHECK(init(independent_ao) == 0, "another player can still open TrueHD");
+        CHECK(init(new_ao(independent, AF_FORMAT_FLOAT)) < 0,
+              "another player's PCM probe leaves the first latch alone");
+        uninit(independent_ao);
 
         // The reopen refuses the failed format without asking the renderer, so
         // mpv falls back to decoding it.

@@ -1,7 +1,7 @@
 From: kristofferR <481270+kristofferR@users.noreply.github.com>
 Subject: [PATCH] ao_spatial: render TrueHD Atmos and DTS:X with SpatialAudioBridge
 
-The output owns its Swift renderer, synchronizer and audio-session lifetime.
+The output owns its Swift renderer, synchronizer and audio-session settings.
 SpatialAudioBridge is compiled from pinned sources by mpv-build. There is no
 application callback, raw-address option or installed spatial-audio header.
 A refused stream latches its format and reopens for mpv's PCM decode path.
@@ -60,7 +60,7 @@ index 0000000..599ef05
 +void mp_spatial_volume(void *sink, float volume);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..437040f
+index 0000000..60d18bf
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
 @@ -0,0 +1,297 @@
@@ -88,12 +88,14 @@ index 0000000..437040f
 +// compressed sink does: the format is latched and the output reloaded, the
 +// reopen refuses it, and mpv decodes the track instead. A later PCM
 +// initialization clears the latch, so the next track or file tries again.
++// The latch belongs to this mpv player and survives AO reconstruction.
 +
 +#include <stdatomic.h>
 +
 +#include "ao.h"
 +#include "audio/format.h"
 +#include "common/common.h"
++#include "common/global.h"
 +#include "common/msg.h"
 +#include "internal.h"
 +#include "ao_spatial.h"
@@ -120,8 +122,6 @@ index 0000000..437040f
 +    bool ended;
 +    bool reload_requested;
 +};
-+
-+static _Atomic bool spatial_format_latch[2];
 +
 +static int spatial_latch_index(int format)
 +{
@@ -183,13 +183,13 @@ index 0000000..437040f
 +        codec = 2;
 +    } else {
 +        if (!af_fmt_is_spdif(ao->format)) {
-+            atomic_store(&spatial_format_latch[0], false);
-+            atomic_store(&spatial_format_latch[1], false);
++            atomic_store(&ao->global->spatial_format_latch[0], false);
++            atomic_store(&ao->global->spatial_format_latch[1], false);
 +        }
 +        MP_VERBOSE(ao, "only TrueHD and DTS-HD passthrough are handed to the renderer\n");
 +        return -1;
 +    }
-+    if (atomic_load(&spatial_format_latch[spatial_latch_index(ao->format)])) {
++    if (atomic_load(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)])) {
 +        MP_INFO(ao, "%s failed in the renderer; decoding it instead\n",
 +                af_fmt_to_str(ao->format));
 +        return -1;
@@ -315,7 +315,7 @@ index 0000000..437040f
 +    if (mp_spatial_failed(p->sink) && !p->reload_requested) {
 +        MP_WARN(ao, "the renderer failed to render the stream, falling back to PCM\n");
 +        p->reload_requested = true;
-+        atomic_store(&spatial_format_latch[spatial_latch_index(ao->format)], true);
++        atomic_store(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)], true);
 +        ao_request_reload(ao);
 +    }
 +
@@ -363,10 +363,10 @@ index 0000000..437040f
 +};
 diff --git a/audio/out/ao_spatial.swift b/audio/out/ao_spatial.swift
 new file mode 100644
-index 0000000..e5ab453
+index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,267 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
@@ -576,9 +576,8 @@ index 0000000..e5ab453
 +            state.users -= 1
 +            guard state.users == 0 else { return }
 +            let session = AVAudioSession.sharedInstance()
-+            do {
-+                try session.setActive(false, options: .notifyOthersOnDeactivation)
-+            } catch { NSLog("[ao_spatial] Cannot deactivate audio session: %@", String(describing: error)) }
++            // Activation is idempotent, but there is no public isActive query.
++            // The host may already own this session; only it may deactivate it.
 +            do {
 +                try session.setCategory(state.category, mode: state.mode, options: state.options)
 +            } catch { NSLog("[ao_spatial] Cannot restore audio session category: %@", String(describing: error)) }
@@ -699,3 +698,37 @@ index 1ac622a..289c8ea 100644
  option('pdf-build', type: 'feature', value: 'disabled', description: 'PDF manual generation')
 +
 +option('spatial-audio', type: 'feature', value: 'auto', description: 'TrueHD Atmos and DTS:X through SpatialAudioBridge')
+diff --git a/common/global.h b/common/global.h
+--- a/common/global.h
++++ b/common/global.h
+@@ -1,6 +1,8 @@
+ #ifndef MPV_MPV_H
+ #define MPV_MPV_H
+ 
++#include <stdatomic.h>
++
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
+@@ -11,6 +13,9 @@ struct mpv_global {
+     char *configdir;
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
++    // Per-player failure state must survive destruction/recreation of its AO.
++    // Only ao_spatial reads/writes it (on the AO and player threads).
++    atomic_bool spatial_format_latch[2];
+ };
+ 
+ #endif
+diff --git a/player/main.c b/player/main.c
+--- a/player/main.c
++++ b/player/main.c
+@@ -285,6 +285,8 @@ struct MPContext *mp_create(void)
+     mp_mutex_init(&mpctx->abort_lock);
+ 
+     mpctx->global = talloc_zero(mpctx, struct mpv_global);
++    for (int i = 0; i < 2; i++)
++        atomic_init(&mpctx->global->spatial_format_latch[i], false);
+ 
+     demux_packet_pool_init(mpctx->global);
+     stats_global_init(mpctx->global);

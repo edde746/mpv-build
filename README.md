@@ -459,7 +459,8 @@ Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
 bursts reach the renderer unchanged, the clock waits until the renderer is ready and
 then runs in real time, pause, seek, underrun and end of stream each keep or
 begin the right timeline, and a renderer failure latches the format so the reopen
-refuses it and mpv decodes the track, until a PCM output clears the latch.
+refuses it and mpv decodes the track, until that player probes PCM and clears
+its latch. A second player neither inherits nor clears that failure.
 Pass an already-patched source directory to run offline.
 
 The output is self-contained: `scripts/build_spatial.py` compiles the
@@ -468,7 +469,12 @@ the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are
 folded into `Libmpv`; that source pin is part of libmpv's content key. There is
 no application callback or separate SpatialAudioBridge package. The binary
 includes the silent Atmos clip and its license notices. Audio-session settings
-are restored on close before mpv opens a fallback output.
+are restored after the last overlapping output closes, before mpv opens a
+fallback output. Opening activates the session; closing never deactivates it,
+because the host may already own activation. Deactivation remains the host
+application's responsibility. `bash scripts/test_spatial_session.sh` exercises
+active/inactive host sessions, overlapping outputs and configuration rollback
+with a fake session, without playing audio.
 
 The Rust core is built as a staticlib alone with fat LTO, then prelinked into
 one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak
@@ -478,6 +484,10 @@ symbols and weak personality for every supported slice.
 After a full platform build, `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`
 checks the installed slices and links their sink with force-loaded libdovi,
 without media. The prelink log also records the Mach-O platform and minimum OS.
+The SwiftPM wrapper contains Swift source so C/Objective-C consumers also get
+the Swift runtime and back-deployment libraries. After packaging,
+`bash scripts/test_spatial_swiftpm.sh <release-dir>` links an Objective-C-only
+app on iOS and tvOS against the packaged frameworks (requires XcodeGen).
 
 Spatial playback requires OS 26 and a supported Rust target: arm64 tvOS and
 its simulator, or iOS and its simulators. macOS, Mac Catalyst, arm64e and Intel
