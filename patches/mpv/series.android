@@ -4,7 +4,7 @@
 0002-egl-android-bt2020-pq-surface.patch
 0003-opengl-treat-gles-direct-rendering-as-slow.patch
 0004-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
-0005-demux-codec-profile-from-avcc.patch
+0005-demux-codec-profile-from-avcc-and-hvcc.patch
 0006-sd-ass-render-threads.patch
 0006-sd-ass-fast-blur.patch
 0008-draw-bmp-fast-libass-blend.patch

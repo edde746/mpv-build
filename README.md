@@ -370,6 +370,22 @@ taken for a late answer. Every lookup the open left behind frees what it
 shares, and literals keep the single AF_UNSPEC lookup. Pass an
 already-patched source directory to run offline.
 
+Run the codec-profile regression with `bash scripts/test_demux_codec_profile.sh`.
+It extracts the profile the Android demuxers publish when a file loads (patch
+0005: demux_mkv names it from CodecPrivate, demux_lavf from MP4's avcC or
+hvcC), which is what a client's per-file decode routing reads before any
+decoder exists, and compares it with the profile mpv publishes once the pinned
+FFmpeg's software decoder has decoded the stream's first access unit (a
+minimal host configure builds the H.264 and HEVC decoders). The samples are
+one-frame x264 and x265 encodes muxed into Matroska and MP4: HEVC Main, Main 10
+and Rext, the same records rewritten to a general_profile_idc of 0 that names
+the profile only in the compatibility flags, and H.264 Constrained Baseline,
+High, High 10 and High 10 Intra. A record whose configurationVersion is not 1,
+one shorter than its fixed header, Annex B extradata or another codec names no
+profile. `--regenerate` re-encodes the samples with a host ffmpeg (libx264 and
+libx265). Pass an already-patched mpv tree and an FFmpeg tree as the first two
+arguments to run offline.
+
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers
 exactly the render's margins in surface pixels, rounds a scaled plane outward,
