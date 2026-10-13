@@ -360,14 +360,16 @@ offline.
 Run the TCP hostname-lookup regression with
 `bash scripts/test_tcp_family_lookup.sh`. It compiles tcp.c's per-family
 lookup (patch 0029) under ASan and UBSan against a scripted resolver and
-connection race. A family whose lookup never answers -- the AAAA query a
-broken resolver drops -- holds nothing up: the race starts with the other
-family 50 ms after it answered, a family that answers later joins a race
-stuck on a blackholed address or is raced alone once every earlier address
-failed, IPv6 is listed first, a failed lookup never ends the open while the
-other is pending, and the caller's interrupt ends any wait without being
-taken for a late answer. Every lookup the open left behind frees what it
-shares, and literals keep the single AF_UNSPEC lookup. Pass an
+connection race on a virtual clock: time moves only when every thread waits,
+so each scripted delay is exact and a loaded machine cannot move an answer
+across the 50 ms Resolution Delay. A family whose lookup never answers --
+the AAAA query a broken resolver drops -- holds nothing up: the race starts
+with the other family 50 ms after it answered, a family that answers later
+joins a race stuck on a blackholed address or is raced alone once every
+earlier address failed, IPv6 is listed first, a failed lookup never ends the
+open while the other is pending, and the caller's interrupt ends any wait
+without being taken for a late answer. Every lookup the open left behind
+frees what it shares, and literals keep the single AF_UNSPEC lookup. Pass an
 already-patched source directory to run offline.
 
 Run the codec-profile regression with `bash scripts/test_demux_codec_profile.sh`.

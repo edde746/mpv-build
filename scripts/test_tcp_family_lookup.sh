@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compile tcp.c's per-family hostname lookup and connection-race restart
-# (patch 0029) against a scripted resolver and race, under ASan and UBSan.
+# (patch 0029) against a scripted resolver and race on a virtual clock, under
+# ASan and UBSan.
 # Pass an already patched FFmpeg tree for offline use, otherwise fetch the
 # pinned Android source.
 set -euo pipefail
