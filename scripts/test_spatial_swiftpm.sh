@@ -83,14 +83,43 @@ targets:
 YAML
 xcodegen generate --spec "$work/project.yml"
 for platform in iOS tvOS; do
+    link_map="$work/Consumer-$platform.map"
     xcodebuild -project "$work/SpatialConsumer.xcodeproj" -scheme "Consumer-$platform" \
         -configuration Release -destination "generic/platform=$platform" \
-        -derivedDataPath "$work/DerivedData" CODE_SIGNING_ALLOWED=NO build
+        -derivedDataPath "$work/DerivedData" CODE_SIGNING_ALLOWED=NO \
+        LD_GENERATE_MAP_FILE=YES "LD_MAP_FILE_PATH=$link_map" build
     case "$platform" in iOS) sdk=iphoneos ;; tvOS) sdk=appletvos ;; esac
     binary="$work/DerivedData/Build/Products/Release-$sdk/Consumer-$platform.app/Consumer-$platform"
-    xcrun nm -gUj "$binary" > "$work/symbols.txt"
-    grep -q '^_mp_spatial_create$' "$work/symbols.txt"
+    # The private Swift entry point need not stay globally visible in a Release
+    # executable. Require it in the linker's live symbols, excluding dead code.
+    python3 - "$link_map" "$platform" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+live = text.split('# Symbols:\n', 1)[1].split('# Dead Stripped Symbols:', 1)[0]
+matches = [line for line in live.splitlines()
+           if line.split() and line.split()[-1] == '_mp_spatial_create']
+if not matches:
+    raise SystemExit(f'{sys.argv[2]}: spatial entry point missing from live link map')
+print(f'{sys.argv[2]}: live spatial entry point: {matches[0]}')
+PY
+    xcrun nm -gUj "$binary" > "$work/global-symbols.txt"
+    if grep -q '^_mp_spatial_create$' "$work/global-symbols.txt"; then
+        echo "$platform: spatial entry point remains global"
+    else
+        xcrun nm -Uj "$binary" > "$work/all-symbols.txt"
+        if grep -q '^_mp_spatial_create$' "$work/all-symbols.txt"; then
+            echo "$platform: spatial entry point is local, excluded by nm -g"
+        else
+            echo "$platform: symbol table omits the private entry point; live link map verified it"
+        fi
+    fi
     xcrun otool -L "$binary" > "$work/libraries.txt"
-    grep 'libswiftCore.dylib' "$work/libraries.txt"
+    if ! grep 'libswiftCore.dylib' "$work/libraries.txt"; then
+        cat "$work/libraries.txt"
+        echo "$platform: missing Swift runtime dependency" >&2
+        exit 1
+    fi
     echo "$platform: Objective-C-only SwiftPM consumer linked the spatial sink and Swift runtime"
 done
