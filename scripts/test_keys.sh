@@ -154,6 +154,7 @@ def make_repo(directory):
     (build_scripts / "Package.swift").write_text("// build scripts package\n", encoding="utf-8")
     (build_scripts / "XCFrameworkBuild" / "base.swift").write_text("// base\n", encoding="utf-8")
     (build_scripts / "XCFrameworkBuild" / "main.swift").write_text("// main\n", encoding="utf-8")
+    (repo / "scripts" / "merge_xcframeworks.py").write_text("# merge\n", encoding="utf-8")
 
     # mpv and ffmpeg carry patches; libass deliberately has no patches/ dir at
     # all in this fixture, so a component without one stays covered.

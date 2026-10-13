@@ -204,6 +204,9 @@ GROUPS = {
             Path("Sources/BuildScripts/Package.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/base.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/main.swift"),
+            # The publish job's XCFramework merge writes the bytes of every
+            # framework asset, so it keys them like the driver that compiles them.
+            Path("scripts/merge_xcframeworks.py"),
         ),
         package=Path("Package.swift"),
     ),
