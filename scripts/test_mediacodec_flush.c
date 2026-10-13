@@ -157,6 +157,14 @@ static int mediacodec_dec_async_wait(MediaCodecDecContext *s, AVFifo *fifo,
     return s->async_error;
 }
 
+// A flush the codec failed becomes the sticky error the dequeues answer;
+// test_mediacodec_error.c drives the production helper.
+static void mediacodec_dec_fail(MediaCodecDecContext *s, int err)
+{
+    if (!s->async_error)
+        s->async_error = err;
+}
+
 static int64_t av_rescale_q(int64_t a, AVRational bq, AVRational cq)
 {
     return a * bq.num * cq.den / ((int64_t)bq.den * cq.num);

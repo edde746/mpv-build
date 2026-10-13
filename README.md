@@ -294,6 +294,16 @@ it, back-to-back seeks flush once, and an oversized first access unit still
 gives its slot back through a flush. Pass an already-patched source directory
 as the first argument to run offline.
 
+Run the MediaCodec codec-error regression with `bash scripts/test_mediacodec_error.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and drives
+the production receive_frame callback, the codec callbacks and the flush
+against a fake codec, on the asynchronous and the polled decoder: an error
+the codec reported before a seek, a flush the codec failed and a restart it
+failed each stay the decoder's answer on every later call, across later
+seeks too, so mpv's hardware-decoding fallback runs; a seek without an error
+decodes on. Pass an already-patched source directory as the first argument
+to run offline.
+
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding

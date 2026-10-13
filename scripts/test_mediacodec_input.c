@@ -68,9 +68,11 @@ typedef struct MediaCodecDecContext {
     ssize_t current_input_buffer;
     int input_since_flush;
     // Asynchronous mode is never taken here (see the stubs below); the paths
-    // that consult it are extracted production code, so the state exists.
+    // that consult it, and the sticky codec error the polled dequeue
+    // answers, are extracted production code, so the state exists.
     int async_mode;
     int async_generation;
+    int async_error;
     AVMutex async_lock;
     AVFifo *async_input;
 } MediaCodecDecContext;

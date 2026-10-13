@@ -100,6 +100,9 @@ jobs:
       - name: Test MediaCodec flush before the first input
         run: bash ./scripts/test_mediacodec_flush.sh
 
+      - name: Test MediaCodec errors across a flush
+        run: bash ./scripts/test_mediacodec_error.sh
+
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh
 
