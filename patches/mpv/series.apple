@@ -38,3 +38,4 @@
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
 0037-avfoundation-skip-redundant-per-frame-metadata.patch
+0038-avfoundation-wait-for-renderer-readiness.patch
