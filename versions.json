@@ -132,6 +132,18 @@
       ],
       "overrides": {}
     },
+    "libaribcaption": {
+      "kind": "git",
+      "version": "v1.1.2",
+      "url": "https://github.com/xqq/libaribcaption",
+      "ref": "v1.1.2",
+      "commit": "c64c23b8905ba514b87c9789269e9f66f949ffe0",
+      "provenance": "ARIB STD-B24 caption decoder for the windows ffmpeg. winbuild builds the master tip and compiles it with -DHAVE_OPENSSL=1; master 6c3b4f36 (2026-10-06) renamed the bundled MD5 to aribcc_md5_* and stopped mapping it to OpenSSL's, while src/base/md5.c is still compiled out under HAVE_OPENSSL, so the master tip leaves aribcc_md5_init/update/final undefined and the ffmpeg link fails. v1.1.2 is the newest release and predates the rename. Lightweight tag; resolved 2026-10-13 from the GitHub tags and git refs APIs and frozen by commit.",
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
     "dav1d": {
       "kind": "git",
       "version": "1.5.3",

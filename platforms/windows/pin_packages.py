@@ -92,12 +92,17 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 #     algorithms, and LibreSSL servers reject a ClientHello with more than
 #     32 with a decode_error alert, so ffmpeg's https could not reach them
 #     (edde746/plezy#2604). Pinned to a release.
+#   libaribcaption: winbuild compiles it with -DHAVE_OPENSSL=1, and master
+#     since 6c3b4f36 calls its own renamed MD5 while md5.c is still compiled
+#     out under that define, so the ffmpeg link fails on undefined
+#     aribcc_md5_* symbols. Pinned to the release before the rename.
 EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
     "svt-av1": "packages/svtav1.cmake",
     "nv-codec-headers": "packages/nvcodec-headers.cmake",
     "openssl": "packages/openssl.cmake",
+    "libaribcaption": "packages/libaribcaption.cmake",
 }
 GROUP = "windows"
 # The meta-build checkout build.sh fetches: its commit pins the whole
