@@ -4,15 +4,18 @@
 # checkout at the pinned winbuild commit contains.
 #
 # Source: https://github.com/shinchiro/mpv-winbuild-cmake
-# Commit: cd1edc11dc6887a50f705717619d879f5a93a488 (master tip, resolved
-#         2026-09-01 via `git ls-remote ... refs/heads/master`; the same
-#         commit versions.json pins as component mpv-winbuild-cmake)
+# Commit: 87e22100409984f2e46fc1895e3265a64f999893 (the master commit after
+#         the original pin cd1edc11, which resolved 2026-09-01 via
+#         `git ls-remote ... refs/heads/master`; the same commit
+#         versions.json pins as component mpv-winbuild-cmake)
 # Fetched: 2026-09-01, raw.githubusercontent.com/<repo>/<commit>/packages/<f>
 # (custom_steps.cmake, mingw-w64.cmake and llvm.cmake: same commit, cmake/,
 # toolchain/ and toolchain/llvm/ respectively, copied from a verified local
 # checkout at the pin 2026-09-01; openssl.cmake: same commit, packages/,
 # fetched 2026-10-08; davs2.cmake: same commit, packages/, copied from a
-# shallow fetch of the pin 2026-10-13)
+# shallow fetch of the pin 2026-10-13). Moving the pin to 87e22100 on
+# 2026-10-13 changed none of them: all eleven were re-fetched from
+# raw.githubusercontent.com at the new commit and hash as listed below.
 #
 # sha256 of each fixture as fetched:
 #   359c9c7da360f57d3a438e6fe117af6169cbd9aa3672751fd2bfc31e02be8fff  ffmpeg.cmake
