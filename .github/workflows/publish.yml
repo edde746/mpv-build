@@ -65,6 +65,9 @@ jobs:
       - name: Test spatial audio session ownership
         run: bash ./scripts/test_spatial_session.sh
 
+      - name: Test build process output capture
+        run: bash ./scripts/test_build_process.sh
+
       - name: Test AVFoundation timebase servo
         run: ./scripts/test_avf_timebase_servo.sh
 
