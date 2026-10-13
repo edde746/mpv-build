@@ -13,7 +13,7 @@
 # The fixture is three tiny static frameworks (macOS with its versioned
 # symlink layout, iOS, iOS simulator) built from one C file, so the real
 # xcodebuild runs in seconds. The second merge runs later, under another time
-# zone, from a fresh copy of the artifacts.
+# zone and umask, from a fresh copy of the artifacts.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory() as tmp:
         (out / f"Probe-all-0123456789ab-leg{index}.zip").write_bytes(f"prebuilt {leg}\n".encode())
 
     runs = []
-    for name, tz, umask in (("first", "UTC", 0o022), ("second", "Pacific/Auckland", 0o022)):
+    for name, tz, umask in (("first", "UTC", 0o022), ("second", "Pacific/Auckland", 0o077)):
         work = tmp / name
         work.mkdir()
         shutil.copytree(partials, work / "partials", symlinks=True)
@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory() as tmp:
             (first / name).read_bytes() == (partials / leg / name).read_bytes(),
             f"{name}: a prebuilt zip must pass through unchanged",
         )
-    print(f"two merges, different clock and TZ: {identical} of {len(produced)} zips byte-identical")
+    print(f"two merges, different clock, TZ and umask: {identical} of {len(produced)} zips byte-identical")
 
     with zipfile.ZipFile(merged) as archive:
         entries = archive.infolist()
@@ -196,6 +196,19 @@ for workflow in sorted((root / ".github" / "workflows").glob("*.yml")):
         f"{workflow.name}: xcframeworks are merged by {merge.name}, not a workflow script",
     )
 print(f"the merge is keyed through {', '.join(covering) or 'nothing'}; no workflow builds xcframeworks itself")
+
+# The merged zips and the driver's per-platform zips are one recipe in two
+# languages; the normalized stamp and mode must not drift apart.
+import merge_xcframeworks  # noqa: E402
+
+swift_zip = (root / "Sources/BuildScripts/XCFrameworkBuild/base.swift").read_text(encoding="utf-8")
+swift_zip = swift_zip[swift_zip.index("static func deterministicZip("):]
+swift_zip = swift_zip[:swift_zip.index("\n    }\n")]
+for name in ("NORMALIZED_MTIME", "NORMALIZED_MODE"):
+    value = getattr(merge_xcframeworks, name)
+    check(value in swift_zip, f"base.swift's deterministicZip must use {name} {value!r} too")
+check("/usr/bin/zip -q -X -y" in swift_zip, "base.swift's deterministicZip must run /usr/bin/zip -q -X -y")
+print("merge and driver zip with the same stamp, mode and zip flags")
 
 if failures:
     print(f"{len(failures)} failure(s)")

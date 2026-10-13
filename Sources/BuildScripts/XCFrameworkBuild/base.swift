@@ -846,14 +846,22 @@ class BaseBuild {
     /// immutable assets and skips re-uploading an existing name, so a rebuild
     /// of the same key MUST produce the identical archive or the recorded
     /// checksum drifts from the published bytes (this happened: zip stores
-    /// each file's DOS mtime, so every rebuild differed). Normalize mtimes,
+    /// each file's DOS mtime, so every rebuild differed). Normalize mtimes and
+    /// modes (zip stores the mode, which otherwise follows the umask),
     /// strip extended attributes (-X), keep symlinks (-y) and feed entries in
-    /// sorted order.
+    /// sorted order. The tools are the system's by absolute path: the driver's
+    /// PATH puts Homebrew first, and another zip writes other bytes.
+    /// scripts/merge_xcframeworks.py zips the merged XCFrameworks the same
+    /// way; keep the two in step.
     static func deterministicZip(entry: String, zipFile: URL, currentDirectoryURL: URL) throws {
-        _ = Utility.shell("find \(entry) -exec touch -h -t 202001010000 {} +", currentDirectoryURL: currentDirectoryURL)
         _ = try Utility.launch(
             path: "/bin/bash",
-            arguments: ["-c", "find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C sort | zip -q -X -y '\(zipFile.path)' -@"],
+            arguments: ["-c", "/usr/bin/find \(entry) -exec /bin/chmod -h u+rw,go-w,a+rX {} + -exec /usr/bin/touch -h -t 202001010000 {} +"],
+            currentDirectoryURL: currentDirectoryURL
+        )
+        _ = try Utility.launch(
+            path: "/bin/bash",
+            arguments: ["-c", "set -o pipefail; /usr/bin/find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C /usr/bin/sort | /usr/bin/zip -q -X -y '\(zipFile.path)' -@"],
             currentDirectoryURL: currentDirectoryURL
         )
     }

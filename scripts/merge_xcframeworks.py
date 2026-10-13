@@ -21,9 +21,11 @@ So a run that rebuilt a key whose assets an earlier run had published (its
 manifest commit lost a push race) failed on Libavcodec. The slices are now
 sorted by LibraryIdentifier, and the zip is made the way the driver's
 deterministicZip makes the per-platform ones: every mtime set to 2020-01-01,
-regular files and symlinks only, in byte order, no extra attributes (-X),
-symlinks kept (-y). This file produces keyed bytes, so it is one of the apple
-group's driver sources in keys.py: changing it moves every apple key.
+modes normalized (create-xcframework writes Info.plist with the umask's
+mode, which zip stores), regular files and symlinks only, in byte order, no
+extra attributes (-X), symlinks kept (-y). This file produces keyed bytes, so
+it is one of the apple group's driver sources in keys.py: changing it moves
+every apple key.
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ from pathlib import Path
 # 2020-01-01 00:00 local time, the stamp base.swift's deterministicZip uses
 # (`touch -t 202001010000`); zip stores the local DOS time.
 NORMALIZED_MTIME = "202001010000"
+# The mode base.swift's deterministicZip gives every member: owner rw, no
+# group/other write, read for all, execute for all where anyone had it.
+NORMALIZED_MODE = "u+rw,go-w,a+rX"
 
 
 def canonicalize_info_plist(xcframework: Path) -> None:
@@ -53,7 +58,9 @@ def canonicalize_info_plist(xcframework: Path) -> None:
 
 
 def deterministic_zip(entry: str, zip_file: Path, cwd: Path) -> None:
-    subprocess.run(["/usr/bin/find", entry, "-exec", "/usr/bin/touch", "-h", "-t", NORMALIZED_MTIME, "{}", "+"],
+    subprocess.run(["/usr/bin/find", entry,
+                    "-exec", "/bin/chmod", "-h", NORMALIZED_MODE, "{}", "+",
+                    "-exec", "/usr/bin/touch", "-h", "-t", NORMALIZED_MTIME, "{}", "+"],
                    cwd=cwd, check=True)
     members = []
     for directory, dirnames, filenames in os.walk(cwd / entry):
