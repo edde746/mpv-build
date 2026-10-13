@@ -367,7 +367,7 @@ index 0000000..e5ab453
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
 @@ -0,0 +1,268 @@
-+import AVFoundation
++@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
 +// Compiled with SpatialAudioBridge's renderer sources into libmpv. The C side
