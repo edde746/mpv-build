@@ -99,13 +99,14 @@ for platform in iOS tvOS; do
 from pathlib import Path
 import sys
 
-text = Path(sys.argv[1]).read_text()
-live = text.split('# Symbols:\n', 1)[1].split('# Dead Stripped Symbols:', 1)[0]
+# Link maps can contain non-UTF-8 symbol names; the required markers are ASCII.
+text = Path(sys.argv[1]).read_bytes()
+live = text.split(b'# Symbols:\n', 1)[1].split(b'# Dead Stripped Symbols:', 1)[0]
 matches = [line for line in live.splitlines()
-           if line.split() and line.split()[-1] == '_mp_spatial_create']
+           if line.split() and line.split()[-1] == b'_mp_spatial_create']
 if not matches:
     raise SystemExit(f'{sys.argv[2]}: spatial entry point missing from live link map')
-print(f'{sys.argv[2]}: live spatial entry point: {matches[0]}')
+print(f'{sys.argv[2]}: live spatial entry point: {matches[0].decode("ascii", errors="backslashreplace")}')
 PY
     xcrun nm -gUj "$binary" > "$work/global-symbols.txt"
     if grep -q '^_mp_spatial_create$' "$work/global-symbols.txt"; then
