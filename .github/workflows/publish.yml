@@ -264,6 +264,12 @@ jobs:
             --platform ${{ matrix.platform_type }} \
             --release-dir dist/release
 
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. A stamp
+      # publishes fine once and fails only the rebuild, weeks later.
+      - name: Check the zips for a build date (${{ matrix.name }})
+        run: bash scripts/test_build_date.sh dist/release/*.zip
+
       - name: Upload platform build (${{ matrix.name }})
         uses: actions/upload-artifact@v4
         with:
@@ -290,6 +296,9 @@ jobs:
 
       - name: Merge platform XCFrameworks
         run: python3 scripts/merge_xcframeworks.py dist/partials dist/release
+
+      - name: Check the merged XCFrameworks for a build date
+        run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Name frameworks by content and record them
         run: python3 scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
@@ -360,10 +369,10 @@ jobs:
         run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
 
       # A rebuild of a published key has to reproduce its bytes (publish-assets
-      # refuses anything else), so no file may carry this build's clock. A
-      # stamp publishes fine once and fails only the rebuild, weeks later.
+      # refuses anything else), so no file may carry a build's clock. A stamp
+      # publishes fine once and fails only the rebuild, weeks later.
       - name: Check the tarball for a build date (${{ matrix.abi }})
-        run: bash scripts/test_android_build_date.sh dist/release/libmpv-android-${{ matrix.abi }}.tar.gz
+        run: bash scripts/test_build_date.sh dist/release/libmpv-android-${{ matrix.abi }}.tar.gz
 
       - name: Upload platform build (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
@@ -402,6 +411,11 @@ jobs:
           KEY="$(python3 scripts/keys.py keys --platform-group linux \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["libmpv-linux"])')"
           KEY="${KEY}" ARCH=${{ matrix.arch }} bash platforms/linux/container-build.sh
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock.
+      - name: Check the tarball for a build date (${{ matrix.arch }})
+        run: bash scripts/test_build_date.sh dist/release/*.tar.zst
 
       - name: Upload platform build (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
@@ -504,6 +518,13 @@ jobs:
       # uploads it as-is; publish records every variant at once.
       - name: Package dev zip (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. The scan
+      # reaches back to 2020: a restored build tree keeps the stamps of the
+      # runs that compiled each package, weeks before this one.
+      - name: Check the zip for a build date (${{ matrix.arch }})
+        run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Save build state cache
         if: always()

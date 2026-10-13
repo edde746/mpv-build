@@ -134,7 +134,8 @@ compile cache, in a tree without `.source-date-epoch` (the toolchain is kept),
 and writes the marker before building.
 
 The zip itself is sorted, `-X`, with every mtime at 2020-01-01 and every mode
-at `u+rw,go-w,a+rX`, as the apple zips are, so the umask has no say.
+at `u+rw,go-w,a+rX`, as the apple zips are, so the umask has no say. The build
+leg runs `scripts/test_build_date.sh` on it before upload.
 
 A rebuild only reproduces from a restored tree: 57 of the 95 git packages at
 the pinned winbuild commit name no `GIT_TAG` or `GIT_RESET` and clone a branch

@@ -167,10 +167,15 @@ A rebuild of a published content key has to reproduce the published tarballs
 byte for byte, so no Android library may record when it was built: mpv is
 configured with `-Dbuild-date=false`, and OpenSSL, whose "built on" date ffmpeg
 links into `libavformat.so`, builds with `SOURCE_DATE_EPOCH` fixed to the
-tarballs' 2020-01-01 mtime. Each build leg runs
-`bash scripts/test_android_build_date.sh <tarball>`, which fails when any file
-in it carries a clock reading from the day of the build (`--day YYYY-MM-DD`
-checks an older tarball against the day it was built).
+tarballs' 2020-01-01 mtime. Every build leg of every group (and the Apple
+merge) runs `bash scripts/test_build_date.sh <asset>...` before uploading. It
+unpacks each `.tar.gz`, `.tar.zst` or `.zip` and fails when a file carries a
+clock reading from any day since 2020-01-02: `__DATE__`, asctime, ISO 8601 or
+RFC 2822 text, a PE or COFF `TimeDateStamp`, an ar member mtime, a Mach-O dylib
+timestamp, or an archive entry's own mtime. The range reaches back that far
+because a restored Windows build tree keeps the stamps of the runs that
+compiled each package. `--day YYYY-MM-DD` checks an older asset against the
+day it was built.
 
 Run the host-side MediaCodec timing regression with
 `bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
