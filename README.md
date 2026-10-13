@@ -163,6 +163,15 @@ patches or source pins, move the old `platforms/android/deps` and
 An obsolete prebuilt-only `deps/libdovi` is explicitly rejected. Use a fresh
 build before packaging; changing patch files does not update installed binaries.
 
+A rebuild of a published content key has to reproduce the published tarballs
+byte for byte, so no Android library may record when it was built: mpv is
+configured with `-Dbuild-date=false`, and OpenSSL, whose "built on" date ffmpeg
+links into `libavformat.so`, builds with `SOURCE_DATE_EPOCH` fixed to the
+tarballs' 2020-01-01 mtime. Each build leg runs
+`bash scripts/test_android_build_date.sh <tarball>`, which fails when any file
+in it carries a clock reading from the day of the build (`--day YYYY-MM-DD`
+checks an older tarball against the day it was built).
+
 Run the host-side MediaCodec timing regression with
 `bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
 It applies the full Android series to pinned mpv and extracts the production

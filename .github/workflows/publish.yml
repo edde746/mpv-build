@@ -359,6 +359,12 @@ jobs:
       - name: Package per-ABI tarball (${{ matrix.abi }})
         run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
 
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry this build's clock. A
+      # stamp publishes fine once and fails only the rebuild, weeks later.
+      - name: Check the tarball for a build date (${{ matrix.abi }})
+        run: bash scripts/test_android_build_date.sh dist/release/libmpv-android-${{ matrix.abi }}.tar.gz
+
       - name: Upload platform build (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
         with:
