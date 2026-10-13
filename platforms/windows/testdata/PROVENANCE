@@ -11,7 +11,8 @@
 # (custom_steps.cmake, mingw-w64.cmake and llvm.cmake: same commit, cmake/,
 # toolchain/ and toolchain/llvm/ respectively, copied from a verified local
 # checkout at the pin 2026-09-01; openssl.cmake: same commit, packages/,
-# fetched 2026-10-08)
+# fetched 2026-10-08; davs2.cmake: same commit, packages/, copied from a
+# shallow fetch of the pin 2026-10-13)
 #
 # sha256 of each fixture as fetched:
 #   359c9c7da360f57d3a438e6fe117af6169cbd9aa3672751fd2bfc31e02be8fff  ffmpeg.cmake
@@ -24,6 +25,7 @@
 #   4649b91fa340471263d52ef23fcd5dd0ff520dc60e91df564ce1059c4be27c9e  svtav1.cmake
 #   ada268ec2e56867a085e66f491e4bdce80bc2ccf84e591ecef75030ee04cab9f  nvcodec-headers.cmake
 #   79cd848d11ebb59ccc55db4fa237e94d600428bbd9ae255c9abeb613ca4be8fc  openssl.cmake
+#   0a8183fbcb5eb2c9ed6eec17ffd3e47d33663c484f5834b5a32e235ae3d772a2  davs2.cmake
 #
 # mpv/ffmpeg/libass are the files pin_packages.py rewrites (pristine upstream:
 # no GIT_TAG, no GIT_RESET, no PATCH_COMMAND -- they track master).
@@ -40,7 +42,9 @@
 # custom_steps.cmake carries the check-git step whose injection
 # pin_packages.neutralize_check_git suppresses for warm-cache correctness; the
 # tests assert the audited idiom still matches and that the rewrite converges.
+# davs2.cmake carries the configure step that pin_davs2_build_time extends
+# with a rewrite of the build time davs2's version.sh reads from `date`.
 #
 # When bumping the mpv-winbuild-cmake pin in versions.json, refresh these
-# ten fixtures from the new commit and update the hashes above;
+# eleven fixtures from the new commit and update the hashes above;
 # test_pin_packages.py asserts them, so a stale fixture fails the suite.

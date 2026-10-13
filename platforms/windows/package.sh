@@ -47,8 +47,10 @@ rm -f "$ASSET"
 # Reproducible bytes: the release skips re-uploading an existing
 # content-addressed name, so a rebuild of the same key MUST produce the
 # identical archive or the recorded checksum drifts from the published bytes.
-# zip stores each file's DOS mtime, so normalize them; sorted input and -X
-# (no extra fs attributes) cover the rest.
+# zip stores each file's DOS mtime and mode, so normalize both (the mode the
+# apple zips use: the tree's modes come from the umask the build ran under);
+# sorted input and -X (no extra fs attributes) cover the rest.
 (cd "$DEV_DIR" && find . -type f -exec touch -t 202001010000 {} + \
+  && find . -type f -exec chmod u+rw,go-w,a+rX {} + \
   && find . -type f | LC_ALL=C sort | zip -q -X -9 "$ASSET" -@)
 echo "$ASSET"

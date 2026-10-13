@@ -31,6 +31,7 @@ import pin_packages  # noqa: E402
 CHECKOUT_FILES = {f"{c}.cmake": f"packages/{c}.cmake" for c in pin_packages.COMPONENTS}
 CHECKOUT_FILES.update({Path(r).name: r for r in pin_packages.EXTRA_COMPONENTS.values()})
 CHECKOUT_FILES["custom_steps.cmake"] = "cmake/custom_steps.cmake"
+CHECKOUT_FILES["davs2.cmake"] = "packages/davs2.cmake"
 COMPONENT_FILES = {c: f"{c}.cmake" for c in pin_packages.COMPONENTS}
 COMPONENT_FILES.update({c: Path(r).name for c, r in pin_packages.EXTRA_COMPONENTS.items()})
 IDIOM_FIXTURE = "mbedtls.cmake"
@@ -220,6 +221,8 @@ class PinPackagesTest(unittest.TestCase):
         steps = (self.winbuild / "cmake/custom_steps.cmake").read_text(encoding="utf-8")
         self.assertNotIn(pin_packages.CHECK_GIT_ORIGINAL, steps)
         self.assertIn(pin_packages.CHECK_GIT_NEUTRALIZED, steps)
+        davs2 = (self.winbuild / "packages/davs2.cmake").read_text(encoding="utf-8")
+        self.assertIn(pin_packages.DAVS2_BUILD_TIME, davs2)
 
     def test_main_converges_on_a_second_run(self):
         self.run_main()
@@ -306,6 +309,23 @@ class PinPackagesTest(unittest.TestCase):
         self.assertIn("vapoursynth\n", gated)
         self.assertEqual(len(text.splitlines()) - 2, len(gated.splitlines()))
         self.assertEqual(pin_packages.gate_mpv_options(gated), gated)
+
+    def test_davs2_build_time_is_pinned_after_configure(self):
+        # version.sh writes `date` into source/version.h from configure; the
+        # rewrite runs right after it, before the build compiles the header.
+        text = (TESTDATA / "davs2.cmake").read_text(encoding="utf-8")
+        self.assertEqual(text.count(pin_packages.DAVS2_CONFIGURE_END), 1)
+        self.assertNotIn("XBUILD_TIME", text)
+        pinned = pin_packages.pin_davs2_build_time(text)
+        self.assertEqual(
+            keyword_sequence(pinned, {"CONFIGURE_COMMAND", "COMMAND", "BUILD_COMMAND"}),
+            ["CONFIGURE_COMMAND", "COMMAND", "BUILD_COMMAND"],
+        )
+        self.assertIn("        ${disable_asm}\n" + pin_packages.DAVS2_BUILD_TIME, pinned)
+        self.assertEqual(len(text.splitlines()) + 1, len(pinned.splitlines()))
+        self.assertEqual(pin_packages.pin_davs2_build_time(pinned), pinned)
+        with self.assertRaises(SystemExit):
+            pin_packages.pin_davs2_build_time(text.replace("${disable_asm}", "--enable-asm"))
 
     def test_neutralize_check_git_suppresses_and_converges(self):
         text = (TESTDATA / "custom_steps.cmake").read_text(encoding="utf-8")

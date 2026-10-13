@@ -386,6 +386,39 @@ def gate_ffmpeg_cuda(text):
     return FFMPEG_CUDA_GUARD + text.replace(FFMPEG_CUDA_ORIGINAL, FFMPEG_CUDA_GATED, 1)
 
 
+# davs2 (ffmpeg's AVS2 decoder, linked into libmpv-2.dll) logs the
+# XBUILD_TIME its version.sh writes into source/version.h, and version.sh
+# reads `date`, not SOURCE_DATE_EPOCH: published key 442b5d101e4c carries
+# "2026-09-01 18:33:07" from the run that first built it. Its configure runs
+# version.sh once and nothing regenerates the header, so the configure step
+# gains a rewrite of the value to build.sh's SOURCE_DATE_EPOCH, 2020-01-01
+# 00:00:00 UTC. One quoted argument: ${EXEC} evals it in a shell, as
+# upstream's own `find ... " ! -iname '*.cmake' "` steps do.
+DAVS2_CONFIGURE_END = (
+    "        ${disable_asm}\n"
+    "    BUILD_COMMAND ${MAKE} -C <SOURCE_DIR>/build/linux\n"
+)
+DAVS2_BUILD_TIME = (
+    "    COMMAND ${EXEC} \"sed -i -e '/define XBUILD_TIME/"
+    "s/[0-9][-0-9]* [0-9][:0-9]*/2020-01-01 00:00:00/' <SOURCE_DIR>/source/version.h\"\n"
+)
+
+
+def pin_davs2_build_time(text):
+    """davs2.cmake text with the generated build time pinned; pure for
+    tests."""
+    end = DAVS2_CONFIGURE_END.replace("    BUILD_COMMAND", DAVS2_BUILD_TIME + "    BUILD_COMMAND")
+    if end in text:
+        return text
+    if text.count(DAVS2_CONFIGURE_END) != 1:
+        fail(
+            "packages/davs2.cmake: the configure step no longer ends in the "
+            "audited shape; re-audit the davs2 build-time rewrite against the "
+            "new winbuild commit before pinning to it"
+        )
+    return text.replace(DAVS2_CONFIGURE_END, end, 1)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
@@ -457,6 +490,15 @@ def main(argv):
             toolchain_file.write_text(pinned, encoding="utf-8")
         converted = ", upstream patch step converted to git apply" if patched else ""
         print(f"pinned {component} -> {pins['ref']} @ {pins['commit'][:10]}{converted}")
+
+    davs2 = packages_dir / "davs2.cmake"
+    if not davs2.is_file():
+        fail(f"{davs2}: missing")
+    davs2_text = davs2.read_text(encoding="utf-8")
+    pinned = pin_davs2_build_time(davs2_text)
+    if pinned != davs2_text:
+        davs2.write_text(pinned, encoding="utf-8")
+    print("pinned davs2's generated build time to the epoch in packages/davs2.cmake")
 
     custom_steps = winbuild / "cmake" / "custom_steps.cmake"
     if not custom_steps.is_file():
