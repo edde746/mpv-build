@@ -29,7 +29,9 @@ typedef void JNIEnv;
 typedef void *jobject;
 typedef struct window { int refs; bool entered, release; } ANativeWindow;
 struct mediacodec_geometry { int width; };
-struct mediacodec_opts { char *video_rect; int osd_vsync_delay; int64_t osd_surface; };
+struct mediacodec_opts {
+    char *video_rect; int osd_vsync_delay; int64_t osd_surface; bool present_trace;
+};
 struct m_config_cache { struct mediacodec_opts *opts; bool dirty; };
 struct mp_osd_res { int w, h; };
 struct osd_slot { void *sbs; };
@@ -62,6 +64,7 @@ struct priv {
     struct osd_ahead osd;
     struct mediacodec_geometry osd_geometry;
     int osd_vsync_delay;
+    bool present_trace;
     struct osd_plane_stats plane;
     double osd_pts;
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
@@ -202,6 +205,12 @@ int main(void)
     cache.dirty = true;
     update_opts(&vo);
     assert(!p.osd_threads_created && !p.osd_window && b.refs == 0);
+    // The present trace is a video-plane switch: it follows the option with
+    // no OSD plane at all.
+    opts.present_trace = true;
+    cache.dirty = true;
+    update_opts(&vo);
+    assert(p.present_trace);
     osd_uninit(&vo);
     assert(freed == 1);
 
@@ -217,6 +226,7 @@ int main(void)
     assert(p.osd_threads_created && !p.osd.terminate && b.refs == 1);
     osd_uninit(&vo);
     assert(b.refs == 0);
-    puts("PASS: OSD rebind waits for producer retirement, releases once, and restarts without stale state");
+    puts("PASS: OSD rebind waits for producer retirement, releases once, restarts without "
+         "stale state, and the present trace follows its option without an OSD plane");
     return 0;
 }

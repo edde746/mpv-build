@@ -375,22 +375,22 @@ static void test_present_reports_match_intents(void)
 {
     struct present_stats s = {0};
     const int64_t period = 16666667;
-    present_record(&s, 1000, EPOCH, period);
-    present_record(&s, 2000, EPOCH + 3 * period, period);
-    present_record(&s, 3000, 0, period);
-    present_observe(&s, 2000, EPOCH + 3 * period + MS, period);
+    present_record(&s, 1000, EPOCH, period, 0);
+    present_record(&s, 2000, EPOCH + 3 * period, period, 0);
+    present_record(&s, 3000, 0, period, 0);
+    present_observe(&s, 2000, EPOCH + 3 * period + MS, period, NULL);
     CHECK_EQ(s.measured, 1, "a report matches its intent by media time, in any order");
     CHECK_EQ(s.hist[2], 1, "a present within half a period is on time");
     CHECK_EQ(s.err_last_ns, MS, "the error is the report against the intended vsync");
-    present_observe(&s, 1000, EPOCH + period + 2 * MS, period);
+    present_observe(&s, 1000, EPOCH + period + 2 * MS, period, NULL);
     CHECK_EQ(s.hist[3], 1, "one period late lands in the +1 bucket");
     CHECK_EQ(s.err_worst_ns, period + 2 * MS, "the worst error is kept by magnitude");
-    present_observe(&s, 3000, EPOCH + 9 * period, period);
+    present_observe(&s, 3000, EPOCH + 9 * period, period, NULL);
     CHECK_EQ(s.untimed, 1, "a report for an untimed release is untimed, not measured");
     CHECK_EQ(s.measured, 2, "untimed releases never enter the histogram");
-    present_observe(&s, 2000, EPOCH, period);
+    present_observe(&s, 2000, EPOCH, period, NULL);
     CHECK_EQ(s.unmatched, 1, "a second report for a retired intent is unmatched");
-    present_observe(&s, 4000, EPOCH, period);
+    present_observe(&s, 4000, EPOCH, period, NULL);
     CHECK_EQ(s.unmatched, 2, "a report nobody intended is unmatched");
     CHECK_EQ(present_failures(&s), 1, "an untimed present is a failure, unmatched reports are not");
     CHECK_EQ(s.missed, 0, "reports out of release order are never read as a hold");
@@ -401,20 +401,20 @@ static void test_present_reports_match_intents(void)
     // hold chain restarts on the first pair of real times.
     struct present_stats z = {0};
     for (int n = 0; n < 4; n++) {
-        present_record(&z, n, EPOCH + n * period, period);
-        CHECK_EQ(present_observe(&z, n, 0, period), false,
+        present_record(&z, n, EPOCH + n * period, period, 0);
+        CHECK_EQ(present_observe(&z, n, 0, period, NULL), false,
                  "a report a second or more off its vsync is not a hold");
     }
     CHECK_EQ(z.unclocked, 4, "reports off the vsync clock are unclocked");
     CHECK_EQ(z.measured + z.missed + z.untimed, 0, "and neither measured, missed nor untimed");
     CHECK_EQ(present_failures(&z), 0, "an unmeasurable platform is not a failure");
-    present_record(&z, 4, EPOCH + 4 * period, period);
-    present_observe(&z, 4, EPOCH + 4 * period, period);
-    present_record(&z, 5, EPOCH + 5 * period, period);
-    CHECK_EQ(present_observe(&z, 5, EPOCH + 7 * period, period), true,
+    present_record(&z, 4, EPOCH + 4 * period, period, 0);
+    present_observe(&z, 4, EPOCH + 4 * period, period, NULL);
+    present_record(&z, 5, EPOCH + 5 * period, period, 0);
+    CHECK_EQ(present_observe(&z, 5, EPOCH + 7 * period, period, NULL), true,
              "the first pair of real times reads as a hold again");
-    present_record(&z, 6, EPOCH + 6 * period, period);
-    present_observe(&z, 6, EPOCH + 6 * period + PRESENT_REPORT_SANE_NS, period);
+    present_record(&z, 6, EPOCH + 6 * period, period, 0);
+    present_observe(&z, 6, EPOCH + 6 * period + PRESENT_REPORT_SANE_NS, period, NULL);
     CHECK_EQ(z.unclocked, 4, "exactly a second off is still a measurement");
     CHECK_EQ(z.measured, 3, "and enters the histogram");
 
@@ -425,21 +425,21 @@ static void test_present_reports_match_intents(void)
     struct present_stats t = {0};
     const int64_t offset = -period * 8 / 10;
     for (int n = 0; n < 6; n++) {
-        present_record(&t, n, EPOCH + n * period, period);
-        CHECK_EQ(present_observe(&t, n, EPOCH + n * period + offset + (n % 2) * MS, period),
+        present_record(&t, n, EPOCH + n * period, period, 0);
+        CHECK_EQ(present_observe(&t, n, EPOCH + n * period + offset + (n % 2) * MS, period, NULL),
                  false, "a steady early report is not a miss");
     }
     CHECK_EQ(t.hist[1], 6, "the histogram still shows where the reports land");
     CHECK_EQ(t.missed, 0, "nothing missed at a steady offset");
-    present_record(&t, 6, EPOCH + 6 * period, period);
-    CHECK_EQ(present_observe(&t, 6, EPOCH + 7 * period + offset, period), true,
+    present_record(&t, 6, EPOCH + 6 * period, period, 0);
+    CHECK_EQ(present_observe(&t, 6, EPOCH + 7 * period + offset, period, NULL), true,
              "a frame held two vsyncs where one was due is a miss");
     CHECK_EQ(t.missed, 1, "the miss is counted");
-    present_record(&t, 7, EPOCH + 7 * period, period);
-    CHECK_EQ(present_observe(&t, 7, EPOCH + 7 * period + offset, period), false,
+    present_record(&t, 7, EPOCH + 7 * period, period, 0);
+    CHECK_EQ(present_observe(&t, 7, EPOCH + 7 * period + offset, period, NULL), false,
              "the zero-length hold that catches up is not a second miss");
-    present_record(&t, 8, EPOCH + 8 * period, period);
-    CHECK_EQ(present_observe(&t, 8, EPOCH + 8 * period + offset, period), false,
+    present_record(&t, 8, EPOCH + 8 * period, period, 0);
+    CHECK_EQ(present_observe(&t, 8, EPOCH + 8 * period + offset, period, NULL), false,
              "the next frame back on its vsync is not a miss");
     CHECK_EQ(present_failures(&t), 1, "misses are failures");
 
@@ -452,9 +452,8 @@ static void test_present_reports_match_intents(void)
     const int64_t intended[] = {0, 3, 5, 8, 10, 13, 15, 18, 20, 23, 25, 28, 30, 33};
     const int64_t shown[] = {-1, 1, 4, 6, 9, 11, 14, 16, 20, 21, 24, 26, 29, 30};
     for (size_t n = 0; n < sizeof(intended) / sizeof(intended[0]); n++) {
-        present_record(&a, n, EPOCH + intended[n] * period60, frame);
-        bool missed = present_observe(&a, n, EPOCH + shown[n] * period60 - 5 * MS,
-                                      period60);
+        present_record(&a, n, EPOCH + intended[n] * period60, frame, 0);
+        bool missed = present_observe(&a, n, EPOCH + shown[n] * period60 - 5 * MS, period60, NULL);
         CHECK_EQ(missed, n == 8 || n == 13, "3:2 in either phase is clean; "
                  "the 4-vsync hold and the lone 1-vsync hold are misses");
     }
@@ -464,27 +463,27 @@ static void test_present_reports_match_intents(void)
     // Only neighbouring releases on one grid read as a hold: a refresh-rate
     // switch, a seek and a report lost in between each start over.
     struct present_stats g = {0};
-    present_record(&g, 1, EPOCH, period);
-    present_observe(&g, 1, EPOCH, period);
-    present_record(&g, 2, EPOCH + period, period);
-    present_observe(&g, 2, EPOCH + 3 * period, period / 2);
+    present_record(&g, 1, EPOCH, period, 0);
+    present_observe(&g, 1, EPOCH, period, NULL);
+    present_record(&g, 2, EPOCH + period, period, 0);
+    present_observe(&g, 2, EPOCH + 3 * period, period / 2, NULL);
     CHECK_EQ(g.missed, 0, "a hold across a period switch is not judged");
-    present_record(&g, 3, EPOCH + 4 * period, period);
-    present_observe(&g, 3, EPOCH + 5 * period, period / 2);
+    present_record(&g, 3, EPOCH + 4 * period, period, 0);
+    present_observe(&g, 3, EPOCH + 5 * period, period / 2, NULL);
     CHECK_EQ(g.missed, 1, "the next hold on the new grid is");
     present_reset(&g);
-    present_record(&g, 4, EPOCH + 9 * period, period);
-    present_observe(&g, 4, EPOCH + 9 * period, period / 2);
+    present_record(&g, 4, EPOCH + 9 * period, period, 0);
+    present_observe(&g, 4, EPOCH + 9 * period, period / 2, NULL);
     CHECK_EQ(g.missed, 1, "a seek starts over");
-    present_record(&g, 5, EPOCH + 10 * period, period);
-    present_record(&g, 6, EPOCH + 11 * period, period);
-    present_observe(&g, 6, EPOCH + 12 * period, period / 2);
+    present_record(&g, 5, EPOCH + 10 * period, period, 0);
+    present_record(&g, 6, EPOCH + 11 * period, period, 0);
+    present_observe(&g, 6, EPOCH + 12 * period, period / 2, NULL);
     CHECK_EQ(g.missed, 1, "a report missing in between starts over");
-    present_record(&g, 7, EPOCH + 12 * period, period + 1);
-    present_observe(&g, 7, EPOCH + 13 * period, period / 2);
+    present_record(&g, 7, EPOCH + 12 * period, period + 1, 0);
+    present_observe(&g, 7, EPOCH + 13 * period, period / 2, NULL);
     CHECK_EQ(g.missed, 1, "two half-periods for a period-long frame is its cadence");
-    present_record(&g, 8, EPOCH + 14 * period, period);
-    present_observe(&g, 8, EPOCH + 13 * period + 3 * (period / 2), period / 2);
+    present_record(&g, 8, EPOCH + 14 * period, period, 0);
+    present_observe(&g, 8, EPOCH + 13 * period + 3 * (period / 2), period / 2, NULL);
     CHECK_EQ(g.missed, 2, "a ratio a rounding away from a whole number is that number");
 
     struct present_stats b = {0};
@@ -493,23 +492,73 @@ static void test_present_reports_match_intents(void)
     const int buckets[] = {0, 1, 2, 2, 2, 3, 4};
     const int counts[] = {1, 1, 1, 2, 3, 1, 1}; // the bucket's count after each edge
     for (size_t n = 0; n < sizeof(edges) / sizeof(edges[0]); n++) {
-        present_record(&b, n, EPOCH, period);
-        present_observe(&b, n, EPOCH + edges[n], period);
+        present_record(&b, n, EPOCH, period, 0);
+        present_observe(&b, n, EPOCH + edges[n], period, NULL);
         CHECK_EQ(b.hist[buckets[n]], counts[n],
                  "bucket edges sit at odd half periods like the OSD probes");
     }
-    present_record(&b, 100, EPOCH, period);
-    present_observe(&b, 100, EPOCH + period, 0);
+    present_record(&b, 100, EPOCH, period, 0);
+    present_observe(&b, 100, EPOCH + period, 0, NULL);
     CHECK_EQ(b.untimed, 1, "an unknown period cannot bucket and reads as untimed");
 
     struct present_stats o = {0};
     for (int n = 0; n < PRESENT_INTENTS + 2; n++)
-        present_record(&o, n, EPOCH, period);
+        present_record(&o, n, EPOCH, period, 0);
     CHECK_EQ(o.overrun, 2, "intents that never got a report are counted when overwritten");
     present_reset(&o);
-    present_observe(&o, PRESENT_INTENTS + 1, EPOCH, period);
+    present_observe(&o, PRESENT_INTENTS + 1, EPOCH, period, NULL);
     CHECK_EQ(o.unmatched, 1, "a reset forgets every intent");
     CHECK_EQ(o.overrun, 2, "a reset keeps the counters");
+}
+
+// The trace reads frame by frame what the counters only sum: 3:2 on 60 Hz
+// with latch reports 0.8 of a period early (MediaTek, Tensor), and one frame
+// shown a vsync late.
+static void test_present_trace_reads_each_frame(void)
+{
+    const int64_t p60 = 16666667, frame = 41666667, lead = 50 * MS;
+    const int64_t latch = -p60 * 8 / 10;
+    const int vsyncs[] = {0, 3, 5, 8, 10};
+    const int64_t shown[] = {latch, latch, latch, p60 / 5, latch};
+    struct present_stats s = {0};
+    struct present_trace t[5];
+    for (int n = 0; n < 5; n++) {
+        int64_t vsync = EPOCH + vsyncs[n] * p60;
+        present_record(&s, n, vsync, frame, vsync - lead);
+        t[n] = (struct present_trace){0};
+        present_observe(&s, n, vsync + shown[n], p60, &t[n]);
+        CHECK_EQ(t[n].seq, n + 1, "every measured report is traced with its release");
+        CHECK_EQ(t[n].lead_ns, lead, "the lead is the vsync after the release decision");
+        CHECK_EQ(t[n].err_ns, shown[n], "the error is the report against the vsync");
+    }
+    CHECK_EQ(t[0].slot_ns, 0, "the first release has no slot");
+    CHECK_EQ(t[0].held_ns, 0, "and no hold before it");
+    CHECK_EQ(t[1].slot_ns, 3 * p60, "3:2 aims three vsyncs on");
+    CHECK_EQ(t[2].slot_ns, 2 * p60, "then two");
+    CHECK_EQ(t[1].held_ns, 3 * p60, "a frame on its latch was held its slot");
+    CHECK_EQ(t[3].held_ns, 3 * p60 + p60 / 5 - latch, "the late frame shows as a four-vsync hold");
+    CHECK_EQ(t[3].missed, 1, "which is the miss");
+    CHECK_EQ(t[4].held_ns, 2 * p60 + latch - p60 / 5, "the catch-up hold is one vsync");
+    CHECK_EQ(t[4].missed, 0, "and not a second miss");
+    CHECK_EQ(s.missed, 1, "the trace and the counter agree");
+
+    struct present_trace u = {0};
+    present_record(&s, 100, 0, frame, EPOCH);
+    present_observe(&s, 100, EPOCH, p60, &u);
+    CHECK_EQ(u.seq, 0, "an untimed release is not traced");
+    present_observe(&s, 200, EPOCH, p60, &u);
+    CHECK_EQ(u.seq, 0, "nor is a report nobody intended");
+
+    struct present_stats w = {0};
+    for (int n = 0; n <= PRESENT_INTENTS; n++)
+        present_record(&w, n, EPOCH + n * p60, frame, 0);
+    struct present_trace v = {0};
+    present_observe(&w, 1, EPOCH + p60, p60, &v);
+    CHECK_EQ(v.seq, 2, "an intent survives until the ring comes round to it");
+    CHECK_EQ(v.slot_ns, 0, "a predecessor the ring overwrote gives no slot");
+    CHECK_EQ(v.lead_ns, 0, "an unknown release time gives no lead");
+    present_observe(&w, 2, EPOCH + 2 * p60, p60, &v);
+    CHECK_EQ(v.slot_ns, p60, "an intact predecessor gives the slot");
 }
 
 // Platform fixture for the extracted production admission/draw/flip path.
@@ -520,6 +569,12 @@ static void test_present_reports_match_intents(void)
 #define OSD_STATS_INTERVAL_FRAMES 120
 #define MP_VERBOSE(...) ((void)0)
 #define MP_WARN(...) ((void)0)
+// The present trace is the one info-level line the driver writes; the
+// fixture keeps the newest and counts them.
+static char info_line[256];
+static unsigned info_lines;
+#define MP_INFO(vo, ...) \
+    ((void)(vo), info_lines++, snprintf(info_line, sizeof(info_line), __VA_ARGS__))
 
 #include "mediacodec_timing_cadence.inc"
 
@@ -586,6 +641,8 @@ struct priv {
     unsigned stats_frames;
     struct present_stats present;
     const char *present_source;
+    bool present_trace;
+    int64_t trace_vsync;
     int64_t prepared_seen_ns, cur_seen_ns;
     int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
 };
@@ -913,6 +970,55 @@ static void test_flip_records_intents_and_drains_reports(void)
              "a late release moves the failure sum too");
     CHECK_EQ(p.present.measured + p.present.untimed + p.present.unmatched, 1,
              "the display-side counters stay where the ndk session left them");
+}
+
+// --vo-mediacodec-present-trace: one line per reported frame, written by the
+// flip that drains its report, and the release side alone where the decoder
+// gives no reports.
+static void test_present_trace_lines(void)
+{
+    const int64_t period = 16666667, latch = period * 8 / 10;
+    const int64_t vsync = EPOCH + 30 * period;
+    struct priv p = {.present_trace = true, .queue_period = period};
+    struct vo vo = {.priv = &p};
+    AVMediaCodecBuffer a = {.pts = 1000000}, b = {.pts = 1050000}, c = {.pts = 1083333};
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    info_lines = 0;
+    present_feedback(&vo, &a, (struct release_target){
+        .timestamp = vsync - latch, .vsync = vsync, .now = vsync - 50 * MS});
+    CHECK_EQ(info_lines, 0, "nothing is traced before its report");
+    rendered_script[0] = (AVMediaCodecRendered){a.pts, vsync - latch};
+    rendered_scripted = 1;
+    present_feedback(&vo, &b, (struct release_target){
+        .timestamp = vsync + 3 * period - latch, .vsync = vsync + 3 * period,
+        .now = vsync + 3 * period - 50 * MS});
+    CHECK_EQ(info_lines, 1, "the report is traced by the flip that drains it");
+    CHECK_EQ(strcmp(info_line, "present-trace seq=1 pts=1.000 slot=n/a lead=50.0 "
+                               "err=-0.80 held=n/a\n"), 0,
+             "a first frame has a lead and an error but no slot or hold");
+    rendered_script[0] = (AVMediaCodecRendered){b.pts, vsync + 3 * period - latch};
+    rendered_scripted = 1;
+    present_feedback(&vo, &c, (struct release_target){
+        .timestamp = vsync + 5 * period - latch, .vsync = vsync + 5 * period,
+        .now = vsync + 5 * period - 50 * MS});
+    CHECK_EQ(strcmp(info_line, "present-trace seq=2 pts=1.050 slot=3.00 lead=50.0 "
+                               "err=-0.80 held=3.00\n"), 0,
+             "the next frame reads its slot and the hold in vsyncs");
+
+    rendered_source = "off:option";
+    present_feedback(&vo, &a, (struct release_target){
+        .timestamp = vsync + 8 * period - latch, .vsync = vsync + 8 * period,
+        .now = vsync + 8 * period - 40 * MS});
+    CHECK_EQ(strcmp(info_line, "present-trace pts=1.000 slot=3.00 lead=40.0 "
+                               "source=off:option\n"), 0,
+             "without reports the release side is traced");
+    CHECK_EQ(info_lines, 3, "one line per frame");
+    p.present_trace = false;
+    present_feedback(&vo, &b, (struct release_target){
+        .timestamp = vsync + 10 * period - latch, .vsync = vsync + 10 * period,
+        .now = vsync + 10 * period - 40 * MS});
+    CHECK_EQ(info_lines, 3, "the trace is silent unless asked for");
 }
 
 static void test_driver_refresh_and_cadence(void)
@@ -1425,9 +1531,11 @@ int main(void)
     test_stats_log_on_failure_or_heartbeat();
     test_present_reports_match_intents();
     test_flip_records_intents_and_drains_reports();
+    test_present_trace_reads_each_frame();
+    test_present_trace_lines();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
          "dropped still redraw/resume, sparse statistics and video-plane "
-         "presentation feedback");
+         "presentation feedback with its per-frame trace");
     return 0;
 }

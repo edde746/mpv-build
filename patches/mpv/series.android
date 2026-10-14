@@ -19,3 +19,4 @@
 0131-player-hand-vo-mediacodec-a-frame-without-waiting-for-the-next.patch
 0132-player-hold-the-video-chain-for-the-embedders-vo-switch.patch
 0133-ao-audiotrack-normalize-loudness-with-the-platform-effect.patch
+0135-vo-mediacodec-per-frame-present-trace.patch

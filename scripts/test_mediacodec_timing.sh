@@ -38,7 +38,8 @@ python3 "$E" range "$src" "$workdir/mediacodec_timing_driver.inc" \
 for fn in read_vsync_sample read_vsync_period read_vsync_spacing request_vsync_sample \
           vsync_sample_is_fresh plausible_period mode_period update_queue_timing \
           get_release_target prepare_osd submit_deadline prepare_frame draw_frame \
-          present_reports_on present_feedback flip_page reset_video; do
+          present_reports_on trace_vsyncs trace_ms present_trace_log present_feedback \
+          flip_page reset_video; do
     python3 "$E" symbol "$src" "$workdir/mediacodec_timing_driver.inc" --append --fn "$fn"
 done
 

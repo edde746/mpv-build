@@ -1,0 +1,275 @@
+Subject: [PATCH] vo_mediacodec: trace each frame's presentation with --vo-mediacodec-present-trace
+
+The video-present statistics only sum. When a display shows frames a
+refresh late that the VO released on time (Plezy #2654: one in seven at
+24 fps on a 60 Hz MediaTek projector), the counters say how many but not
+which: whether the misses sit on one phase of the 3:2 cadence, follow a
+short lead, or come in runs.
+
+--vo-mediacodec-present-trace=yes logs one line per frame at info level,
+written by the flip that drains the frame's rendered report: slot, how
+many vsyncs after the previous release's vsync the frame was aimed at;
+lead, how long before that vsync the release was decided; err, where the
+report landed against it, in vsyncs; held, how long the display held the
+previous frame; and whether that hold was a miss. Without rendered
+reports (no listener, or the decoder's rendered_feedback option off) the
+line carries the release side alone, with the report source. Off by
+default.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 5a5823e..56b4ea8 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -796,6 +796,17 @@ Available video output drivers are:
+     same timestamp; the embedder supplies the offset it measured. Only the
+     presentation time is shifted, the rendered pts is not.
+ 
++    ``--vo-mediacodec-present-trace=<yes|no>`` (default no) logs one
++    ``present-trace`` line per frame at info level, for reading a stutter
++    frame by frame: ``slot``, how many vsyncs after the previous release's
++    vsync the frame was aimed at; ``lead``, how many milliseconds before that
++    vsync the release was decided; ``err``, where the codec's frame-rendered
++    report landed against it, in vsyncs; and ``held``, how many vsyncs the
++    previous frame stayed on screen, followed by ``missed`` when that hold
++    was off the frame's cadence. Without frame-rendered reports (the
++    decoder's ``rendered_feedback`` AVOption off, or a platform without
++    them) only ``slot`` and ``lead`` are known.
++
+ ``mediacodec_embed`` (Android)
+     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
+     Requires ``--hwdec=mediacodec`` for hardware decoding, along with
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index f8a4b40..2a214ff 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -55,6 +55,7 @@
+  */
+ 
+ #include <dlfcn.h>
++#include <inttypes.h>
+ #include <limits.h>
+ #include <math.h>
+ #include <stdbool.h>
+@@ -352,9 +353,10 @@ static const char *stats_due(struct stats_cadence *c, uint64_t failures)
+ 
+ struct present_intent {
+     int64_t media_us;
+-    int64_t vsync;       // CLOCK_MONOTONIC vsync the release targeted, 0 untimed
+-    double duration_ns;  // the frame's display duration, <= 0 unknown
+-    uint64_t seq;        // release order, so a hold is only read between neighbours
++    int64_t vsync;      // CLOCK_MONOTONIC vsync the release targeted, 0 untimed
++    double duration_ns; // the frame's display duration, <= 0 unknown
++    int64_t released;   // CLOCK_MONOTONIC the release was decided, 0 unknown
++    uint64_t seq; // release order, so a hold is only read between neighbours
+     bool live;
+ };
+ 
+@@ -399,6 +401,21 @@ struct present_stats {
+     uint32_t unsnapped;  // releases timed without a fresh vsync sample
+ };
+ 
++// One measured frame's way to the display (--vo-mediacodec-present-trace):
++// where its vsync sat after the previous release's, how early the release
++// was decided, where the report landed and how long the previous frame was
++// held. A cadence or lead pattern behind the misses shows here, not in the
++// counters. Times are 0 where a neighbour or a clock is missing.
++struct present_trace {
++    uint64_t seq;      // the intent the report answered; 0: nothing measured
++    int64_t media_us;
++    int64_t slot_ns;   // this vsync after the previous release's
++    int64_t lead_ns;   // the vsync after the release decision
++    int64_t err_ns;    // the report against the vsync
++    int64_t held_ns;   // the report after the previous frame's
++    bool missed;
++};
++
+ // Forget the intents and the hold in progress; the counters describe the
+ // session.
+ static void present_reset(struct present_stats *s)
+@@ -410,14 +427,14 @@ static void present_reset(struct present_stats *s)
+ }
+ 
+ static void present_record(struct present_stats *s, int64_t media_us,
+-                           int64_t vsync, double duration_ns)
++                           int64_t vsync, double duration_ns, int64_t released)
+ {
+     struct present_intent *e = &s->ring[s->next];
+     if (e->live)
+         s->overrun++;
+     *e = (struct present_intent){.media_us = media_us, .vsync = vsync,
+-                                 .duration_ns = duration_ns, .seq = ++s->seq,
+-                                 .live = true};
++                                 .duration_ns = duration_ns, .released = released,
++                                 .seq = ++s->seq, .live = true};
+     s->next = (s->next + 1) % PRESENT_INTENTS;
+ }
+ 
+@@ -458,9 +475,11 @@ static bool present_hold_missed(struct present_stats *s,
+ // a failure either: the platform is unmeasurable, which the count names.
+ #define PRESENT_REPORT_SANE_NS (1 * INT64_C(1000000000))
+ 
+-// Returns whether the display held the previous frame off its cadence.
++// Returns whether the display held the previous frame off its cadence, and
++// fills [trace], when given, for a measured report.
+ static bool present_observe(struct present_stats *s, int64_t media_us,
+-                            int64_t system_nano, int64_t period_ns)
++                            int64_t system_nano, int64_t period_ns,
++                            struct present_trace *trace)
+ {
+     for (int n = 0; n < PRESENT_INTENTS; n++) {
+         struct present_intent *e = &s->ring[n];
+@@ -483,12 +502,27 @@ static bool present_observe(struct present_stats *s, int64_t media_us,
+         double vsyncs = (double)err / period_ns;
+         s->hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
+               : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
++        // The ring is written in release order: the entry before this one is
++        // the previous release (across a seek too) until a wrap overwrites it.
++        const struct present_intent *before =
++            &s->ring[(n + PRESENT_INTENTS - 1) % PRESENT_INTENTS];
++        int64_t held = s->prev.valid && s->prev.seq + 1 == e->seq
++                     ? system_nano - s->prev.system_nano : 0;
+         bool missed = present_hold_missed(s, &(struct present_hold){
+             .valid = true, .seq = e->seq, .system_nano = system_nano,
+             .duration_ns = e->duration_ns, .period_ns = period_ns,
+         });
+         if (missed)
+             s->missed++;
++        if (trace) {
++            *trace = (struct present_trace){
++                .seq = e->seq, .media_us = media_us,
++                .slot_ns = before->seq + 1 == e->seq && before->vsync
++                         ? e->vsync - before->vsync : 0,
++                .lead_ns = e->released ? e->vsync - e->released : 0,
++                .err_ns = err, .held_ns = held, .missed = missed,
++            };
++        }
+         return missed;
+     }
+     s->unmatched++;
+@@ -667,6 +701,7 @@ struct mediacodec_opts {
+     char *video_rect;
+     int osd_vsync_delay;
+     int64_t osd_surface;
++    bool present_trace;
+ };
+ 
+ #define OPT_BASE_STRUCT struct mediacodec_opts
+@@ -677,6 +712,7 @@ static const struct m_sub_options mediacodec_conf = {
+         {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
+         {"vo-mediacodec-osd-vsync-delay", OPT_INT(osd_vsync_delay),
+             M_RANGE(0, 3)},
++        {"vo-mediacodec-present-trace", OPT_BOOL(present_trace)},
+         {0},
+     },
+     .size = sizeof(struct mediacodec_opts),
+@@ -745,6 +781,10 @@ struct priv {
+     struct present_stats present;
+     struct stats_cadence present_cadence;
+     const char *present_source; // NULL until the first release
++    // --vo-mediacodec-present-trace, and the vsync the previous release
++    // targeted, for the trace's slot when no reports arrive.
++    bool present_trace;
++    int64_t trace_vsync;
+     // When the VO first saw the prepared and the current frame
+     // (CLOCK_MONOTONIC), the core's hand-off stamps of the current frame
+     // (struct vo_frame, mp_time_ns()), and how many releases
+@@ -2739,6 +2779,7 @@ static int preinit(struct vo *vo)
+     if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
+         MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
+     p->osd_vsync_delay = opts->osd_vsync_delay;
++    p->present_trace = opts->present_trace;
+     m_config_cache_set_wakeup_cb(p->opts_cache, opts_wakeup, vo);
+     vo->hwdec_devs = hwdec_devices_create();
+     p->hwctx = (struct mp_hwdec_ctx){
+@@ -2932,6 +2973,7 @@ static void update_opts(struct vo *vo)
+     if (!m_config_cache_update(p->opts_cache))
+         return;
+     struct mediacodec_opts *opts = p->opts_cache->opts;
++    p->present_trace = opts->present_trace;
+     struct mediacodec_geometry geometry;
+     bool geometry_ok = mediacodec_geometry_parse(opts->video_rect, &geometry);
+     if (!geometry_ok)
+@@ -3103,6 +3145,43 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     return VO_TRUE;
+ }
+ 
++static const char *trace_vsyncs(char buf[16], int64_t ns, int64_t period_ns)
++{
++    if (!ns || period_ns <= 0)
++        return "n/a";
++    snprintf(buf, 16, "%.2f", (double)ns / period_ns);
++    return buf;
++}
++
++static const char *trace_ms(char buf[16], int64_t ns)
++{
++    if (!ns)
++        return "n/a";
++    snprintf(buf, 16, "%.1f", ns / 1e6);
++    return buf;
++}
++
++// One line per frame while --vo-mediacodec-present-trace is on: slot and
++// held in vsyncs (2.00 and 3.00 alternating for 24p on 60 Hz), err in
++// vsyncs from the targeted vsync (-0.80 for a frame on time on Tensor and
++// MediaTek, which report the latch), lead in ms.
++static void present_trace_log(struct vo *vo, const struct present_trace *t)
++{
++    struct priv *p = vo->priv;
++    char slot[16], lead[16], err[16], held[16];
++    if (p->queue_period > 0)
++        snprintf(err, sizeof(err), "%+.2f", (double)t->err_ns / p->queue_period);
++    else
++        snprintf(err, sizeof(err), "n/a");
++    MP_INFO(vo, "present-trace seq=%" PRIu64 " pts=%.3f slot=%s lead=%s err=%s "
++                "held=%s%s\n",
++            t->seq, t->media_us / 1e6,
++            trace_vsyncs(slot, t->slot_ns, p->queue_period),
++            trace_ms(lead, t->lead_ns), err,
++            trace_vsyncs(held, t->held_ns, p->queue_period),
++            t->missed ? " missed" : "");
++}
++
+ // Record what this release aimed at, then take in what the codec has
+ // rendered since the previous flip. A report for an intent that reset_video
+ // dropped lands in unmatched, by design.
+@@ -3127,21 +3206,35 @@ static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
+     else if (target.timestamp && !target.vsync)
+         p->present.unsnapped++;
+     int missed = target.late ? 1 : 0;
++    int64_t pts = av_mediacodec_buffer_get_pts(buffer);
+     if (present_reports_on(p)) {
+-        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync,
+-                       p->cur_duration);
++        present_record(&p->present, pts, target.vsync, p->cur_duration, target.now);
+         AVMediaCodecRendered reports[16];
+         int n;
+         while ((n = av_mediacodec_drain_rendered(buffer, reports,
+                                                  MP_ARRAY_SIZE(reports))) > 0)
+         {
+             for (int i = 0; i < n; i++) {
++                struct present_trace t = {0};
+                 if (present_observe(&p->present, reports[i].media_time_us,
+-                                    reports[i].system_nano, p->queue_period))
++                                    reports[i].system_nano, p->queue_period,
++                                    p->present_trace ? &t : NULL))
+                     missed++;
++                if (t.seq)
++                    present_trace_log(vo, &t);
+             }
+         }
+-    }
++    } else if (p->present_trace) {
++        // Without reports only the release side can be traced.
++        char slot[16], lead[16];
++        MP_INFO(vo, "present-trace pts=%.3f slot=%s lead=%s source=%s\n", pts / 1e6,
++                trace_vsyncs(slot, target.vsync && p->trace_vsync
++                                   ? target.vsync - p->trace_vsync : 0,
++                             p->queue_period),
++                trace_ms(lead, target.vsync && target.now ? target.vsync - target.now : 0),
++                source);
++    }
++    p->trace_vsync = target.vsync;
+     if (missed)
+         vo_increment_drop_count(vo, missed);
+ }
