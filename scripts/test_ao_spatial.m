@@ -26,7 +26,7 @@ const char *af_fmt_to_str(int format) { return "spdif"; }
 
 struct fake_sink {
     struct mpv_global player;
-    bool refuse, ready, failed;
+    bool refuse, ready, failed, defer_ready;
     int codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, closes, ends, volumes;
@@ -65,12 +65,13 @@ void mp_spatial_volume(void *ctx, float volume)
     s->volumes++;
     s->volume = volume;
 }
-// The real renderer flushes its renderer here, then reports ready.
+// The feeder reports readiness asynchronously after processing the final input.
 void mp_spatial_end(void *ctx)
 {
     struct fake_sink *s = ctx;
     s->ends++;
-    s->ready = true;
+    if (!s->defer_ready)
+        s->ready = true;
 }
 
 static int failures;
@@ -242,8 +243,15 @@ int main(void)
 
         // At the end the renderer lets go of what it holds back, so audio shorter
         // than its startup buffer still plays.
+        s->defer_ready = true;
         end_of_stream(ao);
         CHECK(s->ends == 1, "the renderer hears the end");
+        state_of(ao);
+        CHECK(!p->clock_running && atomic_load(&p->waiting), "EOF waits for the feeder to finish");
+        CHECK(state_of(ao).free_samples == 0, "an unfinished feeder cannot admit the next file");
+        // The production Swift feeder test covers readiness with no decoded
+        // audio, including a tail that ends before a TrueHD major sync.
+        s->ready = true;
         state_of(ao);
         CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the renderer has flushed");
         CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");

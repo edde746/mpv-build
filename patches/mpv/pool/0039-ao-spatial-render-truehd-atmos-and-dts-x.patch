@@ -366,7 +366,7 @@ new file mode 100644
 index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,281 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
@@ -506,10 +506,14 @@ index 0000000..20d005c
 +                    markReady(generation)
 +                }
 +            }
-+            guard !Task.isCancelled, enqueued else { return }
-+            // A partial final IEC unit does not discard already decoded audio.
-+            try? unpacker.finish()
-+            try await renderer.endOfStream()
++            guard !Task.isCancelled else { return }
++            if enqueued {
++                // A partial final IEC unit does not discard already decoded audio.
++                try? unpacker.finish()
++                try await renderer.endOfStream()
++            }
++            // Even an empty tail must let the carrier clock drain to EOF.
++            // It may end before a major sync, or contain only filler/null bursts.
 +            markReady(generation)
 +        } catch is CancellationError {
 +        } catch {

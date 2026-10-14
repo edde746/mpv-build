@@ -463,6 +463,12 @@ refuses it and mpv decodes the track, until that player probes PCM and clears
 its latch. A second player neither inherits nor clears that failure.
 Pass an already-patched source directory to run offline.
 
+`bash scripts/test_spatial_feed.sh` exercises the production Swift feeder and
+pinned IEC unpacker with a fake renderer and synthetic bursts, without media
+or audio output. Empty, filler, null and pre-major-sync tails must become ready
+at EOF, so the AO clock can drain; failures, flushing and cancelled generations
+remain distinct. The publish workflow runs this regression too.
+
 The output is self-contained: `scripts/build_spatial.py` compiles the
 SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
 the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are

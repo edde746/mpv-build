@@ -62,6 +62,9 @@ jobs:
       - name: Test spatial audio output
         run: bash ./scripts/test_ao_spatial.sh
 
+      - name: Test spatial feeder end of stream
+        run: bash ./scripts/test_spatial_feed.sh
+
       - name: Test spatial audio session ownership
         run: bash ./scripts/test_spatial_session.sh
 
