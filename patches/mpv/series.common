@@ -1,9 +1,29 @@
-# Patches applied on every platform, before series.<platform>.
-# Keep cross-platform fixes here instead of repeating their pool entries in
-# each platform series. The resolved order is series.common first.
+# Patches applied on every platform, before series.<platform>, to the one
+# v0.41.0 pin all four groups build. Keep cross-platform fixes here instead of
+# repeating their pool entries in each platform series.
 0201-aspect-sub-video-rect-aspect-option.patch
 0026-ad-spdif-recreate-muxer-on-reset.patch
 0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch
 0102-f-output-chain-wake-after-reset-harder.patch
 0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
 0035-demux-dts-codec-profile-at-load.patch
+# Codec profile at load and the pending-vid property, for the per-file decode
+# routing an embedder decides before the decoder exists.
+0204-demux-codec-profile-from-avcc-and-hvcc.patch
+0010-player-pending-vid-property.patch
+# GLES renderers (Android, Linux ARM boards, ANGLE). Desktop GL is untouched.
+0202-opengl-treat-gles-direct-rendering-as-slow.patch
+0203-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
+# The subtitle stack: libass threading and fast blur (both from the patched
+# libass every group builds), the faster draw_bmp blend, rendering outside the
+# OSD and dec_sub locks, and the shared ahead-of-time render pipeline
+# vo_mediacodec and vo_avfoundation present through.
+0205-sd-ass-render-threads.patch
+0206-sd-ass-fast-blur.patch
+0008-draw-bmp-fast-libass-blend.patch
+0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
+0011-sub-render-horizon-for-vo-prefetch.patch
+0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared.patch
+0013-sd-ass-isolate-event-prefetch-renderer.patch
+0014-ass-mp-compact-high-overdraw-atlases.patch
+0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch

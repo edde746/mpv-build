@@ -1,42 +1,22 @@
-# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for mpv.
-# One pool filename per line; order is authoritative and nothing is sorted.
+# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for mpv, applied after
+# series.common. One pool filename per line; order is authoritative and
+# nothing is sorted.
 0001-player-add-moltenvk-context.patch
 0002-revert-build-static.patch
 0003-fix-coreaudio-hal-guards-for-non-macos.patch
 0004-avfoundation-video-output.patch
 0005-audiounit-reject-spdif.patch
 0006-avfoundation-avplayer-compressed-passthrough.patch
-0007-avfoundation-osd-performance.patch
-0008-avfoundation-coremedia-source-timebase.patch
-0009-avfoundation-sw-frame-upload-performance.patch
-0011-avfoundation-high-speed-playback.patch
-0012-avfoundation-layer-resize-tracking.patch
-0013-moltenvk-gate-presentation-on-hidden-layer.patch
-0014-avfoundation-preserve-dolby-vision-transfer.patch
 0015-avfoundation-bound-pcm-lookahead.patch
-0016-avfoundation-timebase-rate-servo.patch
-0017-avfoundation-keep-displayed-frame-on-seek.patch
-0018-avfoundation-refuse-geometry-render-for-dolby-vision.patch
 0019-avfoundation-configurable-compressed-audio.patch
 0020-avfoundation-compressed-clock-accounting.patch
 0021-avfoundation-configurable-compressed-lead.patch
 0022-avfoundation-slow-source-preroll-patience.patch
 0023-avfoundation-refuse-reads-past-the-write-head.patch
-0024-avfoundation-frame-space-osd-in-pip.patch
+# Every group but android: a MediaCodec that starts failing mid-stream rarely
+# recovers, and waiting out its error burst only delays the software fallback.
 0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch
 0028-ao-coreaudio-uninit-on-init-failure.patch
-0029-moltenvk-report-display-colorspace.patch
-0030-avfoundation-hdr10plus-per-frame-metadata.patch
-0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
-0006-sd-ass-render-threads.patch
-0011-sub-render-horizon-for-vo-prefetch.patch
-0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared.patch
-0013-sd-ass-isolate-event-prefetch-renderer.patch
-0014-ass-mp-compact-high-overdraw-atlases.patch
-0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
-0032-avfoundation-render-subtitles-through-the-shared-osd-pipeline.patch
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
-0037-avfoundation-skip-redundant-per-frame-metadata.patch
-0038-avfoundation-wait-for-renderer-readiness.patch
 0039-ao-spatial-render-truehd-atmos-and-dts-x.patch

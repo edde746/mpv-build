@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Extract the shipped geometry implementation verbatim from patch 0001.
-# Keep the marked region wholly in that patch: later patches must not edit it.
+# Extract the shipped geometry implementation verbatim from patch 0100, which
+# creates vo_mediacodec.c and carries every change to it.
 # libass rendering is exercised when an existing pkg-config installation exposes
 # libass; this script never installs dependencies.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-patch_file="$root/patches/mpv/pool/0001-vo-mediacodec-timed-surface-with-osd-plane.patch"
+patch_file="$root/patches/mpv/pool/0100-vo-mediacodec-timed-surface-with-osd-plane.patch"
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-# The geometry core ships as added lines of patch 0001.
+# The geometry core ships as added lines of patch 0100.
 python3 "$root/scripts/extract.py" region "$patch_file" "$workdir/mediacodec_geometry_core.inc" \
     --start "mediacodec geometry core" --patch --added-only --require "mediacodec_osd_geometry"
 

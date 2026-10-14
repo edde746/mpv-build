@@ -1,25 +1,21 @@
-# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for ffmpeg.
-# One pool filename per line; order is authoritative and nothing is sorted.
-# Shared with the android series: the libdovi profile 7 to 8.1 conversion
-# helper the MediaCodec and the VideoToolbox path both call. First, so its
-# Makefile lines land on the pristine file before any later patch reads them.
-0021-dolby-vision-convert-profile7-rpu-to-p81.patch
+# Apple (macOS/iOS/tvOS/Catalyst/visionOS) patch series for ffmpeg, applied
+# after series.common. One pool filename per line; order is authoritative and
+# nothing is sorted.
 0001-fix-visionos-videotoolbox.patch
 0002-videotoolbox-add-dolby-vision-hevc-format.patch
 0003-videotoolbox-convert-dolby-vision-p7.patch
 0004-videotoolbox-preserve-dolby-vision-attachments.patch
-0005-libavutil-videotoolbox-share-the-attachment-copy.patch
+0036-libavutil-videotoolbox-share-the-attachment-copy.patch
 0005-videotoolbox-tag-dolby-vision-hdr.patch
 0008-videotoolbox-set-sample-size.patch
 0009-videotoolbox-forward-dolby-vision-rpus.patch
-0010-hevc-downlevel-duplicate-dovi-rpu-log.patch
 0011-securetransport-disable-pem-import-for-catalyst.patch
 0013-videotoolbox-never-signal-dolby-vision-metadata-compression.patch
 0014-videotoolbox-fall-back-to-plain-hevc-session.patch
-0015-hevc-downlevel-skipped-nal-log.patch
 0016-videotoolbox-forward-hevc-prefix-seis.patch
 # Apple's getaddrinfo() alone swaps zero flags for AI_DEFAULT, so only this
 # series carries it.
 0027-tcp-keep-ipv4-literal-beside-nat64-synthesis.patch
-0030-hevc-skip-software-tables-under-hwaccel.patch
 0031-videotoolbox-cache-the-derived-colour-space.patch
+0033-videotoolbox-skip-the-wait-after-a-synchronous-decode.patch
+0034-videotoolbox-leave-matching-attachments-alone.patch

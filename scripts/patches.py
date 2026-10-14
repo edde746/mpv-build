@@ -300,8 +300,8 @@ def _stripped_members(component, tar):
     """The archive's members with their one top-level component dropped.
 
     An archive pin is an upstream release tarball whose every member sits
-    under a single top-level directory (ffmpeg's `ffmpeg-7.1/`, mpv's
-    `mpv-0.40.0/`), and that directory is the source tree the drivers build,
+    under a single top-level directory (lua's `lua-5.2.4/`), and that
+    directory is the source tree the drivers build,
     so exactly one top-level component has to be there to drop. A flat
     tarball, several roots, or an absolute/`..`/`.` root would otherwise
     extract the wrong tree, or nothing at all, while the fetch still reported

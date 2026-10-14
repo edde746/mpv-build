@@ -1,3 +1,16 @@
+vulkan: add a MoltenVK context
+
+The whole of context_moltenvk.m, which no upstream mpv carries. Every change
+to the file lives here instead of in a follow-up patch: a follow-up applies
+by context, so a version bump that breaks one would cascade through every
+later one, while a single file creation cannot conflict at all.
+
+Folded in, in series order:
+
+* 0013-moltenvk-gate-presentation-on-hidden-layer
+
+* 0029-moltenvk-report-display-colorspace
+
 diff --git forkSrcPrefix/meson.build forkDstPrefix/meson.build
 index fb10be5..42ece8e 100644
 --- forkSrcPrefix/meson.build
@@ -68,12 +81,12 @@ index e75cb22..afc1728 100644
  #if HAVE_COCOA
  #define VK_USE_PLATFORM_METAL_EXT
  #endif
-diff --git forkSrcPrefix/video/out/vulkan/context_moltenvk.m forkDstPrefix/video/out/vulkan/context_moltenvk.m
+diff --git a/video/out/vulkan/context_moltenvk.m b/video/out/vulkan/context_moltenvk.m
 new file mode 100644
-index 0000000..8c8354d
+index 0000000..89cb643
 --- /dev/null
-+++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
-@@ -0,0 +1,139 @@
++++ b/video/out/vulkan/context_moltenvk.m
+@@ -0,0 +1,197 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -104,6 +117,7 @@ index 0000000..8c8354d
 +    CAMetalLayer *layer;
 +    int last_width;
 +    int last_height;
++    bool was_hidden;
 +};
 +
 +// Use CAMetalLayer.drawableSize as source of truth (not vo->dwidth/dheight)
@@ -139,6 +153,48 @@ index 0000000..8c8354d
 +    mpvk_uninit(&p->vk);
 +}
 +
++// Presentation gate: the embedding app hides the CAMetalLayer while the
++// window is occluded, the app is hidden, or the displays are asleep.
++// Skipping start_frame while hidden prevents present-completion spins in
++// the swapchain (one core pinned at 100% after long display sleep).
++// CALayer reads are safe off the main thread; upstream context_mac.m
++// reads NSWindow.occlusionState from this same hook.
++static bool moltenvk_check_visible(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    return !p->layer.hidden;
++}
++
++// Display colorspace for --target-colorspace-hint=auto. Only the embedder
++// knows which screen shows the layer (a CALayer has no screen; NSScreen.main
++// follows the key window), so it publishes that screen's EDR headroom -
++// NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue - under
++// this key through CALayer's arbitrary-key KVC, and rewrites it whenever the
++// window changes screens. Read per frame, like the visibility gate above.
++//
++// Headroom above 1 reports a BT.2020 PQ display. With the hint on, libplacebo
++// then negotiates a 10-bit HDR10_ST2084 swapchain, and MoltenVK tags the
++// layer kCGColorSpaceITUR_2100_PQ with EDR on and forwards the HDR metadata
++// as CAEDRMetadata, leaving the mapping to the panel with WindowServer, as
++// AVFoundation does. No key, or headroom at 1 and below, reports an unknown
++// display: the hint stays off and mpv keeps tone-mapping to SDR on the
++// untagged pass-through swapchain, which is what an SDR screen wants and
++// what every screen got before the key existed.
++static NSString *const kMpvEDRHeadroomKey = @"mpvEDRHeadroom";
++
++static struct pl_color_space moltenvk_preferred_csp(struct ra_ctx *ctx)
++{
++    struct priv *p = ctx->priv;
++    id headroom = [p->layer valueForKey:kMpvEDRHeadroomKey];
++    if (![headroom isKindOfClass:[NSNumber class]] || [headroom doubleValue] <= 1.0)
++        return (struct pl_color_space){0};
++
++    return (struct pl_color_space){
++        .primaries = PL_COLOR_PRIM_BT_2020,
++        .transfer  = PL_COLOR_TRC_PQ,
++    };
++}
++
 +static bool moltenvk_init(struct ra_ctx *ctx)
 +{
 +    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
@@ -154,6 +210,7 @@ index 0000000..8c8354d
 +        goto fail;
 +
 +    p->layer = (__bridge CAMetalLayer *)(intptr_t)ctx->vo->opts->WinID;
++    p->was_hidden = p->layer.hidden;
 +
 +    VkMetalSurfaceCreateInfoEXT info = {
 +        .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
@@ -167,7 +224,12 @@ index 0000000..8c8354d
 +        goto fail;
 +    }
 +
-+    if (!ra_vk_ctx_init(ctx, vk, (struct ra_ctx_params){0}, VK_PRESENT_MODE_FIFO_KHR))
++    struct ra_ctx_params params = {
++        .check_visible = moltenvk_check_visible,
++        .preferred_csp = moltenvk_preferred_csp,
++    };
++
++    if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
 +        goto fail;
 +
 +    // Force one initial resize from the layer size, if available.
@@ -192,6 +254,15 @@ index 0000000..8c8354d
 +        return VO_NOTIMPL;
 +
 +    struct priv *p = ctx->priv;
++
++    // Regression lesson from upstream (mpv#16693 / 9f153e2a): on becoming
++    // visible again a redraw must be forced, or a paused video shows a
++    // stale frame (redraws attempted while hidden were skipped).
++    bool hidden = p->layer.hidden;
++    if (p->was_hidden && !hidden)
++        *events |= VO_EVENT_EXPOSE;
++    p->was_hidden = hidden;
++
 +    CGSize s = p->layer.drawableSize;
 +    int w = (int)s.width;
 +    int h = (int)s.height;

@@ -1,8 +1,108 @@
+vo_mediacodec: MediaCodec surface output with a timed OSD plane
+
+The whole of vo_mediacodec.c, which no upstream mpv carries. Every change
+to the file lives here instead of in a follow-up patch: a follow-up applies
+by context, so a version bump that breaks one would cascade through every
+later one, while a single file creation cannot conflict at all. A change
+that also touches upstream files keeps that side, and its write-up, in its
+own patch.
+
+Folded in, in series order:
+
+* 0013-vo-mediacodec-request-isolated-event-prefetch:
+
+    vo_mediacodec: request the isolated event-prefetch renderer
+
+    The event pre-render asks sd_ass for its isolated prefetch state (patch
+    0013) with OSD_DRAW_PREFETCH, and the vo.rst description of the OSD plane
+    says what that buys. Split from 0013 so the sub/ half can be shared with
+    the other VOs that pre-render subtitles.
+
+* 0014-vo-mediacodec-document-compacted-atlases:
+
+    vo_mediacodec: document compacted atlases on the OSD plane
+
+    The vo.rst half of 0014, split from it so the sub/ half can be shared with
+    the other VOs.
+
+* 0105-vo-mediacodec-separate-preparation-and-submission
+    (its vo_mediacodec.c side; the rest, and its write-up, stay in that patch)
+
+* 0104-vo-mediacodec-live-osd-rebind
+
+* 0106-vo-mediacodec-fill-letterbox-on-osd-plane
+
+* 0107-vo-mediacodec-sparse-stats
+
+* 0108-vo-mediacodec-present-feedback
+
+* 0109-vo-mediacodec-repaint-osd-after-resize
+
+* 0110-vo-live-window-id
+    (its vo_mediacodec.c side; the rest, and its write-up, stay in that patch)
+
+* 0112-vo-mediacodec-choreographer-refresh-rate
+
+* 0113-vo-mediacodec-count-missed-frames
+
+* 0114-vo-mediacodec-count-off-cadence-holds
+
+* 0115-vo-mediacodec-own-late-frame-policy
+
+* 0120-vo-mediacodec-distrust-render-times-off-the-vsync-clock
+
+* 0123-vo-mediacodec-snap-to-the-choreographers-own-vsync-grid
+
+* 0124-vo-mediacodec-hand-frames-to-the-codec-50-ms-ahead-as-media3-does
+
+* 0127-vo-mediacodec-render-through-the-shared-osd-pipeline:
+
+    vo_mediacodec: render subtitles through the shared osd_ahead pipeline
+
+    The render stage, request mailbox, result queue and scheduler core moved to
+    video/out/osd_ahead.c (0031); drive that module instead of a private copy.
+    The GL present stage, the swap lead and the statistics lines stay here and
+    read the module's state under its lock. The render thread gets the OSD
+    Surface's size, the embedder's geometry (latched under the lock, as it was
+    copied before) and its display priority through the module's callbacks.
+    No behavior change.
+
+* 0128-vo-mediacodec-call-the-choreographer-outside-the-sampler-lock
+
+* 0129-vo-mediacodec-itemize-late-frame-timing:
+
+    Subject: [PATCH] vo_mediacodec: itemize where a late frame's time went
+
+    The video-present line counts frames released after their deadline, and
+    nothing says why: a codec that decoded the frame late, a player that took
+    it from the decoder late, a core that handed it to the VO late, and a VO
+    thread that woke late all look the same. An Amlogic S928X box at 25 Hz
+    released about one frame in eighteen late on a 1080i50 recording that
+    ExoPlayer kept whole on the same codec and mode (Plezy #2485).
+
+    For each late frame, up to 600 per VO, log one frame-timing line: the
+    instant its access unit was queued to the codec, the codec reported it
+    decoded, the decoder handed it over (av_mediacodec_buffer_get_timing), the
+    core handed it to this VO, and it was released, each in ms against the
+    frame's deadline, plus how many decoded buffers were queued behind it and
+    how many the player held. One release in 250 is itemized as a sample
+    whether late or not, so a late frame reads against an ordinary one. Verbose
+    only, like the stats lines.
+
+* 0130-vo-mediacodec-split-late-frame-wait-between-core-and-vo
+    (its vo_mediacodec.c side; the rest, and its write-up, stay in that patch)
+
+* 0131-player-hand-vo-mediacodec-a-frame-without-waiting-for-the-next
+    (its vo_mediacodec.c side; the rest, and its write-up, stay in that patch)
+
+* 0132-player-hold-the-video-chain-for-the-embedders-vo-switch
+    (its vo_mediacodec.c side; the rest, and its write-up, stay in that patch)
+
 diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index 814e1e4..e1bf520 100644
+index 814e1e4..2206d5d 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
-@@ -723,6 +723,63 @@ Available video output drivers are:
+@@ -723,6 +723,77 @@ Available video output drivers are:
          :yes:   Attempt to enable VRR, whether the capability is reported or not.
          :auto:  Attempt to enable VRR if support is reported.
  
@@ -35,12 +135,26 @@ index 814e1e4..e1bf520 100644
 +    known to the VO, pre-rendered for the next frame from the observed frame
 +    cadence while the current one waits for its deadline, and, while the OSD
 +    is static, for the first frame of the next subtitle event ahead of its
-+    start (never past what the subtitle decoders have read). Event pre-renders
-+    warm the renderer and GPU caches but are not presented directly: each
-+    request uses a timestamp-matched render, reusing the prepared atlas when
-+    the pixels match. A render that repeats the pixels already on screen is
-+    folded into them and costs no swap. Rasterized frames are
-+    uploaded and composed on the GPU while the present thread is idle, and
++    start (never past what the subtitle decoders have read). ASS event
++    pre-renders retain a separate renderer and packed atlas, so intervening
++    current-frame renders cannot evict their prepared state. At handoff only
++    the old renderer's event-layout snapshots are released; both renderers,
++    their raster/font caches and worker pools remain reusable. The exact
++    requested timestamp is rendered, including repeated requests at the same
++    timestamp: an unchanged result reuses the prepared atlas, not an image
++    accepted by age. Reset, option changes and output deselection discard the
++    pending renderer. This prefetch path is used by this Android VO; it does
++    not enable persistent libass layout caching.
++    A render that repeats the pixels already on screen is
++    folded into them and costs no swap. Glyph masks normally remain separate
++    and are composed on the GPU. Heavy overlap is flattened before upload
++    only when the masks occupy more than four times the composited RGBA
++    area in bytes; tracks requiring per-mask VSFilter color correction keep
++    their masks. Transparent pixels are skipped and opaque pixels copied
++    directly during CPU composition. Both workers use display priority.
++    Queue lookahead keeps a 50 ms/two-display-period floor and budgets two
++    source-frame intervals plus a composition display period, capped at 500 ms.
++    Rasterized frames are uploaded while the present thread is idle, and
 +    presented through a GLES2 surface over the OSD Surface with the same
 +    presentation timestamp the video buffer got, so both latch on one vsync.
 +    The video is never held back for the OSD: under load subtitle updates
@@ -100,10 +214,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..9b292e2
+index 0000000..f8a4b40
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,3264 @@
+@@ -0,0 +1,3428 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -125,9 +239,10 @@ index 0000000..9b292e2
 + * Timed MediaCodec Surface output with a sibling OSD plane.
 + *
 + * Decoded buffers go straight to the --wid Surface (no GPU pass, decoder
-+ * dataspace intact) and are released with a presentation timestamp about
-+ * two vsyncs ahead, snapped to the Choreographer vsync grid when a fresh
-+ * sample exists. The embedder owns all geometry; software frames are
++ * dataspace intact) and are released with a presentation timestamp snapped
++ * to the Choreographer vsync grid when a fresh sample exists, and are handed
++ * to the codec 50 ms before that timestamp, as media3 hands them over.
++ * The embedder owns all geometry; software frames are
 + * refused so the Surface never becomes a CPU producer.
 + *
 + * OSD/subtitles go to the transparent --vo-mediacodec-osd-surface Surface,
@@ -135,8 +250,8 @@ index 0000000..9b292e2
 + * that never holds the video back:
 + *
 + *  - The render stage (thread "vo/osd-render") rasterizes the OSD for a
-+ *    media pts into a CPU slot. It is asked to as soon as draw_frame knows
-+ *    the frame, up to --video-timing-offset plus the queue lead before the
++ *    media pts. prepare_frame requests it as soon as the frame is admitted,
++ *    up to --video-timing-offset plus the preparation lead before the
 + *    frame is due, and between requests it pre-renders the next frame's pts
 + *    from the observed cadence so a regular request is served without
 + *    calling libass at all. Pre-rendering never runs past the subtitle
@@ -154,14 +269,16 @@ index 0000000..9b292e2
 + * bounded FIFO and cannot replace one another while the presenter waits.
 + * Only the render stage waits for queue capacity; video keeps advancing.
 + * A pinned result is presented late rather than dropped. Dirty regions from
-+ * skipped requests are folded into the next result. The freestanding
-+ * scheduler core is covered by scripts/test_mediacodec_osd.sh.
++ * skipped requests are folded into the next result. The render stage is
++ * the shared pipeline in osd_ahead.c; its scheduler core and this VO's swap
++ * lead are covered by scripts/test_mediacodec_osd.sh.
 + */
 +
 +#include <dlfcn.h>
 +#include <limits.h>
 +#include <math.h>
 +#include <stdbool.h>
++#include <stdlib.h>
 +#include <string.h>
 +#include <sys/resource.h>
 +#include <time.h>
@@ -176,6 +293,7 @@ index 0000000..9b292e2
 +#include <EGL/eglext.h>
 +
 +#include <libavcodec/mediacodec.h>
++#include <libavutil/error.h>
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/hwcontext_mediacodec.h>
 +
@@ -183,6 +301,7 @@ index 0000000..9b292e2
 +#include "misc/jni.h"
 +#include "options/m_config_core.h"
 +#include "options/m_option.h"
++#include "options/options.h"
 +#include "osdep/threads.h"
 +#include "osdep/timer.h"
 +#include "sub/draw_bmp.h"
@@ -192,6 +311,7 @@ index 0000000..9b292e2
 +#include "video/out/opengl/common.h"
 +#include "video/out/opengl/egl_helpers.h"
 +#include "video/out/opengl/utils.h"
++#include "osd_ahead.h"
 +#include "vo.h"
 +
 +// --- mediacodec timing core
@@ -286,6 +406,39 @@ index 0000000..9b292e2
 +         ? after : before;
 +}
 +
++// The period releases snap with. The phase comes from Choreographer frame
++// times, which run on SurfaceFlinger's vsync model: the clock it latches
++// buffers against. That model can disagree with the display mode: an Amlogic
++// box fits 15.71 ms to a 16.68 ms mode for whole sessions, and snapped with
++// the mode's period, every 500 ms resample moves the grid by ~2 ms and frames
++// land a vsync off in 3:2 pairs all session long. Media3 1.11 takes both
++// phase and period from the Choreographer's frame timelines; here spacing_ns
++// is the gap between the first two timelines' expected presentation times
++// (0 below API 33, or before the first), over the vsyncs nominal_ns (the
++// mode's period) says it spans, since an app render rate below the mode's
++// spaces them by several. Within 2% the mode's period stands, and this is a
++// deliberate departure from media3: a Pixel 7's panel runs at 11.057 ms
++// under its 90 Hz mode, and its timelines are spaced by the mode's 11.111 ms
++// on most samples and by SurfaceFlinger's ~11.05 ms model on the rest.
++// Following them sample by sample, as media3 does, showed 4 to 11 frames a
++// vsync early in 5 minutes there (media3 itself 0 to 12), against 0 to 1 on
++// the mode's period. It also stands for a gap that is not a whole number of
++// vsyncs within a quarter. Consecutive frame callback times are no
++// substitute for the timelines: a Pixel's and a Fire TV's jitter by more
++// than a millisecond.
++static int64_t mediacodec_grid_period(int64_t spacing_ns, int64_t nominal_ns)
++{
++    if (spacing_ns <= 0 || nominal_ns <= 0)
++        return nominal_ns;
++    int64_t vsyncs = (spacing_ns + nominal_ns / 2) / nominal_ns;
++    if (vsyncs < 1 || vsyncs > 3)
++        return nominal_ns;
++    int64_t measured = spacing_ns / vsyncs;
++    int64_t diff = measured > nominal_ns ? measured - nominal_ns
++                                         : nominal_ns - measured;
++    return diff * 50 <= nominal_ns || diff * 4 > nominal_ns ? nominal_ns : measured;
++}
++
 +// Release timestamp, on now_ns's clock, for a frame due at raw_target_ns;
 +// 0 releases untimed, i.e. at the next vsync. sample_ns is a vsync timestamp
 +// on that clock, or 0 when none is fresh; period_ns is the display period, or
@@ -324,7 +477,254 @@ index 0000000..9b292e2
 +    return snapped - period_ns * 8 / 10;
 +}
 +
++// How far before its release timestamp a frame is handed to the codec:
++// media3's early-scheduling threshold (MediaCodecVideoRenderer's
++// DEFAULT_EARLY_SCHEDULING_THRESHOLD_US), whatever the display period. media3
++// checks it about every 10 ms, so its handoffs spread over 40-50 ms; this VO
++// wakes at the threshold. Two display periods, the handoff the MediaCodec
++// documentation suggests, left a MediaTek Fire TV showing 7 frames a vsync
++// early in 35 minutes of 24p, against none at 50 ms. MediaCodec does not
++// return a buffer released with releaseOutputBuffer(int, long) to the
++// decoder until its timestamp passes, so the lead also bounds how many
++// decoded frames the surface holds.
++#define MEDIACODEC_CODEC_LEAD_NS INT64_C(50000000)
++
++// The timestamp mediacodec_timing_release would choose, evaluated without
++// committing the cadence anchor or the snap preference and without the
++// submission-time guards. Preparation needs the decision to know when the
++// codec may have the buffer; only the single release at flip commits it, so
++// repeated preparation wakeups cannot advance the anchor.
++static int64_t mediacodec_timing_preview(const struct mediacodec_timing *timing,
++                                        int64_t raw_target_ns, uint64_t frame_id,
++                                        double frame_duration_ns,
++                                        int64_t sample_ns, int64_t period_ns)
++{
++    struct mediacodec_timing scratch = *timing;
++    int64_t target_ns = mediacodec_timing_predict(&scratch, raw_target_ns,
++                                                  frame_id, frame_duration_ns);
++    if (period_ns <= 0 || !sample_ns)
++        return target_ns;
++    return mediacodec_timing_snap(&scratch, target_ns, sample_ns, period_ns)
++         - period_ns * 8 / 10;
++}
++
++// OSD work needs the current/next render plus composition time, and the core
++// has to wake early enough that the codec window is still reachable: one
++// codec lead, the 80% pull-back, and the cadence-correction bound.
++static int64_t mediacodec_prepare_lead(int64_t period_ns, double duration_ns)
++{
++    int64_t lead = MEDIACODEC_CODEC_LEAD_NS + period_ns + 20000000;
++    if (period_ns > 0 && isfinite(duration_ns) && duration_ns > 0) {
++        int64_t render = llround(fmin(2 * duration_ns + period_ns, 500000000));
++        if (render > lead)
++            lead = render;
++    }
++    return lead;
++}
++
++static bool mediacodec_synthetic_still(bool still, int64_t pts,
++                                      double duration)
++{
++    return still && pts == 0 && duration < 0;
++}
++
 +// --- end mediacodec timing core
++
++// --- mediacodec stats core
++
++// Verbose statistics log sparsely. One line every OSD_STATS_INTERVAL_FRAMES
++// flips was the largest single contributor to an uploaded log (58% of an
++// hour of 24p), and the log relay trims uploads from the front at 1 MiB, so
++// a two-hour session lost its startup section. A tick logs when a failure
++// counter moved since the previous tick, on the first tick, and otherwise as
++// a heartbeat every STATS_HEARTBEAT_TICKS ticks. Failure counters only grow
++// between resets, so their sum moves exactly when one of them does.
++#define STATS_HEARTBEAT_TICKS 12 // 60 s of 24p at 120-frame ticks
++
++struct stats_cadence {
++    unsigned ticks;
++    unsigned logged_tick;
++    bool logged;
++    uint64_t failures;
++};
++
++// The reason this tick logs, or NULL when it stays silent.
++static const char *stats_due(struct stats_cadence *c, uint64_t failures)
++{
++    c->ticks++;
++    bool event = c->logged && failures != c->failures;
++    c->failures = failures;
++    if (!event && c->logged && c->ticks - c->logged_tick < STATS_HEARTBEAT_TICKS)
++        return NULL;
++    c->logged = true;
++    c->logged_tick = c->ticks;
++    return event ? "event" : "periodic";
++}
++
++// Video-plane presentation feedback. flip_page records the vsync each release
++// aimed at, keyed by the presentation time the codec attached to the buffer,
++// and matches the codec's frame-rendered reports (drained through the buffer
++// at the next flip) back to it: the video plane's twin of the OSD plane's
++// EGL present probes. Delivery is batched and may skip frames, so the ring is
++// deep, and a report without an intent or an intent without a report is
++// counted rather than trusted.
++#define PRESENT_INTENTS 32 // ~1.3 s of 24p
++
++struct present_intent {
++    int64_t media_us;
++    int64_t vsync;       // CLOCK_MONOTONIC vsync the release targeted, 0 untimed
++    double duration_ns;  // the frame's display duration, <= 0 unknown
++    uint64_t seq;        // release order, so a hold is only read between neighbours
++    bool live;
++};
++
++// Where a report lands relative to its vsync says which clock the platform
++// reports, not whether the frame was shown on time: Tensor and MediaTek
++// report the latch of the intended vsync, 0.8 of a period early, for every
++// frame; Amlogic latches one or two vsyncs before the timestamp and reports
++// that, alternating by frame. Which class a device is in is what the
++// histogram below names.
++
++// What the viewer can see is a hold: the time between two consecutive
++// frames' reports, in vsyncs. A frame of duration d on a display of period p
++// is legitimately held floor(d/p) or ceil(d/p) vsyncs -- 2 or 3 for 24p on
++// 60 Hz, 5 or 6 for 23.976 on 120 Hz, exactly 1 for 24p on 24 Hz --
++// whichever of the two the platform picks and however its report clock is
++// offset. A longer hold lost the viewer a slot: that is a miss. The short
++// hold that immediately follows it is the same event catching up and is not
++// counted again; a short hold on its own is.
++struct present_hold {
++    bool valid;
++    uint64_t seq;        // the intent the report answered
++    int64_t system_nano; // the report
++    double duration_ns;  // the frame's display duration
++    int64_t period_ns;   // the grid the frame was timed on
++    bool long_hold;      // the hold that ended at this report was too long
++};
++
++struct present_stats {
++    struct present_intent ring[PRESENT_INTENTS];
++    int next;
++    uint64_t seq;        // intents recorded
++    struct present_hold prev; // the newest matched, timed report
++    uint32_t measured;   // reports matched to a timed release
++    uint32_t untimed;    // reports matched to an untimed or unsnapped release
++    uint32_t unclocked;  // reports carrying a time not on the vsync clock
++    uint32_t unmatched;  // reports with no intent: stragglers across a reset
++    uint32_t overrun;    // intents overwritten before any report arrived
++    uint32_t hist[5];    // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
++    int64_t err_last_ns, err_worst_ns;
++    uint32_t missed;     // holds off the frame's legitimate cadence
++    uint32_t late;       // releases due before they reached the codec
++    uint32_t unsnapped;  // releases timed without a fresh vsync sample
++};
++
++// Forget the intents and the hold in progress; the counters describe the
++// session.
++static void present_reset(struct present_stats *s)
++{
++    for (int n = 0; n < PRESENT_INTENTS; n++)
++        s->ring[n].live = false;
++    s->next = 0;
++    s->prev.valid = false;
++}
++
++static void present_record(struct present_stats *s, int64_t media_us,
++                           int64_t vsync, double duration_ns)
++{
++    struct present_intent *e = &s->ring[s->next];
++    if (e->live)
++        s->overrun++;
++    *e = (struct present_intent){.media_us = media_us, .vsync = vsync,
++                                 .duration_ns = duration_ns, .seq = ++s->seq,
++                                 .live = true};
++    s->next = (s->next + 1) % PRESENT_INTENTS;
++}
++
++// Whether the hold that ended at [report] -- the previous matched frame's
++// time on screen -- lost the viewer a slot. Only neighbouring releases on
++// one grid can be read as a hold: a report missing in between, a seek or a
++// refresh-rate switch each start over.
++static bool present_hold_missed(struct present_stats *s,
++                                const struct present_hold *report)
++{
++    const struct present_hold *prev = &s->prev;
++    bool missed = false;
++    bool long_hold = false;
++    if (prev->valid && prev->seq + 1 == report->seq &&
++        prev->period_ns == report->period_ns && prev->duration_ns > 0)
++    {
++        int64_t held = llround((double)(report->system_nano - prev->system_nano)
++                               / report->period_ns);
++        double due = prev->duration_ns / report->period_ns;
++        // A ratio a rounding away from a whole number is that whole number.
++        int64_t shortest = (int64_t)floor(due + 1e-6);
++        int64_t longest = (int64_t)ceil(due - 1e-6);
++        long_hold = held > longest;
++        missed = long_hold || (held < shortest && !prev->long_hold);
++    }
++    s->prev = *report;
++    s->prev.long_hold = long_hold;
++    return missed;
++}
++
++// A render time the platform did not actually take: Tegra on Android 9
++// answers the Java frame-rendered listener with system_nano 0 for every
++// frame. Read as a hold, that is one miss per frame and a drop count that
++// climbs at the frame rate for a picture that is perfectly smooth. Nothing
++// this VO releases can land a second from the vsync it targeted -- the
++// intent ring is not that deep -- so a report that far off is not a
++// measurement, and the pair it would have formed is not a hold. It is not
++// a failure either: the platform is unmeasurable, which the count names.
++#define PRESENT_REPORT_SANE_NS (1 * INT64_C(1000000000))
++
++// Returns whether the display held the previous frame off its cadence.
++static bool present_observe(struct present_stats *s, int64_t media_us,
++                            int64_t system_nano, int64_t period_ns)
++{
++    for (int n = 0; n < PRESENT_INTENTS; n++) {
++        struct present_intent *e = &s->ring[n];
++        if (!e->live || e->media_us != media_us)
++            continue;
++        e->live = false;
++        if (!e->vsync || period_ns <= 0) {
++            s->untimed++;
++            return false;
++        }
++        if (llabs(system_nano - e->vsync) > PRESENT_REPORT_SANE_NS) {
++            s->unclocked++;
++            return false;
++        }
++        int64_t err = system_nano - e->vsync;
++        s->measured++;
++        s->err_last_ns = err;
++        if (llabs(err) > llabs(s->err_worst_ns))
++            s->err_worst_ns = err;
++        double vsyncs = (double)err / period_ns;
++        s->hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
++              : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
++        bool missed = present_hold_missed(s, &(struct present_hold){
++            .valid = true, .seq = e->seq, .system_nano = system_nano,
++            .duration_ns = e->duration_ns, .period_ns = period_ns,
++        });
++        if (missed)
++            s->missed++;
++        return missed;
++    }
++    s->unmatched++;
++    return false;
++}
++
++// What a video-present line exists to catch: a frame held off its cadence, a
++// release the VO could not time, a report that never came, or -- on every
++// source -- a release that was late or could not be snapped to a vsync.
++static uint64_t present_failures(const struct present_stats *s)
++{
++    return (uint64_t)s->untimed + s->overrun + s->missed + s->late +
++           s->unsnapped;
++}
++
++// --- end mediacodec stats core
 +
 +typedef AChoreographer *(*mp_get_choreographer_fn)(void);
 +typedef void (*mp_post_frame_callback_fn)(
@@ -335,6 +735,17 @@ index 0000000..9b292e2
 +    AChoreographer *, AChoreographer_frameCallback64, void *);
 +typedef void (*mp_post_frame_callback_delayed64_fn)(
 +    AChoreographer *, AChoreographer_frameCallback64, void *, uint32_t);
++// API 30. Declared locally: the NDK typedef is guarded by __ANDROID_API__.
++typedef void (*mp_refresh_rate_callback)(int64_t vsync_period_ns, void *data);
++typedef void (*mp_register_refresh_rate_callback_fn)(
++    AChoreographer *, mp_refresh_rate_callback, void *);
++// API 33: a vsync callback carries SurfaceFlinger's frame timelines.
++typedef void (*mp_post_vsync_callback_fn)(
++    AChoreographer *, AChoreographer_vsyncCallback, void *);
++typedef int64_t (*mp_frame_data_time_fn)(const AChoreographerFrameCallbackData *);
++typedef size_t (*mp_frame_data_count_fn)(const AChoreographerFrameCallbackData *);
++typedef int64_t (*mp_frame_data_present_fn)(
++    const AChoreographerFrameCallbackData *, size_t);
 +
 +// --- mediacodec geometry core
 +
@@ -425,253 +836,7 @@ index 0000000..9b292e2
 +
 +// --- end mediacodec geometry core
 +
-+// --- mediacodec osd scheduler core
-+
-+#define OSD_CADENCE_SAMPLES 8
-+#define OSD_CADENCE_MIN_SAMPLES 4
-+#define OSD_CADENCE_MAX_DELTA 0.25  // seconds; longer gaps are not a cadence
-+#define OSD_SPEC_TOLERANCE 0.004    // seconds; a request matches a pre-render
-+
-+// Median of at most OSD_MEDIAN_MAX samples: the middle one, or the mean of
-+// the middle two. Insertion sort; the rings here are far smaller than a sort
-+// would pay for, and no caller's ring is larger than this.
-+#define OSD_MEDIAN_MAX 8
-+
-+static int64_t median_ns(const int64_t *v, int n)
-+{
-+    int64_t sorted[OSD_MEDIAN_MAX];
-+    for (int i = 0; i < n; i++)
-+        sorted[i] = v[i];
-+    for (int i = 1; i < n; i++) {
-+        int64_t key = sorted[i];
-+        int j = i - 1;
-+        while (j >= 0 && sorted[j] > key) {
-+            sorted[j + 1] = sorted[j];
-+            j--;
-+        }
-+        sorted[j + 1] = key;
-+    }
-+    return n & 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
-+}
-+
-+// The same statistic in seconds, for the media-pts cadence. Its deltas are
-+// container timestamps, so nanosecond rounding loses nothing.
-+static double median_seconds(const double *v, int n)
-+{
-+    int64_t ns[OSD_MEDIAN_MAX];
-+    for (int i = 0; i < n; i++)
-+        ns[i] = llround(v[i] * 1e9);
-+    return median_ns(ns, n) / 1e9;
-+}
-+
-+// Media-pts cadence of the frames the VO flips, as the ExoPlayer overlay
-+// estimates it: median of the last eight consecutive deltas, trusted after
-+// four. A frame_id gap (frames the VO dropped), a non-positive delta (seek,
-+// backwards step) or a delta longer than OSD_CADENCE_MAX_DELTA starts over.
-+struct osd_cadence {
-+    double deltas[OSD_CADENCE_SAMPLES];
-+    int count;
-+    int next;
-+    bool have_last;
-+    uint64_t last_frame_id;
-+    double last_pts;
-+};
-+
-+static void osd_cadence_reset(struct osd_cadence *c)
-+{
-+    *c = (struct osd_cadence){0};
-+}
-+
-+static void osd_cadence_observe(struct osd_cadence *c, uint64_t frame_id,
-+                                double pts)
-+{
-+    if (c->have_last) {
-+        double delta = pts - c->last_pts;
-+        if (frame_id != c->last_frame_id + 1 || !(delta > 0) ||
-+            delta > OSD_CADENCE_MAX_DELTA)
-+        {
-+            osd_cadence_reset(c);
-+        } else {
-+            c->deltas[c->next] = delta;
-+            c->next = (c->next + 1) % OSD_CADENCE_SAMPLES;
-+            if (c->count < OSD_CADENCE_SAMPLES)
-+                c->count++;
-+        }
-+    }
-+    c->have_last = true;
-+    c->last_frame_id = frame_id;
-+    c->last_pts = pts;
-+}
-+
-+// Median delta in seconds, 0 until enough consecutive frames were seen.
-+static double osd_cadence_delta(const struct osd_cadence *c)
-+{
-+    if (c->count < OSD_CADENCE_MIN_SAMPLES)
-+        return 0;
-+    return median_seconds(c->deltas, c->count);
-+}
-+
-+struct osd_spec {
-+    bool valid;
-+    double pts;
-+    uint64_t epoch;
-+    int slot; // -1: the pre-render found the OSD unchanged, nothing to post
-+    uint32_t hits, misses, skips, horizon_skips;
-+};
-+
-+enum osd_spec_result {
-+    OSD_SPEC_MISS,     // render on demand
-+    OSD_SPEC_HIT,      // post spec->slot (or nothing when it is -1)
-+};
-+
-+// A request for pts arrived. The speculation is consumed either way. A match
-+// tolerates container timestamp rounding (1 ms alternation at 23.976 in
-+// Matroska) but never half a frame: ASS times have 10 ms resolution and a
-+// few ms of \move are sub-pixel, while the wrong frame is not.
-+static enum osd_spec_result osd_spec_service(struct osd_spec *s, double pts,
-+                                             uint64_t epoch, bool full,
-+                                             double delta)
-+{
-+    if (!s->valid)
-+        return OSD_SPEC_MISS;
-+    s->valid = false;
-+    double tolerance = OSD_SPEC_TOLERANCE;
-+    if (delta > 0 && delta / 4 < tolerance)
-+        tolerance = delta / 4;
-+    if (full || epoch != s->epoch || !(fabs(pts - s->pts) <= tolerance)) {
-+        s->misses++;
-+        return OSD_SPEC_MISS;
-+    }
-+    s->hits++;
-+    return OSD_SPEC_HIT;
-+}
-+
-+// Whether to pre-render after serving last_pts, and for which pts.
-+//  delta:    cadence from osd_cadence_delta(), 0 when unknown
-+//  horizon:  furthest pts the subtitle decoders can render correctly;
-+//            NAN when unknown, INFINITY when unbounded
-+//  eligible: playing, last request was a real frame, no request pending,
-+//            a slot is free
-+static bool osd_spec_plan(struct osd_spec *s, double last_pts, double delta,
-+                          double horizon, bool eligible, double *out_pts)
-+{
-+    if (s->valid)
-+        return false;
-+    if (!eligible || !(delta > 0)) {
-+        s->skips++;
-+        return false;
-+    }
-+    double pts = last_pts + delta;
-+    if (!(pts <= horizon)) { // also rejects NAN
-+        s->horizon_skips++;
-+        return false;
-+    }
-+    *out_pts = pts;
-+    return true;
-+}
-+
-+static void osd_spec_store(struct osd_spec *s, double pts, uint64_t epoch,
-+                           int slot)
-+{
-+    s->valid = true;
-+    s->pts = pts;
-+    s->epoch = epoch;
-+    s->slot = slot;
-+}
-+
-+// Warm the next event while the OSD is static. Keep its first image for
-+// background atlas upload and composition, not as a result for a later PTS.
-+// A timestamp-matched render validates the content; osd_dedup_items reuses
-+// the prepared atlas when its pixels match. While warming, requests coalesce
-+// and a change that falls due meanwhile waits, so it must fit before
-+// anything on screen ends.
-+#define OSD_PREFETCH_MIN_LEAD 0.2
-+#define OSD_PREFETCH_MAX_LEAD 15.0
-+#define OSD_PREFETCH_STATIC_RENDERS 3
-+
-+struct osd_prefetch {
-+    bool valid;            // a slot holds the next event's first frame
-+    double event_start;    // that event's start (video pts)
-+    uint64_t epoch;
-+    int slot;
-+    double attempted_start; // last event start warmed
-+    double max_event_s;    // slowest render per event starting, seen so far
-+    int unchanged_streak;  // consecutive renders that changed nothing
-+    uint32_t count;
-+};
-+
-+// A worst-case guess of what rendering a frame where `events` events start
-+// takes: the slowest per-event rate seen so far, with a floor before any
-+// heavy sign has been measured. Typesetting is hundreds of events per
-+// shot, a dialogue line is one.
-+static double osd_prefetch_estimate(const struct osd_prefetch *p, int events)
-+{
-+    double per_event = p->max_event_s > 0.001 ? p->max_event_s : 0.001;
-+    double estimate = 1.25 * per_event * (events > 1 ? events : 1);
-+    if (estimate < 0.05)
-+        estimate = 0.05;
-+    if (estimate > 1.5)
-+        estimate = 1.5;
-+    return estimate;
-+}
-+
-+// Whether to render next_start's first frame now, playing at pts. Something
-+// on screen ending before that start must not wait for the render, so the
-+// render's estimate has to fit before it, with margin. The start itself may
-+// be overrun: the following timestamp-matched render still benefits from
-+// warm caches. Only an attempt that cannot finish within twice its lead is
-+// skipped.
-+//  eligible: playing, the last request was a real frame, nothing pending,
-+//            a slot is free
-+static bool osd_prefetch_plan(const struct osd_prefetch *p, double pts,
-+                              double next_start, int next_events,
-+                              double visible_end, double horizon,
-+                              bool eligible)
-+{
-+    if (!eligible || p->valid || p->unchanged_streak < OSD_PREFETCH_STATIC_RENDERS)
-+        return false;
-+    if (!(next_start > pts) || !(next_start <= horizon)) // rejects NAN
-+        return false;
-+    double lead = next_start - pts;
-+    if (lead < OSD_PREFETCH_MIN_LEAD || lead > OSD_PREFETCH_MAX_LEAD)
-+        return false;
-+    if (fabs(next_start - p->attempted_start) < 0.002) // same event, another frame
-+        return false;
-+    double estimate = osd_prefetch_estimate(p, next_events);
-+    if (visible_end > pts && visible_end < next_start &&
-+        visible_end - pts < estimate + 0.15)
-+        return false;
-+    return 2 * lead >= estimate;
-+}
-+
-+static void osd_prefetch_store(struct osd_prefetch *p, double event_start,
-+                               int events, uint64_t epoch, int slot,
-+                               double render_s)
-+{
-+    p->valid = slot >= 0;
-+    p->event_start = event_start;
-+    p->epoch = epoch;
-+    p->slot = slot;
-+    p->attempted_start = event_start;
-+    p->count++;
-+    double per_event = render_s / (events > 1 ? events : 1);
-+    if (per_event > p->max_event_s)
-+        p->max_event_s = per_event;
-+}
-+
-+// Called after servicing a request. Keep the prepared image available to
-+// the GPU and pixel deduplication through the first timestamp-matched render
-+// at/after its start, then release the staging slot for the next event.
-+static void osd_prefetch_retire(struct osd_prefetch *p, double pts, uint64_t epoch)
-+{
-+    if (epoch != p->epoch || pts >= p->event_start)
-+        p->valid = false;
-+}
-+
-+static void osd_prefetch_observe_render(struct osd_prefetch *p, bool changed)
-+{
-+    p->unchanged_streak = changed ? 0 : p->unchanged_streak + 1;
-+}
++// --- mediacodec osd swap lead
 +
 +// Swap lead of the present stage: half the median of the last eight release
 +// intervals, clamped to 6..18 ms, so the buffer is queued inside the latch
@@ -711,92 +876,24 @@ index 0000000..9b292e2
 +    l->last_release = release_ns;
 +    if (l->count < OSD_CADENCE_MIN_SAMPLES)
 +        return;
-+    int64_t lead = median_ns(l->intervals, l->count) / 2;
++    int64_t lead = osd_median_ns(l->intervals, l->count) / 2;
 +    l->lead = lead < OSD_SWAP_LEAD_MIN_NS ? OSD_SWAP_LEAD_MIN_NS
 +            : lead > OSD_SWAP_LEAD_MAX_NS ? OSD_SWAP_LEAD_MAX_NS : lead;
 +}
 +
-+// Release timestamp of a flipped frame, by sequence number.
-+struct osd_release {
-+    uint64_t seq;
-+    int64_t timestamp;  // CLOCK_MONOTONIC handed to MediaCodec, 0 = untimed
-+    int64_t vsync;      // the vsync that timestamp targets, 0 = unknown
-+    int64_t period;     // display period at release, 0 = unknown
-+};
-+
-+struct osd_result {
-+    int slot;        // -1: none
-+    uint64_t seq;
-+    uint64_t epoch;
-+    double pts;      // trace
-+    int64_t posted;  // trace: mp_time_ns at post
-+    struct osd_release release; // copied before release history can roll over
-+};
-+
-+// Future poses must not replace each other while the presenter waits for an
-+// earlier deadline. Bound CPU snapshots; only the renderer waits for capacity.
-+#define OSD_RESULT_CAPACITY 4
-+struct osd_result_queue {
-+    struct osd_result entries[OSD_RESULT_CAPACITY];
-+    int first, count;
-+};
-+
-+static struct osd_result *osd_result_head(struct osd_result_queue *q)
-+{
-+    return q->count ? &q->entries[q->first] : NULL;
-+}
-+
-+static int osd_result_slot(const struct osd_result_queue *q)
-+{
-+    return q->count ? q->entries[q->first].slot : -1;
-+}
-+
-+static bool osd_result_holds(const struct osd_result_queue *q, int slot)
-+{
-+    for (int n = 0; n < q->count; n++) {
-+        if (q->entries[(q->first + n) % OSD_RESULT_CAPACITY].slot == slot)
-+            return true;
-+    }
-+    return false;
-+}
-+
-+static bool osd_result_push(struct osd_result_queue *q, struct osd_result r)
-+{
-+    if (q->count == OSD_RESULT_CAPACITY)
-+        return false;
-+    q->entries[(q->first + q->count++) % OSD_RESULT_CAPACITY] = r;
-+    return true;
-+}
-+
-+static struct osd_result osd_result_pop(struct osd_result_queue *q)
-+{
-+    assert(q->count > 0);
-+    struct osd_result r = q->entries[q->first];
-+    q->first = (q->first + 1) % OSD_RESULT_CAPACITY;
-+    q->count--;
-+    return r;
-+}
-+
-+static void osd_result_publish_release(struct osd_result_queue *q,
-+                                       struct osd_release release)
-+{
-+    for (int n = 0; n < q->count; n++) {
-+        struct osd_result *r = &q->entries[(q->first + n) % OSD_RESULT_CAPACITY];
-+        if (r->seq == release.seq)
-+            r->release = release;
-+    }
-+}
-+
-+// --- end mediacodec osd scheduler core
++// --- end mediacodec osd swap lead
 +
 +struct mediacodec_opts {
 +    char *video_rect;
 +    int osd_vsync_delay;
++    int64_t osd_surface;
 +};
 +
 +#define OPT_BASE_STRUCT struct mediacodec_opts
 +static const struct m_sub_options mediacodec_conf = {
 +    .opts = (const struct m_option[]){
++        {"vo-mediacodec-osd-surface", OPT_INT64(osd_surface),
++            .flags = UPDATE_VIDEO},
 +        {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
 +        {"vo-mediacodec-osd-vsync-delay", OPT_INT(osd_vsync_delay),
 +            M_RANGE(0, 3)},
@@ -807,27 +904,9 @@ index 0000000..9b292e2
 +};
 +#undef OPT_BASE_STRUCT
 +
-+// Active frame, bounded pending queue, next-frame and event pre-renders.
-+#define OSD_SLOTS (OSD_RESULT_CAPACITY + 3)
 +#define OSD_STATS_INTERVAL_FRAMES 120
 +#define OSD_LATE_THRESHOLD_NS MP_TIME_MS_TO_NS(4)
-+#define OSD_RELEASE_HISTORY 16
 +#define OSD_PRESENT_PROBES 16
-+
-+// One rendered OSD frame: the sub bitmap list for a canvas_w x canvas_h
-+// canvas, composited by the present stage on the GPU.
-+struct osd_slot {
-+    struct sub_bitmap_list *sbs;
-+    int canvas_w, canvas_h;
-+};
-+
-+struct osd_request {
-+    double pts;      // render pts, MP_NOPTS_VALUE ok
-+    double delta;    // cadence at filing time, 0 when unknown
-+    uint64_t seq;    // frame sequence, 0 for an unpinned repaint
-+    uint64_t epoch;
-+    bool full;
-+};
 +
 +struct osd_present_probe {
 +    EGLuint64KHR frame_id;
@@ -836,48 +915,21 @@ index 0000000..9b292e2
 +    double pts;
 +};
 +
-+// Every field the three threads share lives under osd_lock; osd_wakeup is
-+// broadcast for any change.
-+struct osd_shared {
-+    bool terminate;
-+    bool present_failed; // the present stage could not bring up EGL
-+    bool paused;
-+    uint64_t epoch;
-+    struct mediacodec_geometry geometry;
-+    int vsync_delay;     // present the OSD this many vsyncs after the video
-+
-+    // VO -> render
-+    bool requested;
-+    struct osd_request request;
-+    // VO -> present
-+    struct osd_release releases[OSD_RELEASE_HISTORY];
-+    int release_next;
-+    uint64_t release_seq; // newest published
-+    // render -> present
-+    struct osd_result_queue results;
-+    int present_slot;     // slot on screen or being presented, -1 none
-+
-+    // Statistics (writer noted per field; the VO thread reads them all).
-+    uint32_t frames;            // VO: pinned requests filed
-+    uint32_t coalesced;         // VO: requests replaced before service
-+    uint32_t renders, renders_changed; // render
-+    int64_t render_ns_last, render_ns_max; // render
-+    uint32_t render_hist[5];    // render: <=10, <=25, <=42, <=84, >84 ms
-+    uint32_t stale;             // results cancelled or missing their release
-+    uint32_t swaps, late;       // present
-+    int64_t lead_ns_last, lead_ns_min; // present: release - queued
++// The present stage's statistics. They live under the pipeline's lock
++// (p->osd.lock) like every field the three threads share.
++struct osd_plane_stats {
++    uint32_t swaps, late;
++    int64_t lead_ns_last, lead_ns_min; // release - queued
 +    bool have_lead_min;
-+    int64_t swap_ns_last, swap_ns_max; // present: eglSwapBuffers duration
-+    uint32_t uploads_ahead, uploads_late; // present: atlases ready before / at the draw
-+    uint32_t composed_ahead, composed_late; // present: frames blitted from a composed canvas / drawn from parts
-+    int64_t upload_ns_last, upload_ns_max; // present: upload time inside the draw
-+    int64_t swap_lead_ns;       // present
-+    const char *present_source; // present: which timestamp is measured
++    int64_t swap_ns_last, swap_ns_max; // eglSwapBuffers duration
++    uint32_t uploads_ahead, uploads_late; // atlases ready before / at the draw
++    uint32_t composed_ahead, composed_late; // frames blitted from a composed canvas / drawn from parts
++    int64_t upload_ns_last, upload_ns_max; // upload time inside the draw
++    int64_t swap_lead_ns;
++    const char *present_source; // which timestamp is measured
 +    int64_t present_err_last, present_err_worst;
 +    uint32_t present_hist[5];   // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
 +    uint32_t present_measured, present_invalid, present_dropped;
-+    struct osd_spec spec;       // render (counters read by the VO thread)
-+    struct osd_prefetch prefetch; // render (counters read by the VO thread)
 +};
 +
 +struct priv {
@@ -886,23 +938,41 @@ index 0000000..9b292e2
 +    uint64_t cur_frame_id;
 +    double cur_duration;
 +    uint64_t cur_seq;    // sequence of the frame draw_frame received
++    bool cur_synthetic;
++    uint64_t submitted_frame_id;
++    uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
 +    double osd_pts;      // render pts of the last real frame
 +
 +    struct mp_hwdec_ctx hwctx;
 +
 +    ANativeWindow *osd_window;
 +    bool osd_missing_logged;
-+    mp_thread osd_render_thread, osd_present_thread;
++    mp_thread osd_present_thread;
 +    bool osd_threads_created;
-+    mp_mutex osd_lock;
-+    mp_cond osd_wakeup;
-+    struct osd_shared osd;
-+    struct osd_slot osd_slots[OSD_SLOTS];
++    struct osd_ahead osd;
++    // Under osd.lock: the embedder's geometry and the presentation delay.
++    struct mediacodec_geometry osd_geometry;
++    int osd_vsync_delay;
++    struct osd_plane_stats plane; // under osd.lock
++    // Render thread only: the geometry latched for the renders in flight.
++    struct mediacodec_geometry osd_render_geometry;
 +
 +    // VO thread only
 +    struct osd_cadence cadence;
 +    uint64_t frame_seq;
 +    uint32_t stats_frames;
++    struct stats_cadence osd_stats;
++    struct present_stats present;
++    struct stats_cadence present_cadence;
++    const char *present_source; // NULL until the first release
++    // When the VO first saw the prepared and the current frame
++    // (CLOCK_MONOTONIC), the core's hand-off stamps of the current frame
++    // (struct vo_frame, mp_time_ns()), and how many releases
++    // log_frame_timing has seen and itemized as late.
++    int64_t prepared_seen_ns, cur_seen_ns;
++    int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
++    uint64_t timing_releases;
++    unsigned timing_late_logged;
 +
 +    // Choreographer vsync sampler (shared, see vsync_sampler); these are
 +    // owned by that sampler's lock while attached.
@@ -911,8 +981,9 @@ index 0000000..9b292e2
 +
 +    // VO thread only
 +    struct mediacodec_timing timing;
-+    int64_t queue_period;
-+    int64_t queue_period_changed;
++    int64_t queue_period; // the grid releases snap with
++    int64_t queue_mode;   // the display mode's period it was taken under
++    int64_t queue_period_changed; // when queue_mode last changed
 +    int64_t queue_offset;
 +    struct m_config_cache *opts_cache;
 +
@@ -948,6 +1019,15 @@ index 0000000..9b292e2
 +// process-lifetime thread owns the Looper and Choreographer instead and
 +// samples for whichever vo is attached; between clients it holds no frame
 +// callback and sleeps in the Looper.
++//
++// The same Choreographer reports the display mode's vsync period (API 30) as
++// it changes. Where it has frame timelines (API 33), every 500 ms resample
++// also takes the next vsync's callback, whose timelines are spaced by
++// SurfaceFlinger's own vsync model: the grid it latches against, which need
++// not be the mode's (mediacodec_grid_period). Media3 1.11 reads both from the
++// same timelines on API 33 and the refresh rate on the main thread's display
++// listener below it; here both reach the vo on the Choreographer's own thread,
++// before any frame is timed against them.
 +static struct {
 +    mp_static_mutex lock;
 +    bool started;   // thread created (or creation attempted)
@@ -959,26 +1039,100 @@ index 0000000..9b292e2
 +    mp_post_frame_callback_delayed_fn post_frame_callback_delayed;
 +    mp_post_frame_callback64_fn post_frame_callback64;
 +    mp_post_frame_callback_delayed64_fn post_frame_callback_delayed64;
++    mp_register_refresh_rate_callback_fn register_refresh_rate_callback;
++    mp_post_vsync_callback_fn post_timeline_callback;
++    mp_frame_data_time_fn timeline_frame_time;
++    mp_frame_data_count_fn timeline_count;
++    mp_frame_data_present_fn timeline_presentation;
 +    AChoreographer *choreographer;
 +    mp_thread thread;
 +    struct vo *client; // the attached vo, or NULL
-+    bool posted;       // a frame callback is outstanding
++    int posted;        // callbacks outstanding
++    int64_t vsync_period; // from the refresh-rate callback, 0 until known
++    int64_t vsync_spacing; // frame timelines' spacing, 0 until known
 +} vsync_sampler = { .lock = MP_STATIC_MUTEX_INITIALIZER };
 +
++// What a sampler path has reserved (posted++) under vsync_sampler.lock and
++// hands to the Choreographer once the lock is released: issue_vsync_post.
++enum vsync_post {
++    VSYNC_POST_NONE,
++    VSYNC_POST_NOW,      // the next vsync
++    VSYNC_POST_RESAMPLE, // the next vsync 500 ms from now
++    VSYNC_POST_TIMELINE, // the next vsync's frame timelines (API 33)
++};
++
 +// vsync_sampler.lock held.
-+static void post_vsync_callback(bool delayed);
++static enum vsync_post reserve_vsync_post(bool delayed);
++// vsync_sampler.lock not held.
++static void issue_vsync_post(enum vsync_post post);
++
++static void timeline_callback(const AChoreographerFrameCallbackData *data,
++                              void *arg)
++{
++    enum vsync_post post = VSYNC_POST_NONE;
++    mp_mutex_lock(&vsync_sampler.lock);
++    vsync_sampler.posted--;
++    struct vo *vo = vsync_sampler.client;
++    if (vo) {
++        ((struct priv *)vo->priv)->vsync_sample =
++            vsync_sampler.timeline_frame_time(data);
++        if (vsync_sampler.timeline_count(data) >= 2) {
++            int64_t spacing = vsync_sampler.timeline_presentation(data, 1) -
++                              vsync_sampler.timeline_presentation(data, 0);
++            vsync_sampler.vsync_spacing = spacing > 0 ? spacing : 0;
++        }
++        post = reserve_vsync_post(true);
++    }
++    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
++}
 +
 +static void record_vsync(int64_t frame_time)
 +{
++    enum vsync_post post = VSYNC_POST_NONE;
 +    mp_mutex_lock(&vsync_sampler.lock);
-+    vsync_sampler.posted = false;
++    vsync_sampler.posted--;
 +    struct vo *vo = vsync_sampler.client;
 +    if (vo) {
-+        struct priv *p = vo->priv;
-+        p->vsync_sample = frame_time;
-+        post_vsync_callback(true);
++        ((struct priv *)vo->priv)->vsync_sample = frame_time;
++        // The next vsync's timelines complete the resample (API 33).
++        if (vsync_sampler.post_timeline_callback && vsync_sampler.posted <= 1) {
++            vsync_sampler.posted++;
++            post = VSYNC_POST_TIMELINE;
++        } else {
++            post = reserve_vsync_post(true);
++        }
 +    }
 +    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
++}
++
++// The display's vsync period changed (or is first known). A fresh phase
++// sample on the new grid is requested at once rather than at the next
++// 500 ms resample, and the attached vo re-times its next frame against it.
++// On Android 11 that request re-enters this function before it returns when
++// the same mode switch also queued a config-changed event: see
++// issue_vsync_post.
++static void refresh_rate_callback(int64_t vsync_period_ns, void *data)
++{
++    enum vsync_post post = VSYNC_POST_NONE;
++    mp_mutex_lock(&vsync_sampler.lock);
++    if (vsync_period_ns > 0 && vsync_period_ns != vsync_sampler.vsync_period) {
++        vsync_sampler.vsync_period = vsync_period_ns;
++        vsync_sampler.vsync_spacing = 0;
++        struct vo *vo = vsync_sampler.client;
++        if (vo) {
++            MP_VERBOSE(vo, "Choreographer vsync period: %.3f Hz\n",
++                       1e9 / vsync_period_ns);
++            ((struct priv *)vo->priv)->vsync_sample = 0;
++            post = reserve_vsync_post(false);
++            // Under the lock: it is what keeps the client alive.
++            vo_event(vo, VO_EVENT_WIN_STATE);
++            vo_wakeup(vo);
++        }
++    }
++    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
 +}
 +
 +static void vsync_callback(long frame_time, void *arg)
@@ -991,17 +1145,48 @@ index 0000000..9b292e2
 +    record_vsync(frame_time);
 +}
 +
++static enum vsync_post reserve_vsync_post(bool delayed)
++{
++    // One resample may be outstanding; an urgent one may join it.
++    if (!vsync_sampler.ready || (delayed && vsync_sampler.posted) ||
++        vsync_sampler.posted > 1)
++        return VSYNC_POST_NONE;
++    vsync_sampler.posted++;
++    return delayed ? VSYNC_POST_RESAMPLE : VSYNC_POST_NOW;
++}
++
++// Every Choreographer call is made here, never under vsync_sampler.lock. On
++// Android 11 as first released (android-11.0.0_r1; Fire OS 8 behaves so), a
++// post for the next vsync made on the Choreographer's own thread schedules
++// that vsync before it returns, and scheduling first drains the display
++// events already queued; a config-changed event among them is handed to
++// refresh_rate_callback right there (DisplayEventDispatcher::scheduleVsync ->
++// processPendingEvents -> Choreographer::dispatchConfigChanged). A mode
++// switch queues one while DisplayManager's refresh-rate update for the same
++// switch is already running refresh_rate_callback, so under the lock that
++// thread waited on itself: the attached vo stalled at its next sample read
++// and every later vo in the process at preinit (plezy#2465).
++//
 +// Safe from any thread: the Choreographer forwards a foreign-thread post to
 +// its own Looper. The callback receives no vo pointer; it reads the attached
 +// client under the lock, so a vo that detached before its callback fired is
-+// never touched.
-+static void post_vsync_callback(bool delayed)
++// never touched. The Choreographer and the entry points are fixed before
++// ready is set, and a reservation is only made once it is.
++static void issue_vsync_post(enum vsync_post post)
 +{
-+    const uint32_t delay_ms = delayed ? 500 : 0;
++    const uint32_t delay_ms = post == VSYNC_POST_RESAMPLE ? 500 : 0;
 +
-+    if (!vsync_sampler.ready || vsync_sampler.posted)
++    switch (post) {
++    case VSYNC_POST_NONE:
 +        return;
-+    vsync_sampler.posted = true;
++    case VSYNC_POST_TIMELINE:
++        vsync_sampler.post_timeline_callback(vsync_sampler.choreographer,
++                                             timeline_callback, NULL);
++        return;
++    case VSYNC_POST_NOW:
++    case VSYNC_POST_RESAMPLE:
++        break;
++    }
 +    if (vsync_sampler.post_frame_callback_delayed64) {
 +        if (delay_ms) {
 +            vsync_sampler.post_frame_callback_delayed64(
@@ -1042,9 +1227,16 @@ index 0000000..9b292e2
 +    }
 +    vsync_sampler.choreographer = choreographer;
 +    vsync_sampler.ready = true;
-+    if (vsync_sampler.client)
-+        post_vsync_callback(false);
++    enum vsync_post post = vsync_sampler.client ? reserve_vsync_post(false)
++                                                : VSYNC_POST_NONE;
 +    mp_mutex_unlock(&vsync_sampler.lock);
++
++    // Outside the lock like every Choreographer call (issue_vsync_post).
++    if (vsync_sampler.register_refresh_rate_callback) {
++        vsync_sampler.register_refresh_rate_callback(
++            choreographer, refresh_rate_callback, NULL);
++    }
++    issue_vsync_post(post);
 +
 +    // Process lifetime: the Looper and the Choreographer registered on it
 +    // must outlive every vo, which is the whole point of this thread.
@@ -1081,6 +1273,19 @@ index 0000000..9b292e2
 +        dlsym(lib, "AChoreographer_postFrameCallback64");
 +    vsync_sampler.post_frame_callback_delayed64 =
 +        dlsym(lib, "AChoreographer_postFrameCallbackDelayed64");
++    vsync_sampler.register_refresh_rate_callback =
++        dlsym(lib, "AChoreographer_registerRefreshRateCallback");
++    vsync_sampler.post_timeline_callback =
++        dlsym(lib, "AChoreographer_postVsyncCallback");
++    vsync_sampler.timeline_frame_time =
++        dlsym(lib, "AChoreographerFrameCallbackData_getFrameTimeNanos");
++    vsync_sampler.timeline_count =
++        dlsym(lib, "AChoreographerFrameCallbackData_getFrameTimelinesLength");
++    vsync_sampler.timeline_presentation = dlsym(lib,
++        "AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos");
++    if (!vsync_sampler.timeline_frame_time || !vsync_sampler.timeline_count ||
++        !vsync_sampler.timeline_presentation)
++        vsync_sampler.post_timeline_callback = NULL;
 +
 +    bool have64 = vsync_sampler.post_frame_callback64 &&
 +                  vsync_sampler.post_frame_callback_delayed64;
@@ -1121,8 +1326,10 @@ index 0000000..9b292e2
 +    vsync_sampler.client = vo;
 +    p->vsync_attached = true;
 +    p->vsync_sample = 0;
-+    post_vsync_callback(false);
++    vsync_sampler.vsync_spacing = 0;
++    enum vsync_post post = reserve_vsync_post(false);
 +    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
 +}
 +
 +static void uninit_vsync_sampler(struct vo *vo)
@@ -1148,7 +1355,7 @@ index 0000000..9b292e2
 +
 +    AVHWDeviceContext *ctx = (void *)device_ref->data;
 +    AVMediaCodecDeviceContext *hwctx = ctx->hwctx;
-+    hwctx->surface = (void *)(intptr_t)(vo->opts->WinID);
++    hwctx->surface = (void *)(uintptr_t)vo->opts->WinID;
 +
 +    if (av_hwdevice_ctx_init(device_ref) < 0)
 +        av_buffer_unref(&device_ref);
@@ -1178,440 +1385,32 @@ index 0000000..9b292e2
 +    [SUBBITMAP_BGRA] = true,
 +};
 +
-+struct osd_render_state {
-+    int last_w, last_h;
-+    bool force_full;
-+    int64_t posted_change_id; // sub_bitmap_list.change_id of the last result
-+    struct osd_request last;  // last serviced request
-+    uint64_t planned_seq;     // last.seq whose pre-renders were decided
-+    // Per OSD object: the change id libass last reported, and when that
-+    // render repeated an earlier one's pixels, the earlier item (id, atlas
-+    // layout, atlas) every render with that id is folded into.
-+    int dedup_raw[MAX_OSD_PARTS];
-+    struct sub_bitmaps *dedup_canon[MAX_OSD_PARTS];
-+};
++// Callbacks of the shared render stage (osd_ahead.h).
 +
-+// Locked. Queued and active snapshots stay immutable. Consuming the
-+// next-frame pre-render leaves a working slot even with event prefetch held.
-+static int osd_free_slot(struct priv *p)
++static void osd_render_thread_init(void *ctx)
 +{
-+    struct osd_shared *s = &p->osd;
-+    for (int n = 0; n < OSD_SLOTS; n++) {
-+        if (osd_result_holds(&s->results, n) || n == s->present_slot)
-+            continue;
-+        if (s->spec.valid && n == s->spec.slot)
-+            continue;
-+        if (s->prefetch.valid && n == s->prefetch.slot)
-+            continue;
-+        return n;
-+    }
-+    return -1;
-+}
-+
-+static void osd_record_render(struct priv *p, int64_t render_ns, bool changed)
-+{
-+    struct osd_shared *s = &p->osd;
-+    s->renders++;
-+    if (changed)
-+        s->renders_changed++;
-+    s->render_ns_last = render_ns;
-+    if (render_ns > s->render_ns_max)
-+        s->render_ns_max = render_ns;
-+    int64_t ms = render_ns / 1000000;
-+    s->render_hist[ms <= 10 ? 0 : ms <= 25 ? 1 : ms <= 42 ? 2 : ms <= 84 ? 3 : 4]++;
-+}
-+
-+// Whether two items draw the same pixels: the same parts at the same places
-+// with the same content, wherever each atlas keeps them. Compared part by
-+// part; the packer never clears the space between parts.
-+static bool osd_same_pixels(const struct sub_bitmaps *a, const struct sub_bitmaps *b)
-+{
-+    if (a->format != b->format || a->num_parts != b->num_parts ||
-+        !a->packed || !b->packed)
-+        return false;
-+    for (int k = 0; k < a->num_parts; k++) {
-+        const struct sub_bitmap *x = &a->parts[k], *y = &b->parts[k];
-+        if (x->w != y->w || x->h != y->h || x->x != y->x || x->y != y->y ||
-+            x->dw != y->dw || x->dh != y->dh || x->libass.color != y->libass.color)
-+            return false;
-+    }
-+    int bpp = a->format == SUBBITMAP_LIBASS ? 1 : 4;
-+    for (int k = 0; k < a->num_parts; k++) {
-+        const struct sub_bitmap *x = &a->parts[k], *y = &b->parts[k];
-+        if (a->packed->planes[0] == b->packed->planes[0] &&
-+            x->src_x == y->src_x && x->src_y == y->src_y)
-+            continue; // the packer's own cache: one refcounted buffer
-+        const uint8_t *pa = a->packed->planes[0] +
-+            (ptrdiff_t)x->src_y * a->packed->stride[0] + (ptrdiff_t)x->src_x * bpp;
-+        const uint8_t *pb = b->packed->planes[0] +
-+            (ptrdiff_t)y->src_y * b->packed->stride[0] + (ptrdiff_t)y->src_x * bpp;
-+        for (int row = 0; row < x->h; row++) {
-+            if (memcmp(pa + (ptrdiff_t)row * a->packed->stride[0],
-+                       pb + (ptrdiff_t)row * b->packed->stride[0], (size_t)x->w * bpp))
-+                return false;
-+        }
-+    }
-+    return true;
-+}
-+
-+// A standalone copy of an item's id, layout and atlas reference.
-+static struct sub_bitmaps *osd_clone_item(const struct sub_bitmaps *src)
-+{
-+    struct sub_bitmaps *c = talloc(NULL, struct sub_bitmaps);
-+    *c = *src;
-+    c->parts = talloc_memdup(c, src->parts, sizeof(src->parts[0]) * src->num_parts);
-+    c->packed = mp_image_new_ref(src->packed);
-+    talloc_steal(c, c->packed);
-+    return c;
-+}
-+
-+// Make dst draw from canon's atlas: same id, same part positions in it.
-+static void osd_adopt_item(struct sub_bitmaps *dst, const struct sub_bitmaps *canon)
-+{
-+    talloc_free(dst->packed);
-+    dst->packed = mp_image_new_ref(canon->packed);
-+    talloc_steal(dst, dst->packed);
-+    MP_RESIZE_ARRAY(dst, dst->parts, canon->num_parts);
-+    memcpy(dst->parts, canon->parts, sizeof(canon->parts[0]) * canon->num_parts);
-+    dst->num_parts = canon->num_parts;
-+    dst->packed_w = canon->packed_w;
-+    dst->packed_h = canon->packed_h;
-+    dst->change_id = canon->change_id;
-+}
-+
-+// libass reports a change relative to its previous render, and this
-+// pipeline renders out of order: the pre-render of an event's first frame,
-+// then the frames before it, then that first frame again. The re-render
-+// gets a fresh change id and a fresh atlas layout for the same pixels,
-+// which would mean a swap and an atlas upload for nothing. An item that
-+// repeats a slot's pixels takes over that slot's id and atlas instead, so
-+// ids mean pixels again and the cached texture stays valid; the list id, a
-+// sum of the object ids, moves with it. A run of unchanged renders after
-+// that folds the same way without another pixel compare. Render thread
-+// only: it is the sole writer of the slots, so it may read them unlocked.
-+static void osd_dedup_items(struct priv *p, struct osd_render_state *rs,
-+                            struct sub_bitmap_list *sbs)
-+{
-+    for (int i = 0; i < sbs->num_items; i++) {
-+        struct sub_bitmaps *imgs = sbs->items[i];
-+        int idx = imgs->render_index;
-+        if (idx < 0 || idx >= MAX_OSD_PARTS || !imgs->packed)
-+            continue;
-+        int raw = imgs->change_id;
-+        if (raw != rs->dedup_raw[idx] || !rs->dedup_raw[idx]) {
-+            rs->dedup_raw[idx] = raw;
-+            TA_FREEP(&rs->dedup_canon[idx]);
-+            for (int n = 0; n < OSD_SLOTS && !rs->dedup_canon[idx]; n++) {
-+                struct sub_bitmap_list *ref = p->osd_slots[n].sbs;
-+                for (int j = 0; ref && j < ref->num_items; j++) {
-+                    struct sub_bitmaps *r = ref->items[j];
-+                    if (r->render_index == idx && r->change_id != raw &&
-+                        osd_same_pixels(imgs, r))
-+                    {
-+                        rs->dedup_canon[idx] = osd_clone_item(r);
-+                        break;
-+                    }
-+                }
-+            }
-+        }
-+        struct sub_bitmaps *canon = rs->dedup_canon[idx];
-+        if (canon && canon->change_id != imgs->change_id) {
-+            sbs->change_id -= (int64_t)imgs->change_id - canon->change_id;
-+            osd_adopt_item(imgs, canon);
-+        }
-+    }
-+}
-+
-+// Render the OSD for pts on the canvas res describes, folding a render that
-+// repeats an uploaded one into that render's atlas. Returns the list, owned
-+// by the caller, and its duration.
-+static struct sub_bitmap_list *osd_slot_render(struct vo *vo, struct osd_render_state *rs,
-+                                               double pts, struct mp_osd_res res,
-+                                               int draw_flags, int64_t *render_ns)
-+{
-+    int64_t t0 = mp_time_ns();
-+    struct sub_bitmap_list *sbs =
-+        osd_render(vo->osd, res, pts, draw_flags, osd_gl_formats);
-+    *render_ns = mp_time_ns() - t0;
-+    if (sbs)
-+        osd_dedup_items(vo->priv, rs, sbs);
-+    return sbs;
-+}
-+
-+// Publish sbs as slot's frame: the bitmap list and the canvas it was
-+// rendered on.
-+static void osd_slot_store(struct osd_slot *dst, struct sub_bitmap_list *sbs,
-+                           int w, int h, struct mp_osd_res res)
-+{
-+    talloc_free(dst->sbs);
-+    dst->sbs = sbs;
-+    dst->canvas_w = w;
-+    dst->canvas_h = h;
-+}
-+
-+// Render the OSD for pts into slot. Returns whether the slot holds a frame
-+// that differs from the last one posted (or a forced repaint).
-+static bool osd_render_pass(struct vo *vo, struct osd_render_state *rs,
-+                            double pts, struct mediacodec_geometry geometry,
-+                            int slot)
-+{
-+    struct priv *p = vo->priv;
-+
-+    int w = ANativeWindow_getWidth(p->osd_window);
-+    int h = ANativeWindow_getHeight(p->osd_window);
-+    if (w <= 0 || h <= 0)
-+        return false;
-+    if (w != rs->last_w || h != rs->last_h) {
-+        rs->last_w = w;
-+        rs->last_h = h;
-+        rs->force_full = true;
-+    }
-+
-+    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-+
-+    int64_t render_ns;
-+    struct sub_bitmap_list *sbs = osd_slot_render(vo, rs, pts, res, 0, &render_ns);
-+    if (!sbs)
-+        return false;
-+
-+    bool changed = rs->force_full || sbs->change_id != rs->posted_change_id;
-+    if (render_ns > MP_TIME_MS_TO_NS(100)) {
-+        MP_VERBOSE(vo, "OSD: slow render at %.3f: %.0f ms (%d items)\n", pts,
-+                   render_ns / 1e6, sbs->num_items);
-+    }
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    osd_record_render(p, render_ns, changed);
-+    osd_prefetch_observe_render(&p->osd.prefetch, changed);
-+    mp_mutex_unlock(&p->osd_lock);
-+
-+    if (!changed) {
-+        talloc_free(sbs);
-+        return false;
-+    }
-+
-+    osd_slot_store(&p->osd_slots[slot], sbs, w, h, res);
-+    return true;
-+}
-+
-+static struct osd_release osd_find_release(struct priv *p, uint64_t seq);
-+
-+// Locked. Preserve every accepted future pose until presentation or invalidation.
-+static void osd_post_result(struct priv *p, struct osd_render_state *rs,
-+                            int slot, const struct osd_request *req)
-+{
-+    struct osd_shared *s = &p->osd;
-+    struct osd_release release = osd_find_release(p, req->seq);
-+    if (s->terminate || s->present_failed || req->epoch != s->epoch ||
-+        (req->seq && req->seq <= s->release_seq && release.seq != req->seq))
-+    {
-+        s->stale++;
-+        rs->force_full = true;
-+        return;
-+    }
-+    struct osd_result r = {
-+        .slot = slot, .seq = req->seq, .epoch = req->epoch,
-+        .pts = req->pts, .posted = mp_time_ns(), .release = release,
-+    };
-+    // Admission reserves capacity before rendering; only this thread produces.
-+    bool queued = osd_result_push(&s->results, r);
-+    assert(queued);
-+    if (!queued) {
-+        rs->force_full = true;
-+        return;
-+    }
-+    rs->posted_change_id = p->osd_slots[slot].sbs->change_id;
-+    rs->force_full = false;
-+    mp_cond_broadcast(&p->osd_wakeup);
-+}
-+
-+static void osd_service_request(struct vo *vo, struct osd_render_state *rs,
-+                                struct osd_request req,
-+                                struct mediacodec_geometry geometry)
-+{
-+    struct priv *p = vo->priv;
-+    struct osd_shared *s = &p->osd;
-+
-+    rs->force_full |= req.full;
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    if (req.epoch != s->epoch) {
-+        rs->force_full = true;
-+        mp_mutex_unlock(&p->osd_lock);
-+        return;
-+    }
-+    // A warmed event image is only a cache candidate. It can be animated,
-+    // expired, or missing a cue that started since it was rendered.
-+    if (rs->force_full || req.epoch != s->prefetch.epoch)
-+        s->prefetch.valid = false;
-+    int spec_slot = s->spec.valid ? s->spec.slot : -1;
-+    enum osd_spec_result hit = osd_spec_service(&s->spec, req.pts, req.epoch,
-+                                                rs->force_full, req.delta);
-+    s->spec.slot = -1;
-+    if (hit == OSD_SPEC_HIT) {
-+        if (spec_slot >= 0)
-+            osd_post_result(p, rs, spec_slot, &req);
-+        osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
-+        mp_mutex_unlock(&p->osd_lock);
-+        rs->last = req;
-+        return;
-+    }
-+    // Admission reserves queue capacity and consuming speculation frees its
-+    // slot; an active frame and event prefetch cannot exhaust the working slots.
-+    int slot = osd_free_slot(p);
-+    mp_mutex_unlock(&p->osd_lock);
-+    if (slot < 0) {
-+        rs->last = req;
-+        return;
-+    }
-+
-+    bool posted = osd_render_pass(vo, rs, req.pts, geometry, slot);
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    if (posted)
-+        osd_post_result(p, rs, slot, &req);
-+    osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
-+    mp_mutex_unlock(&p->osd_lock);
-+    rs->last = req;
-+}
-+
-+static void osd_speculate(struct vo *vo, struct osd_render_state *rs,
-+                          double pts, uint64_t epoch,
-+                          struct mediacodec_geometry geometry, int slot)
-+{
-+    struct priv *p = vo->priv;
-+
-+    bool rendered = osd_render_pass(vo, rs, pts, geometry, slot);
-+
-+    mp_mutex_lock(&p->osd_lock);
-+    if (p->osd.epoch == epoch)
-+        osd_spec_store(&p->osd.spec, pts, epoch, rendered ? slot : -1);
-+    mp_mutex_unlock(&p->osd_lock);
-+}
-+
-+// Warm the event's first frame and retain it for GPU preparation and pixel
-+// deduplication. Only a timestamp-matched render can authorize presentation.
-+static void osd_prefetch_event(struct vo *vo, struct osd_render_state *rs,
-+                               double event_start, int events, uint64_t epoch,
-+                               struct mediacodec_geometry geometry, int slot)
-+{
-+    struct priv *p = vo->priv;
-+    int w = rs->last_w, h = rs->last_h;
-+    if (w <= 0 || h <= 0)
-+        return;
-+    struct mp_osd_res res = mediacodec_osd_geometry(geometry, w, h);
-+    int64_t render_ns;
-+    struct sub_bitmap_list *sbs =
-+        osd_slot_render(vo, rs, event_start + 0.001, res, 0, &render_ns);
-+    double render_s = render_ns / 1e9;
-+    mp_mutex_lock(&p->osd_lock);
-+    bool keep = sbs && p->osd.epoch == epoch;
-+    if (keep)
-+        osd_slot_store(&p->osd_slots[slot], sbs, w, h, res);
-+    osd_prefetch_store(&p->osd.prefetch, event_start, events, epoch,
-+                       keep ? slot : -1, render_s);
-+    mp_mutex_unlock(&p->osd_lock);
-+    if (!keep)
-+        talloc_free(sbs);
-+    MP_VERBOSE(vo, "OSD: pre-rendered the event at %.3f (%d events, %.0f ms, %.2fs ahead)\n",
-+               event_start, events, render_s * 1e3, event_start - rs->last.pts);
-+}
-+
-+static MP_THREAD_VOID osd_render_thread(void *arg)
-+{
-+    struct vo *vo = arg;
-+    struct priv *p = vo->priv;
-+    struct osd_shared *s = &p->osd;
-+    mp_thread_set_name("vo/osd-render");
 +    // Raster work has the same frame deadline as presentation.
 +    setpriority(PRIO_PROCESS, 0, -4);
++}
 +
-+    struct osd_render_state rs = {.force_full = true};
++// Locked.
++static void osd_latch_canvas(void *ctx)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    p->osd_render_geometry = p->osd_geometry;
++}
 +
-+    mp_mutex_lock(&p->osd_lock);
-+    while (!s->terminate) {
-+        if (s->present_failed) {
-+            // Nothing will consume results; do not burn CPU on libass.
-+            s->requested = false;
-+            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-+            continue;
-+        }
-+        if (s->results.count == OSD_RESULT_CAPACITY) {
-+            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-+            continue;
-+        }
-+        if (s->requested) {
-+            struct osd_request req = s->request;
-+            struct mediacodec_geometry geometry = s->geometry;
-+            s->requested = false;
-+            mp_mutex_unlock(&p->osd_lock);
-+            osd_service_request(vo, &rs, req, geometry);
-+            mp_mutex_lock(&p->osd_lock);
-+            continue;
-+        }
++static void osd_canvas_size(void *ctx, int *w, int *h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    *w = ANativeWindow_getWidth(p->osd_window);
++    *h = ANativeWindow_getHeight(p->osd_window);
++}
 +
-+        // Pre-render the frame the cadence predicts next, once per request,
-+        // while the present stage may still be waiting on this one's deadline.
-+        if (rs.last.seq == rs.planned_seq) {
-+            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
-+            continue;
-+        }
-+        rs.planned_seq = rs.last.seq;
-+        int spec_slot = osd_free_slot(p);
-+        bool eligible = !s->paused && rs.last.seq && rs.last.epoch == s->epoch &&
-+                        spec_slot >= 0 && !s->spec.valid;
-+        double delta = rs.last.delta;
-+        double last_pts = rs.last.pts;
-+        uint64_t epoch = s->epoch;
-+        struct mediacodec_geometry geometry = s->geometry;
-+        double horizon = NAN;
-+        if (eligible && delta > 0) {
-+            // osd_get_sub_render_horizon takes the OSD and decoder locks;
-+            // never under osd_lock.
-+            mp_mutex_unlock(&p->osd_lock);
-+            horizon = osd_get_sub_render_horizon(vo->osd);
-+            mp_mutex_lock(&p->osd_lock);
-+            eligible = !s->requested && !s->terminate && s->epoch == epoch;
-+        }
-+        double pts;
-+        if (osd_spec_plan(&s->spec, last_pts, delta, horizon, eligible, &pts)) {
-+            mp_mutex_unlock(&p->osd_lock);
-+            osd_speculate(vo, &rs, pts, epoch, geometry, spec_slot);
-+            mp_mutex_lock(&p->osd_lock);
-+        }
-+
-+        // With the next frame covered and the OSD static, render the next
-+        // event's first frame into a slot of its own.
-+        int event_slot = osd_free_slot(p);
-+        bool event_eligible = !s->paused && !s->requested && !s->terminate &&
-+                              rs.last.seq && rs.last.epoch == s->epoch &&
-+                              delta > 0 && event_slot >= 0 && !s->prefetch.valid &&
-+                              s->prefetch.unchanged_streak >= OSD_PREFETCH_STATIC_RENDERS;
-+        if (!event_eligible)
-+            continue;
-+        mp_mutex_unlock(&p->osd_lock);
-+        double next_start, visible_end;
-+        int next_events;
-+        osd_get_sub_schedule(vo->osd, last_pts, last_pts + OSD_PREFETCH_MIN_LEAD,
-+                             &next_start, &next_events, &visible_end);
-+        if (isnan(horizon))
-+            horizon = osd_get_sub_render_horizon(vo->osd);
-+        mp_mutex_lock(&p->osd_lock);
-+        bool plan = osd_prefetch_plan(&s->prefetch, last_pts, next_start,
-+                                      next_events, visible_end, horizon,
-+                                      !s->requested && !s->terminate &&
-+                                      s->epoch == epoch);
-+        mp_mutex_unlock(&p->osd_lock);
-+        if (plan) {
-+            osd_prefetch_event(vo, &rs, next_start, next_events, epoch, geometry,
-+                               event_slot);
-+        }
-+        mp_mutex_lock(&p->osd_lock);
-+    }
-+    mp_mutex_unlock(&p->osd_lock);
-+    for (int n = 0; n < MAX_OSD_PARTS; n++)
-+        talloc_free(rs.dedup_canon[n]);
-+    MP_THREAD_RETURN();
++static struct mp_osd_res osd_canvas_res(void *ctx, int w, int h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    return mediacodec_osd_geometry(p->osd_render_geometry, w, h);
 +}
 +
 +// --- OSD present stage -------------------------------------------------------
@@ -1694,6 +1493,7 @@ index 0000000..9b292e2
 +    struct osd_comp_key pinned_comps[2];
 +    int num_pinned_comps;
 +    int surface_w, surface_h;       // the OSD surface, queried per present
++    int repaint_w, repaint_h;       // window size the last resize repaint targeted
 +    PFNEGLCREATESYNCKHRPROC create_sync;
 +    PFNEGLDESTROYSYNCKHRPROC destroy_sync;
 +    PFNEGLCLIENTWAITSYNCKHRPROC client_wait_sync;
@@ -1977,25 +1777,25 @@ index 0000000..9b292e2
 +        if (ok && value == EGL_TIMESTAMP_PENDING_ANDROID)
 +            break; // later probes are pending too
 +        int64_t err = (int64_t)value - probe->target_ns;
-+        mp_mutex_lock(&p->osd_lock);
++        mp_mutex_lock(&p->osd.lock);
 +        // Some drivers report the stamp in another clock domain entirely.
 +        if (!ok || value == EGL_TIMESTAMP_INVALID_ANDROID ||
 +            llabs(err) > MP_TIME_S_TO_NS(1))
 +        {
-+            p->osd.present_invalid++;
++            p->plane.present_invalid++;
 +        } else {
 +            MP_DBG(vo, "OSD: displayed %.3f: %+.1f ms vs target vsync\n", probe->pts, err / 1e6);
-+            p->osd.present_measured++;
-+            p->osd.present_err_last = err;
-+            if (llabs(err) > llabs(p->osd.present_err_worst))
-+                p->osd.present_err_worst = err;
++            p->plane.present_measured++;
++            p->plane.present_err_last = err;
++            if (llabs(err) > llabs(p->plane.present_err_worst))
++                p->plane.present_err_worst = err;
 +            if (probe->period_ns > 0) {
 +                double vsyncs = (double)err / probe->period_ns;
-+                p->osd.present_hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
++                p->plane.present_hist[vsyncs < -1.5 ? 0 : vsyncs < -0.5 ? 1
 +                                  : vsyncs < 0.5 ? 2 : vsyncs < 1.5 ? 3 : 4]++;
 +            }
 +        }
-+        mp_mutex_unlock(&p->osd_lock);
++        mp_mutex_unlock(&p->osd.lock);
 +        n++;
 +    }
 +    if (n) {
@@ -2045,7 +1845,7 @@ index 0000000..9b292e2
 +// screen and the queue head. Both GPU caches take their residency from here,
 +// so neither can evict a surface the other is about to draw; deeper frames
 +// retain CPU snapshots, not GPU residency.
-+static int osd_live_slots(const struct osd_shared *s, int slots[2])
++static int osd_live_slots(const struct osd_ahead *s, int slots[2])
 +{
 +    slots[0] = s->present_slot;
 +    slots[1] = osd_result_slot(&s->results);
@@ -2054,7 +1854,7 @@ index 0000000..9b292e2
 +
 +// Locked. The slots worth preparing for the GPU, in that order: the posted
 +// result, then the next frame's pre-render, then the next event's.
-+static int osd_ahead_slots(const struct osd_shared *s, int slots[3])
++static int osd_ahead_slots(const struct osd_ahead *s, int slots[3])
 +{
 +    slots[0] = osd_result_slot(&s->results);
 +    slots[1] = s->spec.valid ? s->spec.slot : -1;
@@ -2065,14 +1865,14 @@ index 0000000..9b292e2
 +// Locked. Pin the live slots' atlases against eviction.
 +static void osd_tex_pin_live(struct priv *p, struct osd_gl *g)
 +{
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    int slots[2];
 +    int num_slots = osd_live_slots(s, slots);
 +    g->num_pinned = 0;
 +    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
-+        struct sub_bitmap_list *sbs = p->osd_slots[slots[n]].sbs;
++        struct sub_bitmap_list *sbs = p->osd.slots[slots[n]].sbs;
 +        for (int i = 0; sbs && i < sbs->num_items; i++) {
 +            if (g->num_pinned < MP_ARRAY_SIZE(g->pinned))
 +                g->pinned[g->num_pinned++] = osd_tex_key_of(sbs->items[i]);
@@ -2227,14 +2027,14 @@ index 0000000..9b292e2
 +// with an upload in progress on it, or NULL.
 +static struct osd_tex *osd_upload_work(struct priv *p, struct osd_gl *g)
 +{
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    osd_tex_pin_live(p, g);
 +    int slots[3];
 +    int num_slots = osd_ahead_slots(s, slots);
 +    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
-+        struct sub_bitmap_list *sbs = p->osd_slots[slots[n]].sbs;
++        struct sub_bitmap_list *sbs = p->osd.slots[slots[n]].sbs;
 +        for (int i = 0; sbs && i < sbs->num_items; i++) {
 +            struct sub_bitmaps *imgs = sbs->items[i];
 +            if (!osd_tex_uploadable(imgs))
@@ -2373,14 +2173,14 @@ index 0000000..9b292e2
 +// Locked. Pin the live slots' composed canvases against eviction.
 +static void osd_comp_pin_live(struct priv *p, struct osd_gl *g)
 +{
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    int slots[2];
 +    int num_slots = osd_live_slots(s, slots);
 +    g->num_pinned_comps = 0;
 +    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
-+        struct osd_comp_key key = osd_comp_key_of(&p->osd_slots[slots[n]]);
++        struct osd_comp_key key = osd_comp_key_of(&p->osd.slots[slots[n]]);
 +        if (key.num_items)
 +            g->pinned_comps[g->num_pinned_comps++] = key;
 +    }
@@ -2539,14 +2339,14 @@ index 0000000..9b292e2
 +// atlases are still uploading waits for them.
 +static struct osd_comp *osd_comp_work(struct priv *p, struct osd_gl *g)
 +{
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    osd_comp_pin_live(p, g);
 +    int slots[3];
 +    int num_slots = osd_ahead_slots(s, slots);
 +    for (int n = 0; n < num_slots; n++) {
 +        if (slots[n] < 0)
 +            continue;
-+        struct osd_comp_key key = osd_comp_key_of(&p->osd_slots[slots[n]]);
++        struct osd_comp_key key = osd_comp_key_of(&p->osd.slots[slots[n]]);
 +        if (!key.num_items)
 +            continue;
 +        struct osd_comp *c = osd_comp_find(g, &key);
@@ -2559,7 +2359,7 @@ index 0000000..9b292e2
 +        if (!c) {
 +            if (g->composing)
 +                osd_comp_release(g, g->composing);
-+            c = osd_comp_begin(g, &p->osd_slots[slots[n]], &key);
++            c = osd_comp_begin(g, &p->osd.slots[slots[n]], &key);
 +        }
 +        if (c && osd_comp_atlases_ready(g, c)) {
 +            g->composing = c;
@@ -2586,7 +2386,7 @@ index 0000000..9b292e2
 +        struct osd_comp *c = e ? NULL : osd_comp_work(p, g);
 +        if (!e && !c)
 +            return false;
-+        mp_mutex_unlock(&p->osd_lock);
++        mp_mutex_unlock(&p->osd.lock);
 +        bool busy = false;
 +        if (e) {
 +            if (osd_tex_band(g, e))
@@ -2599,13 +2399,68 @@ index 0000000..9b292e2
 +            int64_t took = mp_time_ns() - t0;
 +            g->band_ns = g->band_ns ? (g->band_ns * 3 + took) / 4 : took;
 +        }
-+        mp_mutex_lock(&p->osd_lock);
++        mp_mutex_lock(&p->osd.lock);
 +        if (busy)
 +            return true;
 +        if (!until && p->osd.results.count)
 +            return false; // a result outranks warming
 +    }
 +    return false;
++}
++
++// A bar of margin canvas pixels in surface pixels, rounded outward: a scaled
++// plane must never leave a sliver of background, and a pixel of black over
++// the picture edge is invisible. Negative margins (cover, zoom) have no bar.
++static int osd_gl_bar(int margin, int surface, int canvas)
++{
++    if (margin <= 0 || surface <= 0 || canvas <= 0)
++        return 0;
++    int64_t bar = ((int64_t)margin * surface + canvas - 1) / canvas;
++    return bar < surface ? (int)bar : surface;
++}
++
++// The OSD plane sits below the app window but spans the whole player, so
++// Android punches the entire container out of the window canvas and the
++// window's black background never reaches the letterbox. Whatever this plane
++// leaves transparent outside the picture scans out as the compositor's own
++// background, which the MediaTek TV pipeline (Google TV Streamer, Fire TV
++// 4K Max) renders above black while the display is in HDR/Dolby Vision
++// mode: gray bars on an OLED. Fill the margins opaque black on this plane.
++// That adds no layer, so the HWC keeps the picture on the video plane - an
++// extra layer, even a non-overlapping solid color, demotes it to GPU
++// composition and drops the HDR output - and subtitles placed in the margins
++// draw over the fill in the same buffer.
++static void osd_gl_fill_letterbox(struct osd_gl *g, const struct osd_slot *slot,
++                                  int sw, int sh)
++{
++    int top = osd_gl_bar(slot->mt, sh, slot->canvas_h);
++    int bottom = osd_gl_bar(slot->mb, sh, slot->canvas_h);
++    int left = osd_gl_bar(slot->ml, sw, slot->canvas_w);
++    int right = osd_gl_bar(slot->mr, sw, slot->canvas_w);
++    if (!top && !bottom && !left && !right)
++        return;
++    struct GL *gl = g->gl;
++    gl->ClearColor(0, 0, 0, 1);
++    gl->Enable(GL_SCISSOR_TEST);
++    // Scissor origin is the bottom-left of the surface.
++    if (top) {
++        gl->Scissor(0, sh - top, sw, top);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (bottom) {
++        gl->Scissor(0, 0, sw, bottom);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (left) {
++        gl->Scissor(0, 0, left, sh);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    if (right) {
++        gl->Scissor(sw - right, 0, right, sh);
++        gl->Clear(GL_COLOR_BUFFER_BIT);
++    }
++    gl->Disable(GL_SCISSOR_TEST);
++    gl->ClearColor(0, 0, 0, 0);
 +}
 +
 +static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *slot)
@@ -2619,6 +2474,7 @@ index 0000000..9b292e2
 +    g->surface_h = sh;
 +    gl->Viewport(0, 0, sw, sh);
 +    gl->Clear(GL_COLOR_BUFFER_BIT);
++    osd_gl_fill_letterbox(g, slot, sw, sh);
 +
 +    struct sub_bitmap_list *sbs = slot->sbs;
 +    // Canvas pixels -> NDC; the list's w/h is the canvas the parts address.
@@ -2627,10 +2483,10 @@ index 0000000..9b292e2
 +    if (cw <= 0 || ch <= 0)
 +        return;
 +
-+    mp_mutex_lock(&p->osd_lock);
++    mp_mutex_lock(&p->osd.lock);
 +    osd_tex_pin_live(p, g);
 +    osd_comp_pin_live(p, g);
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_mutex_unlock(&p->osd.lock);
 +
 +    struct osd_comp_key key = osd_comp_key_of(slot);
 +    struct osd_comp *c = osd_comp_find(g, &key);
@@ -2649,9 +2505,9 @@ index 0000000..9b292e2
 +        gl->VertexAttribPointer(g->a_color, 4, GL_UNSIGNED_BYTE, GL_TRUE,
 +                                sizeof(struct osd_vertex), &quad[0].color);
 +        gl->DrawArrays(GL_TRIANGLES, 0, 6);
-+        mp_mutex_lock(&p->osd_lock);
-+        p->osd.composed_ahead++;
-+        mp_mutex_unlock(&p->osd_lock);
++        mp_mutex_lock(&p->osd.lock);
++        p->plane.composed_ahead++;
++        mp_mutex_unlock(&p->osd.lock);
 +        return;
 +    }
 +
@@ -2680,14 +2536,14 @@ index 0000000..9b292e2
 +    if (late)
 +        osd_tex_trim(g, NULL);
 +
-+    mp_mutex_lock(&p->osd_lock);
-+    p->osd.uploads_ahead += ahead;
-+    p->osd.uploads_late += late;
-+    p->osd.upload_ns_last = upload_ns;
-+    if (upload_ns > p->osd.upload_ns_max)
-+        p->osd.upload_ns_max = upload_ns;
-+    p->osd.composed_late++;
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_mutex_lock(&p->osd.lock);
++    p->plane.uploads_ahead += ahead;
++    p->plane.uploads_late += late;
++    p->plane.upload_ns_last = upload_ns;
++    if (upload_ns > p->plane.upload_ns_max)
++        p->plane.upload_ns_max = upload_ns;
++    p->plane.composed_late++;
++    mp_mutex_unlock(&p->osd.lock);
 +}
 +
 +// Locked. Wait until mono deadline (CLOCK_MONOTONIC) unless the result goes
@@ -2697,51 +2553,41 @@ index 0000000..9b292e2
 +                     uint64_t epoch)
 +{
 +    struct priv *p = vo->priv;
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    int64_t until = monotonic_to_mp_time_ns(deadline_mono);
 +    while (!s->terminate && s->epoch == epoch && until > mp_time_ns()) {
 +        bool gpu_busy = osd_upload_ahead(vo, g, until);
 +        if (s->terminate || s->epoch != epoch || until <= mp_time_ns())
 +            break;
 +        int64_t wake = gpu_busy ? MPMIN(until, mp_time_ns() + OSD_GPU_POLL_NS) : until;
-+        mp_cond_timedwait_until(&p->osd_wakeup, &p->osd_lock, wake);
++        mp_cond_timedwait_until(&p->osd.wakeup, &p->osd.lock, wake);
 +    }
 +    return !s->terminate && s->epoch == epoch;
-+}
-+
-+// Locked. A zero sequence means the release is not retained in the history.
-+static struct osd_release osd_find_release(struct priv *p, uint64_t seq)
-+{
-+    for (int n = 0; n < OSD_RELEASE_HISTORY; n++) {
-+        if (p->osd.releases[n].seq == seq)
-+            return p->osd.releases[n];
-+    }
-+    return (struct osd_release){0};
 +}
 +
 +static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
 +                        struct osd_release release)
 +{
 +    struct priv *p = vo->priv;
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +
 +    int64_t t_taken = mp_time_ns();
 +    osd_gl_resolve_probes(vo, g);
 +    int64_t t_draw0 = mp_time_ns();
-+    osd_gl_draw(vo, g, &p->osd_slots[r.slot]);
++    osd_gl_draw(vo, g, &p->osd.slots[r.slot]);
 +    int64_t t_draw1 = mp_time_ns();
 +
 +    bool pinned = release.timestamp && g->presentation_time;
 +    if (pinned)
 +        osd_swap_lead_observe(&g->swap_lead, release.timestamp);
 +
-+    mp_mutex_lock(&p->osd_lock);
++    mp_mutex_lock(&p->osd.lock);
 +    bool current = pinned
 +        ? osd_park(vo, g, release.timestamp - g->swap_lead.lead, r.epoch)
 +        : !s->terminate && s->epoch == r.epoch;
 +    if (!current)
-+        s->stale++;
-+    mp_mutex_unlock(&p->osd_lock);
++        s->stats.stale++;
++    mp_mutex_unlock(&p->osd.lock);
 +    if (!current)
 +        return;
 +
@@ -2768,9 +2614,9 @@ index 0000000..9b292e2
 +        if (g->num_probes == OSD_PRESENT_PROBES) {
 +            memmove(g->probes, g->probes + 1, (OSD_PRESENT_PROBES - 1) * sizeof(g->probes[0]));
 +            g->num_probes--;
-+            mp_mutex_lock(&p->osd_lock);
-+            s->present_dropped++;
-+            mp_mutex_unlock(&p->osd_lock);
++            mp_mutex_lock(&p->osd.lock);
++            p->plane.present_dropped++;
++            mp_mutex_unlock(&p->osd.lock);
 +        }
 +        g->probes[g->num_probes++] = (struct osd_present_probe){
 +            .frame_id = frame_id, .target_ns = release.vsync,
@@ -2778,31 +2624,66 @@ index 0000000..9b292e2
 +        };
 +    }
 +
-+    mp_mutex_lock(&p->osd_lock);
-+    s->swaps++;
-+    s->swap_ns_last = t_done - t_swap;
-+    if (s->swap_ns_last > s->swap_ns_max)
-+        s->swap_ns_max = s->swap_ns_last;
-+    s->swap_lead_ns = g->swap_lead.lead;
-+    s->present_source = g->ts_source;
++    // The window can change size between this buffer's dequeue - the surface
++    // size the draw used - and its queue: BLASTBufferQueue rejects the buffer
++    // ("rejecting buffer: active_size=... buffer{size=...}") and the swap
++    // showed nothing. A slot rendered for another canvas than the surface has
++    // now scales its letterbox bars onto the wrong axis instead: a portrait
++    // canvas presented on a landscape surface fills all but a 272-pixel strip
++    // of the picture black. Both happen on the PiP -> fullscreen rotation
++    // dance, and with no later OSD change the result stayed on screen until a
++    // seek repainted. Repaint at the size the window has now - the render pass
++    // reads it - once per distinct window size, so a surface that never agrees
++    // with its window cannot spin.
++    int window_w = ANativeWindow_getWidth(p->osd_window);
++    int window_h = ANativeWindow_getHeight(p->osd_window);
++    const struct osd_slot *slot = &p->osd.slots[r.slot];
++    bool window_moved = window_w > 0 && window_h > 0 &&
++                        (window_w != g->surface_w || window_h != g->surface_h);
++    bool canvas_stale = slot->canvas_w != g->surface_w ||
++                        slot->canvas_h != g->surface_h;
++    bool repaint = (window_moved || canvas_stale) &&
++                   (window_w != g->repaint_w || window_h != g->repaint_h);
++    if (repaint) {
++        g->repaint_w = window_w;
++        g->repaint_h = window_h;
++        MP_VERBOSE(vo, "OSD: presented a %dx%d canvas on a %dx%d surface with "
++                       "the window at %dx%d; repainting\n",
++                   slot->canvas_w, slot->canvas_h, g->surface_w, g->surface_h,
++                   window_w, window_h);
++    }
++
++    mp_mutex_lock(&p->osd.lock);
++    if (repaint && !s->terminate) {
++        osd_ahead_file_request(s, (struct osd_request){
++            .pts = r.pts, .epoch = s->epoch, .full = true,
++        });
++    }
++    struct osd_plane_stats *ps = &p->plane;
++    ps->swaps++;
++    ps->swap_ns_last = t_done - t_swap;
++    if (ps->swap_ns_last > ps->swap_ns_max)
++        ps->swap_ns_max = ps->swap_ns_last;
++    ps->swap_lead_ns = g->swap_lead.lead;
++    ps->present_source = g->ts_source;
 +    if (pinned) {
 +        int64_t lead = release.timestamp - t_done;
-+        s->lead_ns_last = lead;
-+        if (!s->have_lead_min || lead < s->lead_ns_min) {
-+            s->lead_ns_min = lead;
-+            s->have_lead_min = true;
++        ps->lead_ns_last = lead;
++        if (!ps->have_lead_min || lead < ps->lead_ns_min) {
++            ps->lead_ns_min = lead;
++            ps->have_lead_min = true;
 +        }
 +        if (-lead > OSD_LATE_THRESHOLD_NS)
-+            s->late++;
++            ps->late++;
 +    }
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_mutex_unlock(&p->osd.lock);
 +}
 +
 +static MP_THREAD_VOID osd_present_thread(void *arg)
 +{
 +    struct vo *vo = arg;
 +    struct priv *p = vo->priv;
-+    struct osd_shared *s = &p->osd;
++    struct osd_ahead *s = &p->osd;
 +    mp_thread_set_name("vo/osd-present");
 +    // ANDROID_PRIORITY_DISPLAY, as the platform gives its own UI threads.
 +    setpriority(PRIO_PROCESS, 0, -4);
@@ -2810,21 +2691,21 @@ index 0000000..9b292e2
 +    struct osd_gl g;
 +    bool ok = osd_gl_init(vo, &g);
 +
-+    mp_mutex_lock(&p->osd_lock);
++    mp_mutex_lock(&p->osd.lock);
 +    if (!ok) {
 +        MP_ERR(vo, "OSD plane unavailable; subtitles/OSD will not render.\n");
 +        s->present_failed = true;
-+        mp_cond_broadcast(&p->osd_wakeup);
++        mp_cond_broadcast(&p->osd.wakeup);
 +    }
 +    while (ok && !s->terminate) {
 +        if (!s->results.count) {
 +            bool gpu_busy = osd_upload_ahead(vo, &g, 0);
 +            if (!s->results.count && !s->terminate) {
 +                if (gpu_busy) {
-+                    mp_cond_timedwait_until(&p->osd_wakeup, &p->osd_lock,
++                    mp_cond_timedwait_until(&p->osd.wakeup, &p->osd.lock,
 +                                            mp_time_ns() + OSD_GPU_POLL_NS);
 +                } else {
-+                    mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++                    mp_cond_wait(&p->osd.wakeup, &p->osd.lock);
 +                }
 +            }
 +            continue;
@@ -2833,35 +2714,35 @@ index 0000000..9b292e2
 +        // Keep unpublished results addressable by flip_page. Once dequeued,
 +        // the exact release travels with the pose, independent of the history.
 +        if (head->seq && head->release.seq != head->seq) {
-+            mp_cond_wait(&p->osd_wakeup, &p->osd_lock);
++            mp_cond_wait(&p->osd.wakeup, &p->osd.lock);
 +            continue;
 +        }
 +        struct osd_result r = osd_result_pop(&s->results);
 +        s->present_slot = r.slot;
-+        mp_cond_broadcast(&p->osd_wakeup);
++        mp_cond_broadcast(&p->osd.wakeup);
 +        bool current = s->epoch == r.epoch;
 +        struct osd_release release = r.release;
 +        // Some codec paths put the picture on screen a vsync after a GL
 +        // layer given the same timestamp; the embedder measured how many.
-+        if (release.timestamp && release.period > 0 && s->vsync_delay) {
-+            int64_t shift = s->vsync_delay * release.period;
++        if (release.timestamp && release.period > 0 && p->osd_vsync_delay) {
++            int64_t shift = p->osd_vsync_delay * release.period;
 +            release.timestamp += shift;
 +            if (release.vsync)
 +                release.vsync += shift;
 +        }
 +        if (!current)
-+            s->stale++;
-+        mp_mutex_unlock(&p->osd_lock);
++            s->stats.stale++;
++        mp_mutex_unlock(&p->osd.lock);
 +
 +        if (current)
 +            osd_present(vo, &g, r, release);
 +
-+        mp_mutex_lock(&p->osd_lock);
++        mp_mutex_lock(&p->osd.lock);
 +        // The slot stays held: it is what is on screen, the reference the
 +        // render thread dedups repeats against, and its atlas stays cached.
-+        mp_cond_broadcast(&p->osd_wakeup);
++        mp_cond_broadcast(&p->osd.wakeup);
 +    }
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_mutex_unlock(&p->osd.lock);
 +
 +    osd_gl_uninit(&g);
 +    MP_THREAD_RETURN();
@@ -2869,52 +2750,29 @@ index 0000000..9b292e2
 +
 +// --- VO thread side of the OSD pipeline -------------------------------------
 +
++// What the statistics line reads, copied under the lock.
++struct osd_stats_snapshot {
++    struct osd_ahead_stats render;
++    struct osd_spec spec;
++    struct osd_prefetch prefetch;
++    struct osd_plane_stats plane;
++};
++
 +// Locked.
-+static void osd_file_request(struct priv *p, struct osd_request req)
++static struct osd_stats_snapshot osd_stats_snapshot(const struct priv *p)
 +{
-+    struct osd_shared *s = &p->osd;
-+    if (s->requested) {
-+        s->coalesced++;
-+        // A pending full repaint must not be lost to a later partial one, and
-+        // a repaint of the frame that is still pending keeps its deadline.
-+        if (!req.seq && !req.full && s->request.seq && req.pts == s->request.pts &&
-+            req.epoch == s->request.epoch)
-+        {
-+            req.seq = s->request.seq;
-+            req.delta = s->request.delta;
-+        }
-+        req.full |= s->request.full;
-+    }
-+    if (!req.seq) {
-+        // An immediate repaint replaces the timeline, not merely its tail.
-+        req.epoch = ++s->epoch;
-+        req.full = true;
-+        s->stale += s->results.count;
-+        s->results.first = s->results.count = 0;
-+        s->spec.valid = s->prefetch.valid = false;
-+    }
-+    s->request = req;
-+    s->requested = true;
-+    mp_cond_broadcast(&p->osd_wakeup);
++    return (struct osd_stats_snapshot){
++        .render = p->osd.stats,
++        .spec = p->osd.spec,
++        .prefetch = p->osd.prefetch,
++        .plane = p->plane,
++    };
 +}
 +
-+// Locked. Discard everything in flight and repaint at the current pts.
-+static void osd_invalidate_locked(struct priv *p)
++static void osd_log_stats_snapshot(struct vo *vo, const char *why,
++                                   const struct osd_stats_snapshot *snapshot)
 +{
-+    struct osd_shared *s = &p->osd;
-+    osd_file_request(p, (struct osd_request){
-+        .pts = p->osd_pts, .epoch = s->epoch, .full = true,
-+    });
-+}
-+
-+static void osd_log_stats(struct vo *vo, const char *why)
-+{
-+    struct priv *p = vo->priv;
-+    if (!p->osd_threads_created)
-+        return;
-+    mp_mutex_lock(&p->osd_lock);
-+    struct osd_shared s = p->osd;
-+    mp_mutex_unlock(&p->osd_lock);
++    const struct osd_stats_snapshot s = *snapshot;
 +    MP_VERBOSE(vo, "osd-sync %s frames=%u render=%u/%u renderMs=%d/%d "
 +               "renderHist=%u,%u,%u,%u,%u spec=%u/%u/%u horizonSkips=%u prefetch=%u "
 +               "coalesced=%u stale=%u swaps=%u late=%u "
@@ -2922,25 +2780,95 @@ index 0000000..9b292e2
 +               "swapMs=%d/%d uploadMs=%d/%d uploads=%u/%u composed=%u/%u present=%s presentErrMs=%s worstPresentMs=%s "
 +               "presentHist=%u,%u,%u,%u,%u presentMeasured=%u "
 +               "presentInvalid=%u presentDropped=%u\n",
-+               why, s.frames, s.renders_changed, s.renders,
-+               (int)(s.render_ns_last / 1000000), (int)(s.render_ns_max / 1000000),
-+               s.render_hist[0], s.render_hist[1], s.render_hist[2],
-+               s.render_hist[3], s.render_hist[4],
++               why, s.render.frames, s.render.renders_changed, s.render.renders,
++               (int)(s.render.render_ns_last / 1000000), (int)(s.render.render_ns_max / 1000000),
++               s.render.render_hist[0], s.render.render_hist[1], s.render.render_hist[2],
++               s.render.render_hist[3], s.render.render_hist[4],
 +               s.spec.hits, s.spec.misses, s.spec.skips, s.spec.horizon_skips,
-+               s.prefetch.count, s.coalesced, s.stale, s.swaps, s.late,
-+               s.late ? (int)(-s.lead_ns_min / 1000000) : 0,
-+               (int)(s.lead_ns_last / 1000000),
-+               s.have_lead_min ? mp_tprintf(16, "%d", (int)(s.lead_ns_min / 1000000)) : "n/a",
-+               (int)(s.swap_lead_ns / 1000000),
-+               (int)(s.swap_ns_last / 1000000), (int)(s.swap_ns_max / 1000000),
-+               (int)(s.upload_ns_last / 1000000), (int)(s.upload_ns_max / 1000000),
-+               s.uploads_ahead, s.uploads_late, s.composed_ahead, s.composed_late,
-+               s.present_source ? s.present_source : "off:no-pipeline",
-+               s.present_measured ? mp_tprintf(16, "%d", (int)(s.present_err_last / 1000000)) : "n/a",
-+               s.present_measured ? mp_tprintf(16, "%d", (int)(s.present_err_worst / 1000000)) : "n/a",
-+               s.present_hist[0], s.present_hist[1], s.present_hist[2],
-+               s.present_hist[3], s.present_hist[4],
-+               s.present_measured, s.present_invalid, s.present_dropped);
++               s.prefetch.count, s.render.coalesced, s.render.stale, s.plane.swaps, s.plane.late,
++               s.plane.late ? (int)(-s.plane.lead_ns_min / 1000000) : 0,
++               (int)(s.plane.lead_ns_last / 1000000),
++               s.plane.have_lead_min ? mp_tprintf(16, "%d", (int)(s.plane.lead_ns_min / 1000000)) : "n/a",
++               (int)(s.plane.swap_lead_ns / 1000000),
++               (int)(s.plane.swap_ns_last / 1000000), (int)(s.plane.swap_ns_max / 1000000),
++               (int)(s.plane.upload_ns_last / 1000000), (int)(s.plane.upload_ns_max / 1000000),
++               s.plane.uploads_ahead, s.plane.uploads_late, s.plane.composed_ahead, s.plane.composed_late,
++               s.plane.present_source ? s.plane.present_source : "off:no-pipeline",
++               s.plane.present_measured ? mp_tprintf(16, "%d", (int)(s.plane.present_err_last / 1000000)) : "n/a",
++               s.plane.present_measured ? mp_tprintf(16, "%d", (int)(s.plane.present_err_worst / 1000000)) : "n/a",
++               s.plane.present_hist[0], s.plane.present_hist[1], s.plane.present_hist[2],
++               s.plane.present_hist[3], s.plane.present_hist[4],
++               s.plane.present_measured, s.plane.present_invalid, s.plane.present_dropped);
++}
++
++static void osd_log_stats(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_threads_created)
++        return;
++    mp_mutex_lock(&p->osd.lock);
++    struct osd_stats_snapshot s = osd_stats_snapshot(p);
++    mp_mutex_unlock(&p->osd.lock);
++    osd_log_stats_snapshot(vo, why, &s);
++}
++
++// What an OSD statistics line exists to catch: a swap that missed its vsync,
++// a result dropped or orphaned, a present the display did not confirm, a
++// pre-render horizon miss, or a confirmed present off its vsync.
++static uint64_t osd_failures(const struct osd_stats_snapshot *s)
++{
++    return (uint64_t)s->plane.late + s->render.stale + s->plane.present_invalid +
++           s->plane.present_dropped + s->spec.horizon_skips +
++           s->plane.present_hist[0] + s->plane.present_hist[1] +
++           s->plane.present_hist[3] + s->plane.present_hist[4];
++}
++
++// Reports arrive from a registered frame-rendered listener ("jni", "ndk");
++// on an "off:*" source no intent could ever be matched, so none is recorded:
++// the display-side counters stay at zero instead of overrun growing forever.
++static bool present_reports_on(const struct priv *p)
++{
++    return p->present_source && strncmp(p->present_source, "off:", 4);
++}
++
++// The line names its source so a zero reads right: on an "off:*" source
++// only the submission-side counters are live.
++static void present_log_stats(struct vo *vo, const char *why)
++{
++    struct priv *p = vo->priv;
++    const struct present_stats *s = &p->present;
++    MP_VERBOSE(vo, "video-present %s source=%s hist=%u,%u,%u,%u,%u lastMs=%s worstMs=%s "
++               "measured=%u missed=%u untimed=%u unclocked=%u late=%u unsnapped=%u unmatched=%u overrun=%u\n",
++               why, p->present_source,
++               s->hist[0], s->hist[1], s->hist[2], s->hist[3], s->hist[4],
++               s->measured ? mp_tprintf(16, "%d", (int)(s->err_last_ns / 1000000)) : "n/a",
++               s->measured ? mp_tprintf(16, "%d", (int)(s->err_worst_ns / 1000000)) : "n/a",
++               s->measured, s->missed, s->untimed, s->unclocked, s->late, s->unsnapped,
++               s->unmatched, s->overrun);
++}
++
++// One tick per OSD_STATS_INTERVAL_FRAMES flips; each line decides its own
++// cadence through stats_due.
++static void stats_tick(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (++p->stats_frames < OSD_STATS_INTERVAL_FRAMES)
++        return;
++    p->stats_frames = 0;
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd.lock);
++        struct osd_stats_snapshot s = osd_stats_snapshot(p);
++        mp_mutex_unlock(&p->osd.lock);
++        const char *why = stats_due(&p->osd_stats, osd_failures(&s));
++        if (why)
++            osd_log_stats_snapshot(vo, why, &s);
++    }
++    if (p->present_source) {
++        const char *why = stats_due(&p->present_cadence,
++                                    present_failures(&p->present));
++        if (why)
++            present_log_stats(vo, why);
++    }
 +}
 +
 +static void osd_init(struct vo *vo)
@@ -2952,7 +2880,7 @@ index 0000000..9b292e2
 +    JNIEnv *env = mp_jni_get_env(vo->log);
 +    if (env) {
 +        p->osd_window = ANativeWindow_fromSurface(env,
-+                (jobject)(intptr_t)p->osd_surface);
++                (jobject)(uintptr_t)p->osd_surface);
 +    }
 +    if (!p->osd_window) {
 +        MP_ERR(vo, "Failed to wrap the OSD surface; "
@@ -2960,12 +2888,25 @@ index 0000000..9b292e2
 +        return;
 +    }
 +
-+    p->osd.results = (struct osd_result_queue){0};
-+    p->osd.present_slot = -1;
-+    p->osd.present_source = NULL;
-+    mp_mutex_init(&p->osd_lock);
-+    mp_cond_init(&p->osd_wakeup);
-+    if (mp_thread_create(&p->osd_render_thread, osd_render_thread, vo)) {
++    // A rebind starts fresh workers, not a new video decoder. Preserve only
++    // the presentation policy (geometry, vsync delay, pause); no old request,
++    // slot or termination flag lives on.
++    p->osd.log = vo->log;
++    p->osd.osd = vo->osd;
++    p->osd.formats = osd_gl_formats;
++    p->osd.cb = (struct osd_ahead_callbacks){
++        .ctx = vo,
++        .thread_init = osd_render_thread_init,
++        .latch_canvas = osd_latch_canvas,
++        .canvas_size = osd_canvas_size,
++        .canvas_res = osd_canvas_res,
++    };
++    p->plane = (struct osd_plane_stats){0};
++    p->prepared_frame_id = p->prepared_seq = p->prepared_epoch = 0;
++    p->stats_frames = 0;
++    p->osd_stats = (struct stats_cadence){0};
++    p->osd_missing_logged = false;
++    if (!osd_ahead_start(&p->osd)) {
 +        MP_ERR(vo, "Failed to start the OSD render thread; "
 +                   "subtitles/OSD will not render.\n");
 +        goto fail;
@@ -2973,19 +2914,14 @@ index 0000000..9b292e2
 +    if (mp_thread_create(&p->osd_present_thread, osd_present_thread, vo)) {
 +        MP_ERR(vo, "Failed to start the OSD present thread; "
 +                   "subtitles/OSD will not render.\n");
-+        mp_mutex_lock(&p->osd_lock);
-+        p->osd.terminate = true;
-+        mp_cond_broadcast(&p->osd_wakeup);
-+        mp_mutex_unlock(&p->osd_lock);
-+        mp_thread_join(p->osd_render_thread);
++        osd_ahead_stop(&p->osd);
++        osd_ahead_destroy(&p->osd);
 +        goto fail;
 +    }
 +    p->osd_threads_created = true;
 +    return;
 +
 +fail:
-+    mp_cond_destroy(&p->osd_wakeup);
-+    mp_mutex_destroy(&p->osd_lock);
 +    ANativeWindow_release(p->osd_window);
 +    p->osd_window = NULL;
 +}
@@ -2994,20 +2930,15 @@ index 0000000..9b292e2
 +{
 +    struct priv *p = vo->priv;
 +    if (p->osd_threads_created) {
-+        mp_mutex_lock(&p->osd_lock);
-+        p->osd.terminate = true;
-+        p->osd.epoch++;
-+        mp_cond_broadcast(&p->osd_wakeup);
-+        mp_mutex_unlock(&p->osd_lock);
-+        mp_thread_join(p->osd_render_thread);
++        // Never free or reuse a producer still executing a vendor EGL call.
++        // The embedder's independent deadline quarantines this native session
++        // while these joins retain its window, slots and VO ownership.
++        osd_ahead_stop(&p->osd);
 +        mp_thread_join(p->osd_present_thread);
 +        osd_log_stats(vo, "final");
-+        mp_cond_destroy(&p->osd_wakeup);
-+        mp_mutex_destroy(&p->osd_lock);
 +        p->osd_threads_created = false;
 +    }
-+    for (int n = 0; n < OSD_SLOTS; n++)
-+        talloc_free(p->osd_slots[n].sbs);
++    osd_ahead_destroy(&p->osd);
 +    if (p->osd_window)
 +        ANativeWindow_release(p->osd_window);
 +    p->osd_window = NULL;
@@ -3024,9 +2955,10 @@ index 0000000..9b292e2
 +    p->osd_pts = MP_NOPTS_VALUE;
 +    p->opts_cache = m_config_cache_alloc(p, vo->global, &mediacodec_conf);
 +    struct mediacodec_opts *opts = p->opts_cache->opts;
-+    if (!mediacodec_geometry_parse(opts->video_rect, &p->osd.geometry))
++    p->osd_surface = opts->osd_surface;
++    if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
 +        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
-+    p->osd.vsync_delay = opts->osd_vsync_delay;
++    p->osd_vsync_delay = opts->osd_vsync_delay;
 +    m_config_cache_set_wakeup_cb(p->opts_cache, opts_wakeup, vo);
 +    vo->hwdec_devs = hwdec_devices_create();
 +    p->hwctx = (struct mp_hwdec_ctx){
@@ -3044,18 +2976,35 @@ index 0000000..9b292e2
 +    init_vsync_sampler(vo);
 +    osd_init(vo);
 +
-+    // vo.c would otherwise wait until frame->pts before calling flip_page.
-+    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(50), 1);
++    // Initial preparation horizon, independent of the codec submission lead.
++    p->queue_offset = MP_TIME_MS_TO_NS(50);
++    vo_set_queue_params(vo, p->queue_offset, 1);
 +
 +    return 0;
 +}
 +
 +#define VSYNC_SAMPLE_MAX_AGE_NS MP_TIME_S_TO_NS(1)
-+#define TIMED_RELEASE_MAX_AHEAD_NS MP_TIME_MS_TO_NS(500)
++// Allow clock-domain sampling jitter, not the old OSD preparation horizon.
++#define TIMED_RELEASE_CLOCK_SLOP_NS MP_TIME_MS_TO_NS(2)
++// Must match the cadence-correction bound in mediacodec_timing_predict.
++#define TIMED_RELEASE_PREDICT_BOUND_NS MP_TIME_MS_TO_NS(20)
++
++// Beyond this a deadline is a discontinuity, not a cadence. A correctly
++// admitted frame reaches flip_page one codec lead before its corrected
++// timestamp, and cadence correction plus snapping can place that timestamp
++// ahead of the raw deadline by the prediction bound and most of a period.
++static int64_t mediacodec_release_horizon(int64_t period_ns)
++{
++    return MEDIACODEC_CODEC_LEAD_NS + TIMED_RELEASE_PREDICT_BOUND_NS
++         + 2 * (period_ns > 0 ? period_ns : 0) + TIMED_RELEASE_CLOCK_SLOP_NS;
++}
 +
 +struct release_target {
 +    int64_t timestamp; // CLOCK_MONOTONIC passed to MediaCodec
 +    int64_t vsync;     // the vsync the timestamp targets, 0 when not snapped
++    bool late;         // due before it reached the codec: shown a vsync late
++    int64_t deadline;  // CLOCK_MONOTONIC the frame was due, 0 untimed
++    int64_t now;       // CLOCK_MONOTONIC when the release was decided
 +};
 +
 +static int64_t read_vsync_sample(struct priv *p)
@@ -3066,6 +3015,38 @@ index 0000000..9b292e2
 +    return sample;
 +}
 +
++// The display mode's period as the Choreographer's refresh-rate callback
++// reports it, 0 where the platform does not (below API 30, or before its
++// first callback).
++static int64_t read_vsync_period(void)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    int64_t period = vsync_sampler.vsync_period;
++    mp_mutex_unlock(&vsync_sampler.lock);
++    return period;
++}
++
++// SurfaceFlinger's vsync spacing from the frame timelines, 0 until known.
++static int64_t read_vsync_spacing(void)
++{
++    mp_mutex_lock(&vsync_sampler.lock);
++    int64_t spacing = vsync_sampler.vsync_spacing;
++    mp_mutex_unlock(&vsync_sampler.lock);
++    return spacing;
++}
++
++// A new grid leaves the last sample stale (vsync_sample_is_fresh): take a
++// fresh one now rather than at the next 500 ms resample.
++static void request_vsync_sample(struct vo *vo)
++{
++    enum vsync_post post = VSYNC_POST_NONE;
++    mp_mutex_lock(&vsync_sampler.lock);
++    if (vsync_sampler.client == vo)
++        post = reserve_vsync_post(false);
++    mp_mutex_unlock(&vsync_sampler.lock);
++    issue_vsync_post(post);
++}
++
 +static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
 +                                  int64_t mono_now)
 +{
@@ -3074,42 +3055,64 @@ index 0000000..9b292e2
 +           sample <= mono_now + p->queue_period;
 +}
 +
-+static int64_t display_period(struct vo *vo)
++// The display mode's period: the Choreographer's where it reports one; else
++// the core's display_fps (the embedder's --display-fps-override, or what
++// VOCTRL_GET_DISPLAY_FPS returned) as a plausibility-bounded interval.
++static int64_t plausible_period(double period)
 +{
-+    double period = vo_get_vsync_interval(vo);
 +    if (!isfinite(period) || period < 1e9 / 240.0 || period > 1e9 / 20.0)
 +        return 0;
 +    return llround(period);
 +}
 +
-+// Keep the initial 50 ms budget and two vsyncs for SurfaceView submission.
-+// Cover the current render, next-frame preparation, and a composition vsync.
++static int64_t mode_period(struct vo *vo)
++{
++    int64_t period = plausible_period(read_vsync_period());
++    if (period)
++        return period;
++    return plausible_period(vo_get_vsync_interval(vo));
++}
++
++// Keep the early OSD preparation horizon. prepare_frame separately tells the
++// core when this queued frame may be submitted to the codec.
 +static void update_queue_timing(struct vo *vo, double frame_duration)
 +{
 +    struct priv *p = vo->priv;
-+    int64_t mono_now = monotonic_now_ns();
-+    int64_t period = display_period(vo);
++    int64_t nominal = mode_period(vo);
++    int64_t period = mediacodec_grid_period(read_vsync_spacing(), nominal);
 +
-+    if (period != p->queue_period) {
-+        mediacodec_timing_reset(&p->timing);
-+        p->queue_period = period;
-+        p->queue_period_changed = mono_now;
++    bool mode_changed = nominal != p->queue_mode;
++    bool was_timelines = !mode_changed && p->queue_period != nominal;
++    if (mode_changed) {
++        // The media cadence anchor is period-independent; only the vsync
++        // sample and the snap preference were taken against the old mode.
++        p->timing.vsync_hysteresis_offset_ns = 0;
++        p->queue_period_changed = monotonic_now_ns();
++        p->queue_mode = nominal;
++        request_vsync_sample(vo);
 +    }
++    // A new timelines' period needs no such restart, whether a refit or a
++    // switch to or from the mode's: the sampler takes it together with a
++    // vsync sample on its grid, and media3 adopts each one as it comes.
++    if (period != nominal && !was_timelines) {
++        MP_VERBOSE(vo, "Timing releases on the Choreographer's %.3f ms "
++                       "vsync grid (display mode %.3f ms).\n",
++                   period / 1e6, nominal / 1e6);
++    }
++    p->queue_period = period;
 +
-+    int64_t offset = MPMAX(2 * period, MP_TIME_MS_TO_NS(50));
-+    if (period > 0 && isfinite(frame_duration) && frame_duration > 0) {
-+        int64_t render_budget = llround(fmin(2 * frame_duration + period,
-+                                             TIMED_RELEASE_MAX_AHEAD_NS));
-+        offset = MPMAX(offset, render_budget);
-+    }
-+    if (offset == p->queue_offset)
++    // A refit moves the budget by microseconds; only a new grid resets it.
++    int64_t offset = mediacodec_prepare_lead(period, frame_duration);
++    int64_t moved = offset > p->queue_offset ? offset - p->queue_offset
++                                             : p->queue_offset - offset;
++    if (p->queue_offset && moved < 1000000)
 +        return;
 +
 +    p->queue_offset = offset;
 +    vo_set_queue_params(vo, offset, 1);
 +    if (period) {
-+        MP_VERBOSE(vo, "Timed release: %.3f Hz, queue %.1f ms ahead.\n",
-+                   1e9 / period, offset / 1e6);
++        MP_VERBOSE(vo, "Timed release: %.3f Hz, prepare %.1f ms, codec %.1f ms ahead.\n",
++                   1e9 / period, offset / 1e6, MEDIACODEC_CODEC_LEAD_NS / 1e6);
 +    }
 +}
 +
@@ -3134,9 +3137,12 @@ index 0000000..9b292e2
 +
 +    result.timestamp = mediacodec_timing_release(
 +        &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
-+        sample, p->queue_period, TIMED_RELEASE_MAX_AHEAD_NS);
++        sample, p->queue_period, mediacodec_release_horizon(p->queue_period));
 +    if (result.timestamp && sample && raw_target > mono_now)
 +        result.vsync = result.timestamp + p->queue_period * 8 / 10;
++    result.late = mono_now > 0 && raw_target <= mono_now;
++    result.deadline = raw_target;
++    result.now = mono_now;
 +    return result;
 +}
 +
@@ -3150,69 +3156,287 @@ index 0000000..9b292e2
 +    bool geometry_ok = mediacodec_geometry_parse(opts->video_rect, &geometry);
 +    if (!geometry_ok)
 +        MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; keeping previous geometry.\n");
++    if (opts->osd_surface != p->osd_surface) {
++        // UPDATE_VIDEO dispatches synchronously onto this VO thread. Returning
++        // acknowledges retirement of the previous producer to the JNI owner.
++        osd_uninit(vo);
++        p->osd_surface = opts->osd_surface;
++        if (geometry_ok)
++            p->osd_geometry = geometry;
++        p->osd_vsync_delay = opts->osd_vsync_delay;
++        osd_init(vo);
++        vo->want_redraw = true;
++    }
 +    if (!p->osd_threads_created)
 +        return;
-+    mp_mutex_lock(&p->osd_lock);
-+    p->osd.vsync_delay = opts->osd_vsync_delay;
++    mp_mutex_lock(&p->osd.lock);
++    p->osd_vsync_delay = opts->osd_vsync_delay;
 +    bool changed = geometry_ok &&
-+                   !mediacodec_geometry_equal(p->osd.geometry, geometry);
++                   !mediacodec_geometry_equal(p->osd_geometry, geometry);
 +    if (changed) {
 +        // Publish the new geometry and invalidate in-flight work atomically.
-+        p->osd.geometry = geometry;
-+        osd_invalidate_locked(p);
++        p->osd_geometry = geometry;
++        osd_ahead_invalidate(&p->osd, p->osd_pts);
 +    }
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_mutex_unlock(&p->osd.lock);
 +    if (changed)
 +        vo->want_redraw = true;
++}
++
++// Preparation does not own or submit the decoder image. The core can discard
++// a queued frame on seek/drop while this bounded OSD request is in flight.
++static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool synthetic)
++{
++    struct priv *p = vo->priv;
++    uint64_t seq = ++p->frame_seq;
++    double pts = frame->current->pts;
++    if (!synthetic && p->cadence.last_frame_id != frame->frame_id) {
++        if (pts == MP_NOPTS_VALUE)
++            osd_cadence_reset(&p->cadence);
++        else
++            osd_cadence_observe(&p->cadence, frame->frame_id, pts);
++    }
++    if (p->osd_threads_created) {
++        mp_mutex_lock(&p->osd.lock);
++        osd_ahead_file_request(&p->osd, (struct osd_request){
++            .pts = pts,
++            .delta = synthetic ? 0 : osd_cadence_delta(&p->cadence),
++            .seq = seq,
++            .epoch = p->osd.epoch,
++        });
++        p->osd.stats.frames++;
++        mp_mutex_unlock(&p->osd.lock);
++    }
++    return seq;
++}
++
++// When this frame may be handed to the codec. The buffer is presented at the
++// vsync get_release_target picks, not at its raw deadline: cadence correction
++// and snapping place that vsync up to the prediction bound plus most of a
++// period away, so admitting against the raw pts hands MediaCodec a timestamp
++// already inside its two-period window and the picture slips a vsync while
++// the OSD plane stays pinned to the intended one. Evaluate the same decision
++// here without committing it, and count the lead back from the timestamp the
++// codec will actually receive.
++static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (frame->pts <= 0 || frame->display_synced)
++        return 0;
++
++    int64_t raw_deadline = frame->pts - MEDIACODEC_CODEC_LEAD_NS;
++    int64_t mono_now = monotonic_now_ns();
++    if (mono_now <= 0)
++        return raw_deadline;
++
++    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
++    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
++        sample = 0;
++
++    int64_t timestamp = mediacodec_timing_preview(
++        &p->timing, mp_time_to_monotonic_ns(frame->pts), frame->frame_id,
++        frame->duration, sample, p->queue_period);
++    // The lead is measured against the timestamp, never against the raw
++    // deadline: the 80% pull-back alone puts the timestamp most of a period
++    // ahead of it, and clamping there is what leaves the codec short. The
++    // hold is bounded by construction, at exactly one lead.
++    int64_t deadline = monotonic_to_mp_time_ns(timestamp) - MEDIACODEC_CODEC_LEAD_NS;
++    return deadline > 0 ? deadline : raw_deadline;
++}
++
++static int64_t prepare_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!frame) {
++        // A dropped prepared pose will never get a release timestamp. Retire
++        // it, including raster work in flight, rather than wedging the FIFO.
++        p->prepared_frame_id = p->prepared_seq = p->prepared_epoch = 0;
++        if (p->osd_threads_created) {
++            mp_mutex_lock(&p->osd.lock);
++            osd_ahead_invalidate(&p->osd, p->osd_pts);
++            mp_mutex_unlock(&p->osd.lock);
++        }
++        return 0;
++    }
++    if (frame->redraw || frame->repeat || !frame->current ||
++        mediacodec_synthetic_still(frame->still, frame->pts, frame->duration))
++        return 0;
++
++    // Called on each event-loop wake, including after refresh-rate changes.
++    // Never rely on the offset the core observed before this frame was drawn.
++    update_queue_timing(vo, frame->duration);
++    // The first wake for a queued frame is when the core handed it over.
++    if (p->prepared_frame_id != frame->frame_id)
++        p->prepared_seen_ns = monotonic_now_ns();
++    // Only this VO thread changes epoch; OSD workers only read it under lock.
++    if (!p->prepared_seq || p->prepared_frame_id != frame->frame_id ||
++        p->prepared_epoch != p->osd.epoch)
++    {
++        p->prepared_seq = prepare_osd(vo, frame, false);
++        p->prepared_frame_id = frame->frame_id;
++        p->prepared_epoch = p->osd.epoch;
++    }
++    return submit_deadline(vo, frame);
 +}
 +
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 +{
 +    struct priv *p = vo->priv;
-+
 +    if (frame->redraw || frame->repeat)
 +        return VO_TRUE;
 +
-+    update_queue_timing(vo, frame->duration);
++    bool synthetic = mediacodec_synthetic_still(
++        frame->still, frame->pts, frame->duration);
 +    mp_image_unrefp(&p->cur_image);
-+    p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
++    if (!frame->current) {
++        if (!synthetic) {
++            mediacodec_timing_reset(&p->timing);
++            osd_cadence_reset(&p->cadence);
++            p->osd_pts = MP_NOPTS_VALUE;
++        }
++        return VO_TRUE;
++    }
++
++    p->osd_pts = frame->current->pts;
++    if (frame->frame_id && frame->frame_id == p->submitted_frame_id)
++        return VO_TRUE;
++
++    p->cur_image = mp_image_new_ref(frame->current);
 +    p->cur_pts = frame->pts;
-+    p->cur_frame_id = p->cur_image ? frame->frame_id : 0;
-+    p->cur_duration = p->cur_image ? frame->duration : 0;
-+    if (!p->cur_image) {
-+        mediacodec_timing_reset(&p->timing);
-+        osd_cadence_reset(&p->cadence);
-+        p->osd_pts = MP_NOPTS_VALUE;
-+        return VO_TRUE;
-+    }
-+
-+    p->cur_seq = ++p->frame_seq;
-+    double pts = p->cur_image->pts;
-+    if (pts == MP_NOPTS_VALUE) {
-+        osd_cadence_reset(&p->cadence);
++    p->cur_frame_id = frame->frame_id;
++    p->cur_duration = frame->duration;
++    p->cur_synthetic = synthetic;
++    p->cur_slot_free_ns = frame->slot_free_ns;
++    p->cur_queued_ns = frame->queued_ns;
++    p->cur_woke_ns = frame->woke_ns;
++    if (!synthetic && p->prepared_seq &&
++        p->prepared_frame_id == frame->frame_id)
++    {
++        p->cur_seq = p->prepared_seq;
++        p->cur_seen_ns = p->prepared_seen_ns;
 +    } else {
-+        osd_cadence_observe(&p->cadence, frame->frame_id, pts);
++        if (!synthetic)
++            update_queue_timing(vo, frame->duration);
++        p->cur_seq = prepare_osd(vo, frame, synthetic);
++        p->cur_seen_ns = monotonic_now_ns();
 +    }
-+
-+    if (!p->osd_threads_created) {
-+        p->osd_pts = pts;
-+        return VO_TRUE;
-+    }
-+
-+    // Ask for this frame's OSD now, up to --video-timing-offset plus the
-+    // queue lead before it is due; flip_page publishes where it will land.
-+    mp_mutex_lock(&p->osd_lock);
-+    p->osd_pts = pts;
-+    osd_file_request(p, (struct osd_request){
-+        .pts = pts,
-+        .delta = osd_cadence_delta(&p->cadence),
-+        .seq = p->cur_seq,
-+        .epoch = p->osd.epoch,
-+    });
-+    p->osd.frames++;
-+    mp_mutex_unlock(&p->osd_lock);
-+
 +    return VO_TRUE;
++}
++
++// Record what this release aimed at, then take in what the codec has
++// rendered since the previous flip. A report for an intent that reset_video
++// dropped lands in unmatched, by design.
++//
++// This vo never drops a frame itself: a late one is shown at the next vsync
++// instead, and the core's own drop count (frame-drop-count) only moves for a
++// frame that is a whole duration late on admission, which preparation makes
++// rare. So the count the viewer can see in an overlay is kept here: a frame
++// that was due before it reached the codec, and a frame the display's reports
++// show was held off its cadence, each cost the viewer a frame's slot.
++static void present_feedback(struct vo *vo, AVMediaCodecBuffer *buffer,
++                             struct release_target target)
++{
++    struct priv *p = vo->priv;
++    const char *source = av_mediacodec_rendered_source(buffer);
++    if (!p->present_source || strcmp(source, p->present_source)) {
++        p->present_source = source;
++        MP_VERBOSE(vo, "video-present feedback: %s\n", source);
++    }
++    if (target.late)
++        p->present.late++;
++    else if (target.timestamp && !target.vsync)
++        p->present.unsnapped++;
++    int missed = target.late ? 1 : 0;
++    if (present_reports_on(p)) {
++        present_record(&p->present, av_mediacodec_buffer_get_pts(buffer), target.vsync,
++                       p->cur_duration);
++        AVMediaCodecRendered reports[16];
++        int n;
++        while ((n = av_mediacodec_drain_rendered(buffer, reports,
++                                                 MP_ARRAY_SIZE(reports))) > 0)
++        {
++            for (int i = 0; i < n; i++) {
++                if (present_observe(&p->present, reports[i].media_time_us,
++                                    reports[i].system_nano, p->queue_period))
++                    missed++;
++            }
++        }
++    }
++    if (missed)
++        vo_increment_drop_count(vo, missed);
++}
++
++// At most this many late frames are itemized per VO; the video-present late
++// counter keeps counting past it.
++#define FRAME_TIMING_LATE_LOG_LIMIT 600
++// One release in this many is itemized late or not, so a late frame can be
++// read against how far ahead an ordinary one moves (10 s at 25 fps).
++#define FRAME_TIMING_SAMPLE_INTERVAL 250
++
++static const char *frame_timing_ms(char buf[16], int64_t t, int64_t deadline)
++{
++    if (!t)
++        return "n/a";
++    snprintf(buf, 16, "%+.1f", (t - deadline) / 1e6);
++    return buf;
++}
++
++// The same for an mp_time_ns() instant, moved onto CLOCK_MONOTONIC by
++// mp_to_mono.
++static const char *frame_timing_mp_ms(char buf[16], int64_t t, int64_t mp_to_mono,
++                                      int64_t deadline)
++{
++    return frame_timing_ms(buf, t ? t + mp_to_mono : 0, deadline);
++}
++
++// Where a timed frame's time went, from the codec's input queue to this
++// release: each stage's CLOCK_MONOTONIC instant against the frame's deadline,
++// in ms, negative ahead of it. input: its access unit was queued to the
++// codec; output: the codec reported it decoded; dequeue: the decoder handed
++// it to the player; freed: the VO took the previous frame out of its
++// one-frame queue, the earliest this one could follow; handoff: the core
++// queued this one; wake: the VO thread first ran with it queued; vo: the
++// VO's preparation first looked at it, after its timing update; release:
++// this release. queued is how many decoded buffers were still waiting behind
++// it at dequeue, held how many the player already held. A late frame is
++// itemized so a codec that decoded it late tells apart from a core that
++// handed it over late and a VO thread that picked it up or released it late
++// (plezy#2485).
++static void log_frame_timing(struct vo *vo, AVMediaCodecBuffer *buffer,
++                             struct release_target target)
++{
++    struct priv *p = vo->priv;
++    if (!target.deadline)
++        return;
++    bool sample = ++p->timing_releases % FRAME_TIMING_SAMPLE_INTERVAL == 0;
++    bool late = target.late && p->timing_late_logged < FRAME_TIMING_LATE_LOG_LIMIT;
++    if (!late && !sample)
++        return;
++    if (late && ++p->timing_late_logged == FRAME_TIMING_LATE_LOG_LIMIT) {
++        MP_VERBOSE(vo, "frame-timing: %d late frames itemized; later ones are "
++                       "only counted.\n", FRAME_TIMING_LATE_LOG_LIMIT);
++    }
++    AVMediaCodecBufferTiming t = {0};
++    if (av_mediacodec_buffer_get_timing(buffer, &t) < 0)
++        t = (AVMediaCodecBufferTiming){0};
++    int64_t d = target.deadline;
++    int64_t mono_now = monotonic_now_ns();
++    int64_t mp_to_mono = mono_now ? mono_now - mp_time_ns() : 0;
++    char input[16], output[16], dequeue[16], freed[16], handoff[16], woke[16],
++         seen[16], release[16];
++    MP_VERBOSE(vo, "frame-timing %s pts=%.3f input=%s output=%s dequeue=%s "
++                   "freed=%s handoff=%s wake=%s vo=%s release=%s ms vs deadline, "
++                   "queued=%d held=%d\n",
++               target.late ? "late" : "sample", p->cur_image->pts,
++               frame_timing_ms(input, t.input_ns, d),
++               frame_timing_ms(output, t.output_ns, d),
++               frame_timing_ms(dequeue, t.dequeue_ns, d),
++               frame_timing_mp_ms(freed, p->cur_slot_free_ns, mp_to_mono, d),
++               frame_timing_mp_ms(handoff, p->cur_queued_ns, mp_to_mono, d),
++               frame_timing_mp_ms(woke, p->cur_woke_ns, mp_to_mono, d),
++               frame_timing_ms(seen, p->cur_seen_ns, d),
++               frame_timing_ms(release, target.now, d),
++               t.queued_outputs, t.held_buffers);
 +}
 +
 +static void flip_page(struct vo *vo)
@@ -3223,11 +3447,11 @@ index 0000000..9b292e2
 +        // OSD redraw without a new codec buffer: repaint at the last pts,
 +        // unpinned, and let the present stage swap at once.
 +        if (p->osd_threads_created) {
-+            mp_mutex_lock(&p->osd_lock);
-+            osd_file_request(p, (struct osd_request){
++            mp_mutex_lock(&p->osd.lock);
++            osd_ahead_file_request(&p->osd, (struct osd_request){
 +                .pts = p->osd_pts, .epoch = p->osd.epoch,
 +            });
-+            mp_mutex_unlock(&p->osd_lock);
++            mp_mutex_unlock(&p->osd.lock);
 +        } else if (!p->osd_missing_logged) {
 +            MP_WARN(vo, "No OSD surface (--vo-mediacodec-osd-surface); "
 +                        "subtitles/OSD are not rendered.\n");
@@ -3236,12 +3460,20 @@ index 0000000..9b292e2
 +        return;
 +    }
 +
-+    struct release_target target = get_release_target(vo, p->cur_pts);
++    // do_redraw's full redraw after a drop has pts=0/duration=-1 but can own
++    // an unsubmitted picture. Show it once without relearning either cadence.
++    struct release_target target = p->cur_synthetic
++                                 ? (struct release_target){0}
++                                 : get_release_target(vo, p->cur_pts);
 +
 +    AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)p->cur_image->planes[3];
 +    int ret = target.timestamp
 +            ? av_mediacodec_render_buffer_at_time(buffer, target.timestamp)
 +            : av_mediacodec_release_buffer(buffer, 1);
++    if (ret >= 0)
++        p->submitted_frame_id = p->cur_frame_id;
++    log_frame_timing(vo, buffer, target);
++    present_feedback(vo, buffer, target);
 +    mp_image_unrefp(&p->cur_image);
 +    p->cur_pts = 0;
 +    p->cur_frame_id = 0;
@@ -3254,22 +3486,14 @@ index 0000000..9b292e2
 +
 +    // The release timestamp is what keeps the OSD in step with the video;
 +    // the present stage waits for it before it schedules the swap.
-+    mp_mutex_lock(&p->osd_lock);
-+    struct osd_shared *s = &p->osd;
-+    s->releases[s->release_next] = (struct osd_release){
++    mp_mutex_lock(&p->osd.lock);
++    osd_ahead_publish_release(&p->osd, (struct osd_release){
 +        .seq = p->cur_seq, .timestamp = target.timestamp, .vsync = target.vsync,
 +        .period = p->queue_period,
-+    };
-+    osd_result_publish_release(&s->results, s->releases[s->release_next]);
-+    s->release_next = (s->release_next + 1) % OSD_RELEASE_HISTORY;
-+    s->release_seq = p->cur_seq;
-+    mp_cond_broadcast(&p->osd_wakeup);
-+    mp_mutex_unlock(&p->osd_lock);
++    });
++    mp_mutex_unlock(&p->osd.lock);
 +
-+    if (++p->stats_frames >= OSD_STATS_INTERVAL_FRAMES) {
-+        p->stats_frames = 0;
-+        osd_log_stats(vo, "periodic");
-+    }
++    stats_tick(vo);
 +}
 +
 +static int query_format(struct vo *vo, int format)
@@ -3284,13 +3508,19 @@ index 0000000..9b292e2
 +    p->cur_pts = 0;
 +    p->cur_frame_id = 0;
 +    p->cur_duration = 0;
++    p->cur_synthetic = false;
++    p->submitted_frame_id = 0;
++    p->prepared_frame_id = 0;
++    p->prepared_seq = 0;
++    p->prepared_epoch = 0;
 +    mediacodec_timing_reset(&p->timing);
 +    osd_cadence_reset(&p->cadence);
++    present_reset(&p->present);
 +    p->osd_pts = MP_NOPTS_VALUE;
 +    if (p->osd_threads_created) {
-+        mp_mutex_lock(&p->osd_lock);
-+        osd_invalidate_locked(p);
-+        mp_mutex_unlock(&p->osd_lock);
++        mp_mutex_lock(&p->osd.lock);
++        osd_ahead_invalidate(&p->osd, p->osd_pts);
++        mp_mutex_unlock(&p->osd.lock);
 +    }
 +}
 +
@@ -3299,20 +3529,54 @@ index 0000000..9b292e2
 +    struct priv *p = vo->priv;
 +    if (!p->osd_threads_created)
 +        return;
-+    mp_mutex_lock(&p->osd_lock);
++    mp_mutex_lock(&p->osd.lock);
 +    if (paused && !p->osd.paused)
-+        osd_invalidate_locked(p);
++        osd_ahead_invalidate(&p->osd, p->osd_pts);
 +    p->osd.paused = paused;
-+    mp_cond_broadcast(&p->osd_wakeup);
-+    mp_mutex_unlock(&p->osd_lock);
++    mp_cond_broadcast(&p->osd.wakeup);
++    mp_mutex_unlock(&p->osd.lock);
++}
++
++// Move the decoder's output to another Surface in place. Nothing of the vo
++// itself is bound to the window: timed release goes through the codec, the
++// OSD has its own plane, and the geometry is the embedder's. Only where the
++// platform cannot repoint a running decoder does the core rebuild instead.
++static int set_window_id(struct vo *vo, int64_t wid)
++{
++    struct priv *p = vo->priv;
++    if (wid == 0 || wid == -1)
++        return VO_NOTIMPL;
++    int ret = av_mediacodec_hwdevice_set_surface(p->hwctx.av_device_ref,
++                                                 (void *)(uintptr_t)wid);
++    if (ret == AVERROR(ENOSYS)) {
++        MP_VERBOSE(vo, "Platform cannot repoint the decoder; rebuilding.\n");
++        return VO_NOTIMPL;
++    }
++    if (ret < 0) {
++        MP_WARN(vo, "Repointing the decoder at the new Surface failed (%s); "
++                    "rebuilding.\n", av_err2str(ret));
++        return VO_NOTIMPL;
++    }
++    MP_VERBOSE(vo, "Video Surface replaced in place.\n");
++    return VO_TRUE;
 +}
 +
 +static int control(struct vo *vo, uint32_t request, void *data)
 +{
 +    switch (request) {
 +    case VOCTRL_CHECK_EVENTS:
++    case VOCTRL_UPDATE_RENDER_OPTS:
 +        update_opts(vo);
 +        return VO_TRUE;
++    case VOCTRL_SET_WINDOW_ID:
++        return set_window_id(vo, *(int64_t *)data);
++    case VOCTRL_GET_DISPLAY_FPS: {
++        int64_t period = plausible_period(read_vsync_period());
++        if (!period)
++            return VO_NOTIMPL;
++        *(double *)data = 1e9 / period;
++        return VO_TRUE;
++    }
 +    case VOCTRL_RESET:
 +        reset_video(vo);
 +        return VO_TRUE;
@@ -3340,6 +3604,8 @@ index 0000000..9b292e2
 +    p->opts_cache = NULL;
 +    mp_image_unrefp(&p->cur_image);
 +
++    if (p->present_source)
++        present_log_stats(vo, "final");
 +    osd_uninit(vo);
 +
 +    uninit_vsync_sampler(vo);
@@ -3348,23 +3614,35 @@ index 0000000..9b292e2
 +    av_buffer_unref(&p->hwctx.av_device_ref);
 +}
 +
-+#define OPT_BASE_STRUCT struct priv
-+
 +const struct vo_driver video_out_mediacodec = {
 +    .description = "Android (Timed MediaCodec Surface with OSD plane)",
 +    .name = "mediacodec",
++    // This VO never drops: a late frame is released untimed and shown at
++    // the next vsync, and present_feedback counts what the viewer lost.
++    // Declaring the cap keeps the core's own late-frame drop (vo.c
++    // render_frame, "degrade to 10 FPS") off this path: the frames it
++    // would discard are already decoded, so on a plane whose flip is one
++    // release call the drop buys no throughput and only empties the
++    // screen. A burst of late frames still collapses at the compositor,
++    // which shows the newest queued buffer per vsync.
++    //
++    // Every release is timed from the frame's own pts (get_release_target),
++    // so the frame after it is not needed first; OWN_TIMING lets the core
++    // hand a frame over as soon as it is decoded instead of once the next
++    // one is (player/video.c get_queue_frames).
++    //
++    // query_format takes MediaCodec buffers only. A stream decoded any other
++    // way is the embedder's cue to switch to a GL VO, so CLIENT_FALLBACK
++    // holds the chain for that switch instead of dropping the video track.
++    .caps = VO_CAP_FRAMEDROP | VO_CAP_OWN_TIMING | VO_CAP_CLIENT_FALLBACK,
 +    .preinit = preinit,
 +    .query_format = query_format,
++    .prepare_frame = prepare_frame,
 +    .control = control,
 +    .draw_frame = draw_frame,
 +    .flip_page = flip_page,
 +    .reconfig = reconfig,
 +    .uninit = uninit,
 +    .priv_size = sizeof(struct priv),
-+    .options = (const struct m_option[]){
-+        {"osd-surface", OPT_INT64(osd_surface)},
-+        {0}
-+    },
-+    .options_prefix = "vo-mediacodec",
 +    .global_opts = &mediacodec_conf,
 +};

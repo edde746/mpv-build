@@ -1,7 +1,8 @@
 # Android patch series for libplacebo, migrated from edde746/libmpv-android
-# buildscripts/patches/libplacebo (its patch.sh applied the directory glob, so
-# this order is that fork's lexicographic apply order; the upstream-commit-named
-# file kept its name to stay byte-identical to the fork).
-# One pool filename per line; order is authoritative and nothing is sorted.
+# buildscripts/patches/libplacebo. One pool filename per line; order is
+# authoritative and nothing is sorted.
+#
+# Shared with series.linux. There is no series.common: apple consumes a
+# prebuilt libplacebo, so a common series would claim a patch the apple group
+# never applies.
 0002-opengl-enable-ubos-on-gles.patch
-c93aa134ab62365ce1177efff99b8e1e66a818e7.patch

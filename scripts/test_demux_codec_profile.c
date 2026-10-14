@@ -1,5 +1,5 @@
-// Behavioral regression for the codec profile the Android demuxers publish at
-// file load (patch 0005), extracted by test_demux_codec_profile.sh.
+// Behavioral regression for the codec profile the demuxers publish at file
+// load (patch 0204), extracted by test_demux_codec_profile.sh.
 //
 // Tortuga and Plezy decide the decode path in on_preloaded, before mpv creates
 // a decoder: H.264 High 10 or HEVC Main 10 goes to software on a device whose

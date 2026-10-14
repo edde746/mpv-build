@@ -131,7 +131,7 @@ jobs:
       - name: Test the audio output reload with a frame held for the old AO
         run: bash ./scripts/test_audio_reload_held_frame.sh
 
-      - name: Test the codec profile the Android demuxers publish at load
+      - name: Test the codec profile the demuxers publish at load
         run: bash ./scripts/test_demux_codec_profile.sh
 
       - name: Test PGS palette cache across an epoch

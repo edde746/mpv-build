@@ -227,18 +227,18 @@ pre-render, or a repaint after seeking.
 Completed animation poses use an immutable bounded FIFO rather than replacing
 each other while the presenter waits. Queue regressions cover ordered handoff,
 full-capacity admission, wraparound, release ownership, and epoch cancellation.
-The same pipeline renders subtitles for vo_avfoundation (patch 0032): the
-Apple series lists 0031 with the sub/ patches it needs (0006 render threads,
-0011, 0012, the sub/ half of 0013 and the sub/ half of 0014). The request
-scenarios also cover the helpers a presenter on the video thread uses: a
-request counts as served even when the OSD did not change, only the newest
-flipped result is drawn, and every queued result, and nothing else, notifies
-the presenter (vo_avfoundation redraws the paused frame with a result that
-missed it). `bash scripts/test_avf_osd_ahead.sh` applies the Apple series and
-checks how long flip_page may hold a frame's video for its subtitles: until
-half the queue lead is left, not at all while the render thread is behind,
-a bounded time for untimed frames (redraws, and frames shown while paused),
-and as long as before in the composite modes.
+The same pipeline renders subtitles for vo_avfoundation (patch 0004, which
+carries all of `vo_avfoundation.m`); series.common lists 0031 with the sub/
+patches it needs (0205 render threads, 0011, 0012, 0013 and 0014), so every
+group builds it. The request scenarios also cover the helpers a presenter on
+the video thread uses: a request counts as served even when the OSD did not
+change, only the newest flipped result is drawn, and every queued result, and
+nothing else, notifies the presenter (vo_avfoundation redraws the paused frame
+with a result that missed it). `bash scripts/test_avf_osd_ahead.sh` applies
+the Apple series and checks how long flip_page may hold a frame's video for
+its subtitles: until half the queue lead is left, not at all while the render
+thread is behind, a bounded time for untimed frames (redraws, and frames shown
+while paused), and as long as before in the composite modes.
 
 Run the OSD surface-retirement regression with
 `bash scripts/test_mediacodec_rebind.sh`. It applies the full Android series
@@ -401,8 +401,8 @@ frees what it shares, and literals keep the single AF_UNSPEC lookup. Pass an
 already-patched source directory to run offline.
 
 Run the codec-profile regression with `bash scripts/test_demux_codec_profile.sh`.
-It extracts the profile the Android demuxers publish when a file loads (patch
-0005: demux_mkv names it from CodecPrivate, demux_lavf from MP4's avcC or
+It extracts the profile the demuxers publish when a file loads (patch
+0204: demux_mkv names it from CodecPrivate, demux_lavf from MP4's avcC or
 hvcC), which is what a client's per-file decode routing reads before any
 decoder exists, and compares it with the profile mpv publishes once the pinned
 FFmpeg's software decoder has decoded the stream's first access unit (a

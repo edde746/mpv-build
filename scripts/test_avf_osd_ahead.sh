@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile vo_avfoundation's subtitle wait policy (the marked "avf osd ahead
-# policy" region, patch 0032) VERBATIM from the final Apple series. Pass an
+# policy" region, patch 0004) VERBATIM from the final Apple series. Pass an
 # already-patched mpv tree for offline use; otherwise fetch and patch the
 # pinned source.
 set -euo pipefail

@@ -11,12 +11,20 @@ libdovi's mode 2 conversion and its error handling now live in one helper,
 and both call sites use it. A failure is logged there, and the caller drops
 the NAL; the frame decodes through its base layer either way.
 
-Listed by both series.apple and series.android rather than promoted to
-series.common, which must also apply to the 7.1 tree linux builds from: the
-helper is only ever useful where libdovi is enabled. The libdovi configure
-registration travels with it, for the same reason: a series that enabled the
-helper without enabling the library would build the stub below and fail every
-profile 7 conversion at runtime.
+It also refuses the one RPU shape libdovi before 3.4.0 cannot survive: a
+payload that, with its emulation prevention bytes cleared and its trailing
+zero bytes trimmed, is shorter than the prefix, CRC32 and final byte libdovi
+then indexes. libdovi 3.3.2 panics there, which aborts the process through
+its C API. Android builds libdovi from source with its own bounds patch, but
+the apple group links the prebuilt 3.3.2, which has none, so the check lives
+here where both reach it, with libdovi 3.4.0's bound (7 bytes). Everything
+else libdovi rejects keeps going through its error path.
+
+The helper is only built where a caller is (MediaCodec or VideoToolbox), so
+it sits in series.common and costs the other groups one configure entry.
+The libdovi configure registration travels with it: a series that enabled
+the helper without enabling the library would build the stub below and fail
+every profile 7 conversion at runtime.
 
 diff --git a/configure b/configure
 index a0eed36..539747c 100755
@@ -62,10 +70,10 @@ index fb22541..c6d8108 100644
              avpacket                                                    \
 diff --git a/libavcodec/dovi_convert.c b/libavcodec/dovi_convert.c
 new file mode 100644
-index 0000000..090cdb5
+index 0000000..33e2744
 --- /dev/null
 +++ b/libavcodec/dovi_convert.c
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,132 @@
 +/*
 + * Dolby Vision profile 7 to profile 8.1 RPU conversion, for the hardware
 + * decoders that only take profile 8.1.
@@ -102,7 +110,39 @@ index 0000000..090cdb5
 +
 +#if CONFIG_LIBDOVI
 +
++#include <string.h>
++
 +#include <libdovi/rpu_parser.h>
++
++/*
++ * libdovi before 3.4.0 panics -- an abort through its C API -- on an RPU
++ * whose payload, once its emulation prevention bytes are cleared and its
++ * trailing zero bytes trimmed, is shorter than the prefix, CRC32 and final
++ * byte it then indexes. The apple group links a prebuilt libdovi 3.3.2 with
++ * no such check, so refuse that shape here, at the bound libdovi 3.4.0 uses:
++ * the prefix byte, one payload byte, the CRC32 and the final byte. Anything
++ * libdovi rejects on its own -- shorter than 25 bytes, or not starting with
++ * the NAL header and RPU prefix below -- is left to its error path.
++ */
++static int dovi_rpu_long_enough(const uint8_t *nal, size_t size)
++{
++    static const uint8_t start[] = { 0x7C, 0x01, 0x19, 0x08, 0x09 };
++    const uint8_t *rpu = nal + 2;
++    size_t len, kept = 0, end = 0;
++
++    if (size < 25 || memcmp(nal, start, sizeof(start)))
++        return 1;
++    len = size - 2;
++    for (size_t i = 0; i < len; i++) {
++        // libdovi drops every 3 that follows two zero bytes of the input.
++        if (i >= 2 && !rpu[i - 2] && !rpu[i - 1] && rpu[i] == 3)
++            continue;
++        kept++;
++        if (rpu[i])
++            end = kept;
++    }
++    return end >= 7;
++}
 +
 +int ff_dovi_convert_p7_rpu_to_p81(const uint8_t *nal, size_t size,
 +                                  uint8_t **out, size_t *out_size, void *logctx)
@@ -114,6 +154,12 @@ index 0000000..090cdb5
 +
 +    *out = NULL;
 +    *out_size = 0;
++
++    if (!dovi_rpu_long_enough(nal, size)) {
++        av_log(logctx, AV_LOG_WARNING,
++               "Dolby Vision RPU conversion failed: RPU data too short\n");
++        return AVERROR_INVALIDDATA;
++    }
 +
 +    rpu = dovi_parse_unspec62_nalu(nal, size);
 +    if (!rpu) {

@@ -1,6 +1,6 @@
 // Behavioral regressions for the production MediaCodec input sizing and packet
 // submission extracted by test_mediacodec_input.sh: the max-input-size rule
-// patch 0004 configures, and what ff_mediacodec_dec_send does with a packet
+// patch 0104 configures, and what ff_mediacodec_dec_send does with a packet
 // that fits, one that does not, end of stream, and back-pressure. The
 // MediaCodec wrapper is a recording fake.
 #include <errno.h>

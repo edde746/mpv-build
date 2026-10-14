@@ -30,13 +30,13 @@ PATCHES_ROOT="${PATCHES_ROOT:-$REPO_ROOT}"
 # that decides what a missing pin means. A table row is
 # <variable> <component> <key> [optional]; `optional` marks a key whose
 # absence means "not offered" (a mirror URL) rather than a broken manifest.
-# Pinned values are never optional: a missing checksum or commit stays fatal.
+# Pinned values are never optional: a missing commit stays fatal.
 #
-# The arguments name the acquisition each step below is written for. When a
-# pin's kind changes (say mpv's linux override is retired and the shared git
-# pin takes over), the step has to be rewritten with it -- the check fails
-# loudly at parse time instead of downloading a tag archive that no longer
-# exists.
+# The arguments name the acquisition each step below is written for. Every
+# step clones a pinned git ref; a pin whose kind changes (an override that
+# swaps a tag for a release archive, say) needs its step rewritten with it --
+# the check fails loudly at parse time instead of cloning a ref the manifest
+# no longer describes.
 resolve_pins() {
   local dump line
   dump="$(python3 - "$VERSIONS_MANIFEST" "$@" <<'PY'
@@ -46,7 +46,8 @@ import sys
 SPECS = """
 FFMPEG_VERSION ffmpeg version
 FFMPEG_URL ffmpeg url
-FFMPEG_SHA256 ffmpeg sha256
+FFMPEG_REF ffmpeg ref
+FFMPEG_COMMIT ffmpeg commit
 DAV1D_VERSION dav1d version
 DAV1D_URL dav1d url
 DAV1D_MIRROR dav1d mirror optional
@@ -67,7 +68,8 @@ LIBASS_REF libass ref
 LIBASS_COMMIT libass commit
 MPV_VERSION mpv version
 MPV_URL mpv url
-MPV_SHA256 mpv sha256
+MPV_REF mpv ref
+MPV_COMMIT mpv commit
 NV_CODEC_HEADERS_VERSION nv-codec-headers version
 NV_CODEC_HEADERS_URL nv-codec-headers url
 NV_CODEC_HEADERS_REF nv-codec-headers ref
@@ -108,57 +110,7 @@ PY
   done <<< "$dump"
 }
 
-resolve_pins dav1d:git nv-codec-headers:git ffmpeg:archive shaderc:git libplacebo:git libass:git mpv:archive
-
-sha256_file() {
-  sha256sum "$1" | cut -d ' ' -f 1
-}
-
-download_verified() {
-  local url="$1"
-  local expected_sha256="$2"
-  local destination="$3"
-  local temporary
-  local actual_sha256
-
-  if [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
-    echo "Invalid SHA-256 pin for $url" >&2
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$destination")"
-  temporary="$(mktemp "${destination}.tmp.XXXXXX")"
-  # Retries cover the transfer only. A checksum mismatch below is never retried:
-  # that is a tampered or moved artefact, not a flaky connection, and trying
-  # again would only turn a loud failure into an intermittent one.
-  if ! curl \
-    --fail \
-    --location \
-    --silent \
-    --show-error \
-    --retry 3 \
-    --retry-connrefused \
-    --retry-delay 5 \
-    --connect-timeout 30 \
-    --proto '=https,file' \
-    --tlsv1.2 \
-    --output "$temporary" \
-    "$url"; then
-    rm -f "$temporary"
-    return 1
-  fi
-
-  actual_sha256="$(sha256_file "$temporary")"
-  if [ "$actual_sha256" != "$expected_sha256" ]; then
-    echo "SHA-256 mismatch for $url" >&2
-    echo "Expected: $expected_sha256" >&2
-    echo "Actual:   $actual_sha256" >&2
-    rm -f "$temporary" "$destination"
-    return 1
-  fi
-
-  mv "$temporary" "$destination"
-}
+resolve_pins dav1d:git nv-codec-headers:git ffmpeg:git shaderc:git libplacebo:git libass:git mpv:git
 
 checkout_verified_ref() {
   local url="$1"
@@ -179,9 +131,9 @@ checkout_verified_ref() {
   # pin below is checked identically whichever source answered, so a mirror can
   # only supply the same tree or fail - it cannot substitute another one.
   #
-  # This exists because code.videolan.org, the only source fetched over git,
-  # refused connections for well over two minutes at a time across several CI
-  # runs and took every build with it.
+  # This exists because code.videolan.org (dav1d, libplacebo) refused
+  # connections for well over two minutes at a time across several CI runs and
+  # took every build with it.
   rm -rf "$destination"
   for source in "$url" ${mirror:+"$mirror"}; do
     for attempt in 1 2 3; do
@@ -307,8 +259,9 @@ main() {
   # configures, builds and plays - on the CPU. Enabling them explicitly turns a
   # missing header into a configure failure instead.
   echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoder-only)..."
-  download_verified "$FFMPEG_URL" "$FFMPEG_SHA256" "$srcdir/ffmpeg.tar.xz"
-  tar -xJf "$srcdir/ffmpeg.tar.xz"
+  checkout_verified_ref \
+    "$FFMPEG_URL" "$FFMPEG_REF" "$FFMPEG_COMMIT" \
+    "$srcdir/ffmpeg-${FFMPEG_VERSION}"
   apply_patch_series ffmpeg "$srcdir/ffmpeg-${FFMPEG_VERSION}"
   cd "ffmpeg-${FFMPEG_VERSION}"
 
@@ -419,8 +372,9 @@ main() {
 
   # ─── Step 7: mpv (shared libmpv) ───────────────────────────────────────────
   echo "==> Building mpv $MPV_VERSION (shared libmpv only)..."
-  download_verified "$MPV_URL" "$MPV_SHA256" "$srcdir/mpv.tar.gz"
-  tar -xzf "$srcdir/mpv.tar.gz"
+  checkout_verified_ref \
+    "$MPV_URL" "$MPV_REF" "$MPV_COMMIT" \
+    "$srcdir/mpv-${MPV_VERSION}"
   apply_patch_series mpv "$srcdir/mpv-${MPV_VERSION}"
   cd "mpv-${MPV_VERSION}"
 

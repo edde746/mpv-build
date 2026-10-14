@@ -1,5 +1,5 @@
 // Regression test for the frame-space OSD geometry used by the PiP compositing
-// path (patch/libmpv/0024-avfoundation-frame-space-osd-in-pip.patch).
+// path (patches/mpv/pool/0004-avfoundation-video-output.patch).
 //
 // The geometry and the subtitle bounding-box mapping are compiled VERBATIM from
 // the patched mpv source (the marked "avf frame-space osd core" region, which is

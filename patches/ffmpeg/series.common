@@ -1,11 +1,23 @@
-# Patches applied on every platform, before series.<platform>. Every entry
-# must apply to both pinned trees: the n8.0.1 git checkout (apple, android,
-# windows) and the 7.1 archive linux builds from (versions.json
-# overrides.linux). Promote a per-platform patch here once a second platform
-# needs the same pool file, instead of copying it into another series -- the
-# pool entry stays the single source of truth and the resolved order stays
-# series.common first.
+# Patches applied on every platform, before series.<platform>, to the one
+# n8.0.1 pin all four groups build. Promote a per-platform patch here once a
+# second platform needs the same pool file, instead of copying it into another
+# series -- the pool entry stays the single source of truth and the resolved
+# order stays series.common first.
+#
+# The libdovi profile 7 to 8.1 conversion helper the MediaCodec and the
+# VideoToolbox paths both call. It only builds where one of them is enabled,
+# so elsewhere it costs one configure entry. First, so its Makefile lines land
+# on the pristine file before any later patch reads them.
+0021-dolby-vision-convert-profile7-rpu-to-p81.patch
 0020-avfilter-audio-frame-pool-exact-size.patch
 0022-pgssub-clear-palette-clut-on-epoch-flush.patch
 0023-http-chunked-end-is-not-a-premature-eof.patch
 0029-tcp-resolve-each-address-family-separately.patch
+# The HEVC decoder's Dolby Vision log noise, and its software-only tables,
+# which no hwaccel reads (d3d11va, nvdec, vaapi and vulkan included).
+0010-hevc-downlevel-duplicate-dovi-rpu-log.patch
+0015-hevc-downlevel-skipped-nal-log.patch
+0030-hevc-skip-software-tables-under-hwaccel.patch
+# OpenSSL is the TLS backend on apple, android and windows. Linux configures
+# GnuTLS, so tls_openssl.c is not compiled there and this changes nothing.
+0035-tls-openssl-read-ahead.patch
