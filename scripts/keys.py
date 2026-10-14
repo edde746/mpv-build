@@ -204,6 +204,10 @@ GROUPS = {
             Path("Sources/BuildScripts/Package.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/base.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/main.swift"),
+            # The publish job's XCFramework merge writes the bytes of every
+            # framework asset, so it keys them like the driver that compiles them.
+            Path("scripts/merge_xcframeworks.py"),
+            Path("scripts/build_spatial.py"),
         ),
         package=Path("Package.swift"),
     ),
@@ -320,13 +324,10 @@ def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
     # An archive pin's identity is its sha256; ref and commit only mean
     # something for a git pin. Folding an override in must not carry the base
     # entry's ref or commit -- describing an unrelated tag and tree -- into the
-    # key of a pin that acquires an archive. ffmpeg's linux override is the 7.1
-    # archive while its base pin is the n8.0.1 tag, and mpv's is the 0.40.0
-    # archive against the v0.41.0 tag, so an inherited ref there is wrong twice
-    # over: no tool reads it for an archive, and a bump to the base git pin
-    # moved the archive's key for no reason. This is also the invariant
-    # platforms/android/download.sh's pin_block relies on when it reads an
-    # archive's ref back as empty.
+    # key of a pin that acquires an archive: no tool reads it for an archive,
+    # and a bump to the base git pin would move the archive's key for no
+    # reason. This is also the invariant platforms/android/download.sh's
+    # pin_block relies on when it reads an archive's ref back as empty.
     if resolved_kind(versions, component, group) != "git":
         pins.pop("commit", None)
         pins.pop("ref", None)
@@ -441,6 +442,10 @@ def key_inputs(root: Path, group: Group, artifact: str) -> str:
         f"component={component}",
     ]
     text.extend(_pin_lines(pins))
+    if group.name == "apple" and artifact == "libmpv":
+        # The Swift renderer and Rust core are folded into libmpv.a.
+        text.append("component=spatialaudiobridge")
+        text.extend(_pin_lines(resolved_pins(load_versions(root), "spatialaudiobridge", group.name)))
     text += [
         # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true
         # and the group.json builds have no flag matrix, so these two lines are

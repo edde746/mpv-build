@@ -109,13 +109,13 @@ fi
 mkdir -p deps
 
 # How a component is acquired is a pin (versions.json kind, override-aware), so
-# a kind change cannot leave a stale copy of this dispatch behind. Only two
-# git pins vendor code in submodules.
+# a kind change cannot leave a stale copy of this dispatch behind. Only
+# libplacebo vendors code in submodules.
 for component in $components; do
 	case "$(pin "$component" kind)" in
 		git)
 			case "$component" in
-				mbedtls|libplacebo) fetch_git "$component" --recurse-submodules ;;
+				libplacebo) fetch_git "$component" --recurse-submodules ;;
 				*) fetch_git "$component" ;;
 			esac
 			;;

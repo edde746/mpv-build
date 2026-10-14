@@ -28,7 +28,7 @@ cpuflags=
 	--arch=${ndk_triple%%-*} --cpu=$cpu --pkg-config=pkg-config --nm=llvm-nm \
 	--extra-cflags="-I$prefix_dir/include $cpuflags" --extra-ldflags="-L$prefix_dir/lib" \
 	--extra-libs=-ldovi \
-	--enable-{jni,mediacodec,mbedtls,libdav1d,libdovi} --disable-vulkan \
+	--enable-{jni,mediacodec,openssl,libdav1d,libdovi} --disable-vulkan \
 	--disable-static --enable-shared --enable-{gpl,version3} \
 	--disable-{stripping,doc,programs} \
 	--disable-{muxers,encoders,devices,filters} \

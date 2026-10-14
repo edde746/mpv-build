@@ -1,4 +1,4 @@
-// Compiles the production geometry region extracted from patch 0001, not a
+// Compiles the production geometry region extracted from patch 0100, not a
 // mirrored implementation. Optional libass coverage renders a positioned vector
 // sign so neither fonts nor Android headers/devices are needed.
 #include <assert.h>

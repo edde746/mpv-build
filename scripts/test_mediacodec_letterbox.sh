@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Compile the production OSD-plane letterbox fill from patch 0106 against a
-# recording GL stub. Accept an already patched mpv tree for offline use,
-# otherwise fetch the pinned Android source.
+# Compile the production OSD-plane letterbox fill from vo_mediacodec.c
+# against a recording GL stub. Accept an already patched mpv tree for offline
+# use, otherwise fetch the pinned Android source.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

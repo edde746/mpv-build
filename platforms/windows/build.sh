@@ -60,6 +60,15 @@ export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-mpv-build@localhost}"
 export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-$GIT_AUTHOR_NAME}"
 export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
 
+# A rebuild of a published key has to reproduce its bytes, so no package may
+# record when it was built. Everything that reads a clock here takes this
+# epoch instead (2020-01-01, package.sh's zip mtime): lld-link's PE header
+# and debug directory TimeDateStamp, clang's __DATE__/__TIME__ (mpv's build
+# date, SVT-AV1's "LIB Build date") and OpenSSL's "built on" line. davs2's
+# build time comes from `date`, which pin_packages.py rewrites to the same
+# moment.
+export SOURCE_DATE_EPOCH=1577836800
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -235,6 +244,30 @@ invalidate_stale_pins() {
   done
 }
 invalidate_stale_pins
+
+# A tree restored from the cache holds what earlier runs compiled, clocks
+# included: published key 442b5d101e4c's libmpv-2.dll carries OpenSSL's
+# "built on" date from the run that bumped it, SVT-AV1's __DATE__ __TIME__
+# and davs2's build time from the run that first built them, and mpv's from
+# a ccache hit (winbuild's ccache.conf sets sloppiness=time_macros, so a hit
+# returns whatever date the compile that filled it saw). A tree not marked as
+# built under this epoch therefore rebuilds every package once, from an empty
+# compile cache. The toolchain (llvm, the mingw-w64 CRT, libc++, rustup)
+# stamps nothing into libmpv-2.dll and is kept. The marker is written before
+# building: a package rebuilt from here on reads the epoch, and one not
+# rebuilt yet has no stamps, so an interrupted run resumes instead of
+# purging again.
+epoch_marker="$BUILD/.source-date-epoch"
+if [[ "$(cat "$epoch_marker" 2> /dev/null)" != "$SOURCE_DATE_EPOCH" ]]; then
+  echo "==> tree not built under SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH: rebuilding every package without the compile cache"
+  find "$BUILD/packages" -type d -name '*-stamp' 2> /dev/null | while read -r d; do
+    drop_stamps "$d"
+  done
+  find "$BUILD/packages" -type d -name '*-build' -prune -exec rm -rf {} + 2> /dev/null || true
+  find "$BUILD/install/$ARCH-w64-mingw32/ccache" -mindepth 1 -maxdepth 1 ! -name ccache.conf \
+    -exec rm -rf {} + 2> /dev/null || true
+  echo "$SOURCE_DATE_EPOCH" > "$epoch_marker"
+fi
 
 # rustup travels in its own cache path and can be evicted independently of
 # the per-arch stamps that claim it was installed; when the binary is gone,

@@ -186,9 +186,16 @@ def _fetch_git(component, pins, destination):
     clone = None
     for source in sources:
         for attempt in range(1, 4):
-            result = subprocess.run(
-                ["git", "clone", "--quiet", "--depth", "1", "--branch", ref, source, str(destination)]
-            )
+            if re.fullmatch(r"[0-9a-f]{40}", ref):
+                # A source-only release commit may have no tag of its own.
+                subprocess.run(["git", "init", "--quiet", str(destination)], check=True)
+                result = subprocess.run(["git", "-C", str(destination), "fetch", "--quiet", "--depth", "1", source, ref])
+                if result.returncode == 0:
+                    result = subprocess.run(["git", "-C", str(destination), "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+            else:
+                result = subprocess.run(
+                    ["git", "clone", "--quiet", "--depth", "1", "--branch", ref, source, str(destination)]
+                )
             if result.returncode == 0:
                 clone = source
                 break
@@ -293,8 +300,8 @@ def _stripped_members(component, tar):
     """The archive's members with their one top-level component dropped.
 
     An archive pin is an upstream release tarball whose every member sits
-    under a single top-level directory (ffmpeg's `ffmpeg-7.1/`, mpv's
-    `mpv-0.40.0/`), and that directory is the source tree the drivers build,
+    under a single top-level directory (lua's `lua-5.2.4/`), and that
+    directory is the source tree the drivers build,
     so exactly one top-level component has to be there to drop. A flat
     tarball, several roots, or an absolute/`..`/`.` root would otherwise
     extract the wrong tree, or nothing at all, while the fetch still reported

@@ -1,0 +1,468 @@
+Subject: [PATCH] ao_audiotrack: normalize loudness with the platform effect on the track's session
+
+Plezy normalizes loudness with loudnorm in --af. The filter runs on the
+core thread at f64/192 kHz, and the core thread is also the one that
+hands video frames to vo_mediacodec. On 32-bit TV boxes the filter pass
+took long enough to make those frames late: a Dangbei Atom showed 32
+late frames in 28 s of playback (Plezy #2654), and a Fire TV Stick 4K
+Max playing HEVC 23.976 with E-AC-3 5.1 showed 17 in a minute, against
+none with normalization off. Plezy also folded everything to stereo
+ahead of the filter, because it could not keep up with 5.1 at all.
+
+--audiotrack-normalize attaches a platform loudness effect to each PCM
+track's audio session instead: the effect Plezy's ExoPlayer backend
+uses, with the same parameters. DynamicsProcessing on API 28+ (a
+full-band compressor as a slow AGC toward -14 LUFS, then a limiter at
+-3 dB); LoudnessEnhancer below that or where the device has no effect
+HAL. The effect runs in AudioFlinger's mixer, so it costs the player
+nothing and keeps every channel. Bitstream tracks are left alone, as a
+filter leaves them. The effect is created with each track and released
+with it, and a new option value reopens the AO. The effect classes are
+optional JNI tables: a class the platform lacks means no normalization,
+not a dead AO.
+
+Same Fire TV and file with the option on: 1 late frame in 1554, the
+first after the seek, which normalization off shows as well.
+
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index 7a3ccf6..20f9c1a 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -181,6 +181,11 @@ struct priv {
+     bool cfg_raw_passthrough;
+     bool cfg_route_reload;
+     int cfg_session_id;
++    bool cfg_normalize;
++
++    // --audiotrack-normalize: the platform loudness effect on the PCM track's
++    // audio session (AudioTrack_attachNormalizer), released with the track.
++    jobject normalizer;
+ 
+     atomic_bool thread_terminate;
+     bool thread_created;
+@@ -250,6 +255,7 @@ static struct JNIAudioTrack {
+     jmethodID getRoutedDevice;
+     jmethodID getUnderrunCount;
+     jmethodID getNativeOutputSampleRate;
++    jmethodID getAudioSessionId;
+     jint STATE_INITIALIZED;
+     jint PLAYSTATE_STOPPED;
+     jint PLAYSTATE_PAUSED;
+@@ -286,6 +292,7 @@ static const struct MPJniField AudioTrack_mapping[] = {
+     {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
+     {"getRoutedDevice", "()Landroid/media/AudioDeviceInfo;", MP_JNI_METHOD, OFFSET(getRoutedDevice), 0},
+     {"getUnderrunCount", "()I", MP_JNI_METHOD, OFFSET(getUnderrunCount), 0},
++    {"getAudioSessionId", "()I", MP_JNI_METHOD, OFFSET(getAudioSessionId), 1},
+     {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
+     {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
+     {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
+@@ -442,10 +449,129 @@ static const struct MPJniField AudioDeviceInfo_mapping[] = {
+ };
+ #undef OFFSET
+ 
+-#define ENTRY(name) { &name, name ## _mapping }
++// Loudness normalization effects (AudioTrack_attachNormalizer). Optional as a
++// whole: DynamicsProcessing is API 28+, so each class entry below is
++// non-mandatory and a missing class leaves its table zeroed, not the AO dead.
++static struct JNIAudioEffect {
++    jclass clazz;
++    jmethodID setEnabled;
++    jmethodID release;
++} AudioEffect;
++#define OFFSET(member) offsetof(struct JNIAudioEffect, member)
++static const struct MPJniField AudioEffect_mapping[] = {
++    {"android/media/audiofx/AudioEffect", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"setEnabled", "(Z)I", MP_JNI_METHOD, OFFSET(setEnabled), 1},
++    {"release", "()V", MP_JNI_METHOD, OFFSET(release), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNILoudnessEnhancer {
++    jclass clazz;
++    jmethodID ctor;
++    jmethodID setTargetGain;
++} LoudnessEnhancer;
++#define OFFSET(member) offsetof(struct JNILoudnessEnhancer, member)
++static const struct MPJniField LoudnessEnhancer_mapping[] = {
++    {"android/media/audiofx/LoudnessEnhancer", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(I)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {"setTargetGain", "(I)V", MP_JNI_METHOD, OFFSET(setTargetGain), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessing {
++    jclass clazz;
++    jmethodID ctor;
++    jint VARIANT_FAVOR_FREQUENCY_RESOLUTION;
++} DynamicsProcessing;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessing, member)
++static const struct MPJniField DynamicsProcessing_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(IILandroid/media/audiofx/DynamicsProcessing$Config;)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {"VARIANT_FAVOR_FREQUENCY_RESOLUTION", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(VARIANT_FAVOR_FREQUENCY_RESOLUTION), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessingConfigBuilder {
++    jclass clazz;
++    jmethodID ctor;
++    jmethodID setPreferredFrameDuration;
++    jmethodID setAllChannelsTo;
++    jmethodID build;
++} DynamicsProcessingConfigBuilder;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessingConfigBuilder, member)
++static const struct MPJniField DynamicsProcessingConfigBuilder_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing$Config$Builder", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(IIZIZIZIZ)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {"setPreferredFrameDuration", "(F)Landroid/media/audiofx/DynamicsProcessing$Config$Builder;", MP_JNI_METHOD, OFFSET(setPreferredFrameDuration), 1},
++    {"setAllChannelsTo", "(Landroid/media/audiofx/DynamicsProcessing$Channel;)Landroid/media/audiofx/DynamicsProcessing$Config$Builder;", MP_JNI_METHOD, OFFSET(setAllChannelsTo), 1},
++    {"build", "()Landroid/media/audiofx/DynamicsProcessing$Config;", MP_JNI_METHOD, OFFSET(build), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessingChannel {
++    jclass clazz;
++    jmethodID ctor;
++    jmethodID setMbc;
++    jmethodID setLimiter;
++} DynamicsProcessingChannel;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessingChannel, member)
++static const struct MPJniField DynamicsProcessingChannel_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing$Channel", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(FZIZIZIZ)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {"setMbc", "(Landroid/media/audiofx/DynamicsProcessing$Mbc;)V", MP_JNI_METHOD, OFFSET(setMbc), 1},
++    {"setLimiter", "(Landroid/media/audiofx/DynamicsProcessing$Limiter;)V", MP_JNI_METHOD, OFFSET(setLimiter), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessingMbc {
++    jclass clazz;
++    jmethodID ctor;
++    jmethodID setBand;
++} DynamicsProcessingMbc;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessingMbc, member)
++static const struct MPJniField DynamicsProcessingMbc_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing$Mbc", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(ZZI)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {"setBand", "(ILandroid/media/audiofx/DynamicsProcessing$MbcBand;)V", MP_JNI_METHOD, OFFSET(setBand), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessingMbcBand {
++    jclass clazz;
++    jmethodID ctor;
++} DynamicsProcessingMbcBand;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessingMbcBand, member)
++static const struct MPJniField DynamicsProcessingMbcBand_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing$MbcBand", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(ZFFFFFFFFFF)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {0}
++};
++#undef OFFSET
++
++static struct JNIDynamicsProcessingLimiter {
++    jclass clazz;
++    jmethodID ctor;
++} DynamicsProcessingLimiter;
++#define OFFSET(member) offsetof(struct JNIDynamicsProcessingLimiter, member)
++static const struct MPJniField DynamicsProcessingLimiter_mapping[] = {
++    {"android/media/audiofx/DynamicsProcessing$Limiter", NULL, MP_JNI_CLASS, OFFSET(clazz), 0},
++    {"<init>", "(ZZIFFFFF)V", MP_JNI_METHOD, OFFSET(ctor), 1},
++    {0}
++};
++#undef OFFSET
++
++#define ENTRY(name) { &name, name ## _mapping, false }
++#define OPTIONAL_ENTRY(name) { &name, name ## _mapping, true }
+ static const struct {
+     void *fields;
+     const struct MPJniField *mapping;
++    bool optional; // a table that fails to resolve is left zeroed
+ } jclass_list[] = {
+     ENTRY(ByteBuffer),
+     ENTRY(AudioTrack),
+@@ -456,7 +582,16 @@ static const struct {
+     ENTRY(AudioManager),
+     ENTRY(AudioTimestamp),
+     ENTRY(AudioDeviceInfo),
++    OPTIONAL_ENTRY(AudioEffect),
++    OPTIONAL_ENTRY(LoudnessEnhancer),
++    OPTIONAL_ENTRY(DynamicsProcessing),
++    OPTIONAL_ENTRY(DynamicsProcessingConfigBuilder),
++    OPTIONAL_ENTRY(DynamicsProcessingChannel),
++    OPTIONAL_ENTRY(DynamicsProcessingMbc),
++    OPTIONAL_ENTRY(DynamicsProcessingMbcBand),
++    OPTIONAL_ENTRY(DynamicsProcessingLimiter),
+ };
++#undef OPTIONAL_ENTRY
+ #undef ENTRY
+ 
+ // ao.c takes device_buffer as the floor of the queue the core keeps in front
+@@ -485,6 +620,218 @@ static int AudioTrack_queueFloor(struct ao *ao, int frames)
+     return frames * 2;
+ }
+ 
++// --audiotrack-normalize: loudness normalization by a platform audio effect on
++// the track's audio session, approximating loudnorm=I=-14:TP=-3:LRA=4 (the
++// same effect and parameters as Plezy's ExoPlayer backend). The effect runs
++// in AudioFlinger's mixer, so it costs the player nothing. loudnorm in --af
++// runs on the core thread at f64/192 kHz; on 32-bit TV boxes that pass took
++// long enough to make the video frames the same thread hands to
++// vo_mediacodec late.
++//
++// API 28+: DynamicsProcessing, one full-band compressor as a slow AGC with
++// makeup gain toward -14 LUFS, then a limiter at the -3 dB peak ceiling. Older
++// platforms, or a device without its effect HAL: LoudnessEnhancer, a fixed
++// boost with built-in limiting. Effects only process mixed PCM; bitstream
++// tracks are left alone.
++#define NORM_EFFECT_PRIORITY 0
++#define NORM_FRAME_DURATION_MS 10.0f
++#define NORM_MBC_CUTOFF_HZ 20000.0f
++#define NORM_MBC_ATTACK_MS 30.0f
++#define NORM_MBC_RELEASE_MS 300.0f
++#define NORM_MBC_RATIO 4.0f
++#define NORM_MBC_THRESHOLD_DB (-34.0f)
++#define NORM_MBC_KNEE_DB 6.0f
++#define NORM_MBC_NOISE_GATE_DB (-90.0f) // effectively off
++#define NORM_MBC_EXPANDER_RATIO 1.0f    // no downward expansion
++#define NORM_MBC_POST_GAIN_DB 15.0f
++#define NORM_LIMITER_ATTACK_MS 1.0f
++#define NORM_LIMITER_RELEASE_MS 60.0f
++#define NORM_LIMITER_RATIO 10.0f
++#define NORM_LIMITER_THRESHOLD_DB (-3.0f)
++#define NORM_LOUDNESS_ENHANCER_GAIN_MB 900 // +9 dB
++
++// A failed effect means a fallback, not a broken AO: clear and log the
++// pending exception, if any, at warn level.
++static bool normalizer_failed(struct ao *ao, JNIEnv *env)
++{
++    if (!(*env)->ExceptionCheck(env))
++        return false;
++    jthrowable exception = (*env)->ExceptionOccurred(env);
++    (*env)->ExceptionClear(env);
++    char *message = NULL;
++    if (mp_jni_exception_get_summary(env, exception, &message, ao->log) >= 0)
++        MP_WARN(ao, "normalization: %s\n", message);
++    talloc_free(message);
++    MP_JNI_LOCAL_FREEP(&exception);
++    return true;
++}
++
++// Enables a freshly created effect; releases it and returns NULL on failure.
++static jobject normalizer_enable(struct ao *ao, JNIEnv *env, jobject effect)
++{
++    if (!effect)
++        return NULL;
++    jint ret = MP_JNI_CALL_INT(effect, AudioEffect.setEnabled, JNI_TRUE);
++    if (!normalizer_failed(ao, env) && ret == 0) // AudioEffect.SUCCESS
++        return effect;
++    MP_WARN(ao, "normalization: effect could not be enabled (%d)\n", (int)ret);
++    MP_JNI_CALL_VOID(effect, AudioEffect.release);
++    normalizer_failed(ao, env);
++    MP_JNI_LOCAL_FREEP(&effect);
++    return NULL;
++}
++
++static jobject normalizer_new_dynamics_processing(struct ao *ao, JNIEnv *env,
++                                                  jint session, int channels)
++{
++    if (!DynamicsProcessing.clazz || !DynamicsProcessingConfigBuilder.clazz ||
++        !DynamicsProcessingChannel.clazz || !DynamicsProcessingMbc.clazz ||
++        !DynamicsProcessingMbcBand.clazz || !DynamicsProcessingLimiter.clazz)
++        return NULL;
++
++    jobject band = NULL, mbc = NULL, limiter = NULL, channel = NULL;
++    jobject builder = NULL, config = NULL, tmp = NULL, effect = NULL;
++
++    band = MP_JNI_NEW(DynamicsProcessingMbcBand.clazz, DynamicsProcessingMbcBand.ctor,
++                      JNI_TRUE, NORM_MBC_CUTOFF_HZ, NORM_MBC_ATTACK_MS,
++                      NORM_MBC_RELEASE_MS, NORM_MBC_RATIO, NORM_MBC_THRESHOLD_DB,
++                      NORM_MBC_KNEE_DB, NORM_MBC_NOISE_GATE_DB,
++                      NORM_MBC_EXPANDER_RATIO, 0.0f /* preGain */,
++                      NORM_MBC_POST_GAIN_DB);
++    if (normalizer_failed(ao, env) || !band)
++        goto done;
++    mbc = MP_JNI_NEW(DynamicsProcessingMbc.clazz, DynamicsProcessingMbc.ctor,
++                     JNI_TRUE, JNI_TRUE, (jint)1);
++    if (normalizer_failed(ao, env) || !mbc)
++        goto done;
++    MP_JNI_CALL_VOID(mbc, DynamicsProcessingMbc.setBand, (jint)0, band);
++    if (normalizer_failed(ao, env))
++        goto done;
++    limiter = MP_JNI_NEW(DynamicsProcessingLimiter.clazz, DynamicsProcessingLimiter.ctor,
++                         JNI_TRUE, JNI_TRUE, (jint)0 /* linkGroup */,
++                         NORM_LIMITER_ATTACK_MS, NORM_LIMITER_RELEASE_MS,
++                         NORM_LIMITER_RATIO, NORM_LIMITER_THRESHOLD_DB,
++                         0.0f /* postGain */);
++    if (normalizer_failed(ao, env) || !limiter)
++        goto done;
++    // inputGain, preEq (off), one MBC band, postEq (off), limiter
++    channel = MP_JNI_NEW(DynamicsProcessingChannel.clazz, DynamicsProcessingChannel.ctor,
++                         0.0f, JNI_FALSE, (jint)0, JNI_TRUE, (jint)1,
++                         JNI_FALSE, (jint)0, JNI_TRUE);
++    if (normalizer_failed(ao, env) || !channel)
++        goto done;
++    MP_JNI_CALL_VOID(channel, DynamicsProcessingChannel.setMbc, mbc);
++    if (normalizer_failed(ao, env))
++        goto done;
++    MP_JNI_CALL_VOID(channel, DynamicsProcessingChannel.setLimiter, limiter);
++    if (normalizer_failed(ao, env))
++        goto done;
++    builder = MP_JNI_NEW(DynamicsProcessingConfigBuilder.clazz,
++                         DynamicsProcessingConfigBuilder.ctor,
++                         DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
++                         (jint)channels, JNI_FALSE, (jint)0, JNI_TRUE, (jint)1,
++                         JNI_FALSE, (jint)0, JNI_TRUE);
++    if (normalizer_failed(ao, env) || !builder)
++        goto done;
++    tmp = MP_JNI_CALL_OBJECT(builder, DynamicsProcessingConfigBuilder.setPreferredFrameDuration,
++                             NORM_FRAME_DURATION_MS);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    if (normalizer_failed(ao, env))
++        goto done;
++    tmp = MP_JNI_CALL_OBJECT(builder, DynamicsProcessingConfigBuilder.setAllChannelsTo, channel);
++    MP_JNI_LOCAL_FREEP(&tmp);
++    if (normalizer_failed(ao, env))
++        goto done;
++    config = MP_JNI_CALL_OBJECT(builder, DynamicsProcessingConfigBuilder.build);
++    if (normalizer_failed(ao, env) || !config)
++        goto done;
++    effect = MP_JNI_NEW(DynamicsProcessing.clazz, DynamicsProcessing.ctor,
++                        (jint)NORM_EFFECT_PRIORITY, session, config);
++    if (normalizer_failed(ao, env))
++        MP_JNI_LOCAL_FREEP(&effect);
++
++done:
++    MP_JNI_LOCAL_FREEP(&config);
++    MP_JNI_LOCAL_FREEP(&builder);
++    MP_JNI_LOCAL_FREEP(&channel);
++    MP_JNI_LOCAL_FREEP(&limiter);
++    MP_JNI_LOCAL_FREEP(&mbc);
++    MP_JNI_LOCAL_FREEP(&band);
++    return normalizer_enable(ao, env, effect);
++}
++
++static jobject normalizer_new_loudness_enhancer(struct ao *ao, JNIEnv *env,
++                                                jint session)
++{
++    if (!LoudnessEnhancer.clazz)
++        return NULL;
++    jobject effect = MP_JNI_NEW(LoudnessEnhancer.clazz, LoudnessEnhancer.ctor, session);
++    if (normalizer_failed(ao, env) || !effect) {
++        MP_JNI_LOCAL_FREEP(&effect);
++        return NULL;
++    }
++    MP_JNI_CALL_VOID(effect, LoudnessEnhancer.setTargetGain,
++                     (jint)NORM_LOUDNESS_ENHANCER_GAIN_MB);
++    if (normalizer_failed(ao, env)) {
++        MP_JNI_CALL_VOID(effect, AudioEffect.release);
++        normalizer_failed(ao, env);
++        MP_JNI_LOCAL_FREEP(&effect);
++        return NULL;
++    }
++    return normalizer_enable(ao, env, effect);
++}
++
++// Called for every new track (p->audiotrack set), which with the default
++// --audiotrack-session-id=0 is also a new audio session.
++static void AudioTrack_attachNormalizer(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++
++    if (!p->cfg_normalize || af_fmt_is_spdif(ao->format) || !AudioEffect.clazz)
++        return;
++
++    jint session = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getAudioSessionId);
++    if (normalizer_failed(ao, env) || session <= 0) {
++        MP_WARN(ao, "normalization: track has no audio session (%d)\n", (int)session);
++        return;
++    }
++
++    const char *engine = "DynamicsProcessing";
++    jobject effect = normalizer_new_dynamics_processing(ao, env, session,
++                                                        ao->channels.num);
++    if (!effect) {
++        engine = "LoudnessEnhancer";
++        effect = normalizer_new_loudness_enhancer(ao, env, session);
++    }
++    if (!effect) {
++        MP_WARN(ao, "normalization: no loudness effect available\n");
++        return;
++    }
++
++    p->normalizer = (*env)->NewGlobalRef(env, effect);
++    if (!p->normalizer) {
++        MP_JNI_CALL_VOID(effect, AudioEffect.release);
++        normalizer_failed(ao, env);
++    }
++    MP_JNI_LOCAL_FREEP(&effect);
++    if (p->normalizer) {
++        MP_INFO(ao, "normalization: %s on session %d (%d channels)\n",
++                engine, (int)session, ao->channels.num);
++    }
++}
++
++static void AudioTrack_releaseNormalizer(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->normalizer)
++        return;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    MP_JNI_CALL_VOID(p->normalizer, AudioEffect.release);
++    MP_JNI_EXCEPTION_LOG(ao);
++    MP_JNI_GLOBAL_FREEP(&p->normalizer);
++}
++
+ static int AudioTrack_New(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -578,6 +925,7 @@ static int AudioTrack_New(struct ao *ao)
+     if (!p->audiotrack)
+         return -1;
+ 
++    AudioTrack_attachNormalizer(ao);
+     return 0;
+ }
+ 
+@@ -647,6 +995,7 @@ static int AudioTrack_Recreate(struct ao *ao)
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+ 
+     mp_mutex_lock(&p->track_lock);
++    AudioTrack_releaseNormalizer(ao);
+     if (p->audiotrack) {
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+         MP_JNI_EXCEPTION_LOG(ao);
+@@ -1751,7 +2100,8 @@ static int init_jni(struct ao *ao)
+     if (jni_static_use_count == 0) {
+         for (int i = 0; i < MP_ARRAY_SIZE(jclass_list); i++) {
+             if (mp_jni_init_jfields(env, jclass_list[i].fields,
+-                                    jclass_list[i].mapping, 1, ao->log) < 0) {
++                                    jclass_list[i].mapping, 1, ao->log) < 0 &&
++                !jclass_list[i].optional) {
+                 goto error;
+             }
+         }
+@@ -2098,6 +2448,7 @@ static void uninit(struct ao *ao)
+     if (p->monitor_created)
+         mp_thread_join(p->monitor);
+ 
++    AudioTrack_releaseNormalizer(ao);
+     if (p->audiotrack) {
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+         MP_JNI_EXCEPTION_LOG(ao);
+@@ -2490,6 +2841,8 @@ const struct ao_driver audio_out_audiotrack = {
+         {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
+         {"route-reload", OPT_BOOL(cfg_route_reload)},
+         {"session-id", OPT_INT(cfg_session_id)},
++        // A new value takes effect when the AO reopens; UPDATE_AUDIO reopens it.
++        {"normalize", OPT_BOOL(cfg_normalize), .flags = UPDATE_AUDIO},
+         {0}
+     },
+     .options_prefix = "audiotrack",

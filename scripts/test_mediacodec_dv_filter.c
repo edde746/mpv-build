@@ -1,5 +1,5 @@
 // Behavioral regressions for the exact freestanding Dolby Vision access-unit
-// filter extracted from ffmpeg patch 0001 by test_mediacodec_dv_filter.sh.
+// filter extracted from ffmpeg patch 0101 by test_mediacodec_dv_filter.sh.
 // libavutil's buffer/packet API and libdovi are stubbed with counting fakes;
 // the access units are hand-built Annex B HEVC.
 #include <errno.h>
@@ -132,16 +132,19 @@ static void av_fast_malloc(void *ptr, unsigned int *size, size_t min_size)
 }
 
 // libdovi: a conversion succeeds unless the RPU payload starts with the
-// poison byte, and writes a recognizable replacement NAL.
+// poison byte, and writes a recognizable replacement NAL. Every parse is
+// counted, so a test can prove an RPU never reached libdovi.
 typedef struct DoviRpuOpaque { int poisoned; } DoviRpuOpaque;
 typedef struct DoviData { const uint8_t *data; size_t len; } DoviData;
 static const uint8_t converted_rpu[] = { 0x7C, 0x01, 0xC0, 0x4E, 0x56 };
 #define RPU_POISON 0xEE
+static int dovi_parses;
 
 static DoviRpuOpaque *dovi_parse_unspec62_nalu(const uint8_t *buf, size_t len)
 {
     DoviRpuOpaque *rpu = calloc(1, sizeof(*rpu));
     rpu->poisoned = len >= 3 && buf[2] == RPU_POISON;
+    dovi_parses++;
     return rpu;
 }
 
@@ -524,6 +527,49 @@ static void test_output_buffer_is_reused(void)
     expect_bytes(&grown, "output larger than the input keeps its padding");
 }
 
+// libdovi 3.3.2 (the apple group's prebuilt) panics, aborting the process,
+// on an RPU whose payload -- emulation prevention bytes cleared, trailing
+// zero bytes trimmed -- is shorter than the prefix, CRC32 and final byte it
+// indexes. The converter refuses those before libdovi sees them, at libdovi
+// 3.4.0's bound of 7 bytes, and leaves every other rejection to libdovi.
+static void test_short_rpu_never_reaches_libdovi(void)
+{
+    static const struct {
+        const char *name;
+        uint8_t bytes[32];
+        size_t n;
+        bool reaches_libdovi;
+    } cases[] = {
+        {"prefix then zero padding", {0x7C, 0x01, 0x19, 0x08, 0x09}, 30, false},
+        {"tail that is an emulation prevention byte",
+         {0x7C, 0x01, 0x19, 0x08, 0x09, 0xAA, 0x00, 0x00, 0x03}, 30, false},
+        {"six bytes survive",
+         {0x7C, 0x01, 0x19, 0x08, 0x09, 0xAA, 0xBB, 0xCC}, 30, false},
+        {"seven bytes survive",
+         {0x7C, 0x01, 0x19, 0x08, 0x09, 0xAA, 0xBB, 0xCC, 0xDD}, 30, true},
+        {"shorter than libdovi's own minimum",
+         {0x7C, 0x01, 0x19, 0x08, 0x09}, 24, true},
+        {"start bytes libdovi does not know",
+         {0x7C, 0x01, 0x19, 0x08, 0x0A}, 30, true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t *out = NULL;
+        size_t out_size = 0;
+        reset(DV_FILTER_CONVERT);
+        int parses = dovi_parses;
+        int ret = ff_dovi_convert_p7_rpu_to_p81(cases[i].bytes, cases[i].n,
+                                                &out, &out_size, &avctx);
+        if (cases[i].reaches_libdovi) {
+            check(dovi_parses == parses + 1, cases[i].name);
+        } else {
+            check(dovi_parses == parses, cases[i].name);
+            check(ret == AVERROR_INVALIDDATA && !out && !out_size && warnings == 1,
+                  cases[i].name);
+        }
+        av_free(out);
+    }
+}
+
 int main(void)
 {
     test_unchanged_access_unit_is_not_copied();
@@ -534,6 +580,7 @@ int main(void)
     test_convert_rewrites_rpu();
     test_emptied_access_unit();
     test_output_buffer_is_reused();
+    test_short_rpu_never_reaches_libdovi();
     reset(DV_FILTER_NONE);
     check(live_buffers == 0, "no buffer leaks");
     puts("PASS: MediaCodec Dolby Vision filter leaves unchanged access units "

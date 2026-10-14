@@ -41,7 +41,8 @@ jobs:
     permissions:
       contents: read
     # The harnesses need only bash, python3 and cc (plus libass's host
-    # dependencies for one of them), but not a Linux cc:
+    # dependencies for one of them, and Xcode for the apple merge test), but
+    # not a Linux cc:
     # test_avf_timebase_servo.c uses M_PI under -std=c11, which glibc hides in
     # strict ISO mode (gcc 13 on ubuntu-24.04: "'M_PI' undeclared"), while
     # Apple libc exposes it. Keep them on the compiler they are written for.
@@ -60,6 +61,12 @@ jobs:
 
       - name: Test spatial audio output
         run: bash ./scripts/test_ao_spatial.sh
+
+      - name: Test spatial audio session ownership
+        run: bash ./scripts/test_spatial_session.sh
+
+      - name: Test build process output capture
+        run: bash ./scripts/test_build_process.sh
 
       - name: Test AVFoundation timebase servo
         run: ./scripts/test_avf_timebase_servo.sh
@@ -103,6 +110,9 @@ jobs:
       - name: Test MediaCodec flush before the first input
         run: bash ./scripts/test_mediacodec_flush.sh
 
+      - name: Test MediaCodec errors across a flush
+        run: bash ./scripts/test_mediacodec_error.sh
+
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh
 
@@ -120,6 +130,9 @@ jobs:
 
       - name: Test the audio output reload with a frame held for the old AO
         run: bash ./scripts/test_audio_reload_held_frame.sh
+
+      - name: Test the codec profile the demuxers publish at load
+        run: bash ./scripts/test_demux_codec_profile.sh
 
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
@@ -146,6 +159,9 @@ jobs:
 
       - name: Test content keys
         run: ./scripts/test_keys.sh
+
+      - name: Test apple XCFramework merge reproducibility
+        run: ./scripts/test_apple_merge.sh
 
   plan:
     name: Plan
@@ -246,6 +262,16 @@ jobs:
       # published per-platform zips. No version= argument: the URLs the build
       # script would spell from it are replaced by the manifest's
       # content-addressed ones in the publish job.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+          test -n "$rust_version"
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup target add --toolchain "$rust_version" \
+            aarch64-apple-darwin x86_64-apple-darwin \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+            aarch64-apple-tvos aarch64-apple-tvos-sim
+
       - name: Build GPL version (${{ matrix.name }})
         run: |
           make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
@@ -256,6 +282,12 @@ jobs:
             --platform-group apple \
             --platform ${{ matrix.platform_type }} \
             --release-dir dist/release
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. A stamp
+      # publishes fine once and fails only the rebuild, weeks later.
+      - name: Check the zips for a build date (${{ matrix.name }})
+        run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Upload platform build (${{ matrix.name }})
         uses: actions/upload-artifact@v4
@@ -282,62 +314,10 @@ jobs:
           path: ./dist/partials
 
       - name: Merge platform XCFrameworks
-        run: |
-          python3 - <<'PY'
-          import shutil
-          import subprocess
-          import tempfile
-          from pathlib import Path
+        run: python3 scripts/merge_xcframeworks.py dist/partials dist/release
 
-          partial_root = Path('dist/partials')
-          release_dir = Path('dist/release')
-          xcframework_dir = release_dir / 'xcframework'
-
-          if release_dir.exists():
-            shutil.rmtree(release_dir)
-          release_dir.mkdir(parents=True)
-          xcframework_dir.mkdir()
-
-          # The per-platform zips pass straight through: they are the artifacts a
-          # later run restores instead of recompiling, and they are already named
-          # by content.
-          prebuilt_zips = sorted(partial_root.glob('*/*-all-*.zip'))
-          for zip_path in prebuilt_zips:
-            shutil.copy2(zip_path, release_dir / zip_path.name)
-          print(f'Collected {len(prebuilt_zips)} per-platform prebuilt zips')
-
-          grouped_zips = {}
-          for zip_path in partial_root.glob('*/*.xcframework.zip'):
-            grouped_zips.setdefault(zip_path.name, []).append(zip_path)
-          if not grouped_zips:
-            raise SystemExit('No platform XCFramework artifacts found')
-
-          for zip_name, zip_parts in sorted(grouped_zips.items()):
-            framework_name = zip_name[:-len('.xcframework.zip')]
-            output_xcframework = xcframework_dir / f'{framework_name}.xcframework'
-            framework_paths = []
-
-            with tempfile.TemporaryDirectory() as tmp:
-              tmp_path = Path(tmp)
-              for index, zip_part in enumerate(sorted(zip_parts)):
-                extract_dir = tmp_path / f'part-{index}'
-                extract_dir.mkdir()
-                subprocess.run(['/usr/bin/unzip', '-q', str(zip_part.resolve()), '-d', str(extract_dir)], check=True)
-                framework_paths.extend(sorted(path for path in extract_dir.glob('*.xcframework/**/*.framework') if path.is_dir()))
-
-              if not framework_paths:
-                raise SystemExit(f'No frameworks found inside {zip_name}')
-
-              args = ['/usr/bin/xcodebuild', '-create-xcframework']
-              for framework_path in framework_paths:
-                args.extend(['-framework', str(framework_path)])
-              args.extend(['-output', str(output_xcframework)])
-              subprocess.run(args, check=True)
-
-            merged_zip = release_dir / zip_name
-            subprocess.run(['/usr/bin/zip', '-qry', str(merged_zip.resolve()), output_xcframework.name], cwd=xcframework_dir, check=True)
-            print(f'Merged {zip_name} from {len(zip_parts)} platform artifacts')
-          PY
+      - name: Check the merged XCFrameworks for a build date
+        run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Name frameworks by content and record them
         run: python3 scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
@@ -347,6 +327,11 @@ jobs:
 
       - name: Verify manifest matches this commit
         run: python3 scripts/keys.py verify --platform-group apple
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: |
+          brew install xcodegen
+          bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload binaries that are not published yet
         env:
@@ -407,6 +392,12 @@ jobs:
       - name: Package per-ABI tarball (${{ matrix.abi }})
         run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
 
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. A stamp
+      # publishes fine once and fails only the rebuild, weeks later.
+      - name: Check the tarball for a build date (${{ matrix.abi }})
+        run: bash scripts/test_build_date.sh dist/release/libmpv-android-${{ matrix.abi }}.tar.gz
+
       - name: Upload platform build (${{ matrix.abi }})
         uses: actions/upload-artifact@v4
         with:
@@ -444,6 +435,11 @@ jobs:
           KEY="$(python3 scripts/keys.py keys --platform-group linux \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["libmpv-linux"])')"
           KEY="${KEY}" ARCH=${{ matrix.arch }} bash platforms/linux/container-build.sh
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock.
+      - name: Check the tarball for a build date (${{ matrix.arch }})
+        run: bash scripts/test_build_date.sh dist/release/*.tar.zst
 
       - name: Upload platform build (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
@@ -546,6 +542,13 @@ jobs:
       # uploads it as-is; publish records every variant at once.
       - name: Package dev zip (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. The scan
+      # reaches back to 2020: a restored build tree keeps the stamps of the
+      # runs that compiled each package, weeks before this one.
+      - name: Check the zip for a build date (${{ matrix.arch }})
+        run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Save build state cache
         if: always()

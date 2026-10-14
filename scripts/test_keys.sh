@@ -90,6 +90,10 @@ VERSIONS = {
             # An override for another group must not touch apple's key.
             "overrides": {"android": {"version": "0.18.3-ndk"}},
         },
+        "spatialaudiobridge": {
+            "kind": "git", "version": "1.6.1", "url": "https://example.invalid/spatial",
+            "ref": "1" * 40, "commit": "1" * 40, "platforms": ["apple"],
+        },
         # A prebuilt dependency keys.py must leave alone.
         "libplacebo": {
             "kind": "prebuilt",
@@ -140,6 +144,7 @@ def make_repo(directory):
     repo = Path(directory)
     (repo / "scripts").mkdir(parents=True)
     shutil.copy2(tool, repo / "scripts" / "keys.py")
+    (repo / "scripts/build_spatial.py").write_text("# source build\n")
     # keys.py reads the series format through patches.py, so the fixture carries
     # it too; the sandbox mirrors the real scripts/ layout.
     shutil.copy2(root / "scripts" / "patches.py", repo / "scripts" / "patches.py")
@@ -154,6 +159,7 @@ def make_repo(directory):
     (build_scripts / "Package.swift").write_text("// build scripts package\n", encoding="utf-8")
     (build_scripts / "XCFrameworkBuild" / "base.swift").write_text("// base\n", encoding="utf-8")
     (build_scripts / "XCFrameworkBuild" / "main.swift").write_text("// main\n", encoding="utf-8")
+    (repo / "scripts" / "merge_xcframeworks.py").write_text("# merge\n", encoding="utf-8")
 
     # mpv and ffmpeg carry patches; libass deliberately has no patches/ dir at
     # all in this fixture, so a component without one stays covered.
@@ -237,6 +243,19 @@ if (root / "versions.json").is_file() and (root / "toolchain" / "apple.txt").is_
     print(f"real repo: {json.dumps(real, sort_keys=True)}")
 else:
     print("real repo: skipped (versions.json / toolchain/apple.txt not landed yet)")
+
+# The source compiled into libmpv is part of its key, independently of mpv's own pin.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = Path(tmp)
+    make_repo(repo)
+    before = keys(repo)
+    path = repo / "versions.json"
+    pins = json.loads(path.read_text())
+    pins["components"]["spatialaudiobridge"]["commit"] = "2" * 40
+    path.write_text(json.dumps(pins))
+    after = keys(repo)
+    check(before["libmpv"] != after["libmpv"], "SpatialAudioBridge source moves libmpv's key")
+    check(before["FFmpeg"] == after["FFmpeg"], "SpatialAudioBridge source does not move FFmpeg")
 
 # 2. The committed manifest describes the published apple assets.
 committed = root / "artifacts.json"

@@ -170,6 +170,115 @@ private class BuildMPV: BaseBuild {
         super.init(library: .libmpv)
     }
 
+    private func spatialTarget(platform: PlatformType, arch: ArchType) -> String? {
+        switch (platform, arch) {
+        case (.ios, .arm64): return "aarch64-apple-ios"
+        case (.isimulator, .arm64): return "aarch64-apple-ios-sim"
+        case (.isimulator, .x86_64): return "x86_64-apple-ios"
+        case (.tvos, .arm64): return "aarch64-apple-tvos"
+        case (.tvsimulator, .arm64): return "aarch64-apple-tvos-sim"
+        // macOS includes LuaJIT; adding Rust exceeds its unwind personality limit.
+        default: return nil // macOS, Catalyst and unsupported Rust targets keep PCM.
+        }
+    }
+
+    private func spatialDirectory(platform: PlatformType, arch: ArchType) -> URL {
+        scratch(platform: platform, arch: arch) + "spatial"
+    }
+
+    override func environment(platform: PlatformType, arch: ArchType) -> [String: String] {
+        var environment = super.environment(platform: platform, arch: arch)
+        if spatialTarget(platform: platform, arch: arch) != nil {
+            environment["PKG_CONFIG_LIBDIR"] = (spatialDirectory(platform: platform, arch: arch) + "pkgconfig").path
+                + ":" + (environment["PKG_CONFIG_LIBDIR"] ?? "")
+        }
+        return environment
+    }
+
+    override func build(platform: PlatformType, arch: ArchType) throws {
+        let spatial = spatialDirectory(platform: platform, arch: arch)
+        if let target = spatialTarget(platform: platform, arch: arch) {
+            try Utility.launch(path: "python3", arguments: [
+                (URL.currentDirectory + "../scripts/build_spatial.py").path,
+                "--source", (URL.currentDirectory + "SpatialAudioBridge-\(Versions.pin("spatialaudiobridge").commit!)").path,
+                "--output", spatial.path, "--mpv", directoryURL.path,
+                "--target", platform.deploymentTarget(arch), "--sdk", platform.isysroot,
+                "--rust-target", target,
+            ])
+        }
+        try super.build(platform: platform, arch: arch)
+        if spatialTarget(platform: platform, arch: arch) != nil {
+            let library = thinDir(platform: platform, arch: arch) + "lib/libmpv.a"
+            let combined = spatial + "libmpv.a"
+            try Utility.launch(path: "/usr/bin/libtool", arguments: [
+                "-static", "-o", combined.path, library.path,
+                (spatial + "libmpv_spatial.a").path, (spatial + "libspatial_audio_core.a").path,
+            ], environment: ["ZERO_AR_DATE": "1"])
+            try FileManager.default.removeItem(at: library)
+            try FileManager.default.moveItem(at: combined, to: library)
+            let notices = thinDir(platform: platform, arch: arch) + "share/licenses/SpatialAudioBridge"
+            try FileManager.default.createDirectory(at: notices, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: spatial + "ThirdPartyNotices.txt", to: notices + "ThirdPartyNotices.txt")
+            // The private libraries are now inside libmpv.a; installed clients
+            // must not need the build-only pkg-config dependency.
+            let pkgConfig = thinDir(platform: platform, arch: arch) + "lib/pkgconfig/mpv.pc"
+            let swiftCompiler = try Utility.launch(path: "/usr/bin/xcrun", arguments: ["--find", "swiftc"], isOutput: true)
+            let swiftToolchain = URL(fileURLWithPath: swiftCompiler)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            let swiftLinkFlags = " -L\"${swift_toolchain}/usr/lib/swift/\(platform.sdk.lowercased())\""
+                + " -L/usr/lib/swift -framework Accelerate"
+            let text = try String(contentsOf: pkgConfig, encoding: .utf8)
+            let lines = text.components(separatedBy: "\n").map { line in
+                if line.hasPrefix("Libs.private:") {
+                    return line + swiftLinkFlags
+                }
+                guard line.hasPrefix("Requires:") || line.hasPrefix("Requires.private:"),
+                      let colon = line.firstIndex(of: ":") else { return line }
+                let dependencies = line[line.index(after: colon)...].components(separatedBy: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { $0 != "mpv-spatial" }
+                return String(line[...colon]) + " " + dependencies.joined(separator: ", ")
+            }
+            let extra = lines.contains { $0.hasPrefix("Libs.private:") }
+                ? "" : "Libs.private:" + swiftLinkFlags + "\n"
+            try ("swift_toolchain=\(swiftToolchain.path)\n" + lines.joined(separator: "\n") + extra)
+                .write(to: pkgConfig, atomically: true, encoding: .utf8)
+        }
+    }
+
+    override func createFramework(framework: String, platform: PlatformType) throws -> String? {
+        guard let path = try super.createFramework(framework: framework, platform: platform) else { return nil }
+        let notices = spatialDirectory(platform: platform, arch: .arm64) + "ThirdPartyNotices.txt"
+        if FileManager.default.fileExists(atPath: notices.path) {
+            try FileManager.default.copyItem(at: notices, to: URL(fileURLWithPath: path) + "LICENSE.SpatialAudioBridge")
+        }
+        return path
+    }
+
+    override func packagePkgConfigRelease() throws {
+        try super.packagePkgConfigRelease()
+        // This hook runs after the release tree is created, before it is zipped.
+        for platform in BaseBuild.platforms {
+            for arch in architectures(platform) where spatialTarget(platform: platform, arch: arch) != nil {
+                let pkgConfig = URL.currentDirectory
+                    + ["release/libmpv/pkgconfig-example", platform.rawValue, arch.rawValue, "mpv.pc"]
+                let text = try String(contentsOf: pkgConfig, encoding: .utf8)
+                // Consumers select their toolchain; never distribute the builder's Xcode path.
+                try text.replacingOccurrences(of: "(?m)^swift_toolchain=.*$",
+                    with: "swift_toolchain=/path/to/Swift.xctoolchain", options: .regularExpression)
+                    .write(to: pkgConfig, atomically: true, encoding: .utf8)
+            }
+        }
+        for platform in BaseBuild.platforms {
+            let notices = spatialDirectory(platform: platform, arch: .arm64) + "ThirdPartyNotices.txt"
+            if FileManager.default.fileExists(atPath: notices.path) {
+                try FileManager.default.copyItem(at: notices,
+                    to: URL.currentDirectory + "release/libmpv/LICENSE.SpatialAudioBridge")
+                break
+            }
+        }
+    }
+
     override func arguments(platform: PlatformType, arch: ArchType) -> [String] {
         var array = [
             "-Dlibmpv=true",
@@ -191,6 +300,7 @@ private class BuildMPV: BaseBuild {
             "-Drubberband=disabled",
         ]
         array.append("-Dgpl=true")
+        array.append("-Dspatial-audio=\(spatialTarget(platform: platform, arch: arch) == nil ? "disabled" : "enabled")")
         let blurayLibPath =
             URL.currentDirectory + [
                 Library.libbluray.rawValue, platform.rawValue, "thin", arch.rawValue,

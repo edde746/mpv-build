@@ -1,6 +1,6 @@
 // Behavioral regressions for the production MediaCodec input sizing and packet
 // submission extracted by test_mediacodec_input.sh: the max-input-size rule
-// patch 0004 configures, and what ff_mediacodec_dec_send does with a packet
+// patch 0104 configures, and what ff_mediacodec_dec_send does with a packet
 // that fits, one that does not, end of stream, and back-pressure. The
 // MediaCodec wrapper is a recording fake.
 #include <errno.h>
@@ -68,9 +68,11 @@ typedef struct MediaCodecDecContext {
     ssize_t current_input_buffer;
     int input_since_flush;
     // Asynchronous mode is never taken here (see the stubs below); the paths
-    // that consult it are extracted production code, so the state exists.
+    // that consult it, and the sticky codec error the polled dequeue
+    // answers, are extracted production code, so the state exists.
     int async_mode;
     int async_generation;
+    int async_error;
     AVMutex async_lock;
     AVFifo *async_input;
 } MediaCodecDecContext;

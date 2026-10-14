@@ -112,6 +112,36 @@ only reachable if something still asks for it; bump
 `toolchain/windows.txt`'s generation to force a clean state when that
 matters.
 
+## Reproducible bytes
+
+A rebuild of a published key has to reproduce the published zip byte for
+byte (`keys.py publish-assets` refuses anything else), so nothing in it may
+record when it was built. Key 442b5d101e4c's `libmpv-2.dll` recorded five
+clocks: the PE header and debug directory `TimeDateStamp` lld-link takes at
+link time, so every rebuild differed; and OpenSSL's "built on" line, SVT-AV1's
+and mpv's `__DATE__ __TIME__` and davs2's build time, which the cached tree
+had kept from the runs that compiled them.
+
+`build.sh` exports `SOURCE_DATE_EPOCH=1577836800` (2020-01-01, the zip's
+mtime), which lld-link uses as the `TimeDateStamp`, clang as `__DATE__` and
+`__TIME__`, and OpenSSL as its "built on" date. davs2's `version.sh` reads
+`date`, so `pin_packages.py` adds a step after davs2's configure that rewrites
+the generated `XBUILD_TIME` to the same moment. A cached tree compiled before
+the epoch still holds the old stamps, and winbuild's ccache, configured with
+`sloppiness=time_macros`, hands back objects with the date of whichever
+compile filled it. So `build.sh` rebuilds every package once, from an empty
+compile cache, in a tree without `.source-date-epoch` (the toolchain is kept),
+and writes the marker before building.
+
+The zip itself is sorted, `-X`, with every mtime at 2020-01-01 and every mode
+at `u+rw,go-w,a+rX`, as the apple zips are, so the umask has no say. The build
+leg runs `scripts/test_build_date.sh` on it before upload.
+
+A rebuild only reproduces from a restored tree: 57 of the 95 git packages at
+the pinned winbuild commit name no `GIT_TAG` or `GIT_RESET` and clone a branch
+tip, so a cold rebuild of the same key fetches different sources; see "Key
+coarseness".
+
 ## Slimming candidates (later pass, deliberately not wave 2)
 
 The dependency set is full-fat to keep the pinning change isolated. Candidates
@@ -153,5 +183,5 @@ and asserts what it leaves behind: every pinned package carrying its resolved
 commit, the staged series and its PATCH_COMMAND (injected exactly when the
 resolved series is non-empty), the neutralized check-git step, and a second
 run converging. The remaining tests pin the pure rewrites -- the injected
-block matches the mbedtls idiom, the aarch64 cuda gate, and the mpv option
-gate.
+block matches the mbedtls idiom, the aarch64 cuda gate, the mpv option
+gate, and the davs2 build-time rewrite.

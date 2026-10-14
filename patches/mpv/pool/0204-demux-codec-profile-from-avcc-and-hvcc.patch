@@ -1,0 +1,119 @@
+demux: publish the H.264 and HEVC profile from the container's record
+
+codec-profile on the track list was decoder-supplied, so a client could
+only learn that a stream is H.264 High 10 or HEVC Main 10 after the
+decoder produced a frame. Per-file decode routing (a 10-bit stream on
+hardware whose MediaCodec has no such profile, which fails the decoder
+or, on some SoCs, renders garbage) has to be decided in on_preloaded,
+before the decoder exists.
+
+Fill codec_profile at demux time from the decoder configuration record
+(MKV CodecPrivate, MP4 stsd), or from lavf's own codecpar->profile when
+it knows one. avcC carries profile_idc and the constraint_set flags,
+hvcC general_profile_idc and the profile compatibility flags; both are
+named the way the decoder names the SPS they were written from, so the
+answer the decoder replaces it with once it runs is the same.
+
+diff --git a/common/av_common.c b/common/av_common.c
+index af72b54..623128a 100644
+--- a/common/av_common.c
++++ b/common/av_common.c
+@@ -411,6 +411,53 @@ void mp_free_av_packet(AVPacket **pkt)
+     av_packet_free(pkt);
+ }
+ 
++// Profile name for an H.264 or HEVC stream from its decoder configuration
++// record (MKV CodecPrivate, MP4 stsd), as the decoder names it once it has
++// parsed the SPS the record was written from. Demuxers use this to publish
++// codec_profile before any decoder ran, so a client can decide the decode
++// path at file load (e.g. route H.264 High 10 or HEVC Main 10 to software on
++// hardware that has no such profile) instead of after a failed hardware
++// init. NULL if unknown.
++const char *mp_codec_profile_from_extradata(const char *codec,
++                                            const unsigned char *extradata,
++                                            int extradata_size)
++{
++    if (!codec || !extradata)
++        return NULL;
++    if (strcmp(codec, "h264") == 0) {
++        // avcC: configurationVersion, profile_idc, then the constraint_set
++        // flags (set0 in the top bit). The decoder refines the profile with
++        // two of them, as ff_h264_get_profile() does.
++        if (extradata_size < 7 || extradata[0] != 1)
++            return NULL;
++        int profile = extradata[1];
++        bool set1 = extradata[2] & 0x40, set3 = extradata[2] & 0x10;
++        if (profile == AV_PROFILE_H264_BASELINE && set1)
++            profile |= AV_PROFILE_H264_CONSTRAINED;
++        if ((profile == AV_PROFILE_H264_HIGH_10 ||
++             profile == AV_PROFILE_H264_HIGH_422 ||
++             profile == AV_PROFILE_H264_HIGH_444_PREDICTIVE) && set3)
++            profile |= AV_PROFILE_H264_INTRA;
++        return avcodec_profile_name(AV_CODEC_ID_H264, profile);
++    }
++    if (strcmp(codec, "hevc") == 0) {
++        // hvcC: configurationVersion, then general_profile_space (2 bits),
++        // general_tier_flag (1) and general_profile_idc (5), then the 32
++        // general_profile_compatibility_flags (flag 0 in the top bit); 23
++        // bytes precede the parameter set arrays. A profile_idc of 0 takes
++        // the first compatible profile, as the decoder's PTL parsing does.
++        if (extradata_size < 23 || extradata[0] != 1)
++            return NULL;
++        int profile = extradata[1] & 0x1f;
++        for (int i = 1; !profile && i < 32; i++) {
++            if (extradata[2 + i / 8] & (0x80 >> (i % 8)))
++                profile = i;
++        }
++        return avcodec_profile_name(AV_CODEC_ID_HEVC, profile);
++    }
++    return NULL;
++}
++
+ void mp_codec_info_from_av(const AVCodecContext *avctx, struct mp_codec_params *c)
+ {
+     c->codec_profile = av_get_profile_name(avctx->codec, avctx->profile);
+diff --git a/common/av_common.h b/common/av_common.h
+index b019aa8..a5475c5 100644
+--- a/common/av_common.h
++++ b/common/av_common.h
+@@ -52,5 +52,8 @@ int mp_set_avopts(struct mp_log *log, void *avobj, char **kv);
+ int mp_set_avopts_pos(struct mp_log *log, void *avobj, void *posargs, char **kv);
+ void mp_free_av_packet(AVPacket **pkt);
+ void mp_codec_info_from_av(const AVCodecContext *avctx, struct mp_codec_params *c);
++const char *mp_codec_profile_from_extradata(const char *codec,
++                                            const unsigned char *extradata,
++                                            int extradata_size);
+ 
+ #endif
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..b95bba9 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -821,6 +821,14 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+         sh->ff_index = st->index;
+         sh->codec->codec = mp_codec_from_av_codec_id(codec->codec_id);
+         sh->codec->codec_tag = codec->codec_tag;
++        if (codec->codec_type == AVMEDIA_TYPE_VIDEO) {
++            // Known before decoding for containers that carry an avcC or
++            // hvcC record; a decoder later replaces it with its own answer.
++            sh->codec->codec_profile = codec->profile != AV_PROFILE_UNKNOWN
++                ? avcodec_profile_name(codec->codec_id, codec->profile)
++                : mp_codec_profile_from_extradata(sh->codec->codec, codec->extradata,
++                                                  codec->extradata_size);
++        }
+         sh->codec->lav_codecpar = avcodec_parameters_alloc();
+         if (sh->codec->lav_codecpar)
+             avcodec_parameters_copy(sh->codec->lav_codecpar, codec);
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index 501d20e..16aeda7 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -1700,6 +1700,8 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track)
+ 
+     sh_v->extradata = talloc_memdup(sh_v, extradata, extradata_size);
+     sh_v->extradata_size = extradata_size;
++    sh_v->codec_profile = mp_codec_profile_from_extradata(sh_v->codec, sh_v->extradata,
++                                                          sh_v->extradata_size);
+     if (!sh_v->codec) {
+         MP_WARN(demuxer, "Unknown/unsupported CodecID (%s) or missing/bad "
+                 "CodecPrivate data (track %d).\n",

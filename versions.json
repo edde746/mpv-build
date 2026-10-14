@@ -23,15 +23,7 @@
         "linux",
         "windows"
       ],
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "0.40.0",
-          "url": "https://github.com/mpv-player/mpv/archive/refs/tags/v0.40.0.tar.gz",
-          "sha256": "10a0f4654f62140a6dd4d380dcf0bbdbdcf6e697556863dc499c296182f081a3",
-          "provenance": "GitHub reports annotated tag object 287d7cdb78975ae350d7c2a287eae3c2072c93f7 as a valid PGP signature over release commit e48ac7ce08462f5e33af6ef9deeac6fa87eef01e; the complete tag archive was then hashed. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared v0.41.0 git pin is a later deliberate step."
-        }
-      }
+      "overrides": {}
     },
     "ffmpeg": {
       "kind": "git",
@@ -46,15 +38,7 @@
         "linux",
         "windows"
       ],
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "7.1",
-          "url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz",
-          "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6",
-          "provenance": "FFmpeg release archive verified against ffmpeg-7.1.tar.xz.asc with the official ffmpeg-devel.asc full fingerprint FCF986EA15E6E293A5644F10B4322F04D67658D8 before recording this digest. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared n8.0.1 git pin is a later deliberate step."
-        }
-      }
+      "overrides": {}
     },
     "libass": {
       "kind": "git",
@@ -73,11 +57,11 @@
     },
     "mpv-winbuild-cmake": {
       "kind": "git",
-      "version": "master-2026-09-01",
+      "version": "master-2026-09-19",
       "url": "https://github.com/shinchiro/mpv-winbuild-cmake",
       "ref": "master",
-      "commit": "cd1edc11dc6887a50f705717619d879f5a93a488",
-      "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the master tip was resolved 2026-09-01 with `git ls-remote https://github.com/shinchiro/mpv-winbuild-cmake refs/heads/master` and frozen by commit; its internal dependency pins are keyed through this commit (see platforms/windows/README.md).",
+      "commit": "87e22100409984f2e46fc1895e3265a64f999893",
+      "provenance": "Windows meta-build system (clang/rust toolchain plus the full dependency graph feeding libmpv-2.dll). Upstream publishes no release tags, so the pin is a master commit frozen by its hash; its internal dependency pins are keyed through this commit (see platforms/windows/README.md). First resolved 2026-09-01 as the master tip cd1edc11; moved 2026-10-13 to 87e22100 (\"curl: fix build with current libssh\", the next master commit after cd1edc11), because libssh master moved the SCP declarations out of libssh.h and curl stopped compiling. The master commits after it (llvm release/23.x, libvpl, libaribcaption, angle-headers) are deliberately not taken.",
       "platforms": [
         "windows"
       ],
@@ -132,27 +116,31 @@
       ],
       "overrides": {}
     },
+    "libaribcaption": {
+      "kind": "git",
+      "version": "v1.1.2",
+      "url": "https://github.com/xqq/libaribcaption",
+      "ref": "v1.1.2",
+      "commit": "c64c23b8905ba514b87c9789269e9f66f949ffe0",
+      "provenance": "ARIB STD-B24 caption decoder for the windows ffmpeg. winbuild builds the master tip and compiles it with -DHAVE_OPENSSL=1; master 6c3b4f36 (2026-10-06) renamed the bundled MD5 to aribcc_md5_* and stopped mapping it to OpenSSL's, while src/base/md5.c is still compiled out under HAVE_OPENSSL, so the master tip leaves aribcc_md5_init/update/final undefined and the ffmpeg link fails. v1.1.2 is the newest release and predates the rename. Lightweight tag; resolved 2026-10-13 from the GitHub tags and git refs APIs and frozen by commit.",
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
     "dav1d": {
       "kind": "git",
-      "version": "1.5.3",
-      "url": "https://code.videolan.org/videolan/dav1d",
-      "ref": "1.5.3",
-      "commit": "b546257f770768b2c88258c533da38b91a06f737",
-      "provenance": "Official VideoLAN GitLab annotated tag object 0664c109d1b85503bc32bf89920f951cacf5702e (1.5.3) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "version": "1.5.4",
+      "url": "https://code.videolan.org/videolan/dav1d.git",
+      "mirror": "https://github.com/videolan/dav1d.git",
+      "ref": "1.5.4",
+      "commit": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
+      "provenance": "Official VideoLAN GitLab tag record 1.5.4 dereferences to this root commit; upstream's own GitHub mirror (videolan/dav1d, not a fork) reports the same annotated tag object 191bdda98ec3c68137754dc97da1db34043d7cd4 dereferencing to that same commit. The tag is annotated by the dav1d maintainers but not GPG-verified by GitHub; the two independent remotes agreeing on the tag object and root commit is the pinning evidence. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Shared by android and linux since android moved up from 1.5.3.",
       "platforms": [
         "android",
         "linux"
       ],
-      "overrides": {
-        "linux": {
-          "version": "1.5.4",
-          "url": "https://code.videolan.org/videolan/dav1d.git",
-          "mirror": "https://github.com/videolan/dav1d.git",
-          "ref": "1.5.4",
-          "commit": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
-          "provenance": "Official VideoLAN GitLab tag record 1.5.4 dereferences to this root commit; upstream's own GitHub mirror (videolan/dav1d, not a fork) reports the same annotated tag object 191bdda98ec3c68137754dc97da1db34043d7cd4 dereferencing to that same commit. The tag is annotated by the dav1d maintainers but not GPG-verified by GitHub; the two independent remotes agreeing on the tag object and root commit is the pinning evidence. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way."
-        }
-      }
+      "overrides": {}
     },
     "shaderc": {
       "kind": "git",
@@ -163,18 +151,6 @@
       "provenance": "Official GitHub annotated tag object 3cd72062f297df05e6a042f2616c42bc8956c326 dereferences to this root commit; its DEPS file pins synchronized dependencies by full commit.",
       "platforms": [
         "linux"
-      ],
-      "overrides": {}
-    },
-    "mbedtls": {
-      "kind": "git",
-      "version": "3.6.5",
-      "url": "https://github.com/Mbed-TLS/mbedtls",
-      "ref": "v3.6.5",
-      "commit": "e185d7fd85499c8ce5ca2a54f5cf8fe7dbe3f8df",
-      "provenance": "Official Mbed-TLS GitHub annotated tag object d934b47669d1cc60c72caecae2ae2a45aea70c79 (v3.6.5) dereferences to this root commit; its gitlinks pin the mbedtls-framework submodule the android driver clones recursively. TODO(provenance): review the framework gitlink target before the next bump.",
-      "platforms": [
-        "android"
       ],
       "overrides": {}
     },
@@ -287,7 +263,8 @@
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
       "platforms": [
         "apple",
-        "windows"
+        "windows",
+        "android"
       ],
       "overrides": {
         "windows": {
@@ -297,6 +274,14 @@
           "ref": "openssl-4.0.3",
           "commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
           "provenance": "TLS backend of the windows ffmpeg. winbuild pins an unreleased master snapshot (d8bf6cdd, 4.1.0-dev); since openssl/openssl 4a08aa1346 added the SLH-DSA TLS 1.3 schemes, its default ClientHello offers 34 signature algorithms, and LibreSSL servers answer more than 32 with a decode_error alert, so playback from them failed (edde746/plezy#2604). 4.0.3 offers 22. Official openssl/openssl GitHub annotated tag object ae89995a4fdd66c460a916dce3950948a0b5a8e6 (openssl-4.0.3, tagged by openssl-machine 2026-09-29) dereferences to this commit; GitHub does not know the signing key, so the tag signature is unverified here. Resolved 2026-10-08 from the GitHub git refs API. Its gitlinks are test-only (pyca-cryptography, krb5, gost-engine, wycheproof, tlsfuzzer, python-ecdsa, tlslite-ng, oqs-provider, cloudflare-quiche, fuzz/corpora) and winbuild clones with GIT_SUBMODULES \"\". 4.0.3 already carries winbuild's MinGW SIO_UDP_NETRESET workaround; winbuild's openssl-0001 patch still applies cleanly and is redundant."
+        },
+        "android": {
+          "kind": "git",
+          "version": "4.0.3",
+          "url": "https://github.com/openssl/openssl",
+          "ref": "openssl-4.0.3",
+          "commit": "af1775b60dfa141a4ad762585052cabeb9f37e9e",
+          "provenance": "TLS backend of the android ffmpeg, replacing mbedTLS 3.6.5 (edde746/plezy#2643). On a 32-bit Fire TV Stick 4K Max core the libavformat HTTPS read path cost 31.8 cycles/byte with mbedTLS, which offers ChaCha20-Poly1305 first and so gets it from servers that honor client order, and 24.5 when AES-256-GCM is forced, since its GCM runs one 16-byte block per call; OpenSSL's Armv8 assembly negotiates AES-256-GCM at 9.2. Same pin and tag verification as overrides.windows; download.sh clones it without submodules, which are test-only."
         }
       }
     },
@@ -370,20 +355,21 @@
       "overrides": {
         "android": {
           "kind": "git",
-          "version": "7.360.0",
-          "url": "https://code.videolan.org/videolan/libplacebo",
-          "ref": "v7.360.0",
-          "commit": "b2ea27dceb6418aabfe9121174c6dbb232942998",
-          "provenance": "Official VideoLAN GitLab annotated tag object 2948be2e7bdb8797a3026677fd84e8c106107ff8 (v7.360.0) dereferences to this root commit; its gitlinks pin the recursive submodules the android driver clones."
+          "version": "7.360.1",
+          "url": "https://code.videolan.org/videolan/libplacebo.git",
+          "mirror": "https://github.com/haasn/libplacebo.git",
+          "ref": "v7.360.1",
+          "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+          "provenance": "Official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit; upstream's own author repository (haasn/libplacebo, not a fork) reports the same tag object and commit. Its gitlinks are identical to v7.360.0's, which the android driver already cloned recursively. Ships the OpenGL sync-object leak fix (upstream c93aa134) the android series used to carry."
         },
         "linux": {
           "kind": "git",
-          "version": "7.351.0",
+          "version": "7.360.1",
           "url": "https://code.videolan.org/videolan/libplacebo.git",
           "mirror": "https://github.com/haasn/libplacebo.git",
-          "ref": "v7.351.0",
-          "commit": "3188549fba13bbdf3a5a98de2a38c2e71f04e21e",
-          "provenance": "Official VideoLAN GitLab tag record v7.351.0 contains a PGP-signed release message and dereferences to this root commit; its gitlinks pin recursive submodules. The mirror is upstream's own author repository (haasn/libplacebo, not a fork), whose annotated v7.351.0 tag object 98c1416e95b21cd767b84ac9ee430ccadf263ff6 dereferences to that same commit. It is consulted only after the primary fails, and the commit pin is verified identically either way, so it cannot introduce a different tree."
+          "ref": "v7.360.1",
+          "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+          "provenance": "Same pin as overrides.android: official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit, and haasn/libplacebo reports the same tag object and commit. Gitlinks are identical to v7.360.0's. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Brings the OpenGL sync-object leak fix (mpv#12708) to this GL-only build."
         }
       }
     },
@@ -410,6 +396,17 @@
       "version": "2.1.0-xcode",
       "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-xcode/libluajit-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "platforms": [
+        "apple"
+      ]
+    },
+    "spatialaudiobridge": {
+      "kind": "git",
+      "version": "1.6.1",
+      "url": "https://github.com/kristofferR/SpatialAudioBridge",
+      "ref": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
+      "commit": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
+      "provenance": "Source of 1.6.1, before the release-only binary Package.swift. Includes the DTS-HD seek fix; Cargo.lock pins both decoder repositories and every crate. Built with Rust 1.99.0.",
       "platforms": [
         "apple"
       ]

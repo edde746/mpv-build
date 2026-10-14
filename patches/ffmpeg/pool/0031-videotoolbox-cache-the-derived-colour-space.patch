@@ -1,0 +1,162 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 12:30:00 +0200
+Subject: [PATCH] avutil/videotoolbox: derive the colour space once per tag set
+
+av_vt_pixbuf_set_attachments() runs for every frame the VideoToolbox
+hwaccel outputs. After writing the matrix, primaries, transfer and
+gamma attachments it copied every propagating attachment back off the
+pixel buffer and handed the copy to
+CVImageBufferCreateColorSpaceFromAttachments() to build the
+kCVImageBufferCGColorSpaceKey value. On a 4K HDR10 file in mpv this
+read-back was the single largest item on the player's main thread
+(4.6 ms of CPU per second of playback), and the colour space it
+produced was the same on every frame.
+
+The colour space depends only on the attachments this function has
+just written, which are a pure function of the frame's colorspace,
+color_primaries and color_trc. Build it once per combination from a
+dictionary holding exactly those attachments and keep it in a small
+process-wide cache behind a mutex, so concurrent decoders and frame
+threads share it. The cache holds 16 combinations; past that the
+colour space is derived from the same dictionary every time, uncached.
+The availability guards around the derivation are unchanged, so tvOS
+and visionOS still get no CGColorSpace attachment from here.
+---
+diff --git a/libavutil/hwcontext_videotoolbox.c b/libavutil/hwcontext_videotoolbox.c
+index 51e79a8..f2a89ea 100644
+--- a/libavutil/hwcontext_videotoolbox.c
++++ b/libavutil/hwcontext_videotoolbox.c
+@@ -32,6 +32,7 @@
+ #include "mem.h"
+ #include "pixfmt.h"
+ #include "pixdesc.h"
++#include "thread.h"
+ 
+ typedef struct VTFramesContext {
+     /**
+@@ -560,6 +561,104 @@ CFDictionaryRef av_vt_cv_buffer_copy_attachments(CVBufferRef buffer,
+     #endif
+ }
+ 
++/*
++ * Deriving the CGColorSpace by copying every propagating attachment back
++ * off the pixel buffer and handing the copy to
++ * CVImageBufferCreateColorSpaceFromAttachments() cost more than the rest
++ * of the per-frame tagging put together. The result depends only on the
++ * colour attachments this file writes from the frame's colorspace,
++ * primaries and transfer fields, so it is built once per combination from
++ * exactly those attachments and reused for every later frame.
++ */
++typedef struct VTColorSpaceCacheEntry {
++    enum AVColorSpace space;
++    enum AVColorPrimaries primaries;
++    enum AVColorTransferCharacteristic trc;
++    CGColorSpaceRef colorspace; ///< NULL if CoreVideo derives none
++} VTColorSpaceCacheEntry;
++
++static AVMutex vt_colorspace_cache_lock = AV_MUTEX_INITIALIZER;
++static VTColorSpaceCacheEntry vt_colorspace_cache[16];
++static int vt_colorspace_cache_count;
++
++static CGColorSpaceRef vt_colorspace_create(CFStringRef colormatrix,
++                                            CFStringRef colorpri,
++                                            CFStringRef colortrc,
++                                            Float32 gamma)
++{
++    CGColorSpaceRef colorspace = NULL;
++
++#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 100800) || \
++    (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 100000)
++    if (__builtin_available(macOS 10.8, iOS 10, *)) {
++        CFMutableDictionaryRef attachments =
++            CFDictionaryCreateMutable(kCFAllocatorDefault, 4,
++                                      &kCFTypeDictionaryKeyCallBacks,
++                                      &kCFTypeDictionaryValueCallBacks);
++        if (!attachments)
++            return NULL;
++
++        if (colormatrix)
++            CFDictionarySetValue(attachments, kCVImageBufferYCbCrMatrixKey, colormatrix);
++        if (colorpri)
++            CFDictionarySetValue(attachments, kCVImageBufferColorPrimariesKey, colorpri);
++        if (colortrc)
++            CFDictionarySetValue(attachments, kCVImageBufferTransferFunctionKey, colortrc);
++        if (gamma != 0) {
++            CFNumberRef gamma_level = CFNumberCreate(NULL, kCFNumberFloat32Type, &gamma);
++            if (gamma_level) {
++                CFDictionarySetValue(attachments, kCVImageBufferGammaLevelKey, gamma_level);
++                CFRelease(gamma_level);
++            }
++        }
++
++        colorspace = CVImageBufferCreateColorSpaceFromAttachments(attachments);
++        CFRelease(attachments);
++    }
++#endif
++
++    return colorspace;
++}
++
++/* Returns a +1 reference, or NULL. */
++static CGColorSpaceRef vt_colorspace_get(const AVFrame *src,
++                                         CFStringRef colormatrix,
++                                         CFStringRef colorpri,
++                                         CFStringRef colortrc,
++                                         Float32 gamma)
++{
++    CGColorSpaceRef colorspace;
++    VTColorSpaceCacheEntry *entry;
++
++    ff_mutex_lock(&vt_colorspace_cache_lock);
++    for (int i = 0; i < vt_colorspace_cache_count; i++) {
++        entry = &vt_colorspace_cache[i];
++        if (entry->space     == src->colorspace      &&
++            entry->primaries == src->color_primaries &&
++            entry->trc       == src->color_trc) {
++            colorspace = entry->colorspace;
++            if (colorspace)
++                CFRetain(colorspace);
++            ff_mutex_unlock(&vt_colorspace_cache_lock);
++            return colorspace;
++        }
++    }
++
++    colorspace = vt_colorspace_create(colormatrix, colorpri, colortrc, gamma);
++    if (vt_colorspace_cache_count < FF_ARRAY_ELEMS(vt_colorspace_cache)) {
++        entry = &vt_colorspace_cache[vt_colorspace_cache_count++];
++        entry->space      = src->colorspace;
++        entry->primaries  = src->color_primaries;
++        entry->trc        = src->color_trc;
++        entry->colorspace = colorspace;
++        if (colorspace)
++            CFRetain(colorspace);
++    }
++    ff_mutex_unlock(&vt_colorspace_cache_lock);
++
++    return colorspace;
++}
++
+ static int vt_pixbuf_set_colorspace(void *log_ctx,
+                                     CVPixelBufferRef pixbuf, const AVFrame *src)
+ {
+@@ -616,19 +715,7 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+     } else
+         CVBufferRemoveAttachment(pixbuf, kCVImageBufferGammaLevelKey);
+ 
+-#if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 100800) || \
+-    (TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 100000)
+-    if (__builtin_available(macOS 10.8, iOS 10, *)) {
+-        CFDictionaryRef attachments =
+-            av_vt_cv_buffer_copy_attachments(pixbuf, kCVAttachmentMode_ShouldPropagate);
+-
+-        if (attachments) {
+-            colorspace =
+-                CVImageBufferCreateColorSpaceFromAttachments(attachments);
+-            CFRelease(attachments);
+-        }
+-    }
+-#endif
++    colorspace = vt_colorspace_get(src, colormatrix, colorpri, colortrc, gamma);
+ 
+     // Done outside the above preprocessor code and if's so that
+     // in any case a wrong kCVImageBufferCGColorSpaceKey is removed

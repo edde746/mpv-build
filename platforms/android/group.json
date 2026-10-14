@@ -14,8 +14,8 @@
     "platforms/android/scripts/ffmpeg.sh",
     "platforms/android/scripts/libdovi.sh",
     "platforms/android/scripts/lua.sh",
-    "platforms/android/scripts/mbedtls.sh",
-    "platforms/android/scripts/meson.sh"
+    "platforms/android/scripts/meson.sh",
+    "platforms/android/scripts/openssl.sh"
   ],
   "artifacts": {
     "libmpv-android": {
@@ -25,7 +25,7 @@
         "libass",
         "libplacebo",
         "dav1d",
-        "mbedtls",
+        "openssl",
         "freetype",
         "fribidi",
         "harfbuzz",

@@ -315,6 +315,9 @@ static int64_t jni_long(JNIEnv *env, jobject stamp, int field)
 static int AudioTrack_New(struct ao *ao);
 static void AudioTrack_recreateOrFail(struct ao *ao);
 static void AudioTrack_checkRouteChange(struct ao *ao) { (void)ao; }
+// The fake AudioTrack_New below attaches no loudness effect, so there is none
+// for AudioTrack_Recreate to release.
+static void AudioTrack_releaseNormalizer(struct ao *ao) { (void)ao; }
 static void ao_request_failure(struct ao *ao) { (void)ao; failures++; }
 static void ao_request_reload(struct ao *ao) { (void)ao; reloads++; }
 static const char *af_fmt_to_str(int format) { (void)format; return "spdif"; }

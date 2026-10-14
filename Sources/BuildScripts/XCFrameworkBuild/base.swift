@@ -212,10 +212,10 @@ class BaseBuild {
         }
 
         // pull code from git
-        try! Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
+        try Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
 
         for patchFile in patchFiles {
-            try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
+            try Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
         }
 
         if let expectedPatchState {
@@ -846,14 +846,22 @@ class BaseBuild {
     /// immutable assets and skips re-uploading an existing name, so a rebuild
     /// of the same key MUST produce the identical archive or the recorded
     /// checksum drifts from the published bytes (this happened: zip stores
-    /// each file's DOS mtime, so every rebuild differed). Normalize mtimes,
+    /// each file's DOS mtime, so every rebuild differed). Normalize mtimes and
+    /// modes (zip stores the mode, which otherwise follows the umask),
     /// strip extended attributes (-X), keep symlinks (-y) and feed entries in
-    /// sorted order.
+    /// sorted order. The tools are the system's by absolute path: the driver's
+    /// PATH puts Homebrew first, and another zip writes other bytes.
+    /// scripts/merge_xcframeworks.py zips the merged XCFrameworks the same
+    /// way; keep the two in step.
     static func deterministicZip(entry: String, zipFile: URL, currentDirectoryURL: URL) throws {
-        _ = Utility.shell("find \(entry) -exec touch -h -t 202001010000 {} +", currentDirectoryURL: currentDirectoryURL)
         _ = try Utility.launch(
             path: "/bin/bash",
-            arguments: ["-c", "find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C sort | zip -q -X -y '\(zipFile.path)' -@"],
+            arguments: ["-c", "/usr/bin/find \(entry) -exec /bin/chmod -h u+rw,go-w,a+rX {} + -exec /usr/bin/touch -h -t 202001010000 {} +"],
+            currentDirectoryURL: currentDirectoryURL
+        )
+        _ = try Utility.launch(
+            path: "/bin/bash",
+            arguments: ["-c", "set -o pipefail; /usr/bin/find \(entry) \\( -type f -o -type l \\) -print | LC_ALL=C /usr/bin/sort | /usr/bin/zip -q -X -y '\(zipFile.path)' -@"],
             currentDirectoryURL: currentDirectoryURL
         )
     }
@@ -1269,6 +1277,9 @@ enum Utility {
         var outputBuffer = Data()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let drained = DispatchGroup()
+        drained.enter()
+        drained.enter()
         task.standardOutput = outputPipe
         task.standardError = errorPipe
         
@@ -1299,6 +1310,7 @@ enum Utility {
                 // Close the read capability processing program and clean up resources.
                 fileHandle.readabilityHandler = nil
                 fileHandle.closeFile()
+                drained.leave()
             }
         }
         errorPipe.fileHandleForReading.readabilityHandler = { fileHandle in
@@ -1315,6 +1327,7 @@ enum Utility {
                 // Close the read capability processing program and clean up resources.
                 fileHandle.readabilityHandler = nil
                 fileHandle.closeFile()
+                drained.leave()
             }
         }
     
@@ -1329,6 +1342,9 @@ enum Utility {
         task.executableURL = executableURL
         try task.run()
         task.waitUntilExit()
+        // Process exit does not wait for the asynchronous pipe handlers.
+        // Drain both before reading captured output or reporting a failure.
+        drained.wait()
         if task.terminationStatus == 0 {
             if isOutput {
                 let result = String(data: outputBuffer, encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? ""

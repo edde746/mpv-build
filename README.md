@@ -123,6 +123,10 @@ tree at all, and `test_patches.sh`, `test_extract.sh` and `test_keys.sh` are
 regression tests of the Python tools themselves rather than of a source tree:
 `patches.py`'s series rules and archive fetching, `extract.py`'s slicing and
 hunk parsing over the whole pool, and `keys.py`'s content keys and gates.
+`test_apple_merge.sh` (macOS with Xcode) runs the publish job's XCFramework
+merge, `scripts/merge_xcframeworks.py`, twice over the same tiny per-platform
+frameworks and requires byte-identical zips: a rebuilt apple key has to
+reproduce the merged assets already published under its name.
 
 ## How to build
 
@@ -158,6 +162,20 @@ patches or source pins, move the old `platforms/android/deps` and
 `platforms/android/prefix` directories aside before fetching and rebuilding.
 An obsolete prebuilt-only `deps/libdovi` is explicitly rejected. Use a fresh
 build before packaging; changing patch files does not update installed binaries.
+
+A rebuild of a published content key has to reproduce the published tarballs
+byte for byte, so no Android library may record when it was built: mpv is
+configured with `-Dbuild-date=false`, and OpenSSL, whose "built on" date ffmpeg
+links into `libavformat.so`, builds with `SOURCE_DATE_EPOCH` fixed to the
+tarballs' 2020-01-01 mtime. Every build leg of every group (and the Apple
+merge) runs `bash scripts/test_build_date.sh <asset>...` before uploading. It
+unpacks each `.tar.gz`, `.tar.zst` or `.zip` and fails when a file carries a
+clock reading from any day since 2020-01-02: `__DATE__`, asctime, ISO 8601 or
+RFC 2822 text, a PE or COFF `TimeDateStamp`, an ar member mtime, a Mach-O dylib
+timestamp, or an archive entry's own mtime. The range reaches back that far
+because a restored Windows build tree keeps the stamps of the runs that
+compiled each package. `--day YYYY-MM-DD` checks an older asset against the
+day it was built.
 
 Run the host-side MediaCodec timing regression with
 `bash scripts/test_mediacodec_timing.sh` (Bash, Python 3, and a C compiler).
@@ -209,18 +227,18 @@ pre-render, or a repaint after seeking.
 Completed animation poses use an immutable bounded FIFO rather than replacing
 each other while the presenter waits. Queue regressions cover ordered handoff,
 full-capacity admission, wraparound, release ownership, and epoch cancellation.
-The same pipeline renders subtitles for vo_avfoundation (patch 0032): the
-Apple series lists 0031 with the sub/ patches it needs (0006 render threads,
-0011, 0012, the sub/ half of 0013 and the sub/ half of 0014). The request
-scenarios also cover the helpers a presenter on the video thread uses: a
-request counts as served even when the OSD did not change, only the newest
-flipped result is drawn, and every queued result, and nothing else, notifies
-the presenter (vo_avfoundation redraws the paused frame with a result that
-missed it). `bash scripts/test_avf_osd_ahead.sh` applies the Apple series and
-checks how long flip_page may hold a frame's video for its subtitles: until
-half the queue lead is left, not at all while the render thread is behind,
-a bounded time for untimed frames (redraws, and frames shown while paused),
-and as long as before in the composite modes.
+The same pipeline renders subtitles for vo_avfoundation (patch 0004, which
+carries all of `vo_avfoundation.m`); series.common lists 0031 with the sub/
+patches it needs (0205 render threads, 0011, 0012, 0013 and 0014), so every
+group builds it. The request scenarios also cover the helpers a presenter on
+the video thread uses: a request counts as served even when the OSD did not
+change, only the newest flipped result is drawn, and every queued result, and
+nothing else, notifies the presenter (vo_avfoundation redraws the paused frame
+with a result that missed it). `bash scripts/test_avf_osd_ahead.sh` applies
+the Apple series and checks how long flip_page may hold a frame's video for
+its subtitles: until half the queue lead is left, not at all while the render
+thread is behind, a bounded time for untimed frames (redraws, and frames shown
+while paused), and as long as before in the composite modes.
 
 Run the OSD surface-retirement regression with
 `bash scripts/test_mediacodec_rebind.sh`. It applies the full Android series
@@ -294,6 +312,16 @@ it, back-to-back seeks flush once, and an oversized first access unit still
 gives its slot back through a flush. Pass an already-patched source directory
 as the first argument to run offline.
 
+Run the MediaCodec codec-error regression with `bash scripts/test_mediacodec_error.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and drives
+the production receive_frame callback, the codec callbacks and the flush
+against a fake codec, on the asynchronous and the polled decoder: an error
+the codec reported before a seek, a flush the codec failed and a restart it
+failed each stay the decoder's answer on every later call, across later
+seeks too, so mpv's hardware-decoding fallback runs; a seek without an error
+decodes on. Pass an already-patched source directory as the first argument
+to run offline.
+
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding
@@ -360,15 +388,33 @@ offline.
 Run the TCP hostname-lookup regression with
 `bash scripts/test_tcp_family_lookup.sh`. It compiles tcp.c's per-family
 lookup (patch 0029) under ASan and UBSan against a scripted resolver and
-connection race. A family whose lookup never answers -- the AAAA query a
-broken resolver drops -- holds nothing up: the race starts with the other
-family 50 ms after it answered, a family that answers later joins a race
-stuck on a blackholed address or is raced alone once every earlier address
-failed, IPv6 is listed first, a failed lookup never ends the open while the
-other is pending, and the caller's interrupt ends any wait without being
-taken for a late answer. Every lookup the open left behind frees what it
-shares, and literals keep the single AF_UNSPEC lookup. Pass an
+connection race on a virtual clock: time moves only when every thread waits,
+so each scripted delay is exact and a loaded machine cannot move an answer
+across the 50 ms Resolution Delay. A family whose lookup never answers --
+the AAAA query a broken resolver drops -- holds nothing up: the race starts
+with the other family 50 ms after it answered, a family that answers later
+joins a race stuck on a blackholed address or is raced alone once every
+earlier address failed, IPv6 is listed first, a failed lookup never ends the
+open while the other is pending, and the caller's interrupt ends any wait
+without being taken for a late answer. Every lookup the open left behind
+frees what it shares, and literals keep the single AF_UNSPEC lookup. Pass an
 already-patched source directory to run offline.
+
+Run the codec-profile regression with `bash scripts/test_demux_codec_profile.sh`.
+It extracts the profile the demuxers publish when a file loads (patch
+0204: demux_mkv names it from CodecPrivate, demux_lavf from MP4's avcC or
+hvcC), which is what a client's per-file decode routing reads before any
+decoder exists, and compares it with the profile mpv publishes once the pinned
+FFmpeg's software decoder has decoded the stream's first access unit (a
+minimal host configure builds the H.264 and HEVC decoders). The samples are
+one-frame x264 and x265 encodes muxed into Matroska and MP4: HEVC Main, Main 10
+and Rext, the same records rewritten to a general_profile_idc of 0 that names
+the profile only in the compatibility flags, and H.264 Constrained Baseline,
+High, High 10 and High 10 Intra. A record whose configurationVersion is not 1,
+one shorter than its fixed header, Annex B extradata or another codec names no
+profile. `--regenerate` re-encodes the samples with a host ffmpeg (libx264 and
+libx265). Pass an already-patched mpv tree and an FFmpeg tree as the first two
+arguments to run offline.
 
 Run the OSD-plane letterbox regression with `bash scripts/test_mediacodec_letterbox.sh`.
 It compiles the production fill against a recording GL stub: the fill covers
@@ -408,13 +454,96 @@ so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
-(macOS). It compiles `audio/out/ao_spatial.m` (patch 0037) against a real
-`AVSampleBufferRenderSynchronizer` and a fake host sink: TrueHD and DTS-HD
-bursts reach the host unchanged, the clock waits until the host is ready and
+(macOS). It compiles `audio/out/ao_spatial.m` (patch 0039) against a real
+`AVSampleBufferRenderSynchronizer` and a fake renderer: TrueHD and DTS-HD
+bursts reach the renderer unchanged, the clock waits until the renderer is ready and
 then runs in real time, pause, seek, underrun and end of stream each keep or
-begin the right timeline, and a host failure latches the format so the reopen
-refuses it and mpv decodes the track, until a PCM output clears the latch.
+begin the right timeline, and a renderer failure latches the format so the reopen
+refuses it and mpv decodes the track, until that player probes PCM and clears
+its latch. A second player neither inherits nor clears that failure.
 Pass an already-patched source directory to run offline.
+
+The output is self-contained: `scripts/build_spatial.py` compiles the
+SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
+the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are
+folded into `Libmpv`; that source pin is part of libmpv's content key. There is
+no application callback or separate SpatialAudioBridge package. The binary
+includes the silent Atmos clip and its license notices. When the last overlapping
+output closes, it restores audio-session settings that still match what it
+installed: category, mode and options as one group, multichannel independently.
+Differing host settings are preserved. Matching values cannot prove that another
+caller left the session untouched. Opening activates the session; closing never
+deactivates it, because the host may already own activation. Deactivation remains the host
+application's responsibility. `bash scripts/test_spatial_session.sh` exercises
+active/inactive host sessions, host configuration changes, overlapping outputs
+and failed-open rollback with a fake session, without playing audio.
+
+The Rust core is built as a staticlib alone with fat LTO, then prelinked into
+one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak
+`rust_eh_personality` remain global. This avoids collisions with libdovi's Rust
+runtime while preserving decoder panic handling. The build checks the exported
+symbols and weak personality for every supported slice.
+After a full platform build, `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`
+checks the installed slices and links their sink with force-loaded libdovi,
+without media. It also links an Objective-C-only Clang consumer using the
+packaged `mpv.pc`, including a toolchain path containing spaces. The prelink
+log records the Mach-O platform and minimum OS.
+The SwiftPM wrapper contains Swift source so C/Objective-C consumers also get
+the Swift runtime and back-deployment libraries. After packaging,
+`bash scripts/test_spatial_swiftpm.sh <release-dir>` links an Objective-C-only
+app on iOS and tvOS against the packaged frameworks (requires XcodeGen).
+
+Static pkg-config consumers must configure the install paths in
+`pkgconfig-example` and select their Xcode toolchain. `mpv.pc` supplies both
+Swift runtime and platform-specific compatibility-library flags; its distributed
+`swift_toolchain` value is a placeholder, not the build machine's Xcode path.
+Set that variable in the installed file or override it when invoking pkg-config:
+
+```bash
+swift_compiler="$(xcrun --find swiftc)"
+swift_toolchain="$(dirname "$(dirname "$(dirname "$swift_compiler")")")"
+pkg-config --define-variable="swift_toolchain=$swift_toolchain" --static --libs mpv
+```
+
+Use the metadata for the target slice: device and simulator Swift libraries
+live in different toolchain directories. The selected Xcode must be compatible
+with the compiler used to build the binaries.
+
+Spatial playback requires OS 26 and a supported Rust target: arm64 tvOS and
+its simulator, or iOS and its simulators. macOS, Mac Catalyst, arm64e and Intel
+tvOS retain their other audio outputs. mpv's macOS build includes LuaJIT, and
+LuaJIT, C++, Objective-C and the core's Rust would require four unwind
+personality routines, exceeding the binary's compact-unwind limit of three.
+Ordinary TrueHD/DTS-HD and conversion failures fall back to PCM on the spatial
+path. Source inspection confirms that a tvOS consumer using `ao=spatial,`
+also reaches PCM when the spatial driver is absent:
+the trailing comma enables ordinary output probing; AudioUnit rejects every
+SPDIF format (`audio/out/ao_audiounit.m:116`), and AVFoundation accepts only
+AC-3/E-AC-3 (`audio/out/ao_avfoundation.m:1180`). With no output accepting
+TrueHD/DTS-HD passthrough, `player/audio.c:467` disables SPDIF and reinitializes
+the decoder. These are lines in the patched mpv tree. This path can log output
+probe refusals; it does not return the playback error below the PCM retry.
+The unsupported slices were inspected, not run.
+
+macOS needs a different guard: CoreAudio redirects non-PCM to
+`coreaudio_exclusive` (`audio/out/ao_coreaudio.c:162`), which accepts SPDIF
+(`audio/out/ao_coreaudio_exclusive.c:295`) and may retain that format for a
+compressed device stream (`:356`). Plezy never requests passthrough on macOS:
+its macOS player selects `coreaudio,avfoundation`
+(`macos/Runner/MpvPlayer/MpvPlayerCore.swift:125`), and
+`PlatformDetector.supportsAudioPassthrough()` excludes macOS
+(`lib/utils/platform_detector.dart:312`), gating `audio-spdif` in
+`lib/screens/video_player_screen.dart:1981`. This is source inspection of
+Plezy's configuration, not a guarantee that arbitrary mpv passthrough settings
+fall back to PCM.
+
+For a real muted renderer test, build
+the macOS dependency with `build_spatial.py`, then run
+`bash scripts/test_spatial_renderer.sh <patched-mpv> <built-spatial-dir> <IEC-file> <codec> <expect-failure>`.
+Codec is 1 for TrueHD or 2 for DTS-HD; the final argument is 0 or 1. Supply
+IEC 61937 generated by FFmpeg's `spdif` muxer, with `-dtshd_rate 768000` for DTS-HD.
+An optional final libdovi archive argument force-loads its Rust runtime too,
+so the same test checks that the prelinked core coexists with it.
 
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,

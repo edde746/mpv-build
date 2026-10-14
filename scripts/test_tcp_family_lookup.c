@@ -9,8 +9,9 @@
 // or is still pending never ends the open early, the caller's interrupt
 // callback ends any wait, and a lookup left behind frees what it shares.
 //
-// getaddrinfo() and ff_connect_parallel() are scripted here; everything
-// between them is the production code.
+// getaddrinfo() and ff_connect_parallel() are scripted here, and every clock
+// read and timed wait runs on a virtual clock; everything between them is the
+// production code.
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -46,8 +47,8 @@
 #define ff_mutex_destroy pthread_mutex_destroy
 #define ff_cond_init pthread_cond_init
 #define ff_cond_destroy pthread_cond_destroy
-#define ff_cond_broadcast pthread_cond_broadcast
-#define ff_cond_timedwait pthread_cond_timedwait
+#define ff_cond_broadcast vc_cond_broadcast // the virtual clock's, below
+#define ff_cond_timedwait vc_cond_timedwait
 
 typedef struct AVIOInterruptCB {
     int (*callback)(void *);
@@ -70,15 +71,187 @@ static int ff_check_interrupt(AVIOInterruptCB *cb)
     return cb->callback ? cb->callback(cb->opaque) : 0;
 }
 
-static int64_t clock_us(clockid_t id)
+// --- virtual clock. Every wait runs on it: the scripted resolver's delays,
+// the scripted race's polling and lookup_wait()'s ff_cond_timedwait(). The
+// clock moves only when every thread waits, to the earliest deadline, and
+// wakes that one waiter. Of deadlines that fall together, the one set first
+// wakes first, and of those set at the same instant, the one of the thread
+// created first (main, then the IPv6 lookup, then the IPv4 one). A scripted
+// delay is therefore exact and the order of events does not depend on the
+// scheduler: a loaded machine only slows the run down. With real sleeps, a
+// CI runner that stalled the scripted A answer, due 10 ms after AAAA, past
+// LOOKUP_DELAY_US raced IPv6 alone.
+
+typedef struct VirtualWaiter {
+    struct VirtualWaiter *next;
+    const pthread_cond_t *cond; // NULL for a sleep
+    int64_t deadline, set_at;
+    unsigned thread;
+    int released;
+    int signaled;               // by a broadcast, not the deadline
+} VirtualWaiter;
+
+static pthread_mutex_t vc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vc_wakeup = PTHREAD_COND_INITIALIZER;
+static VirtualWaiter *vc_waiters;
+static int64_t vc_now = 1000000; // microseconds
+static int vc_running = 1;      // threads not waiting on the clock: main
+static unsigned vc_threads;     // created so far
+static _Thread_local unsigned vc_thread_id; // 0 for main, then 1, 2, ...
+
+// av_gettime() counts from another epoch than av_gettime_relative(), as
+// CLOCK_REALTIME and CLOCK_MONOTONIC do, so a timed wait whose deadline mixes
+// the two never waits its intended time.
+#define VC_REALTIME_EPOCH INT64_C(1700000000000000)
+
+static int64_t av_gettime_relative(void)
 {
-    struct timespec ts;
-    clock_gettime(id, &ts);
-    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    int64_t now;
+
+    pthread_mutex_lock(&vc_lock);
+    now = vc_now;
+    pthread_mutex_unlock(&vc_lock);
+    return now;
 }
 
-static int64_t av_gettime(void) { return clock_us(CLOCK_REALTIME); }
-static int64_t av_gettime_relative(void) { return clock_us(CLOCK_MONOTONIC); }
+static int64_t av_gettime(void) { return VC_REALTIME_EPOCH + av_gettime_relative(); }
+
+static int vc_wakes_before(const VirtualWaiter *a, const VirtualWaiter *b)
+{
+    if (a->deadline != b->deadline)
+        return a->deadline < b->deadline;
+    if (a->set_at != b->set_at)
+        return a->set_at < b->set_at;
+    return a->thread < b->thread;
+}
+
+// With vc_lock held, once no thread runs.
+static void vc_advance(void)
+{
+    VirtualWaiter *w, *next = NULL;
+
+    for (w = vc_waiters; w; w = w->next)
+        if (!w->released && (!next || vc_wakes_before(w, next)))
+            next = w;
+    if (!next) {
+        fprintf(stderr, "FAIL: no thread runs and none waits for the clock\n");
+        abort();
+    }
+    if (next->deadline > vc_now)
+        vc_now = next->deadline;
+    next->released = 1;
+    vc_running++;
+    pthread_cond_broadcast(&vc_wakeup);
+}
+
+// Waits until `deadline` or, given `cond`, a vc_cond_broadcast() on it, with
+// `mutex` (if any) released meanwhile, as pthread_cond_timedwait() does. A
+// deadline of now still waits its turn, so lookups scripted to answer at the
+// same instant answer one at a time, IPv6 first.
+static int vc_wait(const pthread_cond_t *cond, pthread_mutex_t *mutex, int64_t deadline)
+{
+    VirtualWaiter self = { .cond = cond, .deadline = deadline, .thread = vc_thread_id }, **link;
+
+    pthread_mutex_lock(&vc_lock);
+    if (deadline < vc_now) {
+        pthread_mutex_unlock(&vc_lock);
+        return ETIMEDOUT;
+    }
+    self.set_at = vc_now;
+    self.next = vc_waiters;
+    vc_waiters = &self;
+    if (mutex)
+        pthread_mutex_unlock(mutex);
+    if (!--vc_running)
+        vc_advance();
+    while (!self.released)
+        pthread_cond_wait(&vc_wakeup, &vc_lock);
+    for (link = &vc_waiters; *link != &self; link = &(*link)->next)
+        ;
+    *link = self.next;
+    pthread_mutex_unlock(&vc_lock);
+    if (mutex)
+        pthread_mutex_lock(mutex);
+    return self.signaled ? 0 : ETIMEDOUT;
+}
+
+static void vc_sleep_ms(int ms)
+{
+    vc_wait(NULL, NULL, av_gettime_relative() + ms * 1000LL);
+}
+
+static int vc_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                             const struct timespec *abstime)
+{
+    int64_t wake = (int64_t)abstime->tv_sec * 1000000 + abstime->tv_nsec / 1000;
+
+    return vc_wait(cond, mutex, wake - VC_REALTIME_EPOCH);
+}
+
+static int vc_cond_broadcast(pthread_cond_t *cond)
+{
+    VirtualWaiter *w;
+
+    pthread_mutex_lock(&vc_lock);
+    for (w = vc_waiters; w; w = w->next)
+        if (w->cond == cond && !w->released) {
+            w->released = w->signaled = 1;
+            vc_running++;
+        }
+    pthread_cond_broadcast(&vc_wakeup);
+    pthread_mutex_unlock(&vc_lock);
+    return 0;
+}
+
+// A lookup thread runs, for the clock, from pthread_create() until its
+// function returns, so the clock cannot pass a scripted delay before the
+// lookup that sleeps it has started.
+
+typedef struct VirtualThread {
+    void *(*fn)(void *);
+    void *arg;
+    unsigned id;
+} VirtualThread;
+
+static void *vc_thread(void *opaque)
+{
+    VirtualThread thread = *(VirtualThread *)opaque;
+
+    free(opaque);
+    vc_thread_id = thread.id;
+    thread.fn(thread.arg);
+    pthread_mutex_lock(&vc_lock);
+    if (!--vc_running)
+        vc_advance();
+    pthread_mutex_unlock(&vc_lock);
+    return NULL;
+}
+
+static int vc_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                             void *(*fn)(void *), void *arg)
+{
+    VirtualThread *start = malloc(sizeof(*start));
+    int ret;
+
+    if (!start)
+        return EAGAIN;
+    start->fn = fn;
+    start->arg = arg;
+    pthread_mutex_lock(&vc_lock);
+    start->id = ++vc_threads;
+    vc_running++;
+    pthread_mutex_unlock(&vc_lock);
+    ret = pthread_create(thread, attr, vc_thread, start);
+    if (ret) {
+        free(start);
+        pthread_mutex_lock(&vc_lock);
+        vc_running--; // the caller still runs, so this never reaches zero
+        pthread_mutex_unlock(&vc_lock);
+    }
+    return ret;
+}
+
+#define pthread_create vc_pthread_create
 
 static atomic_int live_allocs;
 
@@ -187,7 +360,7 @@ static int fake_getaddrinfo(const char *node, const char *service,
     atomic_fetch_add(&family_lookups, 1);
     atomic_fetch_add(&running_lookups, 1);
     script = hints->ai_family == AF_INET6 ? &fake_v6 : &fake_v4;
-    usleep(script->delay_ms * 1000);
+    vc_sleep_ms(script->delay_ms);
     atomic_fetch_sub(&running_lookups, 1);
     if (script->err)
         return script->err;
@@ -241,7 +414,7 @@ static int wait_out_race(URLContext *h)
     while (av_gettime_relative() < end) {
         if (ff_check_interrupt(&h->interrupt_callback))
             return AVERROR_EXIT;
-        usleep(5000);
+        vc_sleep_ms(5);
     }
     return AVERROR(ETIMEDOUT);
 }
@@ -375,7 +548,7 @@ static void run(const Scenario *sc)
     waited_until = av_gettime_relative() + 3000000;
     while ((atomic_load(&running_lookups) || atomic_load(&live_allocs) || atomic_load(&live_results)) &&
            av_gettime_relative() < waited_until)
-        usleep(10000);
+        vc_sleep_ms(10);
     snprintf(what, sizeof(what), "left %d allocations, %d resolver results, %d lookups running",
              atomic_load(&live_allocs), atomic_load(&live_results), atomic_load(&running_lookups));
     check(!atomic_load(&live_allocs) && !atomic_load(&live_results) && !atomic_load(&running_lookups),
@@ -432,6 +605,10 @@ int main(void)
           1, 100, 0, { 0 } },
     };
     size_t i;
+
+    // The virtual clock stands still while a thread spins without waiting,
+    // so such a regression would hang the run: fail it instead.
+    alarm(30);
 
     for (i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); i++)
         run(&scenarios[i]);

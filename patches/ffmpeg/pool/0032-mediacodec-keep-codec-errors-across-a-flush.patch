@@ -1,0 +1,133 @@
+Subject: [PATCH] avcodec/mediacodec: keep a codec error across a flush
+
+The decoder lost codec errors across a flush. A flush cleared the error the
+codec's callback had reported, so the restarted codec, still failed, was
+waited on as if it were decoding. A flush or restart the codec failed was
+returned to mediacodec_decode_flush, which returns void like
+avcodec_flush_buffers(), so the failure went nowhere; MediaCodec answers an
+error that reaches it during a flush through the flush alone. Either way
+the decoder could answer EAGAIN on a codec that would never answer again,
+and the host's hardware-decoding fallback never ran.
+
+Keep the codec's first error, in both modes, as the answer of every later
+dequeue: no flush clears it, and a failed flush or restart sets it and, in
+asynchronous mode, wakes the host.
+
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 502299c..27e2eb0 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -893,6 +893,19 @@ static void mediacodec_dec_wake_host(MediaCodecDecContext *s)
+         ff_cond_broadcast(&s->async_cond);
+ }
+ 
++// Make err the codec's error unless it already has one, and in asynchronous
++// mode wake whoever waits on the codec: a decoding thread blocked on it and
++// the host. async_lock held.
++static void mediacodec_dec_fail(MediaCodecDecContext *s, int err)
++{
++    if (!s->async_error)
++        s->async_error = err;
++    if (!s->async_mode)
++        return;
++    ff_cond_broadcast(&s->async_cond);
++    mediacodec_dec_wake_host(s);
++}
++
+ static void mediacodec_dec_on_input_available(FFAMediaCodec *codec, void *userdata,
+                                               int32_t index)
+ {
+@@ -946,10 +959,7 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
+ 
+     av_log(codec, AV_LOG_ERROR, "Codec error %s (%s)\n", av_err2str(error), detail);
+     ff_mutex_lock(&s->async_lock);
+-    if (!s->async_error)
+-        s->async_error = error < 0 ? error : AVERROR_EXTERNAL;
+-    ff_cond_signal(&s->async_cond);
+-    mediacodec_dec_wake_host(s);
++    mediacodec_dec_fail(s, error < 0 ? error : AVERROR_EXTERNAL);
+     ff_mutex_unlock(&s->async_lock);
+ }
+ 
+@@ -1057,7 +1067,12 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+     int ret;
+ 
+     if (!s->async_mode) {
+-        ssize_t idx = ff_AMediaCodec_dequeueInputBuffer(s->codec, timeout_us);
++        ssize_t idx;
++        // No codec thread in polled mode: async_error is a flush or restart
++        // the codec failed, and it stays the answer as in asynchronous mode.
++        if (s->async_error)
++            return s->async_error;
++        idx = ff_AMediaCodec_dequeueInputBuffer(s->codec, timeout_us);
+         if (ff_AMediaCodec_infoTryAgainLater(s->codec, idx))
+             return AVERROR(EAGAIN);
+         if (idx < 0)
+@@ -1099,7 +1114,10 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+ 
+     if (!s->async_mode) {
+         FFAMediaCodec *codec = s->codec;
+-        ssize_t idx = ff_AMediaCodec_dequeueOutputBuffer(codec, info, timeout_us);
++        ssize_t idx;
++        if (s->async_error)
++            return s->async_error;
++        idx = ff_AMediaCodec_dequeueOutputBuffer(codec, info, timeout_us);
+         if (idx >= 0) {
+             *index = idx;
+             timing->output_ns = mediacodec_monotonic_ns();
+@@ -1176,25 +1194,31 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+     status = ff_AMediaCodec_flush(codec);
+     if (status < 0) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to flush codec\n");
+-        return AVERROR_EXTERNAL;
+-    }
+-
+-    if (s->async_mode) {
++    } else if (s->async_mode) {
+         // Every index delivered so far is void; the codec re-offers its
+         // input slots once restarted, which asynchronous mode requires.
+         ff_mutex_lock(&s->async_lock);
+         av_fifo_reset2(s->async_input);
+         av_fifo_reset2(s->async_output);
+-        s->async_error = 0;
+         s->async_generation++;
+         ff_mutex_unlock(&s->async_lock);
+         status = ff_AMediaCodec_start(codec);
+-        if (status < 0) {
++        if (status < 0)
+             av_log(avctx, AV_LOG_ERROR, "Failed to restart codec after flush\n");
+-            return AVERROR_EXTERNAL;
+-        }
+     }
+ 
++    // A codec error outlives the flush (async_error is never cleared here),
++    // and so does the flush's own failure, which avcodec_flush_buffers() has
++    // no way to return: MediaCodec answers an error that reaches it during a
++    // flush through the flush alone. Either is the next decoding call's
++    // answer, so the host's fallback runs instead of waiting on a codec that
++    // will not answer.
++    if (status < 0) {
++        ff_mutex_lock(&s->async_lock);
++        mediacodec_dec_fail(s, AVERROR_EXTERNAL);
++        ff_mutex_unlock(&s->async_lock);
++        return AVERROR_EXTERNAL;
++    }
+     return 0;
+ }
+ 
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 0df6644..6d278db 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -106,7 +106,10 @@ typedef struct MediaCodecDecContext {
+     AVCond async_cond;
+     AVFifo *async_input;   // int32_t input buffer indices
+     AVFifo *async_output;  // MediaCodecAsyncOutput
+-    int async_error;       // first codec error, sticky until flush
++    // The codec's first error, in either mode: what its error callback
++    // reported, or a flush or restart it failed. Sticky: every later dequeue
++    // answers it, and no flush clears it.
++    int async_error;
+     // Flush generation, folded into every timestamp handed to the codec so
+     // that output the codec finished before a flush is recognised after it.
+     int async_generation;

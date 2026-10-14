@@ -1,0 +1,9 @@
+# Linux patch series for libplacebo, applied by platforms/linux/build.sh to the
+# pin in overrides.linux. One pool filename per line; order is authoritative.
+#
+# Shared with series.android (see there for why this is not series.common).
+# The linux build is OpenGL-only (-Dvulkan=disabled), and on a GLES context --
+# the aarch64 boards whose EGL offers no desktop GL -- this patch is the only
+# way an array too large for plain uniforms reaches the shader at all; desktop
+# GL is untouched.
+0002-opengl-enable-ubos-on-gles.patch

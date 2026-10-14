@@ -1,0 +1,188 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:10:24 +0200
+Subject: [PATCH] avutil/videotoolbox: leave matching attachments alone
+
+av_vt_pixbuf_set_attachments() wrote or removed seven attachments on
+every frame the VideoToolbox hwaccel outputs: pixel aspect ratio,
+matrix, primaries, transfer function, gamma level, CGColorSpace and
+chroma location. The decoder's buffers are IOSurface-backed, so each of
+those calls is a kernel round trip, and the decoder has usually tagged
+its output with the same values already: on a 4K HDR10 file on tvOS,
+3595 of 5033 calls in 720 frames wrote a value the buffer already held
+or removed one it did not have. A player's video output that reads the
+attachments back for each sample buffer also paid for the writes; in
+mpv's vo_avfoundation the IOSurface calls on the VO thread took 80 ms
+per 10 s of that playback with them and 9 ms without.
+
+Read each attachment first, write it only when the value or its
+propagation mode differs, and remove it only when it is present. The
+attachments a buffer ends up with are unchanged.
+
+diff --git a/libavutil/hwcontext_videotoolbox.c b/libavutil/hwcontext_videotoolbox.c
+index f2a89ea..1556416 100644
+--- a/libavutil/hwcontext_videotoolbox.c
++++ b/libavutil/hwcontext_videotoolbox.c
+@@ -338,6 +338,52 @@ static void vt_unmap(AVHWFramesContext *ctx, HWMapDescriptor *hwmap)
+     CVPixelBufferUnlockBaseAddress(pixbuf, (uintptr_t)hwmap->priv);
+ }
+ 
++/*
++ * The decoder's output buffers are IOSurface-backed, so every attachment
++ * written to or removed from one is a kernel round trip. VideoToolbox has
++ * usually tagged its output with the values the functions below write, so
++ * an attachment that already holds the value, or a missing one that is to
++ * be removed, is left alone.
++ */
++static CFTypeRef vt_buffer_copy_attachment(CVBufferRef buffer, CFStringRef key,
++                                           CVAttachmentMode *mode)
++{
++    CFTypeRef value;
++
++    if (__builtin_available(macOS 12.0, iOS 15.0, tvOS 15.0, *))
++        return CVBufferCopyAttachment(buffer, key, mode);
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
++    value = CVBufferGetAttachment(buffer, key, mode);
++#pragma clang diagnostic pop
++    return value ? CFRetain(value) : NULL;
++}
++
++static void vt_buffer_set_attachment(CVBufferRef buffer, CFStringRef key,
++                                     CFTypeRef value)
++{
++    CVAttachmentMode mode = kCVAttachmentMode_ShouldNotPropagate;
++    CFTypeRef current = vt_buffer_copy_attachment(buffer, key, &mode);
++    int unchanged = current && mode == kCVAttachmentMode_ShouldPropagate &&
++                    CFEqual(current, value);
++
++    if (current)
++        CFRelease(current);
++    if (!unchanged)
++        CVBufferSetAttachment(buffer, key, value, kCVAttachmentMode_ShouldPropagate);
++}
++
++static void vt_buffer_remove_attachment(CVBufferRef buffer, CFStringRef key)
++{
++    CFTypeRef current = vt_buffer_copy_attachment(buffer, key, NULL);
++
++    if (current) {
++        CFRelease(current);
++        CVBufferRemoveAttachment(buffer, key);
++    }
++}
++
+ static int vt_pixbuf_set_par(void *log_ctx,
+                              CVPixelBufferRef pixbuf, const AVFrame *src)
+ {
+@@ -346,7 +392,7 @@ static int vt_pixbuf_set_par(void *log_ctx,
+     AVRational avpar = src->sample_aspect_ratio;
+ 
+     if (avpar.num == 0) {
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferPixelAspectRatioKey);
+         return 0;
+     }
+ 
+@@ -383,12 +429,7 @@ static int vt_pixbuf_set_par(void *log_ctx,
+         kCVImageBufferPixelAspectRatioVerticalSpacingKey,
+         den);
+ 
+-    CVBufferSetAttachment(
+-        pixbuf,
+-        kCVImageBufferPixelAspectRatioKey,
+-        par,
+-        kCVAttachmentMode_ShouldPropagate
+-    );
++    vt_buffer_set_attachment(pixbuf, kCVImageBufferPixelAspectRatioKey, par);
+ 
+     CFRelease(par);
+     CFRelease(num);
+@@ -422,16 +463,10 @@ static int vt_pixbuf_set_chromaloc(void *log_ctx,
+ {
+     CFStringRef loc = av_map_videotoolbox_chroma_loc_from_av(src->chroma_location);
+ 
+-    if (loc) {
+-        CVBufferSetAttachment(
+-            pixbuf,
+-            kCVImageBufferChromaLocationTopFieldKey,
+-            loc,
+-            kCVAttachmentMode_ShouldPropagate);
+-    } else
+-        CVBufferRemoveAttachment(
+-            pixbuf,
+-            kCVImageBufferChromaLocationTopFieldKey);
++    if (loc)
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferChromaLocationTopFieldKey, loc);
++    else
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferChromaLocationTopFieldKey);
+ 
+     return 0;
+ }
+@@ -668,10 +703,9 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+ 
+     colormatrix = av_map_videotoolbox_color_matrix_from_av(src->colorspace);
+     if (colormatrix)
+-        CVBufferSetAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey,
+-            colormatrix, kCVAttachmentMode_ShouldPropagate);
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferYCbCrMatrixKey, colormatrix);
+     else {
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferYCbCrMatrixKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferYCbCrMatrixKey);
+         if (src->colorspace != AVCOL_SPC_UNSPECIFIED && src->colorspace != AVCOL_SPC_RGB)
+             av_log(log_ctx, AV_LOG_WARNING,
+                 "Color space %s is not supported.\n",
+@@ -680,10 +714,9 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+ 
+     colorpri = av_map_videotoolbox_color_primaries_from_av(src->color_primaries);
+     if (colorpri)
+-        CVBufferSetAttachment(pixbuf, kCVImageBufferColorPrimariesKey,
+-            colorpri, kCVAttachmentMode_ShouldPropagate);
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferColorPrimariesKey, colorpri);
+     else {
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferColorPrimariesKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferColorPrimariesKey);
+         if (src->color_primaries != AVCOL_PRI_UNSPECIFIED)
+             av_log(log_ctx, AV_LOG_WARNING,
+                 "Color primaries %s is not supported.\n",
+@@ -692,10 +725,9 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+ 
+     colortrc = av_map_videotoolbox_color_trc_from_av(src->color_trc);
+     if (colortrc)
+-        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
+-            colortrc, kCVAttachmentMode_ShouldPropagate);
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferTransferFunctionKey, colortrc);
+     else {
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferTransferFunctionKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferTransferFunctionKey);
+         if (src->color_trc != AVCOL_TRC_UNSPECIFIED)
+             av_log(log_ctx, AV_LOG_WARNING,
+                 "Color transfer function %s is not supported.\n",
+@@ -709,11 +741,10 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+ 
+     if (gamma != 0) {
+         CFNumberRef gamma_level = CFNumberCreate(NULL, kCFNumberFloat32Type, &gamma);
+-        CVBufferSetAttachment(pixbuf, kCVImageBufferGammaLevelKey,
+-            gamma_level, kCVAttachmentMode_ShouldPropagate);
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferGammaLevelKey, gamma_level);
+         CFRelease(gamma_level);
+     } else
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferGammaLevelKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferGammaLevelKey);
+ 
+     colorspace = vt_colorspace_get(src, colormatrix, colorpri, colortrc, gamma);
+ 
+@@ -721,11 +752,10 @@ static int vt_pixbuf_set_colorspace(void *log_ctx,
+     // in any case a wrong kCVImageBufferCGColorSpaceKey is removed
+     // if the above code is not used or fails.
+     if (colorspace) {
+-        CVBufferSetAttachment(pixbuf, kCVImageBufferCGColorSpaceKey,
+-            colorspace, kCVAttachmentMode_ShouldPropagate);
++        vt_buffer_set_attachment(pixbuf, kCVImageBufferCGColorSpaceKey, colorspace);
+         CFRelease(colorspace);
+     } else
+-        CVBufferRemoveAttachment(pixbuf, kCVImageBufferCGColorSpaceKey);
++        vt_buffer_remove_attachment(pixbuf, kCVImageBufferCGColorSpaceKey);
+ 
+     return 0;
+ }
