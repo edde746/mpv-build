@@ -1,5 +1,6 @@
-# Windows patch series for mpv, applied after series.common (which carries
-# the cross-platform fixes; the apple avfoundation/moltenvk stack lives in
-# series.apple). Empty today: nothing is Windows-only yet. Entries are staged
+# Windows patch series for mpv, applied after series.common. Entries are staged
 # into the mpv-winbuild-cmake checkout and applied with `git apply` by the
 # injected PATCH_COMMAND (see platforms/windows/pin_packages.py).
+# Every group but android: a MediaCodec that starts failing mid-stream rarely
+# recovers, and waiting out its error burst only delays the software fallback.
+0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch

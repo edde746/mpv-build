@@ -1,22 +1,10 @@
-# Android patch series for mpv. One pool filename per line; order is
-# authoritative and nothing is sorted.
+# Android patch series for mpv, applied after series.common. One pool filename
+# per line; order is authoritative and nothing is sorted.
 0001-vo-mediacodec-timed-surface-with-osd-plane.patch
 0002-egl-android-bt2020-pq-surface.patch
-0003-opengl-treat-gles-direct-rendering-as-slow.patch
-0004-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
-0005-demux-codec-profile-from-avcc-and-hvcc.patch
-0006-sd-ass-render-threads.patch
-0006-sd-ass-fast-blur.patch
-0008-draw-bmp-fast-libass-blend.patch
-0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
-0011-sub-render-horizon-for-vo-prefetch.patch
-0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared.patch
-0013-sd-ass-isolate-event-prefetch-renderer.patch
 0013-vo-mediacodec-request-isolated-event-prefetch.patch
-0014-ass-mp-compact-high-overdraw-atlases.patch
 0014-vo-mediacodec-document-compacted-atlases.patch
 0101-ao-audiotrack-passthrough-and-clock.patch
-0010-player-pending-vid-property.patch
 0103-ao-audiotrack-output-stall-watchdog.patch
 0105-vo-mediacodec-separate-preparation-and-submission.patch
 0104-vo-mediacodec-live-osd-rebind.patch
@@ -41,7 +29,6 @@
 0124-vo-mediacodec-hand-frames-to-the-codec-50-ms-ahead-as-media3-does.patch
 0125-player-run-the-core-at-video-priority-on-android.patch
 0126-ao-audiotrack-raw-truehd-where-the-route-refuses-the-mat-carrier.patch
-0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
 0127-vo-mediacodec-render-through-the-shared-osd-pipeline.patch
 0128-vo-mediacodec-call-the-choreographer-outside-the-sampler-lock.patch
 0129-vo-mediacodec-itemize-late-frame-timing.patch
