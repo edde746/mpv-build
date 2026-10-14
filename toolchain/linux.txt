@@ -12,9 +12,9 @@
 # and rejected on dependency constraints:
 #   - jammy has no libdisplay-info-dev at all, and mpv's `drm` feature -- which
 #     build.sh pins to -Ddrm=enabled precisely so it cannot silently vanish --
-#     hard-requires libdisplay-info on mpv 0.40.
-#   - jammy's meson is 0.61.2, below mpv 0.40's minimum, which would force an
-#     unpinned pip-installed meson on top of the "stable" image.
+#     hard-requires libdisplay-info since mpv 0.40.
+#   - jammy's meson is 0.61.2, below mpv's minimum (1.3.0 since 0.40), which
+#     would force an unpinned pip-installed meson on top of the "stable" image.
 # noble carries libdisplay-info-dev, meson 1.3.x, cmake 3.28, nasm 2.16 and
 # gcc 13 straight from the archive. The resulting glibc 2.39 floor is exactly
 # what today's artifacts already require (they were built on ubuntu-latest =

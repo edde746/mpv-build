@@ -30,23 +30,6 @@ init_repository() {
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
-fixture="$temporary/source.bin"
-destination="$temporary/download/output.bin"
-printf 'reviewed native input\n' >"$fixture"
-expected="$(sha256_file "$fixture")"
-download_verified "file://$fixture" "$expected" "$destination"
-cmp -s "$fixture" "$destination" || fail "verified download changed bytes"
-
-printf 'reviewed native inpuu\n' >"$fixture"
-rm -f "$destination"
-if download_verified "file://$fixture" "$expected" "$destination"; then
-  fail "changed archive was accepted"
-fi
-assert_absent "$destination"
-if compgen -G "$destination.tmp.*" >/dev/null; then
-  fail "failed download left a temporary file"
-fi
-
 repository="$temporary/repository"
 checkout="$temporary/checkout"
 init_repository "$repository"
@@ -129,44 +112,32 @@ STUB
   chmod +x "$directory/$name"
 }
 
-payload="$temporary/payload.bin"
-printf 'stub archive payload\n' >"$payload"
-payload_sha256="$(sha256_file "$payload")"
-
-curl_extra='
-output=""
-previous=""
-for argument in "$@"; do
-  if [ "$previous" = "--output" ]; then output="$argument"; fi
-  previous="$argument"
-done
-[ -n "$output" ] || { echo "stub curl: no --output argument" >&2; exit 1; }
-cp -- "'"$payload"'" "$output"
-'
-
-# The unmapped case is fatal on purpose: a new archive in the build plan has to
-# come here and be described rather than silently extract to nothing.
-tar_extra='
-archive="$(basename -- "${!#}")"
-case "$archive" in
-  ffmpeg.tar.xz) directory="ffmpeg-'"$ffmpeg_version"'" ;;
-  mpv.tar.gz) directory="mpv-'"$mpv_version"'" ;;
-  *) echo "stub tar: unexpected archive $archive" >&2; exit 1 ;;
-esac
-mkdir -p "$directory"
-cp -- "'"$stub_extra"'/configure" "$directory/configure"
-chmod +x "$directory/configure"
-'
-
-# ffmpeg runs ./configure out of its own tarball, so that one is planted by the
-# tar stub rather than found on PATH; libass's comes out of its stub
-# repository's autogen.sh, exactly where the real build finds it.
+# Every source arrives through checkout_verified_ref; ffmpeg's configure and
+# libass's autogen.sh come out of their stub repositories, exactly where the
+# real build finds them.
 make_stub "$stub_extra" configure
-make_stub "$stub_bin" curl "$curl_extra"
-make_stub "$stub_bin" tar "$tar_extra"
 for tool in make cmake meson ninja; do
   make_stub "$stub_bin" "$tool"
 done
+
+# ffmpeg runs ./configure out of its own checkout, so the recording configure
+# stub is committed into its stub repository.
+ffmpeg_repository="$temporary/ffmpeg-source"
+init_repository "$ffmpeg_repository"
+cp -- "$stub_extra/configure" "$ffmpeg_repository/configure"
+git -C "$ffmpeg_repository" add configure
+git -C "$ffmpeg_repository" update-index --chmod=+x configure
+git -C "$ffmpeg_repository" commit --quiet -m ffmpeg
+git -C "$ffmpeg_repository" -c tag.gpgsign=false tag release
+ffmpeg_commit="$(git -C "$ffmpeg_repository" rev-parse HEAD)"
+
+mpv_repository="$temporary/mpv-source"
+init_repository "$mpv_repository"
+printf 'stub mpv\n' >"$mpv_repository/meson.build"
+git -C "$mpv_repository" add meson.build
+git -C "$mpv_repository" commit --quiet -m mpv
+git -C "$mpv_repository" -c tag.gpgsign=false tag release
+mpv_commit="$(git -C "$mpv_repository" rev-parse HEAD)"
 
 # git stays real, pointed at local repositories: the checkout is pinned by
 # commit, and a stub that answered rev-parse would be asserting its own input.
@@ -226,41 +197,27 @@ git -C "$libass_repository" -c tag.gpgsign=false tag release
 libass_commit="$(git -C "$libass_repository" rev-parse HEAD)"
 
 # The stub manifest mirrors versions.json: linux pins live in overrides.linux
-# wherever the real file keeps them there, and those base fields carry broken
-# values on purpose - a fold that stopped preferring the override would send
-# the build to stub.invalid/wrong or a wrong directory name and fail loudly.
+# wherever the real file keeps them there (libplacebo, whose base pin is the
+# apple prebuilt), and those base fields carry broken values on purpose - a
+# fold that stopped preferring the override would send the build to
+# stub.invalid/wrong or a wrong directory name and fail loudly.
 manifest="$temporary/versions.json"
 cat >"$manifest" <<JSON
 {
   "components": {
     "ffmpeg": {
       "kind": "git",
-      "version": "0.0.0",
-      "url": "https://stub.invalid/wrong",
-      "ref": "wrong",
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "$ffmpeg_version",
-          "url": "https://stub.invalid/ffmpeg.tar.xz",
-          "sha256": "$payload_sha256"
-        }
-      }
+      "version": "$ffmpeg_version",
+      "url": "file://$ffmpeg_repository",
+      "ref": "release",
+      "commit": "$ffmpeg_commit"
     },
     "dav1d": {
       "kind": "git",
-      "version": "0.0.0",
-      "url": "file://$temporary/definitely-not-a-repository",
-      "ref": "wrong",
-      "commit": "0000000000000000000000000000000000000000",
-      "overrides": {
-        "linux": {
-          "version": "$dav1d_version",
-          "url": "file://$dav1d_repository",
-          "ref": "release",
-          "commit": "$dav1d_commit"
-        }
-      }
+      "version": "$dav1d_version",
+      "url": "file://$dav1d_repository",
+      "ref": "release",
+      "commit": "$dav1d_commit"
     },
     "nv-codec-headers": {
       "kind": "git",
@@ -299,17 +256,10 @@ cat >"$manifest" <<JSON
     },
     "mpv": {
       "kind": "git",
-      "version": "0.0.0",
-      "url": "https://stub.invalid/wrong",
-      "ref": "wrong",
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "$mpv_version",
-          "url": "https://stub.invalid/mpv.tar.gz",
-          "sha256": "$payload_sha256"
-        }
-      }
+      "version": "$mpv_version",
+      "url": "file://$mpv_repository",
+      "ref": "release",
+      "commit": "$mpv_commit"
     }
   }
 }
@@ -337,10 +287,10 @@ if ! run_build "$manifest" >"$build_log" 2>&1; then
 fi
 
 # A pin whose kind stopped matching its acquisition step must fail at parse
-# time, before anything downloads - the acquisition steps are written per
+# time, before anything is cloned - the acquisition steps are written per
 # kind, and a silently retargeted step is exactly what resolve_pins' kind
-# check exists to catch. Strip mpv's override so the folded kind degrades to
-# git.
+# check exists to catch. Give mpv a linux override that swaps its tag for a
+# release archive.
 kind_manifest="$temporary/versions-kind-drift.json"
 python3 - "$manifest" "$kind_manifest" <<'PY'
 import json
@@ -348,14 +298,20 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as source:
     manifest = json.load(source)
-del manifest["components"]["mpv"]["overrides"]
+manifest["components"]["mpv"]["overrides"] = {
+    "linux": {
+        "kind": "archive",
+        "url": "https://stub.invalid/mpv.tar.gz",
+        "sha256": "0" * 64,
+    }
+}
 with open(sys.argv[2], "w", encoding="utf-8") as sink:
     json.dump(manifest, sink)
 PY
 if run_build "$kind_manifest" >"$temporary/kind-drift.log" 2>&1; then
   fail "a kind drifted away from its acquisition step and was accepted"
 fi
-grep -q "kind 'git'" "$temporary/kind-drift.log" ||
+grep -q "kind 'archive'" "$temporary/kind-drift.log" ||
   fail "kind drift was not reported"
 
 recorded_call() {

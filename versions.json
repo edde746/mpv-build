@@ -23,15 +23,7 @@
         "linux",
         "windows"
       ],
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "0.40.0",
-          "url": "https://github.com/mpv-player/mpv/archive/refs/tags/v0.40.0.tar.gz",
-          "sha256": "10a0f4654f62140a6dd4d380dcf0bbdbdcf6e697556863dc499c296182f081a3",
-          "provenance": "GitHub reports annotated tag object 287d7cdb78975ae350d7c2a287eae3c2072c93f7 as a valid PGP signature over release commit e48ac7ce08462f5e33af6ef9deeac6fa87eef01e; the complete tag archive was then hashed. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared v0.41.0 git pin is a later deliberate step."
-        }
-      }
+      "overrides": {}
     },
     "ffmpeg": {
       "kind": "git",
@@ -46,15 +38,7 @@
         "linux",
         "windows"
       ],
-      "overrides": {
-        "linux": {
-          "kind": "archive",
-          "version": "7.1",
-          "url": "https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz",
-          "sha256": "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6",
-          "provenance": "FFmpeg release archive verified against ffmpeg-7.1.tar.xz.asc with the official ffmpeg-devel.asc full fingerprint FCF986EA15E6E293A5644F10B4322F04D67658D8 before recording this digest. Carried over from plezy's linux/packaging/native-inputs.json; converging linux onto the shared n8.0.1 git pin is a later deliberate step."
-        }
-      }
+      "overrides": {}
     },
     "libass": {
       "kind": "git",
@@ -146,25 +130,17 @@
     },
     "dav1d": {
       "kind": "git",
-      "version": "1.5.3",
-      "url": "https://code.videolan.org/videolan/dav1d",
-      "ref": "1.5.3",
-      "commit": "b546257f770768b2c88258c533da38b91a06f737",
-      "provenance": "Official VideoLAN GitLab annotated tag object 0664c109d1b85503bc32bf89920f951cacf5702e (1.5.3) dereferences to this root commit; the pinned version is carried over from libmpv-android's depinfo.",
+      "version": "1.5.4",
+      "url": "https://code.videolan.org/videolan/dav1d.git",
+      "mirror": "https://github.com/videolan/dav1d.git",
+      "ref": "1.5.4",
+      "commit": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
+      "provenance": "Official VideoLAN GitLab tag record 1.5.4 dereferences to this root commit; upstream's own GitHub mirror (videolan/dav1d, not a fork) reports the same annotated tag object 191bdda98ec3c68137754dc97da1db34043d7cd4 dereferencing to that same commit. The tag is annotated by the dav1d maintainers but not GPG-verified by GitHub; the two independent remotes agreeing on the tag object and root commit is the pinning evidence. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Shared by android and linux since android moved up from 1.5.3.",
       "platforms": [
         "android",
         "linux"
       ],
-      "overrides": {
-        "linux": {
-          "version": "1.5.4",
-          "url": "https://code.videolan.org/videolan/dav1d.git",
-          "mirror": "https://github.com/videolan/dav1d.git",
-          "ref": "1.5.4",
-          "commit": "54706fc6bc0cdecab7e9593974a4039cc038fca7",
-          "provenance": "Official VideoLAN GitLab tag record 1.5.4 dereferences to this root commit; upstream's own GitHub mirror (videolan/dav1d, not a fork) reports the same annotated tag object 191bdda98ec3c68137754dc97da1db34043d7cd4 dereferencing to that same commit. The tag is annotated by the dav1d maintainers but not GPG-verified by GitHub; the two independent remotes agreeing on the tag object and root commit is the pinning evidence. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way."
-        }
-      }
+      "overrides": {}
     },
     "shaderc": {
       "kind": "git",
@@ -379,20 +355,21 @@
       "overrides": {
         "android": {
           "kind": "git",
-          "version": "7.360.0",
-          "url": "https://code.videolan.org/videolan/libplacebo",
-          "ref": "v7.360.0",
-          "commit": "b2ea27dceb6418aabfe9121174c6dbb232942998",
-          "provenance": "Official VideoLAN GitLab annotated tag object 2948be2e7bdb8797a3026677fd84e8c106107ff8 (v7.360.0) dereferences to this root commit; its gitlinks pin the recursive submodules the android driver clones."
+          "version": "7.360.1",
+          "url": "https://code.videolan.org/videolan/libplacebo.git",
+          "mirror": "https://github.com/haasn/libplacebo.git",
+          "ref": "v7.360.1",
+          "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+          "provenance": "Official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit; upstream's own author repository (haasn/libplacebo, not a fork) reports the same tag object and commit. Its gitlinks are identical to v7.360.0's, which the android driver already cloned recursively. Ships the OpenGL sync-object leak fix (upstream c93aa134) the android series used to carry."
         },
         "linux": {
           "kind": "git",
-          "version": "7.351.0",
+          "version": "7.360.1",
           "url": "https://code.videolan.org/videolan/libplacebo.git",
           "mirror": "https://github.com/haasn/libplacebo.git",
-          "ref": "v7.351.0",
-          "commit": "3188549fba13bbdf3a5a98de2a38c2e71f04e21e",
-          "provenance": "Official VideoLAN GitLab tag record v7.351.0 contains a PGP-signed release message and dereferences to this root commit; its gitlinks pin recursive submodules. The mirror is upstream's own author repository (haasn/libplacebo, not a fork), whose annotated v7.351.0 tag object 98c1416e95b21cd767b84ac9ee430ccadf263ff6 dereferences to that same commit. It is consulted only after the primary fails, and the commit pin is verified identically either way, so it cannot introduce a different tree."
+          "ref": "v7.360.1",
+          "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
+          "provenance": "Same pin as overrides.android: official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit, and haasn/libplacebo reports the same tag object and commit. Gitlinks are identical to v7.360.0's. The mirror is consulted only after the primary fails, and the commit pin is verified identically either way. Brings the OpenGL sync-object leak fix (mpv#12708) to this GL-only build."
         }
       }
     },
