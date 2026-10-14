@@ -366,7 +366,7 @@ new file mode 100644
 index 0000000..20d005c
 --- /dev/null
 +++ b/audio/out/ao_spatial.swift
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,277 @@
 +@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
 +import Synchronization
 +
@@ -532,7 +532,8 @@ index 0000000..20d005c
 +}
 +
 +// AVAudioSession is process-wide. Overlapping mpv outputs share the session
-+// and the last close restores the configuration observed by the first open.
++// and the last close restores settings still matching those it installed.
++// Matching values cannot reveal whether another caller touched the session.
 +@available(macOS 26, iOS 26, tvOS 26, *)
 +private enum SpatialSession {
 +    #if os(iOS) || os(tvOS)
@@ -578,12 +579,21 @@ index 0000000..20d005c
 +            let session = AVAudioSession.sharedInstance()
 +            // Activation is idempotent, but there is no public isActive query.
 +            // The host may already own this session; only it may deactivate it.
-+            do {
-+                try session.setCategory(state.category, mode: state.mode, options: state.options)
-+            } catch { NSLog("[ao_spatial] Cannot restore audio session category: %@", String(describing: error)) }
-+            do {
-+                try session.setSupportsMultichannelContent(state.multichannel)
-+            } catch { NSLog("[ao_spatial] Cannot restore multichannel setting: %@", String(describing: error)) }
++            let restoreMultichannel = session.supportsMultichannelContent
++            // setCategory writes all three values, so preserve the whole group
++            // if any current value differs from what we installed.
++            if session.category == .playback,
++               session.mode == .moviePlayback,
++               session.categoryOptions.isEmpty {
++                do {
++                    try session.setCategory(state.category, mode: state.mode, options: state.options)
++                } catch { NSLog("[ao_spatial] Cannot restore audio session category: %@", String(describing: error)) }
++            }
++            if restoreMultichannel {
++                do {
++                    try session.setSupportsMultichannelContent(state.multichannel)
++                } catch { NSLog("[ao_spatial] Cannot restore multichannel setting: %@", String(describing: error)) }
++            }
 +        }
 +        #endif
 +    }

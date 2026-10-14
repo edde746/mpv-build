@@ -468,13 +468,15 @@ SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
 the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are
 folded into `Libmpv`; that source pin is part of libmpv's content key. There is
 no application callback or separate SpatialAudioBridge package. The binary
-includes the silent Atmos clip and its license notices. Audio-session settings
-are restored after the last overlapping output closes, before mpv opens a
-fallback output. Opening activates the session; closing never deactivates it,
-because the host may already own activation. Deactivation remains the host
+includes the silent Atmos clip and its license notices. When the last overlapping
+output closes, it restores audio-session settings that still match what it
+installed: category, mode and options as one group, multichannel independently.
+Differing host settings are preserved. Matching values cannot prove that another
+caller left the session untouched. Opening activates the session; closing never
+deactivates it, because the host may already own activation. Deactivation remains the host
 application's responsibility. `bash scripts/test_spatial_session.sh` exercises
-active/inactive host sessions, overlapping outputs and configuration rollback
-with a fake session, without playing audio.
+active/inactive host sessions, host configuration changes, overlapping outputs
+and failed-open rollback with a fake session, without playing audio.
 
 The Rust core is built as a staticlib alone with fat LTO, then prelinked into
 one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak

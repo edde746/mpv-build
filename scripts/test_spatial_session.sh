@@ -36,6 +36,38 @@ for initiallyActive in [true, false] {
     precondition(session.categoryCalls == 2)
     checkRestored()
 }
+// Each setting independently protects the whole setCategory group. Even a
+// host change back to the original group must not cause a redundant write.
+let hostConfigurations: [(AVAudioSession.Category, AVAudioSession.Mode, AVAudioSession.CategoryOptions)] = [
+    (.ambient, .moviePlayback, []),
+    (.playback, .default, []),
+    (.playback, .moviePlayback, [.mixWithOthers]),
+    (.ambient, .default, [.mixWithOthers]),
+]
+for (category, mode, options) in hostConfigurations {
+    try SpatialSession.acquire()
+    try SpatialSession.acquire()
+    try session.setCategory(category, mode: mode, options: options)
+    let hostCategoryCalls = session.categoryCalls
+    SpatialSession.release()
+    precondition(session.categoryCalls == hostCategoryCalls && session.supportsMultichannelContent)
+    SpatialSession.release()
+    precondition(session.categoryCalls == hostCategoryCalls)
+    precondition(session.category == category && session.mode == mode && session.categoryOptions == options)
+    precondition(!session.supportsMultichannelContent) // unchanged setting restores independently
+    precondition(session.active && session.deactivationCalls == 0)
+    try session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+}
+// A host multichannel change must survive even when the saved value was true.
+try session.setSupportsMultichannelContent(true)
+try SpatialSession.acquire()
+try SpatialSession.acquire()
+try session.setSupportsMultichannelContent(false)
+SpatialSession.release()
+precondition(session.category == .playback && !session.supportsMultichannelContent)
+SpatialSession.release()
+checkRestored() // unchanged category group restores; host's false remains
+precondition(session.active && session.deactivationCalls == 0)
 session.active = false
 session.refuseActivation = true
 do {
@@ -49,7 +81,7 @@ try SpatialSession.acquire()
 SpatialSession.release()
 checkRestored() // a failed acquire must not leak a lease
 precondition(session.active && session.deactivationCalls == 0)
-print("session ownership, overlapping leases and failed-open rollback passed")
+print("session activation, conditional restoration, overlapping leases and failed-open rollback passed")
 SWIFT
 xcrun swiftc -swift-version 6 -target "$(uname -m)-apple-macos26.0" \
     "$work/main.swift" -o "$work/test"
