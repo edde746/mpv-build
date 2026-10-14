@@ -483,11 +483,29 @@ runtime while preserving decoder panic handling. The build checks the exported
 symbols and weak personality for every supported slice.
 After a full platform build, `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`
 checks the installed slices and links their sink with force-loaded libdovi,
-without media. The prelink log also records the Mach-O platform and minimum OS.
+without media. It also links an Objective-C-only Clang consumer using the
+packaged `mpv.pc`, including a toolchain path containing spaces. The prelink
+log records the Mach-O platform and minimum OS.
 The SwiftPM wrapper contains Swift source so C/Objective-C consumers also get
 the Swift runtime and back-deployment libraries. After packaging,
 `bash scripts/test_spatial_swiftpm.sh <release-dir>` links an Objective-C-only
 app on iOS and tvOS against the packaged frameworks (requires XcodeGen).
+
+Static pkg-config consumers must configure the install paths in
+`pkgconfig-example` and select their Xcode toolchain. `mpv.pc` supplies both
+Swift runtime and platform-specific compatibility-library flags; its distributed
+`swift_toolchain` value is a placeholder, not the build machine's Xcode path.
+Set that variable in the installed file or override it when invoking pkg-config:
+
+```bash
+swift_compiler="$(xcrun --find swiftc)"
+swift_toolchain="$(dirname "$(dirname "$(dirname "$swift_compiler")")")"
+pkg-config --define-variable="swift_toolchain=$swift_toolchain" --static --libs mpv
+```
+
+Use the metadata for the target slice: device and simulator Swift libraries
+live in different toolchain directories. The selected Xcode must be compatible
+with the compiler used to build the binaries.
 
 Spatial playback requires OS 26 and a supported Rust target: arm64 tvOS and
 its simulator, or iOS and its simulators. macOS, Mac Catalyst, arm64e and Intel

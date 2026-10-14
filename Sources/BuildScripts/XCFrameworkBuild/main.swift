@@ -222,10 +222,15 @@ private class BuildMPV: BaseBuild {
             // The private libraries are now inside libmpv.a; installed clients
             // must not need the build-only pkg-config dependency.
             let pkgConfig = thinDir(platform: platform, arch: arch) + "lib/pkgconfig/mpv.pc"
+            let swiftCompiler = try Utility.launch(path: "/usr/bin/xcrun", arguments: ["--find", "swiftc"], isOutput: true)
+            let swiftToolchain = URL(fileURLWithPath: swiftCompiler)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            let swiftLinkFlags = " -L\"${swift_toolchain}/usr/lib/swift/\(platform.sdk.lowercased())\""
+                + " -L/usr/lib/swift -framework Accelerate"
             let text = try String(contentsOf: pkgConfig, encoding: .utf8)
             let lines = text.components(separatedBy: "\n").map { line in
                 if line.hasPrefix("Libs.private:") {
-                    return line + " -L/usr/lib/swift -framework Accelerate"
+                    return line + swiftLinkFlags
                 }
                 guard line.hasPrefix("Requires:") || line.hasPrefix("Requires.private:"),
                       let colon = line.firstIndex(of: ":") else { return line }
@@ -235,8 +240,8 @@ private class BuildMPV: BaseBuild {
                 return String(line[...colon]) + " " + dependencies.joined(separator: ", ")
             }
             let extra = lines.contains { $0.hasPrefix("Libs.private:") }
-                ? "" : "Libs.private: -L/usr/lib/swift -framework Accelerate\n"
-            try (lines.joined(separator: "\n") + extra)
+                ? "" : "Libs.private:" + swiftLinkFlags + "\n"
+            try ("swift_toolchain=\(swiftToolchain.path)\n" + lines.joined(separator: "\n") + extra)
                 .write(to: pkgConfig, atomically: true, encoding: .utf8)
         }
     }
@@ -253,6 +258,17 @@ private class BuildMPV: BaseBuild {
     override func packagePkgConfigRelease() throws {
         try super.packagePkgConfigRelease()
         // This hook runs after the release tree is created, before it is zipped.
+        for platform in BaseBuild.platforms {
+            for arch in architectures(platform) where spatialTarget(platform: platform, arch: arch) != nil {
+                let pkgConfig = URL.currentDirectory
+                    + ["release/libmpv/pkgconfig-example", platform.rawValue, arch.rawValue, "mpv.pc"]
+                let text = try String(contentsOf: pkgConfig, encoding: .utf8)
+                // Consumers select their toolchain; never distribute the builder's Xcode path.
+                try text.replacingOccurrences(of: "(?m)^swift_toolchain=.*$",
+                    with: "swift_toolchain=/path/to/Swift.xctoolchain", options: .regularExpression)
+                    .write(to: pkgConfig, atomically: true, encoding: .utf8)
+            }
+        }
         for platform in BaseBuild.platforms {
             let notices = spatialDirectory(platform: platform, arch: .arm64) + "ThirdPartyNotices.txt"
             if FileManager.default.fileExists(atPath: notices.path) {
