@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compile the codec profile the Android demuxers publish at file load
-# (mp_codec_profile_from_extradata, patch 0005) and check it against the
+# Compile the codec profile the demuxers publish at file load
+# (mp_codec_profile_from_extradata, patch 0204) and check it against the
 # profile mpv publishes once the decoder has output a frame: the pinned
 # FFmpeg's software H.264 and HEVC decoders decode the first access unit of
 # each sample and mp_codec_info_from_av names their profile. A minimal host
@@ -110,7 +110,7 @@ fi
 
 # The pin contract lives in scripts/patches.py: it resolves the
 # override-aware pin, clones the ref, proves HEAD is the pinned commit and
-# applies the resolved android series (0005 is Android's).
+# applies the resolved android series (0204 is in series.common).
 if [[ -z "$mpv_dir" ]]; then
     mpv_dir="$workdir/mpv"
     (cd "$root" && python3 scripts/patches.py fetch-pinned mpv android "$mpv_dir")

@@ -9,17 +9,17 @@
 0035-demux-dts-codec-profile-at-load.patch
 # Codec profile at load and the pending-vid property, for the per-file decode
 # routing an embedder decides before the decoder exists.
-0005-demux-codec-profile-from-avcc-and-hvcc.patch
+0204-demux-codec-profile-from-avcc-and-hvcc.patch
 0010-player-pending-vid-property.patch
 # GLES renderers (Android, Linux ARM boards, ANGLE). Desktop GL is untouched.
-0003-opengl-treat-gles-direct-rendering-as-slow.patch
-0004-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
+0202-opengl-treat-gles-direct-rendering-as-slow.patch
+0203-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
 # The subtitle stack: libass threading and fast blur (both from the patched
 # libass every group builds), the faster draw_bmp blend, rendering outside the
 # OSD and dec_sub locks, and the shared ahead-of-time render pipeline
 # vo_mediacodec and vo_avfoundation present through.
-0006-sd-ass-render-threads.patch
-0006-sd-ass-fast-blur.patch
+0205-sd-ass-render-threads.patch
+0206-sd-ass-fast-blur.patch
 0008-draw-bmp-fast-libass-blend.patch
 0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
 0011-sub-render-horizon-for-vo-prefetch.patch

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Compile the marked, freestanding Dolby Vision packet filter VERBATIM from the
 # ffmpeg patch's post-image, following test_mediacodec_timing.sh. Keep changes
-# to this region in patch 0001: extracting it here cannot see edits in later
+# to this region in patch 0101: extracting it here cannot see edits in later
 # patches. libavutil and libdovi are stubbed by the test.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 E="$root/scripts/extract.py"
-patch_file="$root/patches/ffmpeg/pool/0001-mediacodec-dolby-vision.patch"
+patch_file="$root/patches/ffmpeg/pool/0101-mediacodec-dolby-vision.patch"
 # The profile 7 to 8.1 conversion the filter calls; see patch 0021.
 helper_file="$root/patches/ffmpeg/pool/0021-dolby-vision-convert-profile7-rpu-to-p81.patch"
 

@@ -1,5 +1,5 @@
 // Behavioral regressions for the exact freestanding Dolby Vision access-unit
-// filter extracted from ffmpeg patch 0001 by test_mediacodec_dv_filter.sh.
+// filter extracted from ffmpeg patch 0101 by test_mediacodec_dv_filter.sh.
 // libavutil's buffer/packet API and libdovi are stubbed with counting fakes;
 // the access units are hand-built Annex B HEVC.
 #include <errno.h>

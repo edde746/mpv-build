@@ -1,5 +1,5 @@
 // Simulation test for the vo_avfoundation timebase servo
-// (patch/libmpv/0016-avfoundation-timebase-rate-servo.patch).
+// (patches/mpv/pool/0004-avfoundation-video-output.patch).
 //
 // The servo and playback-rate decision code is compiled VERBATIM from the
 // patched mpv source. The harness mirrors the surrounding bookkeeping and

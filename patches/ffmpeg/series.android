@@ -1,17 +1,17 @@
 # Android patch series for ffmpeg, applied after series.common. One pool
 # filename per line; order is authoritative and nothing is sorted.
-0001-mediacodec-dolby-vision.patch
-0003-mediacodec-av1-refuse-non-main-profiles.patch
-0004-mediacodec-size-input-buffers-for-access-units.patch
+0101-mediacodec-dolby-vision.patch
+0103-mediacodec-av1-refuse-non-main-profiles.patch
+0104-mediacodec-size-input-buffers-for-access-units.patch
 0006-mediacodec-select-decoder-despite-profile-mismatch.patch
 0007-mediacodec-read-output-crop-on-mediatek.patch
-0008-mediacodec-frame-rendered-feedback.patch
-0009-mediacodec-eagain-for-polling-host.patch
-0010-mediacodec-live-output-surface.patch
-0011-mediacodec-real-time-rate-and-nonref-shedding.patch
-# 0012 refines 0009's registration into the asynchronous mode the app asks
+0108-mediacodec-frame-rendered-feedback.patch
+0109-mediacodec-eagain-for-polling-host.patch
+0110-mediacodec-live-output-surface.patch
+0111-mediacodec-real-time-rate-and-nonref-shedding.patch
+# 0012 refines 0109's registration into the asynchronous mode the app asks
 # for with async, and restores the priority MediaFormat key that
-# belongs beside the operating rate 0011 declares.
+# belongs beside the operating rate 0111 declares.
 0012-mediacodec-async-decode-and-priority.patch
 0024-mediacodec-jni-async-and-feedback.patch
 0025-mediacodec-skip-flush-before-first-input.patch

@@ -1,15 +1,252 @@
-From 362b6eabb164c6fd9e2f9fb771754c615a39cbae Mon Sep 17 00:00:00 2001
-From: Alex Kim <alexkim@Alexs-MacBook-Pro.local>
-Date: Sat, 23 Aug 2025 20:11:28 +1000
-Subject: [PATCH] AVfoundation video output
+vo_avfoundation: AVFoundation video output
 
----
- meson.build                 |   15 +
- meson.options               |    1 +
- video/out/vo.c              |    4 +
- video/out/vo_avfoundation.m | 2818 +++++++++++++++++++++++++++++++++++
- 4 files changed, 2838 insertions(+)
- create mode 100644 video/out/vo_avfoundation.m
+The whole of vo_avfoundation.m, which no upstream mpv carries. Every change
+to the file lives here instead of in a follow-up patch: a follow-up applies
+by context, so a version bump that breaks one would cascade through every
+later one, while a single file creation cannot conflict at all.
+
+The original patch:
+
+    From: Alex Kim <alexkim@Alexs-MacBook-Pro.local>
+    Date: Sat, 23 Aug 2025 20:11:28 +1000
+    Subject: [PATCH] AVfoundation video output
+
+Folded in, in series order:
+
+* 0007-avfoundation-osd-performance
+
+* 0008-avfoundation-coremedia-source-timebase
+
+* 0009-avfoundation-sw-frame-upload-performance
+
+* 0011-avfoundation-high-speed-playback
+
+* 0012-avfoundation-layer-resize-tracking
+
+* 0014-avfoundation-preserve-dolby-vision-transfer:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Mon, 13 Jul 2026 22:38:36 +0200
+    Subject: [PATCH] fix(avfoundation): preserve Dolby Vision transfer metadata
+
+* 0016-avfoundation-timebase-rate-servo:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Sat, 8 Aug 2026 20:07:53 +0200
+    Subject: [PATCH] fix(avfoundation): slew the media timebase instead of
+     snapping on drift
+
+    mpv schedules video against its playback clock (the audio clock), while
+    the CMTimebase driving AVSampleBufferDisplayLayer presentation runs on
+    the CoreMedia host clock. On real hardware those clocks skew and wander.
+    A fixed-rate timebase therefore accumulates phase error, while correcting
+    that error with a hard re-anchor repeats, skips, or drops a queued frame.
+    That is the recurring micro-stutter of plezy#1776.
+
+    Replace the snap-only correction with a bounded PI servo. The
+    proportional term retires phase error over a 2s horizon; the integral term
+    absorbs constant clock skew. Corrections are capped at +-1.5%, rate writes
+    are throttled, and >50ms discontinuities still re-anchor promptly.
+
+    Do not infer playback speed from frame presentation deadlines. tvOS
+    compressed-audio playback produces bursty deadlines (observed frame gaps
+    from 34ms to 70ms at a constant 1x rate); the old inference treated those
+    as speed changes and hard re-anchored repeatedly. Estimate nominal speed
+    from media-PTS deltas divided by mpv's speed-adjusted frame durations,
+    averaged over 500ms to remove timestamp quantization. Two coherent
+    samples fast-track large real speed changes. Scheduling discontinuities
+    no longer overwrite the nominal rate.
+
+    Keep the servo and rate estimator freestanding so the simulation harness
+    compiles the production code verbatim. It covers clock skew and wander,
+    route-change steps, speed changes, timestamp jitter, and recurring 30ms
+    deadline bursts. The burst trace produces 823 spurious anchors in the old
+    model and zero with frame-duration rate estimation.
+
+    The 5s pacing diagnostics report rate updates, applied offset in ppm, and
+    the window's peak phase error.
+
+* 0017-avfoundation-keep-displayed-frame-on-seek:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Sun, 9 Aug 2026 15:49:37 +0200
+    Subject: [PATCH] fix(avfoundation): keep the displayed frame across seek
+     resets
+
+    Every seek fires VOCTRL_RESET (vo_seek_reset()), which the VO answered
+    with flushAndRemoveImage on the display layer. Removing the displayed
+    image blanks the AVSampleBufferDisplayLayer to black until the first
+    post-seek frame makes it through demux and decode, so every skip
+    flashed black for the seek latency -- glaring on tvOS where seeks ride
+    the network (plezy#1803). Reference VOs (gpu/gpu-next) hold the last
+    rendered frame through a seek.
+
+    Flush without removal instead: queued-but-undisplayed samples are still
+    discarded, but the on-screen frame holds until the first frame at the
+    new position re-anchors the timebase and replaces it. The OSD layer
+    keeps removing its image so a stale subtitle doesn't linger over the
+    held frame, and uninit still removes the image on teardown.
+
+* 0018-avfoundation-refuse-geometry-render-for-dolby-vision:
+
+    From: Edvard Wikhall <edvard@wikhall.com>
+    Date: Sun, 10 Aug 2026 14:20:00 +0200
+    Subject: [PATCH] fix(avfoundation): refuse geometry rendering for Dolby
+     Vision passthrough frames
+
+    Nonzero --video-zoom/--video-pan-* switch the VO to a per-frame Core
+    Image re-render. Apple Dolby Vision passthrough buffers (native dvh1
+    decode sessions) carry per-frame RPU metadata that only survives an
+    untouched enqueue into AVSampleBufferDisplayLayer; re-rendered frames
+    feed the DV display pipeline data the RPU no longer describes and the
+    picture collapses to near-black (observed on tvOS in DV-Lowlatency
+    HDMI mode).
+
+    Skip geometry rendering for buffers carrying DolbyVisionRPUData and
+    warn once: an unzoomed but correct picture beats a destroyed one.
+    Hosts that need viewer zoom on this VO should scale the display layer
+    instead.
+
+* 0024-avfoundation-frame-space-osd-in-pip
+
+* 0030-avfoundation-hdr10plus-per-frame-metadata:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Sun, 20 Sep 2026 23:50:00 +0200
+    Subject: [PATCH] vo_avfoundation: attach HDR10+ per-frame metadata to display samples
+
+    Companion to the ffmpeg patch that forwards HEVC prefix SEIs to
+    VideoToolbox (plezy#2404). HEVC carries HDR10+ (SMPTE ST 2094-40) as a
+    per-frame T.35 user-data SEI; FFmpeg parses it into
+    AV_FRAME_DATA_DYNAMIC_HDR_PLUS on every decoded frame, hwaccel included,
+    and mpv keeps that side data on the mp_image. It travels no further on its
+    own: Core Video only has attachment keys for the static HDR10 metadata.
+
+    AVSampleBufferDisplayLayer accepts HDR10+ from one documented place, the
+    per-sample attachment kCMSampleAttachmentKey_HDR10PlusPerFrameData: the
+    SEI payload as sent, starting at itu_t_t35_country_code, which overrides
+    whatever the decoder attached to the pixel buffer. Serialize the parsed
+    metadata back with av_dynamic_hdr_plus_to_t35 into a per-VO scratch and
+    set it on each enqueued video sample. Applies to the geometry and
+    composite render outputs as well: those keep the frame's PQ tags and the
+    metadata describes the scene, not the pixel grid.
+
+    Dolby Vision frames are skipped - their RPU is the dynamic metadata the DV
+    pipeline presents - as are non-PQ transfers, and a pixel buffer that
+    already carries DolbyVisionRPUData. One-shot info log on the first attached
+    frame; one-shot warning when the OS is too old (pre-16) or the payload
+    cannot be serialized, in which case playback continues as HDR10.
+
+* 0032-avfoundation-render-subtitles-through-the-shared-osd-pipeline:
+
+    avfoundation: render subtitles through the shared osd_ahead pipeline
+
+    On Apple TV a subtitle frame that took longer than the queue lead to render
+    made the video late with it: flip_page rendered the frame's subtitles on the
+    VO thread and enqueued the video sample only afterwards. A heavy sign (the
+    Ex2 sample, 105-122 ms on an Apple TV 4K) cost a late video frame every
+    time it appeared.
+
+    Render them on the shared render-ahead pipeline (osd_ahead.[ch], as
+    vo_mediacodec does): draw_frame files the frame's request as soon as the
+    frame is known, the pipeline pre-renders the frame its cadence predicts
+    next and, while the OSD is static, the next subtitle event on a separate
+    renderer (0013), and flip_page presents the result. flip_page waits for it
+    only as avf_osd_wait_until allows: a timed frame keeps half its queue lead
+    for the video, and does not wait at all while the render thread is still
+    on an older frame; subtitles that arrive later are shown with a later
+    frame, and of several ready results only the newest is drawn. The composite
+    modes wait as the synchronous path did. When the render thread cannot
+    start, the synchronous path renders as before.
+
+    While paused no later frame comes. A frame shown while paused (a seek) has
+    no queue lead to protect and waits like a redraw, and a result that still
+    arrives after its frame wakes the VO thread, which redraws the frame on
+    screen with it without filing a new request.
+
+    The inline overlay now draws every item of a frame's list into one buffer;
+    before, a second item (the OSD, a secondary subtitle) replaced the first.
+
+* 0037-avfoundation-skip-redundant-per-frame-metadata:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Tue, 13 Oct 2026 12:30:00 +0200
+    Subject: [PATCH] vo_avfoundation: stop rewriting buffer metadata that already
+     matches
+
+    Two per-frame calls in create_video_sample_buffer() repeated work that
+    was already done.
+
+    tag_pixel_buffer_pixel_aspect() removed the pixel aspect attachment from
+    every square-pixel frame. On a VideoToolbox passthrough buffer FFmpeg
+    has just written the frame's sample aspect ratio there, 1:1 for a
+    square-pixel stream, and removing an attachment from an IOSurface-backed
+    buffer is a kernel round trip (0.9 ms of CPU per second of 4K playback).
+    Read the attachment first and only write or remove it when its ratio
+    differs from the one wanted; a missing attachment counts as square, and
+    a 1:1 one now stays.
+
+    The cached format description was checked with
+    CMVideoFormatDescriptionMatchesImageBuffer() before every
+    CMSampleBufferCreateReadyWithImageBuffer(), which runs the same check
+    itself and fails with kCMSampleBufferError_InvalidMediaFormat on a
+    mismatch (0.8 ms/s). Create the sample buffer against the cached
+    description directly, and rebuild the description and retry only when
+    that call refuses it.
+
+* 0038-avfoundation-wait-for-renderer-readiness:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Tue, 13 Oct 2026 13:00:00 +0200
+    Subject: [PATCH] vo_avfoundation: wait for renderer readiness instead of
+     polling it
+
+    When the display layer's renderer was not ready for more media data,
+    wait_until_ready_for_more_media_data() slept 1 ms at a time and asked
+    isReadyForMoreMediaData again until the renderer was ready or the
+    frame's deadline passed. About half the frames meet a full renderer: on
+    a 4K HDR10 HEVC file the VO reported 56-72 ready-waits per 5 s averaging
+    5.8-7.0 ms, so the VO thread woke about 80 times a second only to poll,
+    and the player process ran at 136-147 wakeups/s where AVPlayer runs at
+    31. At speed=2 nearly every frame waits, about 22 ms each, and the
+    player ran at 828 wakeups/s.
+
+    Arm requestMediaDataWhenReadyOnQueue: for the wait instead. The renderer
+    runs the block once it is ready, at once if it already is, so readiness
+    that arrives between the check and the request is not missed, and the
+    block signals a semaphore the VO thread sleeps on. Each wait sleeps at
+    most 20 ms and never past the frame's give-up time, and the loop
+    re-checks readiness, recovery and the deadline after every wait as
+    before, so deadline drops and layer recovery keep their behaviour.
+
+    The block disarms the request itself, because a block that returns
+    without enqueueing is run again at once (1.5 million times in 300 ms in
+    a standalone test). stopRequestingMediaData drops the renderer's
+    reference to the block while the block is still running, so a block
+    only the renderer holds reads its captured semaphore from freed memory
+    after the stop: a standalone loop doing that crashes in
+    dispatch_semaphore_signal within a second. The wait therefore holds its
+    own copy of the block, which runs on a private serial queue, and drains
+    that queue after stopping the request before releasing the copy; that
+    also covers an invocation that began just before a timed-out wait
+    stopped the request. The same loop then ran 16,500 waits under
+    MallocScribble and Guard Malloc without a fault.
+
+    A renderer that fails without becoming ready need not run the block, so
+    a wait can now reach the deadline without having seen a failure the 1
+    ms poll would have caught. Check for a failed layer before declaring the
+    deadline missed, so such a frame is recovered and enqueued rather than
+    dropped.
+
+    MPVBuildBench cell, 1280x720 pt window, 45 s measured, wakeups/s of the
+    player process, every run without a dropped frame:
+
+      hevc-4k-hdr10.mp4, 4 alternating pairs       136-147 -> 85.1-85.4
+      hevc-4k-hdr10-90m.mp4 at speed=2                 828 -> 85
+
+    With the patch the VO still reports 38-51 ready-waits per 5 s averaging
+    6.2-7.7 ms on the first file, and 124-129 averaging 32-33 ms at speed=2,
+    with no deadline drops.
 
 diff --git a/meson.build b/meson.build
 index f6f8e7f..55612b4 100644
@@ -73,10 +310,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..f3f96cd
+index 0000000..d2736e7
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,2708 @@
+@@ -0,0 +1,4608 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -97,13 +334,22 @@ index 0000000..f3f96cd
 +#include <math.h>
 +#include <stdlib.h>
 +#include <stdatomic.h>
++#include <limits.h>
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
 +#include <libavutil/hwcontext.h>
++#include <libavutil/frame.h>
++#include <libavutil/hdr_dynamic_metadata.h>
 +#include <libavutil/hwcontext_videotoolbox.h>
++#include <libavutil/pixfmt.h>
 +#include "common/common.h"
 +#include "options/m_config.h"
 +#include "options/m_option.h"
 +#include "osdep/timer.h"
++#include "osd_ahead.h"
 +#include "vo.h"
++#include "video/fmt-conversion.h"
 +#include "video/mp_image.h"
 +#include "video/hwdec.h"
 +#include "sub/osd.h"
@@ -127,6 +373,46 @@ index 0000000..f3f96cd
 +    struct mp_rect src, dst;
 +    struct mp_osd_res osd_res;
 +};
++
++// The canvas libass lays the OSD out on (res) and the pixel size of the
++// overlay buffer it is drawn into.
++struct avf_osd_canvas {
++    int w, h;
++    struct mp_osd_res res;
++};
++
++// --- avf osd ahead policy
++
++// How long flip_page may wait for its frame's subtitles before it enqueues
++// the video without them, as an mp_time_ns deadline (0: do not wait).
++// Subtitles render ahead on the shared pipeline's thread (osd_ahead.h), so
++// the wait is normally just the handoff of a result that is already there.
++// A timed frame keeps at least half its queue lead for the video: a slow
++// render costs the subtitle a frame, never the video. While the render
++// thread is still busy with an older frame, waiting would only buy part of
++// that render, so the frame does not wait and shows what is ready. An
++// untimed frame (a redraw, or any frame while paused) has no deadline to
++// keep and waits a bounded time; a result later than that is shown on its
++// own while paused (ahead_present_late). The composite modes draw the subtitle into the
++// video sample itself, so they wait as the synchronous path did.
++#define AVF_OSD_UNTIMED_WAIT_NS INT64_C(250000000)
++#define AVF_OSD_COMPOSITE_WAIT_NS INT64_C(1000000000)
++
++static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
++                                  int64_t queue_lead_ns, bool timed,
++                                  bool composite, bool behind)
++{
++    if (composite)
++        return now + AVF_OSD_COMPOSITE_WAIT_NS;
++    if (behind)
++        return 0;
++    if (!timed)
++        return now + AVF_OSD_UNTIMED_WAIT_NS;
++    int64_t until = present_ns - queue_lead_ns / 2;
++    return until > now ? until : 0;
++}
++
++// --- end avf osd ahead policy
 +
 +enum avf_osd_draw_path {
 +    AVF_OSD_DRAW_NONE = 0,
@@ -160,7 +446,214 @@ index 0000000..f3f96cd
 +    bool pip_composite_osd;
 +    int queue_lead_ms;
 +    int presentation;
++    int osd_max_height;
++    bool osd_video_res;
 +};
++
++// --- avf sync servo core (host-testable; keep freestanding) ---
++//
++// mpv schedules video against its playback clock (normally the audio clock),
++// while the CMTimebase driving presentation runs on the CoreMedia host
++// clock. On real hardware those clocks skew against each other, and the
++// skew wanders (HDMI audio PLLs, route renegotiation, temperature). A
++// timebase that free-runs at a fixed rate therefore accumulates error, and
++// correcting it by re-anchoring is a visible >=20ms snap: queued samples
++// are suddenly early or late by the full error, so a frame repeats, skips,
++// or is dropped by the renderer outright (#1776's recurring stutter).
++//
++// Instead, sub-threshold error is absorbed by slewing the timebase rate: a
++// PI servo that retires the error over AVF_SERVO_HORIZON_NS. Rate offsets
++// this small only shift presentation deadlines by microseconds per frame,
++// so corrections are invisible; the integral term additionally absorbs any
++// constant rate mismatch (clock skew, an imperfectly inferred playback
++// rate), so the steady-state error converges to zero instead of parking at
++// mismatch * horizon. Hard re-anchoring remains only for genuine
++// discontinuities (broken timestamps, playback-speed changes, audio-clock
++// steps after route changes).
++
++// Errors above this are discontinuities: snap the anchor instead of chasing
++// them (at the slew cap, retiring 50ms would take >3s of visibly off-sync
++// video; mpv itself hard-resyncs A/V at this scale).
++#define AVF_DRIFT_SNAP_NS      MP_TIME_MS_TO_NS(50)
++// Retire the measured error over this long: the servo's time constant.
++#define AVF_SERVO_HORIZON_NS   MP_TIME_S_TO_NS(2)
++// Cap the correction offset at +-1.5% of nominal rate.
++#define AVF_SERVO_MAX_OFFSET   0.015
++// Skip timebase updates smaller than 100ppm; quantizes the steady state to
++// ~0.2ms of error rather than churning CoreMedia every frame.
++#define AVF_SERVO_MIN_DELTA    0.0001
++// Floor between consecutive rate updates; ~10x faster than the horizon, so
++// throttling never destabilizes the loop.
++#define AVF_SERVO_UPDATE_NS    MP_TIME_MS_TO_NS(200)
++// Integral time constant: 4x the horizon critically damps the loop
++// ((s + 1/(2T))^2 closed-loop poles); larger would absorb rate mismatch
++// slower, smaller would ring.
++#define AVF_SERVO_INTEGRAL_NS  (4 * AVF_SERVO_HORIZON_NS)
++// Estimate playback rate over enough frame time to average timestamp
++// quantization. Crucially, the denominator is mpv's speed-adjusted frame
++// duration, not the frame's host scheduling deadline: the latter follows the
++// audio clock and contains wakeup jitter, buffering stalls, and A/V corrections
++// that are not playback-speed changes.
++#define AVF_RATE_WINDOW_NS        MP_TIME_MS_TO_NS(500)
++#define AVF_RATE_MIN              0.05
++#define AVF_RATE_MAX              8.0
++#define AVF_RATE_CHANGE_FRACTION  0.01
++#define AVF_RATE_FAST_FRACTION    0.04
++#define AVF_RATE_FAST_SAMPLES     2
++
++// Playback-rate estimator state. Media deltas are compared with mpv's
++// speed-adjusted frame durations, never with jittery scheduling deadlines.
++struct avf_rate_est {
++    int64_t last_media_pts_ns;
++    int64_t last_frame_duration_ns;
++    bool last_sample_valid;
++    // Averaging window for steady-state drift.
++    int64_t media_span_ns;
++    int64_t real_span_ns;
++    // Confirmation window for the large-change fast path.
++    int64_t fast_media_span_ns;
++    int64_t fast_real_span_ns;
++    int fast_sample_count;
++};
++
++// Discard partially collected windows; the last-sample pair stays valid.
++static void avf_rate_reset_windows(struct avf_rate_est *e)
++{
++    e->media_span_ns = 0;
++    e->real_span_ns = 0;
++    e->fast_media_span_ns = 0;
++    e->fast_real_span_ns = 0;
++    e->fast_sample_count = 0;
++}
++
++static bool avf_rate_sample(struct avf_rate_est *e, int64_t media_pts_ns,
++                            int64_t frame_duration_ns, double current_rate,
++                            double *rate)
++{
++    if (frame_duration_ns <= 0)
++        return false;
++
++    if (!e->last_sample_valid) {
++        e->last_media_pts_ns = media_pts_ns;
++        e->last_frame_duration_ns = frame_duration_ns;
++        e->last_sample_valid = true;
++        return false;
++    }
++
++    int64_t media_delta = media_pts_ns - e->last_media_pts_ns;
++    int64_t previous_duration = e->last_frame_duration_ns;
++
++    if (media_delta == 0)
++        return false;
++
++    e->last_media_pts_ns = media_pts_ns;
++    e->last_frame_duration_ns = frame_duration_ns;
++
++    // A duration step normally means mpv's playback speed changed. Discard a
++    // partly collected old-rate window so it cannot produce an intermediate
++    // false rate. This also safely restarts estimation at VFR transitions.
++    int64_t duration_gate = MPMAX(MP_TIME_US_TO_NS(250),
++                                  llabs(previous_duration) / 100);
++    if (media_delta < 0 ||
++        llabs(frame_duration_ns - previous_duration) > duration_gate) {
++        avf_rate_reset_windows(e);
++        return false;
++    }
++
++    double instant = (double)media_delta / (double)previous_duration;
++    if (instant < AVF_RATE_MIN || instant > AVF_RATE_MAX) {
++        avf_rate_reset_windows(e);
++        return false;
++    }
++
++    // Large speed changes must not wait for the averaging window: by then a
++    // 2x schedule would already be one quarter-second away. Require two
++    // consecutive frame-duration samples so timestamp quantization or one VFR
++    // transition cannot masquerade as a speed change.
++    if (fabs(instant - current_rate) >
++            AVF_RATE_FAST_FRACTION * current_rate) {
++        if (e->fast_sample_count > 0) {
++            double fast_rate = (double)e->fast_media_span_ns /
++                               (double)e->fast_real_span_ns;
++            if (fabs(instant - fast_rate) >
++                    AVF_RATE_FAST_FRACTION * fast_rate) {
++                e->fast_media_span_ns = 0;
++                e->fast_real_span_ns = 0;
++                e->fast_sample_count = 0;
++            }
++        }
++        e->fast_media_span_ns += media_delta;
++        e->fast_real_span_ns += previous_duration;
++        e->fast_sample_count++;
++        if (e->fast_sample_count >= AVF_RATE_FAST_SAMPLES) {
++            *rate = (double)e->fast_media_span_ns /
++                    (double)e->fast_real_span_ns;
++            avf_rate_reset_windows(e);
++            return *rate >= AVF_RATE_MIN && *rate <= AVF_RATE_MAX;
++        }
++    } else {
++        e->fast_media_span_ns = 0;
++        e->fast_real_span_ns = 0;
++        e->fast_sample_count = 0;
++    }
++
++    e->media_span_ns += media_delta;
++    e->real_span_ns += previous_duration;
++    if (e->real_span_ns < AVF_RATE_WINDOW_NS)
++        return false;
++
++    *rate = (double)e->media_span_ns / (double)e->real_span_ns;
++    e->media_span_ns = 0;
++    e->real_span_ns = 0;
++    return *rate >= AVF_RATE_MIN && *rate <= AVF_RATE_MAX;
++}
++
++// Ignore implausible integration steps (scheduling stalls, first sample).
++#define AVF_SERVO_MAX_DT_NS    MP_TIME_MS_TO_NS(500)
++
++// Decide how one frame's scheduling error feeds back into the timebase.
++// error_ns: frame media pts minus the timebase's projected media time at
++// the frame's presentation time (positive = timebase behind the schedule).
++// dt_ns: host time since the previous evaluation; *integral persists
++// between calls and must be zeroed on every hard anchor.
++// Returns the rate to run at; *snap requests a hard re-anchor, *update_rate
++// requests applying the returned rate to the timebase.
++static double avf_servo_rate(int64_t error_ns, double nominal_rate,
++                             double applied_rate, int64_t now_ns,
++                             int64_t last_update_ns, int64_t dt_ns,
++                             double *integral, bool *snap,
++                             bool *update_rate)
++{
++    *snap = false;
++    *update_rate = false;
++
++    if (llabs(error_ns) > AVF_DRIFT_SNAP_NS) {
++        *snap = true;
++        return nominal_rate;
++    }
++
++    double p_term = (double)error_ns / (double)AVF_SERVO_HORIZON_NS;
++    p_term = MPCLAMP(p_term, -AVF_SERVO_MAX_OFFSET, AVF_SERVO_MAX_OFFSET);
++
++    if (dt_ns > 0 && dt_ns <= AVF_SERVO_MAX_DT_NS) {
++        *integral += p_term * (double)dt_ns / (double)AVF_SERVO_INTEGRAL_NS;
++        *integral = MPCLAMP(*integral, -AVF_SERVO_MAX_OFFSET,
++                            AVF_SERVO_MAX_OFFSET);
++    }
++
++    double offset = MPCLAMP(p_term + *integral, -AVF_SERVO_MAX_OFFSET,
++                            AVF_SERVO_MAX_OFFSET);
++    double desired = nominal_rate * (1.0 + offset);
++
++    if (fabs(desired - applied_rate) <= AVF_SERVO_MIN_DELTA * nominal_rate)
++        return applied_rate;
++    if (last_update_ns && now_ns - last_update_ns < AVF_SERVO_UPDATE_NS)
++        return applied_rate;
++
++    *update_rate = true;
++    return desired;
++}
++// --- end avf sync servo core ---
 +
 +struct priv {
 +    struct mp_hwdec_ctx hwctx;
@@ -177,6 +670,8 @@ index 0000000..f3f96cd
 +    int64_t next_present_host_ns;
 +    int64_t next_media_pts_ns;
 +    bool next_media_pts_valid;
++    double next_timebase_rate;
++    bool next_timebase_rate_valid;
 +    __strong AVSampleBufferDisplayLayer *displayLayer;
 +
 +    // OSD/Subtitle support (timed AVSampleBufferDisplayLayer overlay mode)
@@ -189,6 +684,59 @@ index 0000000..f3f96cd
 +    CVPixelBufferPoolRef osdPool;
 +    int osd_pool_w, osd_pool_h;
 +    bool osd_needs_enqueue;
++
++    // Subtitles render ahead on the shared pipeline's thread (osd_ahead.h)
++    // and flip_page presents the results. When that thread cannot start,
++    // render_osd renders synchronously instead.
++    struct osd_ahead ahead;
++    struct osd_cadence ahead_cadence;        // VO thread
++    struct avf_osd_canvas ahead_canvas;      // written under ahead.lock
++    bool ahead_canvas_valid;
++    struct avf_osd_canvas ahead_render_canvas; // render thread, latched
++    uint64_t ahead_frame_seq;                // VO thread
++    double ahead_last_pts;                   // pts of the last request
++    struct {
++        bool valid, timed;
++        uint64_t seq, epoch;
++    } ahead_req;                             // this frame's request
++    // The last frame flip_page enqueued, kept for a paused redraw with a
++    // result that arrived after it (ahead_present_late).
++    struct mp_image *ahead_shown_image;      // VO thread
++    bool ahead_replay;                       // VO thread: redraw, no request
++    atomic_bool ahead_paused;                // mirrors ahead.paused
++    atomic_bool ahead_late_result;           // render thread -> VO thread
++    struct {
++        int presented, waited, gave_up, behind, dropped, late, max_late;
++        int64_t wait_ns, wait_max_ns;
++    } ahead_perf;
++
++    // Per-IOSurface dirty-rect tracking for partial OSD buffer clears. Pool
++    // buffers are recycled with their previous contents intact and this code
++    // is their only writer, so remembering what was last drawn into each
++    // backing surface lets the clear touch just those rows instead of the
++    // whole display-sized buffer. The CFRetain on the surface pins its
++    // pointer so an entry can never alias a different (recycled) surface.
++    struct osd_buf_state {
++        IOSurfaceRef surf;     // CFRetained
++        struct mp_rect dirty;  // drawn region from the surface's last use
++        int64_t last_used_ns;
++    } osd_buf_states[4];
++    int osd_buf_state_count;
++
++    // OSD performance counters; accumulation is unconditional (cheap),
++    // formatted output is gated on -v.
++    struct {
++        int renders, skipped, empty, frames;
++        int64_t total_ns, max_ns;
++        int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
++        int64_t enqueue_ns, video_sample_ns;
++        // Scheduling margin of enqueued OSD samples: sample PTS minus the
++        // timebase position at enqueue. Negative/small lead means the
++        // presentation deadline was already missed on the CPU side.
++        int enq_count, enq_drops;
++        int64_t lead_sum_ns, lead_min_ns;
++        int64_t last_spike_ns;
++    } perf;
 +
 +    // Compositing mode support
 +    __strong id<MTLDevice> mtlDevice;
@@ -206,6 +754,14 @@ index 0000000..f3f96cd
 +    int sw_pool_w, sw_pool_h;
 +    OSType sw_pool_format;
 +
++    // Cached video format description; recreated only when the incoming
++    // image buffer stops matching (dimensions/format/attachments).
++    CMVideoFormatDescriptionRef video_format_desc;
++
++    // Serial queue the renderer runs its readiness block on; see
++    // wait_for_renderer_ready().
++    dispatch_queue_t ready_queue;
++
 +    // Frame counter for periodic maintenance
 +    int frame_count;
 +    int not_ready_drop_count;
@@ -217,6 +773,24 @@ index 0000000..f3f96cd
 +    bool timebase_anchor_valid;
 +    bool playback_paused;
 +    double timebase_rate;
++    // Rate actually applied to the CMTimebase: timebase_rate plus the
++    // servo's drift-correction offset (see avf_servo_rate()).
++    double timebase_applied_rate;
++    int64_t last_rate_update_ns;
++    // PI servo state; zeroed on every hard anchor.
++    double servo_integral;
++    int64_t last_servo_eval_ns;
++    struct avf_rate_est rate_est;
++
++    // Periodic presentation-pacing diagnostics (logged every ~5s)
++    int64_t diag_window_start_ns;
++    int diag_wait_count;
++    int64_t diag_wait_total_ns;
++    int diag_drop_count;
++    int diag_anchor_count;
++    int diag_rate_update_count;
++    // Peak |scheduling error| seen by the servo in the window.
++    int64_t diag_drift_peak_ns;
 +
 +    // Track if OSD callback was invoked this frame
 +    bool osd_callback_invoked;
@@ -228,6 +802,19 @@ index 0000000..f3f96cd
 +    // Avoid logging every frame if geometry rendering repeatedly fails.
 +    bool geometry_render_failure_logged;
 +
++    // One-shot log for refusing geometry rendering on Dolby Vision frames.
++    bool dovi_geometry_skip_logged;
++
++    // One-shot log for dropping a composite that changed the sample size.
++    bool composite_size_mismatch_logged;
++
++    // HDR10+ (SMPTE ST 2094-40) per-frame metadata, serialized once per frame
++    // into this scratch as the T.35 payload the display pipeline expects.
++    // One-shot logs: first attached frame, and a frame refused by the OS.
++    uint8_t hdr10plus_t35[6 + AV_HDR_PLUS_MAX_PAYLOAD_SIZE];
++    bool hdr10plus_attached_logged;
++    bool hdr10plus_unsupported_logged;
++
 +    // App-active presentation resync (iOS/tvOS). The system suspends the
 +    // autonomous AVSampleBufferDisplayLayer on resign-active without setting
 +    // requiresFlushToResumeDecoding, so we force a layer recovery on resume.
@@ -235,6 +822,13 @@ index 0000000..f3f96cd
 +    id app_resign_observer;
 +    bool presentation_suspended;
 +    atomic_bool pending_presentation_resync;
++
++    // Host layer resize tracking (KVO). The embedding app owns the --wid
++    // layer and resizes it directly (device rotation, external-display
++    // moves); no VOCTRL fires for that, so a KVO observer flags it and
++    // VOCTRL_CHECK_EVENTS resyncs the cached OSD geometry.
++    id layer_geometry_observer;
++    atomic_bool pending_layer_geometry_sync;
 +};
 +
 +static CGFloat get_screen_scale(void)
@@ -249,8 +843,40 @@ index 0000000..f3f96cd
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block);
 +static void clear_subtitle_cache(struct priv *p);
++static void ahead_invalidate(struct priv *p, double pts);
 +static void release_ci_compositor(struct priv *p);
 +static const struct m_sub_options avfoundation_conf;
++
++// KVO observer for host-driven resizes of the --wid display layer. The
++// callback runs on whatever thread mutates the layer (the app's main
++// thread); it must only flag the change and wake the VO thread.
++@interface MPVLayerGeometryObserver : NSObject {
++@public
++    struct vo *vo;
++}
++@end
++
++@implementation MPVLayerGeometryObserver
++- (void)observeValueForKeyPath:(NSString *)keyPath
++                      ofObject:(id)object
++                        change:(NSDictionary *)change
++                       context:(void *)context
++{
++    // KVO fires on every setter call; only real changes matter. A spurious
++    // resync flushes the OSD layer, blinking any displayed subtitle.
++    id oldValue = change[NSKeyValueChangeOldKey];
++    id newValue = change[NSKeyValueChangeNewKey];
++    if (oldValue && newValue && [oldValue isEqual:newValue])
++        return;
++
++    struct vo *target = self->vo;
++    if (!target)
++        return;
++    struct priv *p = target->priv;
++    atomic_store(&p->pending_layer_geometry_sync, true);
++    vo_wakeup(target);
++}
++@end
 +
 +static bool should_composite_into_video(struct priv *p)
 +{
@@ -262,9 +888,23 @@ index 0000000..f3f96cd
 +    return !should_composite_into_video(p);
 +}
 +
++// Whether the OSD is laid out on the video frame instead of the display layer.
++// PiP presents the enqueued samples directly, so the frame is the whole visible
++// surface: there is no window around it to place a subtitle in, and its
++// dimensions are what the system sizes the PiP window from.
++static bool should_use_frame_space_osd(struct priv *p)
++{
++    return p->opts && p->opts->pip_composite_osd;
++}
++
 +static bool should_apply_video_geometry(struct vo *vo)
 +{
++    struct priv *p = vo->priv;
 +    struct mp_vo_opts *opts = vo->opts;
++    // Frame-space presentation has no window to zoom or pan against, and a
++    // geometry render would resize the samples the PiP window follows.
++    if (should_use_frame_space_osd(p))
++        return false;
 +    // Only per-frame geometry options use Core Image; panscan and aspect
 +    // override stay on the sample-buffer/videoGravity path.
 +    return opts && (fabsf(opts->zoom) > 0.0001f ||
@@ -295,6 +935,19 @@ index 0000000..f3f96cd
 +{
 +    return format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
 +           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++}
++
++// Planar 10/12-bit 4:2:0 (what dav1d/FFmpeg emit for 10/12-bit AV1/HEVC
++// software decode) has no named IMGFMT_* constant; resolve it through the
++// generic FFmpeg mapping (same approach as vo_drm.c).
++static int imgfmt_420p10(void)
++{
++    return pixfmt2imgfmt(AV_PIX_FMT_YUV420P10);
++}
++
++static int imgfmt_420p12(void)
++{
++    return pixfmt2imgfmt(AV_PIX_FMT_YUV420P12);
 +}
 +
 +static id<AVQueuedSampleBufferRendering> active_sample_buffer_renderer(
@@ -368,6 +1021,20 @@ index 0000000..f3f96cd
 +    return converted.value;
 +}
 +
++// CMTimebase anchors must use the immediate CoreMedia source clock. mpv's
++// scheduled presentation timestamps share mp_time_ns()'s epoch, not CM host time.
++static CMTime source_time_for_mp_time(struct priv *p, int64_t target_mp_ns)
++{
++    CMClockOrTimebaseRef source = CMTimebaseCopySource(p->timebase);
++    CMTime source_now = source ? CMSyncGetTime(source) : kCMTimeInvalid;
++    if (source)
++        CFRelease(source);
++    if (!CMTIME_IS_NUMERIC(source_now))
++        source_now = CMClockGetTime(CMClockGetHostTimeClock());
++
++    return CMTimeAdd(source_now, cm_time_from_ns(target_mp_ns - mp_time_ns()));
++}
++
 +static int64_t current_media_time_ns(struct priv *p)
 +{
 +    if (p->next_media_pts_valid)
@@ -392,13 +1059,23 @@ index 0000000..f3f96cd
 +
 +static void reset_media_timing(struct priv *p)
 +{
++    p->next_present_host_ns = 0;
 +    p->next_media_pts_ns = 0;
 +    p->next_media_pts_valid = false;
++    p->next_timebase_rate = 0.0;
++    p->next_timebase_rate_valid = false;
 +    p->last_media_pts_ns = 0;
 +    p->last_media_pts_valid = false;
 +    p->timebase_anchor_valid = false;
 +    p->playback_paused = false;
-+    p->timebase_rate = 1.0;
++    // Keep the nominal rate across seeks. Unlike the frame/timestamp mapping,
++    // the player's speed persists, so the first post-seek anchor starts correct.
++    p->timebase_rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++    p->timebase_applied_rate = p->timebase_rate;
++    p->last_rate_update_ns = 0;
++    p->servo_integral = 0.0;
++    p->last_servo_eval_ns = 0;
++    p->rate_est = (struct avf_rate_est){0};
 +}
 +
 +static void update_media_timebase_for_frame(struct vo *vo)
@@ -412,28 +1089,74 @@ index 0000000..f3f96cd
 +        ? p->next_present_host_ns
 +        : now;
 +    int64_t media_pts_ns = p->next_media_pts_ns;
++
 +    double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++    bool rate_changed = false;
++    if (p->next_timebase_rate_valid && !p->playback_paused &&
++        fabs(p->next_timebase_rate - rate) >
++            AVF_RATE_CHANGE_FRACTION * rate) {
++        MP_VERBOSE(vo, "Playback rate changed from %.6f to %.6f\n",
++                   rate, p->next_timebase_rate);
++        rate = p->next_timebase_rate;
++        rate_changed = true;
++    }
 +    if (p->playback_paused)
 +        rate = 0.0;
 +
-+    bool should_anchor = !p->timebase_anchor_valid || p->playback_paused;
++    bool should_anchor = !p->timebase_anchor_valid || p->playback_paused ||
++        rate_changed;
 +
 +    if (!should_anchor) {
++        double applied = p->timebase_applied_rate > 0.0
++            ? p->timebase_applied_rate
++            : rate;
 +        int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
 +        int64_t projected_ns = timebase_ns +
-+            (int64_t)((double)(present_host_ns - now) * p->timebase_rate);
-+        should_anchor = llabs(projected_ns - media_pts_ns) > MP_TIME_MS_TO_NS(20);
++            (int64_t)((double)(present_host_ns - now) * applied);
++        int64_t error_ns = media_pts_ns - projected_ns;
++
++        if (llabs(error_ns) > p->diag_drift_peak_ns)
++            p->diag_drift_peak_ns = llabs(error_ns);
++
++        int64_t dt_ns = p->last_servo_eval_ns
++            ? now - p->last_servo_eval_ns
++            : 0;
++        p->last_servo_eval_ns = now;
++
++        bool snap = false, update_rate = false;
++        double servo = avf_servo_rate(error_ns, rate, applied, now,
++                                      p->last_rate_update_ns, dt_ns,
++                                      &p->servo_integral,
++                                      &snap, &update_rate);
++        if (snap) {
++            should_anchor = true;
++            MP_VERBOSE(vo, "Timebase %.1f ms off schedule; re-anchoring\n",
++                       error_ns / 1e6);
++            // Preserve the nominal playback rate. A scheduling discontinuity
++            // says nothing about speed; the frame-duration estimator owns it.
++        } else if (update_rate) {
++            CMTimebaseSetRate(p->timebase, servo);
++            p->timebase_applied_rate = servo;
++            p->last_rate_update_ns = now;
++            p->diag_rate_update_count++;
++        }
 +    }
 +
 +    if (should_anchor) {
++        CMTime source_time = source_time_for_mp_time(p, present_host_ns);
 +        OSStatus err = CMTimebaseSetRateAndAnchorTime(
 +            p->timebase, rate, cm_time_from_ns(media_pts_ns),
-+            cm_time_from_ns(present_host_ns));
++            source_time);
 +        if (err != noErr) {
 +            MP_WARN(vo, "Failed to anchor AVFoundation media timebase: %d\n", (int)err);
 +        }
 +        p->timebase_rate = rate;
++        p->timebase_applied_rate = rate;
++        p->last_rate_update_ns = now;
++        p->servo_integral = 0.0;
++        p->last_servo_eval_ns = 0;
 +        p->timebase_anchor_valid = true;
++        p->diag_anchor_count++;
 +    }
 +
 +    p->last_media_pts_ns = media_pts_ns;
@@ -450,14 +1173,14 @@ index 0000000..f3f96cd
 +    if (paused) {
 +        CMTime media_time = CMTimebaseGetTime(p->timebase);
 +        if (!CMTIME_IS_NUMERIC(media_time)) {
-+            media_time = cm_time_from_ns(p->last_media_pts_valid
-+                ? p->last_media_pts_ns
-+                : 0);
++            media_time = cm_time_from_ns(current_media_time_ns(p));
 +        }
++        CMTime source_time = source_time_for_mp_time(p, mp_time_ns());
 +        OSStatus err = CMTimebaseSetRateAndAnchorTime(
-+            p->timebase, 0.0, media_time, cm_time_from_ns(mp_time_ns()));
++            p->timebase, 0.0, media_time, source_time);
 +        if (err != noErr)
 +            MP_WARN(vo, "Failed to pause AVFoundation media timebase: %d\n", (int)err);
++        p->timebase_applied_rate = 0.0;
 +        return;
 +    }
 +
@@ -608,6 +1331,90 @@ index 0000000..f3f96cd
 +    vo->monitor_par = 1.0;
 +}
 +
++// --- avf frame-space osd core ---
++// PiP hands the enqueued samples themselves to the system, which sizes its
++// window from their dimensions. The OSD therefore cannot be laid out in
++// display-layer space: a plaintext subtitle sits in the letterbox margin around
++// the video by default (--sub-use-margins), which is not part of the frame, so
++// compositing it grew the sample to the layer's size and the PiP window resized
++// with every cue (plezy#2078).
++//
++// Frame-space geometry lays the OSD out on the frame's own coded grid instead:
++// margins collapse, so --sub-pos is a percentage of the presented frame, the
++// dimension-preserving composite always applies, and the Core Image fallback
++// still produces a frame-sized buffer. Non-square source pixels squeeze the
++// text exactly as the display layer stretches the frame back out, which is the
++// convention osd_res_from_image_params() uses for the same job.
++static struct avf_render_geometry avf_frame_space_geometry(int frame_w, int frame_h,
++                                                          int p_w, int p_h)
++{
++    if (frame_w <= 0 || frame_h <= 0)
++        return (struct avf_render_geometry){0};
++
++    struct mp_rect frame = {0, 0, frame_w, frame_h};
++
++    return (struct avf_render_geometry){
++        .w = frame_w,
++        .h = frame_h,
++        .src = frame,
++        .dst = frame,
++        .osd_res = {
++            .w = frame_w,
++            .h = frame_h,
++            .display_par = p_w > 0 && p_h > 0 ? p_h / (double)p_w : 1.0,
++        },
++    };
++}
++
++// Clip the cached subtitle's OSD-space bounding box against the video rect the
++// frame actually contains, then map it onto the frame's pixel grid, with a
++// pixel of slack per side for the inverse mapping the composite loop does.
++// Returns false when the box misses that rect entirely: in display-layer space
++// that means the subtitle was laid out in a letterbox margin.
++static bool avf_map_subtitle_rect(struct avf_render_geometry geometry,
++                                  struct mp_rect sub, int sub_w, int sub_h,
++                                  int frame_w, int frame_h,
++                                  struct mp_rect *out)
++{
++    struct mp_rect src = geometry.src;
++    struct mp_rect dst = geometry.dst;
++    int srcW = src.x1 - src.x0;
++    int srcH = src.y1 - src.y0;
++    int dstW = dst.x1 - dst.x0;
++    int dstH = dst.y1 - dst.y0;
++    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
++        return false;
++
++    int frame_x0 = MPCLAMP(src.x0, 0, frame_w);
++    int frame_y0 = MPCLAMP(src.y0, 0, frame_h);
++    int frame_x1 = MPCLAMP(src.x1, 0, frame_w);
++    int frame_y1 = MPCLAMP(src.y1, 0, frame_h);
++    if (frame_x1 <= frame_x0 || frame_y1 <= frame_y0)
++        return false;
++
++    int osd_x0 = MPMAX(sub.x0, MPMAX(dst.x0, 0));
++    int osd_y0 = MPMAX(sub.y0, MPMAX(dst.y0, 0));
++    int osd_x1 = MPMIN(sub.x1, MPMIN(dst.x1, sub_w));
++    int osd_y1 = MPMIN(sub.y1, MPMIN(dst.y1, sub_h));
++    if (osd_x1 <= osd_x0 || osd_y1 <= osd_y0)
++        return false;
++
++    int x0 = src.x0 + (int)(((int64_t)(osd_x0 - dst.x0) * srcW) / dstW) - 1;
++    int y0 = src.y0 + (int)(((int64_t)(osd_y0 - dst.y0) * srcH) / dstH) - 1;
++    int x1 = src.x0 + (int)((((int64_t)(osd_x1 - dst.x0) * srcW) + dstW - 1) / dstW) + 1;
++    int y1 = src.y0 + (int)((((int64_t)(osd_y1 - dst.y0) * srcH) + dstH - 1) / dstH) + 1;
++    x0 = MPCLAMP(x0, frame_x0, frame_x1);
++    y0 = MPCLAMP(y0, frame_y0, frame_y1);
++    x1 = MPCLAMP(x1, frame_x0, frame_x1);
++    y1 = MPCLAMP(y1, frame_y0, frame_y1);
++    if (x1 <= x0 || y1 <= y0)
++        return false;
++
++    *out = (struct mp_rect){x0, y0, x1, y1};
++    return true;
++}
++// --- end avf frame-space osd core ---
++
 +static struct avf_render_geometry compute_render_geometry(struct vo *vo,
 +                                                          int frame_w,
 +                                                          int frame_h)
@@ -616,12 +1423,18 @@ index 0000000..f3f96cd
 +    struct mp_rect src, dst;
 +    struct mp_osd_res vo_osd;
 +
-+    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
-+
 +    if (frame_w <= 0)
 +        frame_w = vo->params ? vo->params->w : 0;
 +    if (frame_h <= 0)
 +        frame_h = vo->params ? vo->params->h : 0;
++
++    if (should_use_frame_space_osd(p)) {
++        return avf_frame_space_geometry(frame_w, frame_h,
++                                        vo->params ? vo->params->p_w : 1,
++                                        vo->params ? vo->params->p_h : 1);
++    }
++
++    vo_get_src_dst_rects(vo, &src, &dst, &vo_osd);
 +
 +    if (should_use_inline_osd_layer(p)) {
 +        return (struct avf_render_geometry){
@@ -797,6 +1610,8 @@ index 0000000..f3f96cd
 +    bool old_composite_osd = p->opts->composite_osd;
 +    bool old_pip_composite_osd = p->opts->pip_composite_osd;
 +    int old_queue_lead_ms = p->opts->queue_lead_ms;
++    int old_osd_max_height = p->opts->osd_max_height;
++    bool old_osd_video_res = p->opts->osd_video_res;
 +
 +    if (!m_config_cache_update(p->opts_cache))
 +        return;
@@ -804,21 +1619,105 @@ index 0000000..f3f96cd
 +    if (old_queue_lead_ms != p->opts->queue_lead_ms)
 +        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
 +
-+    if (old_composite_osd == p->opts->composite_osd &&
-+        old_pip_composite_osd == p->opts->pip_composite_osd)
++    bool composite_changed =
++        old_composite_osd != p->opts->composite_osd ||
++        old_pip_composite_osd != p->opts->pip_composite_osd;
++    bool osd_scale_changed = old_osd_max_height != p->opts->osd_max_height ||
++        old_osd_video_res != p->opts->osd_video_res;
++
++    if (!composite_changed && !osd_scale_changed)
 +        return;
 +
-+    MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
-+               "pip_composite_osd: %s\n",
-+               p->opts->composite_osd ? "yes" : "no",
-+               p->opts->pip_composite_osd ? "yes" : "no");
++    if (composite_changed) {
++        MP_VERBOSE(vo, "OSD compositing updated: composite_osd: %s, "
++                   "pip_composite_osd: %s\n",
++                   p->opts->composite_osd ? "yes" : "no",
++                   p->opts->pip_composite_osd ? "yes" : "no");
++    }
++    if (osd_scale_changed) {
++        MP_VERBOSE(vo, "OSD scaling updated: max_height: %d, video_res: %s\n",
++                   p->opts->osd_max_height,
++                   p->opts->osd_video_res ? "yes" : "no");
++    }
 +
 +    clear_subtitle_cache(p);
-+    if (!should_composite_into_video(p))
++    if (composite_changed && !should_composite_into_video(p))
 +        release_ci_compositor(p);
 +    if (p->osdLayer)
 +        sample_buffer_renderer_flush(p->osdLayer, true);
 +    sync_osd_layer_frame(vo);
++}
++
++// Consume a pending host-layer resize flagged by MPVLayerGeometryObserver.
++static void handle_layer_geometry_change(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    // Composite mode draws the OSD into the video samples, which follow the
++    // layer via videoGravity; skipping here also keeps system-driven PiP
++    // window resizes from rescaling PiP subtitles. Inline geometry is
++    // re-read when composite-osd flips back anyway.
++    if (!should_use_inline_osd_layer(p))
++        return;
++
++    MP_VERBOSE(vo, "Host layer resized; resyncing OSD geometry\n");
++
++    clear_subtitle_cache(p);
++    if (p->osdLayer)
++        sample_buffer_renderer_flush(p->osdLayer, true);
++    sync_osd_layer_frame(vo);
++    // Repaint promptly even while paused so a rotation doesn't leave the
++    // old-geometry subtitle on screen until the next natural frame.
++    vo->want_redraw = true;
++}
++
++static void record_deadline_drop(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    record_not_ready_drop(vo);
++    vo_increment_drop_count(vo, 1);
++    p->diag_drop_count++;
++}
++
++// Sleep until the renderer announces it is ready for more media data, or
++// until `until`. The announcement comes from requestMediaDataWhenReadyOnQueue:,
++// which runs the block once the renderer is (or becomes) ready, so the wait
++// costs one wakeup instead of one per millisecond of isReadyForMoreMediaData
++// polling. The 20 ms slice is a backstop for a renderer that fails without
++// ever becoming ready; the caller re-checks readiness and recovery after every
++// return.
++//
++// The block disarms the request itself, because a block that returns without
++// enqueueing is run again at once. Disarming drops the renderer's reference to
++// the block while the block is still running, so this function holds its own
++// copy, and before releasing it drains the private serial queue the block runs
++// on: a timed-out wait may stop the request while an invocation that began
++// just before is still running.
++static void wait_for_renderer_ready(struct priv *p, int64_t until)
++{
++    int64_t timeout = MPMIN(until - mp_time_ns(), MP_TIME_MS_TO_NS(20));
++    if (timeout <= 0)
++        return;
++
++    id<AVQueuedSampleBufferRendering> renderer =
++        active_sample_buffer_renderer(p->displayLayer);
++    if (!renderer || !p->ready_queue) {
++        mp_sleep_ns(MPMIN(timeout, MP_TIME_MS_TO_NS(1)));
++        return;
++    }
++
++    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
++    dispatch_block_t on_ready = [^{
++        [renderer stopRequestingMediaData];
++        dispatch_semaphore_signal(ready);
++    } copy];
++    [renderer requestMediaDataWhenReadyOnQueue:p->ready_queue
++                                    usingBlock:on_ready];
++    dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, timeout));
++    [renderer stopRequestingMediaData];
++    dispatch_sync(p->ready_queue, ^{});
++    [on_ready release];
++    dispatch_release(ready);
 +}
 +
 +static bool wait_until_ready_for_more_media_data(struct vo *vo, int64_t present_host_ns)
@@ -833,31 +1732,90 @@ index 0000000..f3f96cd
 +        return true;
 +    }
 +
-+    int64_t now = mp_time_ns();
-+    int64_t latest = present_host_ns > 0
++    // A renderer that reports not-ready while the frame's deadline is still
++    // far away is back-pressure, not a failure: frames arrive up to
++    // queue-lead-ms ahead of their presentation time, and at high playback
++    // rates the renderer's queue fills long before frames are due. Pace to
++    // the drain rate by waiting until shortly before the deadline (#1484).
++    int64_t start = mp_time_ns();
++    int64_t give_up = present_host_ns > 0
 +        ? present_host_ns - MP_TIME_MS_TO_NS(4)
-+        : now + MP_TIME_MS_TO_NS(1);
-+    int64_t give_up = MPMIN(now + MP_TIME_MS_TO_NS(2), latest);
++        : start + MP_TIME_MS_TO_NS(2);
 +
-+    if (give_up <= now) {
++    if (give_up <= start) {
 +        MP_VERBOSE(vo, "Display layer not ready %.2f ms before PTS; dropping frame\n",
-+                   (present_host_ns - now) / 1000000.0);
-+        record_not_ready_drop(vo);
++                   (present_host_ns - start) / 1000000.0);
++        record_deadline_drop(vo);
 +        return false;
 +    }
 +
 +    while (!sample_buffer_renderer_is_ready(p->displayLayer)) {
++        // Check for a failed layer before the deadline: a renderer that fails
++        // without becoming ready need not run the readiness block, so a wait
++        // can end at the deadline without having seen the failure.
++        if (display_layer_needs_recovery(p->displayLayer)) {
++            recover_display_layer(vo, "not-ready wait", false);
++            if (display_layer_needs_recovery(p->displayLayer)) {
++                // Recovery was throttle-suppressed; don't poll a failed
++                // renderer all the way to the deadline.
++                MP_VERBOSE(vo, "Display layer unrecovered during wait; dropping frame\n");
++                record_deadline_drop(vo);
++                return false;
++            }
++            continue;
++        }
 +        if (mp_time_ns() >= give_up) {
-+            MP_VERBOSE(vo, "Display layer not ready after bounded wait; dropping frame\n");
-+            record_not_ready_drop(vo);
++            MP_VERBOSE(vo, "Display layer not ready at PTS deadline; dropping frame\n");
++            record_deadline_drop(vo);
 +            return false;
 +        }
-+        mp_sleep_ns(MP_TIME_MS_TO_NS(1));
++        wait_for_renderer_ready(p, give_up);
 +    }
 +
 +    p->not_ready_drop_count = 0;
 +    p->last_not_ready_drop_ns = 0;
++    p->diag_wait_count++;
++    p->diag_wait_total_ns += mp_time_ns() - start;
 +    return true;
++}
++
++static void report_presentation_diagnostics(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int64_t now = mp_time_ns();
++
++    if (!p->diag_window_start_ns) {
++        p->diag_window_start_ns = now;
++        return;
++    }
++    if (now - p->diag_window_start_ns < MP_TIME_MS_TO_NS(5000))
++        return;
++
++    if (p->diag_wait_count || p->diag_drop_count || p->diag_anchor_count ||
++        p->diag_rate_update_count || p->diag_drift_peak_ns) {
++        double rate = p->timebase_rate > 0.0 ? p->timebase_rate : 1.0;
++        double offset_ppm =
++            (p->timebase_applied_rate / rate - 1.0) * 1e6;
++        MP_VERBOSE(vo, "Presentation pacing over %.1fs: %d ready-waits "
++                   "(avg %.2f ms), %d deadline drops, %d timebase anchors, "
++                   "%d rate updates (now %+.0f ppm), drift peak %.2f ms\n",
++                   (now - p->diag_window_start_ns) / 1e9,
++                   p->diag_wait_count,
++                   p->diag_wait_count
++                       ? p->diag_wait_total_ns / 1e6 / p->diag_wait_count
++                       : 0.0,
++                   p->diag_drop_count, p->diag_anchor_count,
++                   p->diag_rate_update_count, offset_ppm,
++                   p->diag_drift_peak_ns / 1e6);
++    }
++
++    p->diag_window_start_ns = now;
++    p->diag_wait_count = 0;
++    p->diag_wait_total_ns = 0;
++    p->diag_drop_count = 0;
++    p->diag_anchor_count = 0;
++    p->diag_rate_update_count = 0;
++    p->diag_drift_peak_ns = 0;
 +}
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block)
@@ -1036,6 +1994,138 @@ index 0000000..f3f96cd
 +        set_colorspace_from_attachments(pixbuf);
 +}
 +
++static void restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
++                                          const struct mp_image_params *params)
++{
++    if (!pixbuf || params->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
++        return;
++    if (!CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL) ||
++        CVBufferGetAttachment(pixbuf, kCVImageBufferTransferFunctionKey, NULL))
++        return;
++
++    CFStringRef transfer = get_cv_transfer_function(params->color.transfer);
++    if (transfer) {
++        CVBufferSetAttachment(pixbuf, kCVImageBufferTransferFunctionKey,
++                              transfer, kCVAttachmentMode_ShouldPropagate);
++    }
++}
++
++// --- HDR10+ per-frame metadata ---
++// HEVC carries HDR10+ (SMPTE ST 2094-40) as a per-frame T.35 user-data SEI.
++// FFmpeg parses it into AV_FRAME_DATA_DYNAMIC_HDR_PLUS on every decoded frame,
++// hwaccel included, and mpv keeps that side data on the mp_image. It travels no
++// further on its own: Core Video only has attachment keys for the static HDR10
++// metadata, so a VideoToolbox pixel buffer arrives without it and the display
++// layer signals plain HDR10 to the sink. AVSampleBufferDisplayLayer forwards
++// HDR10+ from one place, the per-sample attachment
++// kCMSampleAttachmentKey_HDR10PlusPerFrameData: the SEI payload as sent,
++// starting at itu_t_t35_country_code (plezy#2404).
++//
++// av_dynamic_hdr_plus_to_t35() writes the payload from application_mode on and
++// leaves the 48-bit T.35 header to the caller: country code US (0xB5),
++// terminal provider Samsung (0x003C), provider oriented code 0x0001 and
++// application identifier 4 name ST 2094-40, the same values FFmpeg's SEI
++// parser matches before it hands the rest to av_dynamic_hdr_plus_from_t35().
++static const uint8_t hdr10plus_t35_header[6] = {0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04};
++
++static const AVDynamicHDRPlus *find_hdr10plus_side_data(const mp_image_t *mpi)
++{
++    for (int i = 0; i < mpi->num_ff_side_data; i++) {
++        const struct mp_ff_side_data *sd = &mpi->ff_side_data[i];
++        if (sd->type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS && sd->buf &&
++            sd->buf->size >= sizeof(AVDynamicHDRPlus))
++            return (const AVDynamicHDRPlus *)sd->buf->data;
++    }
++    return NULL;
++}
++
++// Dolby Vision frames are left alone: their RPU is the dynamic metadata the DV
++// pipeline presents (tvOS derives HDR10+ from it itself for a DV-less sink),
++// and a second, competing description of the same frame is not something to
++// hand the display. HDR10+ is defined over PQ only, so other transfers are
++// skipped as well.
++static void attach_hdr10plus_metadata(struct vo *vo, const mp_image_t *mpi,
++                                      CVPixelBufferRef pixbuf, CMSampleBufferRef buf)
++{
++    struct priv *p = vo->priv;
++
++    if (mpi->params.color.transfer != PL_COLOR_TRC_PQ ||
++        mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        return;
++    const AVDynamicHDRPlus *hdr_plus = find_hdr10plus_side_data(mpi);
++    if (!hdr_plus)
++        return;
++    if (CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL))
++        return;
++
++    if (@available(iOS 16.0, tvOS 16.0, macOS 13.0, *)) {
++        uint8_t *payload = p->hdr10plus_t35 + sizeof(hdr10plus_t35_header);
++        size_t payload_size = sizeof(p->hdr10plus_t35) - sizeof(hdr10plus_t35_header);
++        int ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
++        if (ret < 0) {
++            if (!p->hdr10plus_unsupported_logged) {
++                MP_WARN(vo, "HDR10+ metadata could not be serialized (%d); "
++                            "presenting as HDR10\n", ret);
++                p->hdr10plus_unsupported_logged = true;
++            }
++            return;
++        }
++        memcpy(p->hdr10plus_t35, hdr10plus_t35_header, sizeof(hdr10plus_t35_header));
++        size_t t35_size = sizeof(hdr10plus_t35_header) + payload_size;
++
++        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, true);
++        if (!attachments || CFArrayGetCount(attachments) < 1)
++            return;
++        CFMutableDictionaryRef sample_attachments =
++            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++        CFDataRef t35 = CFDataCreate(NULL, p->hdr10plus_t35, t35_size);
++        if (!t35)
++            return;
++        CFDictionarySetValue(sample_attachments,
++                             kCMSampleAttachmentKey_HDR10PlusPerFrameData, t35);
++        CFRelease(t35);
++
++        if (!p->hdr10plus_attached_logged) {
++            MP_INFO(vo, "HDR10+ per-frame metadata attached to the display "
++                        "samples (%zu bytes, %d window%s)\n",
++                    t35_size, hdr_plus->num_windows,
++                    hdr_plus->num_windows == 1 ? "" : "s");
++            p->hdr10plus_attached_logged = true;
++        }
++    } else if (!p->hdr10plus_unsupported_logged) {
++        MP_WARN(vo, "HDR10+ metadata present but this OS cannot forward it; "
++                    "presenting as HDR10\n");
++        p->hdr10plus_unsupported_logged = true;
++    }
++}
++// --- end HDR10+ per-frame metadata ---
++
++// Whether the buffer's pixel aspect attachment already describes p_w:p_h. A
++// buffer without one is square. Reading an attachment is cheap; setting or
++// removing one on an IOSurface-backed buffer is a kernel round trip, and
++// FFmpeg's VideoToolbox hwaccel has already written the frame's sample aspect
++// ratio, which is usually the one wanted here.
++static bool pixel_aspect_matches(CVPixelBufferRef pixbuf, int p_w, int p_h)
++{
++    CFTypeRef par = CVBufferGetAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey, NULL);
++    if (!par)
++        return p_w == p_h;
++    if (CFGetTypeID(par) != CFDictionaryGetTypeID())
++        return false;
++
++    CFNumberRef h = CFDictionaryGetValue(par, kCVImageBufferPixelAspectRatioHorizontalSpacingKey);
++    CFNumberRef v = CFDictionaryGetValue(par, kCVImageBufferPixelAspectRatioVerticalSpacingKey);
++    int64_t hs = 0, vs = 0;
++    if (!h || !v || CFGetTypeID(h) != CFNumberGetTypeID() ||
++        CFGetTypeID(v) != CFNumberGetTypeID() ||
++        !CFNumberGetValue(h, kCFNumberSInt64Type, &hs) ||
++        !CFNumberGetValue(v, kCFNumberSInt64Type, &vs) ||
++        hs <= 0 || vs <= 0)
++        return false;
++
++    return hs * p_h == vs * p_w;
++}
++
 +static void tag_pixel_buffer_pixel_aspect(struct vo *vo, CVPixelBufferRef pixbuf)
 +{
 +    if (!pixbuf || !vo->params)
@@ -1046,13 +2136,16 @@ index 0000000..f3f96cd
 +    size_t bw = CVPixelBufferGetWidth(pixbuf);
 +    size_t bh = CVPixelBufferGetHeight(pixbuf);
 +
-+    // Only coded-size passthrough/upload buffers need the source sample aspect
-+    // ratio. Geometry- and composite-rendered buffers are already display-shaped
-+    // (letterboxed via vo_get_src_dst_rects) and must stay square pixels to avoid
-+    // double-correcting the aspect.
++    // Only coded-size buffers carry the source sample aspect ratio: passthrough
++    // and upload buffers, plus the frame-space composites that keep the coded
++    // grid. A display-shaped buffer (window-space geometry or composite, both
++    // letterboxed via vo_get_src_dst_rects) is already square-pixel and must
++    // stay that way to avoid double-correcting the aspect.
 +    bool coded_size = bw == (size_t)vo->params->w && bh == (size_t)vo->params->h;
 +
 +    if (coded_size && p_w > 0 && p_h > 0 && p_w != p_h) {
++        if (pixel_aspect_matches(pixbuf, p_w, p_h))
++            return;
 +        NSDictionary *par = @{
 +            (id)kCVImageBufferPixelAspectRatioHorizontalSpacingKey: @(p_w),
 +            (id)kCVImageBufferPixelAspectRatioVerticalSpacingKey: @(p_h)
@@ -1060,8 +2153,10 @@ index 0000000..f3f96cd
 +        CVBufferSetAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey,
 +                              (__bridge CFDictionaryRef)par,
 +                              kCVAttachmentMode_ShouldPropagate);
-+    } else {
-+        // Square pixels (or a reused pool buffer): strip any stale attachment.
++    } else if (!pixel_aspect_matches(pixbuf, 1, 1)) {
++        // Square pixels (or a reused pool buffer): strip a stale non-square
++        // attachment. A 1:1 one, which FFmpeg writes for square-pixel
++        // streams, already means square and stays.
 +        CVBufferRemoveAttachment(pixbuf, kCVImageBufferPixelAspectRatioKey);
 +    }
 +}
@@ -1188,51 +2283,56 @@ index 0000000..f3f96cd
 +    return MPCLAMP((int)(value + 0.5), 0, 1023);
 +}
 +
-+static void update_subtitle_bounds(struct priv *p, CVPixelBufferRef subtitle)
++// Union of the part destination rects, clamped to the OSD buffer. Both draw
++// paths only write inside these rects, so this bounds everything non-blank
++// without scanning the rendered pixels.
++static void reset_subtitle_bounds(struct priv *p)
 +{
 +    p->subtitle_x0 = p->osd_w;
 +    p->subtitle_y0 = p->osd_h;
 +    p->subtitle_x1 = 0;
 +    p->subtitle_y1 = 0;
-+
-+    if (!subtitle || p->osd_w <= 0 || p->osd_h <= 0)
-+        return;
-+
-+    if (CVPixelBufferLockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
-+        return;
-+
-+    uint8_t *base = CVPixelBufferGetBaseAddress(subtitle);
-+    size_t stride = CVPixelBufferGetBytesPerRow(subtitle);
-+    if (base && stride) {
-+        for (int y = 0; y < p->osd_h; y++) {
-+            uint8_t *row = base + (size_t)y * stride;
-+            for (int x = 0; x < p->osd_w; x++) {
-+                if (row[(size_t)x * 4 + 3]) {
-+                    p->subtitle_x0 = MPMIN(p->subtitle_x0, x);
-+                    p->subtitle_y0 = MPMIN(p->subtitle_y0, y);
-+                    p->subtitle_x1 = MPMAX(p->subtitle_x1, x + 1);
-+                    p->subtitle_y1 = MPMAX(p->subtitle_y1, y + 1);
-+                }
-+            }
-+        }
-+    }
-+
-+    CVPixelBufferUnlockBaseAddress(subtitle, kCVPixelBufferLock_ReadOnly);
 +}
 +
-+// Map mpv image format to CVPixelBuffer format
++static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs)
++{
++    if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
++        return;
++
++    for (int i = 0; i < imgs->num_parts; i++) {
++        struct sub_bitmap *sb = &imgs->parts[i];
++        if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++            continue;
++        int dw = sb->dw > 0 ? sb->dw : sb->w;
++        int dh = sb->dh > 0 ? sb->dh : sb->h;
++        p->subtitle_x0 = MPMIN(p->subtitle_x0, MPCLAMP(sb->x, 0, p->osd_w));
++        p->subtitle_y0 = MPMIN(p->subtitle_y0, MPCLAMP(sb->y, 0, p->osd_h));
++        p->subtitle_x1 = MPMAX(p->subtitle_x1, MPCLAMP(sb->x + dw, 0, p->osd_w));
++        p->subtitle_y1 = MPMAX(p->subtitle_y1, MPCLAMP(sb->y + dh, 0, p->osd_h));
++    }
++}
++
++static void update_subtitle_bounds_from_parts(struct priv *p,
++                                              struct sub_bitmaps *imgs)
++{
++    reset_subtitle_bounds(p);
++    extend_subtitle_bounds(p, imgs);
++}
++
++// Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
++// Everything lands in a biplanar format: the display pipeline only handles
++// NV12/P010-family surfaces reliably (tri-planar 'y420' is not used by any
++// shipping AVSampleBufferDisplayLayer client and would also fall off the fast
++// biplanar subtitle blend path). Planar sources are interleaved during the
++// upload copy itself.
 +static OSType get_cv_pixel_format(int imgfmt)
 +{
-+    switch (imgfmt) {
-+        case IMGFMT_NV12:
-+            return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-+        case IMGFMT_420P:
-+            return kCVPixelFormatType_420YpCbCr8Planar;
-+        case IMGFMT_P010:
-+            return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
-+        default:
-+            return 0;
-+    }
++    if (imgfmt == IMGFMT_NV12 || imgfmt == IMGFMT_420P)
++        return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
++    if (imgfmt == IMGFMT_P010 || imgfmt == imgfmt_420p10() ||
++        imgfmt == imgfmt_420p12())
++        return kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
++    return 0;
 +}
 +
 +// Create software upload pool
@@ -1243,11 +2343,198 @@ index 0000000..f3f96cd
 +        &p->sw_pool_h, &p->sw_pool_format, w, h, format, "software upload");
 +}
 +
++static void reset_osd_buf_states(struct priv *p)
++{
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        if (p->osd_buf_states[i].surf)
++            CFRelease(p->osd_buf_states[i].surf);
++    }
++    p->osd_buf_state_count = 0;
++}
++
++// Entries pin their IOSurface only briefly past the pool's own lifetime;
++// drop ones the pool has likely aged out so they don't hold memory.
++static void prune_osd_buf_states(struct priv *p, int64_t now)
++{
++    for (int i = 0; i < p->osd_buf_state_count;) {
++        if (now - p->osd_buf_states[i].last_used_ns > MP_TIME_MS_TO_NS(2000)) {
++            CFRelease(p->osd_buf_states[i].surf);
++            p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
++        } else {
++            i++;
++        }
++    }
++}
++
++static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
++                                                   CVPixelBufferRef buf)
++{
++    IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
++    if (!surf)
++        return NULL;
++
++    int64_t now = mp_time_ns();
++    struct osd_buf_state *oldest = NULL;
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        struct osd_buf_state *st = &p->osd_buf_states[i];
++        if (st->surf == surf) {
++            st->last_used_ns = now;
++            return st;
++        }
++        if (!oldest || st->last_used_ns < oldest->last_used_ns)
++            oldest = st;
++    }
++
++    struct osd_buf_state *st;
++    if (p->osd_buf_state_count < (int)MP_ARRAY_SIZE(p->osd_buf_states)) {
++        st = &p->osd_buf_states[p->osd_buf_state_count++];
++    } else {
++        st = oldest;
++        CFRelease(st->surf);
++    }
++    *st = (struct osd_buf_state){
++        .surf = (IOSurfaceRef)CFRetain(surf),
++        // Contents unknown until this code has drawn into it: clear fully.
++        .dirty = {0, 0, INT_MAX, INT_MAX},
++        .last_used_ns = now,
++    };
++    return st;
++}
++
++static void osd_buf_record_dirty(struct priv *p, CVPixelBufferRef buf,
++                                 struct mp_rect dirty)
++{
++    IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
++    if (!surf)
++        return;
++    for (int i = 0; i < p->osd_buf_state_count; i++) {
++        if (p->osd_buf_states[i].surf == surf) {
++            p->osd_buf_states[i].dirty = dirty;
++            return;
++        }
++    }
++}
++
 +static bool create_osd_pool(struct vo *vo, int w, int h)
 +{
 +    struct priv *p = vo->priv;
++    // The pool is about to be recreated: its buffers (and their recorded
++    // dirty state) are going away.
++    if (p->osdPool && (p->osd_pool_w != w || p->osd_pool_h != h))
++        reset_osd_buf_states(p);
 +    return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
 +        &p->osd_pool_h, NULL, w, h, kCVPixelFormatType_32BGRA, "OSD overlay");
++}
++
++// Row kernels for the software-frame upload. Planar sources are fused
++// (interleave, and for 10/12-bit the MSB-align shift) into the biplanar
++// destination during the one unavoidable copy, so no separate conversion
++// pass runs anywhere.
++
++// 16-bit row copy with LSB->MSB alignment shift (yuv420p10/12 -> P010 layout).
++static void copy_shift_u16_row(uint16_t *dst, const uint16_t *src, size_t n,
++                               int shift)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    int16x8_t vshift = vdupq_n_s16(shift);
++    for (; x + 8 <= n; x += 8)
++        vst1q_u16(dst + x, vshlq_u16(vld1q_u16(src + x), vshift));
++#endif
++    for (; x < n; x++)
++        dst[x] = src[x] << shift;
++}
++
++// Interleave 16-bit U and V rows with the alignment shift
++// (libyuv I010ToP010 semantics).
++static void interleave_shift_uv_row_u16(uint16_t *dst, const uint16_t *u,
++                                        const uint16_t *v, size_t n, int shift)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    int16x8_t vshift = vdupq_n_s16(shift);
++    for (; x + 8 <= n; x += 8) {
++        uint16x8x2_t uv = {{
++            vshlq_u16(vld1q_u16(u + x), vshift),
++            vshlq_u16(vld1q_u16(v + x), vshift),
++        }};
++        vst2q_u16(dst + 2 * x, uv);
++    }
++#endif
++    for (; x < n; x++) {
++        dst[2 * x + 0] = u[x] << shift;
++        dst[2 * x + 1] = v[x] << shift;
++    }
++}
++
++// Interleave 8-bit U and V rows (yuv420p -> NV12).
++static void interleave_uv_row_u8(uint8_t *dst, const uint8_t *u,
++                                 const uint8_t *v, size_t n)
++{
++    size_t x = 0;
++#if defined(__aarch64__)
++    for (; x + 16 <= n; x += 16) {
++        uint8x16x2_t uv = {{ vld1q_u8(u + x), vld1q_u8(v + x) }};
++        vst2q_u8(dst + 2 * x, uv);
++    }
++#endif
++    for (; x < n; x++) {
++        dst[2 * x + 0] = u[x];
++        dst[2 * x + 1] = v[x];
++    }
++}
++
++// yuv420p10/12 (LSB-aligned planar) -> locked P010-layout ('x420') buffer.
++static void upload_420p1x_to_p010(struct mp_image *mpi, CVPixelBufferRef pixbuf,
++                                  int shift)
++{
++    int w = mpi->w, h = mpi->h;
++    int cw = (w + 1) / 2, ch = (h + 1) / 2;
++
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 0);
++    size_t dst_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 0);
++    for (int y = 0; y < h; y++) {
++        copy_shift_u16_row((uint16_t *)(dst_y + y * dst_y_stride),
++                           (const uint16_t *)(mpi->planes[0] + y * mpi->stride[0]),
++                           w, shift);
++    }
++
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 1);
++    size_t dst_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 1);
++    for (int y = 0; y < ch; y++) {
++        interleave_shift_uv_row_u16(
++            (uint16_t *)(dst_uv + y * dst_uv_stride),
++            (const uint16_t *)(mpi->planes[1] + y * mpi->stride[1]),
++            (const uint16_t *)(mpi->planes[2] + y * mpi->stride[2]),
++            cw, shift);
++    }
++}
++
++// yuv420p (planar) -> locked NV12 ('420v') buffer.
++static void upload_420p_to_nv12(struct mp_image *mpi, CVPixelBufferRef pixbuf)
++{
++    int w = mpi->w, h = mpi->h;
++    int cw = (w + 1) / 2, ch = (h + 1) / 2;
++
++    uint8_t *dst_y = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 0);
++    size_t dst_y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 0);
++    if (dst_y_stride == (size_t)mpi->stride[0]) {
++        memcpy(dst_y, mpi->planes[0], dst_y_stride * h);
++    } else {
++        for (int y = 0; y < h; y++) {
++            memcpy(dst_y + y * dst_y_stride,
++                   mpi->planes[0] + y * mpi->stride[0], w);
++        }
++    }
++
++    uint8_t *dst_uv = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 1);
++    size_t dst_uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 1);
++    for (int y = 0; y < ch; y++) {
++        interleave_uv_row_u8(dst_uv + y * dst_uv_stride,
++                             mpi->planes[1] + y * mpi->stride[1],
++                             mpi->planes[2] + y * mpi->stride[2],
++                             cw);
++    }
 +}
 +
 +// Upload a software-decoded frame to CVPixelBuffer
@@ -1280,7 +2567,15 @@ index 0000000..f3f96cd
 +
 +    size_t planeCount = CVPixelBufferGetPlaneCount(pixbuf);
 +
-+    if (planeCount == 0) {
++    if (mpi->imgfmt == IMGFMT_420P) {
++        upload_420p_to_nv12(mpi, pixbuf);
++    } else if (mpi->imgfmt == imgfmt_420p10()) {
++        upload_420p1x_to_p010(mpi, pixbuf, 6);
++    } else if (mpi->imgfmt == imgfmt_420p12()) {
++        // P010 layout keeps 2 extra significant low bits; harmless, they sit
++        // below the display's 10-bit quantization (libyuv does the same).
++        upload_420p1x_to_p010(mpi, pixbuf, 4);
++    } else if (planeCount == 0) {
 +        // Non-planar format
 +        void *dst = CVPixelBufferGetBaseAddress(pixbuf);
 +        size_t dstStride = CVPixelBufferGetBytesPerRow(pixbuf);
@@ -1298,7 +2593,7 @@ index 0000000..f3f96cd
 +            }
 +        }
 +    } else {
-+        // Planar format (NV12, YUV420P, P010)
++        // Source plane layout matches the destination (NV12, P010)
 +        for (size_t plane = 0; plane < planeCount && plane < MP_MAX_PLANES; plane++) {
 +            void *dst = CVPixelBufferGetBaseAddressOfPlane(pixbuf, plane);
 +            size_t dstStride = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, plane);
@@ -1418,9 +2713,9 @@ index 0000000..f3f96cd
 +    return path;
 +}
 +
-+static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
-+                              uint8_t *src, int src_stride,
-+                              int w, int h, uint32_t color)
++static void blend_libass_bgra_scalar(uint8_t *dst, size_t dst_stride,
++                                     uint8_t *src, int src_stride,
++                                     int w, int h, uint32_t color)
 +{
 +    const unsigned int r = (color >> 24) & 0xff;
 +    const unsigned int g = (color >> 16) & 0xff;
@@ -1456,9 +2751,9 @@ index 0000000..f3f96cd
 +    }
 +}
 +
-+static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
-+                                 uint8_t *src, int src_stride,
-+                                 int w, int h)
++static void blend_bgra_over_bgra_scalar(uint8_t *dst, size_t dst_stride,
++                                        uint8_t *src, int src_stride,
++                                        int w, int h)
 +{
 +    for (int y = 0; y < h; y++) {
 +        uint32_t *srcrow = (uint32_t *)src;
@@ -1492,6 +2787,153 @@ index 0000000..f3f96cd
 +        dst += dst_stride;
 +        src += src_stride;
 +    }
++}
++
++#if defined(__aarch64__)
++
++// NEON versions of the two scalar blends above, bit-exact with them: both
++// divisions are folded into exact floor-by-255 stages (floor(x/65025) ==
++// floor(floor(x/255)/255)).
++
++// Exact floor(x/255) for u16 lanes.
++static inline uint16x8_t div255_u16_neon(uint16x8_t x)
++{
++    return vshrq_n_u16(
++        vaddq_u16(vaddq_u16(x, vdupq_n_u16(1)), vshrq_n_u16(x, 8)), 8);
++}
++
++// Exact floor(x/255) for u32 lanes (canonical magic-multiply), narrowed to
++// u16; every reachable numerator here is < 2^24 so the result fits.
++static inline uint16x4_t div255_u32_to_u16_neon(uint32x4_t x)
++{
++    const uint32x2_t magic = vdup_n_u32(0x80808081u);
++    uint64x2_t lo = vmull_u32(vget_low_u32(x), magic);
++    uint64x2_t hi = vmull_u32(vget_high_u32(x), magic);
++    uint32x2_t l = vmovn_u64(vshrq_n_u64(lo, 39));
++    uint32x2_t h = vmovn_u64(vshrq_n_u64(hi, 39));
++    return vmovn_u32(vcombine_u32(l, h));
++}
++
++// One channel of the libass blend: (aa*c + inv*dst + 32512) / 65025.
++static inline uint8x8_t blend_libass_channel_neon(uint16x8_t aa, uint16x8_t inv,
++                                                  uint8_t c, uint8x8_t dst)
++{
++    uint16x8_t d16 = vmovl_u8(dst);
++    uint32x4_t lo = vmull_n_u16(vget_low_u16(aa), c);
++    uint32x4_t hi = vmull_n_u16(vget_high_u16(aa), c);
++    lo = vmlal_u16(lo, vget_low_u16(inv), vget_low_u16(d16));
++    hi = vmlal_u16(hi, vget_high_u16(inv), vget_high_u16(d16));
++    lo = vaddq_u32(lo, vdupq_n_u32(32512));
++    hi = vaddq_u32(hi, vdupq_n_u32(32512));
++    uint16x8_t y = vcombine_u16(div255_u32_to_u16_neon(lo),
++                                div255_u32_to_u16_neon(hi));
++    return vmovn_u16(div255_u16_neon(y));
++}
++
++// Requires w % 8 == 0; the dispatcher routes the tail through the scalar path.
++// Mask lanes of 0 come out as dst exactly ((dst*65025 + 32512)/65025 == dst),
++// so no per-lane select is needed; the vmaxv skip is purely an optimization.
++static void blend_libass_bgra_neon(uint8_t *dst, size_t dst_stride,
++                                   uint8_t *src, int src_stride,
++                                   int w, int h, uint32_t color)
++{
++    const uint8_t r = (color >> 24) & 0xff;
++    const uint8_t g = (color >> 16) & 0xff;
++    const uint8_t b = (color >>  8) & 0xff;
++    const uint8_t a = 0xff - (color & 0xff);
++    const uint8x8_t va = vdup_n_u8(a);
++    const uint16x8_t full = vdupq_n_u16(255 * 255);
++
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x += 8) {
++            uint8x8_t m = vld1_u8(src + x);
++            if (!vmaxv_u8(m))
++                continue;
++
++            uint16x8_t aa = vmull_u8(m, va);
++            uint16x8_t inv = vsubq_u16(full, aa);
++            uint8x8x4_t d = vld4_u8(dst + (size_t)x * 4);
++            d.val[0] = blend_libass_channel_neon(aa, inv, b, d.val[0]);
++            d.val[1] = blend_libass_channel_neon(aa, inv, g, d.val[1]);
++            d.val[2] = blend_libass_channel_neon(aa, inv, r, d.val[2]);
++            d.val[3] = blend_libass_channel_neon(aa, inv, 255, d.val[3]);
++            vst4_u8(dst + (size_t)x * 4, d);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++// One channel of src-over: min(0xff, src + (dst*inv + 127)/255). The scalar
++// srca==0xff and dst==0 shortcuts produce the same result as this formula,
++// so only srca==0 lanes need to keep dst (selected by the caller).
++static inline uint8x8_t blend_over_channel_neon(uint8x8_t srcc, uint8x8_t dstc,
++                                                uint8x8_t inv)
++{
++    uint16x8_t t = vaddq_u16(vmull_u8(dstc, inv), vdupq_n_u16(127));
++    return vqadd_u8(srcc, vmovn_u16(div255_u16_neon(t)));
++}
++
++// Requires w % 8 == 0; tail goes through the scalar path.
++static void blend_bgra_over_bgra_neon(uint8_t *dst, size_t dst_stride,
++                                      uint8_t *src, int src_stride,
++                                      int w, int h)
++{
++    for (int y = 0; y < h; y++) {
++        for (int x = 0; x < w; x += 8) {
++            uint8x8x4_t s = vld4_u8(src + (size_t)x * 4);
++            if (!vmaxv_u8(s.val[3]))
++                continue;
++
++            uint8x8x4_t d = vld4_u8(dst + (size_t)x * 4);
++            uint8x8_t inv = vmvn_u8(s.val[3]);
++            uint8x8_t keep = vceqz_u8(s.val[3]);
++            for (int c = 0; c < 4; c++) {
++                d.val[c] = vbsl_u8(keep, d.val[c],
++                    blend_over_channel_neon(s.val[c], d.val[c], inv));
++            }
++            vst4_u8(dst + (size_t)x * 4, d);
++        }
++        dst += dst_stride;
++        src += src_stride;
++    }
++}
++
++#endif // __aarch64__
++
++static void blend_libass_bgra(uint8_t *dst, size_t dst_stride,
++                              uint8_t *src, int src_stride,
++                              int w, int h, uint32_t color)
++{
++    if (!(0xff - (color & 0xff)))
++        return;
++#if defined(__aarch64__)
++    int w8 = w & ~7;
++    if (w8 > 0)
++        blend_libass_bgra_neon(dst, dst_stride, src, src_stride, w8, h, color);
++    if (w > w8)
++        blend_libass_bgra_scalar(dst + (size_t)w8 * 4, dst_stride,
++                                 src + w8, src_stride, w - w8, h, color);
++#else
++    blend_libass_bgra_scalar(dst, dst_stride, src, src_stride, w, h, color);
++#endif
++}
++
++static void blend_bgra_over_bgra(uint8_t *dst, size_t dst_stride,
++                                 uint8_t *src, int src_stride,
++                                 int w, int h)
++{
++#if defined(__aarch64__)
++    int w8 = w & ~7;
++    if (w8 > 0)
++        blend_bgra_over_bgra_neon(dst, dst_stride, src, src_stride, w8, h);
++    if (w > w8)
++        blend_bgra_over_bgra_scalar(dst + (size_t)w8 * 4, dst_stride,
++                                    src + (size_t)w8 * 4, src_stride,
++                                    w - w8, h);
++#else
++    blend_bgra_over_bgra_scalar(dst, dst_stride, src, src_stride, w, h);
++#endif
 +}
 +
 +static void draw_direct_libass_bitmap(uint8_t *base, size_t stride,
@@ -1616,7 +3058,26 @@ index 0000000..f3f96cd
 +        CVPixelBufferRelease(pixbuf);
 +        return NULL;
 +    }
-+    memset(base, 0, stride * h);
++
++    int64_t t = mp_time_ns();
++    struct osd_buf_state *st = osd_buf_state_acquire(p, pixbuf);
++    struct mp_rect dirty = st ? st->dirty : (struct mp_rect){0, 0, w, h};
++    dirty.x0 = MPCLAMP(dirty.x0, 0, w);
++    dirty.y0 = MPCLAMP(dirty.y0, 0, h);
++    dirty.x1 = MPCLAMP(dirty.x1, 0, w);
++    dirty.y1 = MPCLAMP(dirty.y1, 0, h);
++    if (dirty.x1 > dirty.x0 && dirty.y1 > dirty.y0) {
++        size_t span = (size_t)(dirty.x1 - dirty.x0) * 4;
++        uint8_t *row = (uint8_t *)base + (size_t)dirty.y0 * stride +
++                       (size_t)dirty.x0 * 4;
++        for (int y = dirty.y0; y < dirty.y1; y++) {
++            memset(row, 0, span);
++            row += stride;
++        }
++    }
++    if (st)
++        st->dirty = (struct mp_rect){0, 0, 0, 0};
++    p->perf.clear_ns += mp_time_ns() - t;
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
 +    return pixbuf;
@@ -1645,7 +3106,9 @@ index 0000000..f3f96cd
 +        return NULL;
 +    }
 +
++    int64_t t = mp_time_ns();
 +    if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++        p->perf.blend_ns += mp_time_ns() - t;
 +        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
 +        return pixbuf;
 +    }
@@ -1667,8 +3130,70 @@ index 0000000..f3f96cd
 +
 +    draw_subtitle_bitmaps(context, imgs, h);
 +    CGContextRelease(context);
++    p->perf.cg_ns += mp_time_ns() - t;
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    return pixbuf;
++}
++
++// Draw every item of list into one overlay buffer: the frame's subtitles and
++// OSD share the inline layer, so one item must not replace another. NULL
++// when nothing could be drawn.
++static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
++                                                          struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return NULL;
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    CGContextRef context = NULL;
++    bool drawn = false;
++    for (int n = 0; n < list->num_items; n++) {
++        struct sub_bitmaps *imgs = list->items[n];
++        if (!imgs->num_parts)
++            continue;
++        int64_t t = mp_time_ns();
++        if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
++            p->perf.blend_ns += mp_time_ns() - t;
++            drawn = true;
++            continue;
++        }
++        if (!context) {
++            CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++            context = colorSpace ? CGBitmapContextCreate(
++                base, w, h, 8, stride, colorSpace,
++                kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
++            ) : NULL;
++            if (colorSpace)
++                CGColorSpaceRelease(colorSpace);
++            if (!context)
++                continue;
++        }
++        draw_subtitle_bitmaps(context, imgs, h);
++        p->perf.cg_ns += mp_time_ns() - t;
++        drawn = true;
++    }
++    if (context)
++        CGContextRelease(context);
++
++    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++    if (!drawn) {
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
 +    return pixbuf;
 +}
 +
@@ -1755,6 +3280,7 @@ index 0000000..f3f96cd
 +    // Clear subtitles when there are none
 +    if (!imgs || imgs->num_parts == 0) {
 +        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
++            p->perf.empty++;
 +            p->has_subtitle = false;
 +            p->osd_change_id = 0;  // Reset change_id so next subtitle renders
 +            if (p->cachedSubtitleImage) {
@@ -1779,9 +3305,11 @@ index 0000000..f3f96cd
 +        (!need_buffer || p->cachedSubtitleBuffer);
 +    if (imgs->change_id != 0 && imgs->change_id == p->osd_change_id &&
 +        p->has_subtitle && has_cached_subtitle) {
++        p->perf.skipped++;
 +        return;
 +    }
 +
++    int64_t t_render = mp_time_ns();
 +    bool rendered = false;
 +    if (need_image) {
 +        CGImageRef subtitleImage = render_subtitle_image(vo, imgs);
@@ -1802,7 +3330,12 @@ index 0000000..f3f96cd
 +            if (p->cachedSubtitleBuffer)
 +                CVPixelBufferRelease(p->cachedSubtitleBuffer);
 +            p->cachedSubtitleBuffer = subtitleBuffer;
-+            update_subtitle_bounds(p, subtitleBuffer);
++            int64_t t_bounds = mp_time_ns();
++            update_subtitle_bounds_from_parts(p, imgs);
++            osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
++                p->subtitle_x0, p->subtitle_y0,
++                p->subtitle_x1, p->subtitle_y1});
++            p->perf.bounds_ns += mp_time_ns() - t_bounds;
 +            rendered = true;
 +        }
 +    }
@@ -1810,15 +3343,34 @@ index 0000000..f3f96cd
 +    if (!rendered)
 +        return;
 +
++    int64_t render_ns = mp_time_ns() - t_render;
++    p->perf.renders++;
++    p->perf.total_ns += render_ns;
++    p->perf.max_ns = MPMAX(p->perf.max_ns, render_ns);
++    if (render_ns > MP_TIME_MS_TO_NS(8) && mp_msg_test(vo->log, MSGL_V)) {
++        int64_t now = mp_time_ns();
++        if (now - p->perf.last_spike_ns > MP_TIME_MS_TO_NS(1000)) {
++            p->perf.last_spike_ns = now;
++            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d)\n",
++                       render_ns / 1e6, imgs->num_parts, p->osd_w, p->osd_h);
++        }
++    }
++
 +    p->osd_change_id = imgs->change_id;
 +    p->has_subtitle = true;
 +    if (should_use_inline_osd_layer(p))
 +        p->osd_needs_enqueue = true;
 +}
 +
-+// Render OSD/subtitles for an already computed geometry.
-+static bool render_osd_with_geometry(struct vo *vo, double pts,
-+                                     struct avf_render_geometry geometry)
++static const bool osd_formats[SUBBITMAP_COUNT] = {
++    [SUBBITMAP_BGRA] = true,
++    [SUBBITMAP_LIBASS] = true,
++};
++
++// The OSD canvas for a frame of height frame_h shown with geometry. False
++// when there is nothing to draw on.
++static bool osd_canvas(struct vo *vo, struct avf_render_geometry geometry,
++                       int frame_h, struct avf_osd_canvas *out)
 +{
 +    struct priv *p = vo->priv;
 +
@@ -1834,44 +3386,157 @@ index 0000000..f3f96cd
 +    if (geometry.w <= 0 || geometry.h <= 0 || osd_res.w <= 0 || osd_res.h <= 0)
 +        return false;
 +
-+    if (!osd_res_equals(p->osd_res, osd_res)) {
-+        p->osd_res = osd_res;
-+        p->osd_change_id = 0;
-+    }
-+    p->osd_w = geometry.w;
-+    p->osd_h = geometry.h;
++    int osd_w = geometry.w;
++    int osd_h = geometry.h;
 +
-+    static const bool formats[SUBBITMAP_COUNT] = {
-+        [SUBBITMAP_BGRA] = true,
-+        [SUBBITMAP_LIBASS] = true,
-+    };
-+
-+    // Reset flag before calling osd_draw
-+    p->osd_callback_invoked = false;
-+
-+    osd_draw(vo->osd, osd_res, pts, 0, formats, draw_osd_cb, vo);
-+
-+    // If callback wasn't invoked, there are no subtitles for this PTS
-+    // Clear any cached subtitle state
-+    if (!p->osd_callback_invoked && p->has_subtitle) {
-+        p->has_subtitle = false;
-+        p->osd_change_id = 0;
-+        if (p->cachedSubtitleImage) {
-+            CGImageRelease(p->cachedSubtitleImage);
-+            p->cachedSubtitleImage = NULL;
++    // Optionally rasterize the OSD below display resolution; the OSD layer
++    // upscales (videoGravity resize). Inline mode only: the composite paths
++    // do pixel math that assumes the buffer matches the display geometry.
++    double scale = 1.0;
++    if (should_use_inline_osd_layer(p) && p->opts) {
++        // Video-resolution mode: match the OSD pixel density to the video's
++        // upscale factor, so the canvas maps 1:1 onto video pixels over the
++        // on-screen video rect.
++        if (p->opts->osd_video_res) {
++            if (frame_h <= 0)
++                frame_h = vo->params ? vo->params->h : 0;
++            int dst_h = geometry.dst.y1 - geometry.dst.y0;
++            if (frame_h > 0 && dst_h > frame_h)
++                scale = (double)frame_h / dst_h;
 +        }
-+        if (p->cachedSubtitleBuffer) {
-+            CVPixelBufferRelease(p->cachedSubtitleBuffer);
-+            p->cachedSubtitleBuffer = NULL;
-+        }
-+        if (should_use_inline_osd_layer(p))
-+            p->osd_needs_enqueue = true;
++        int max_h = p->opts->osd_max_height;
++        if (max_h > 0 && osd_res.h * scale > max_h)
++            scale = (double)max_h / osd_res.h;
++    }
++    if (scale < 1.0) {
++        osd_res.w = MPMAX(1, (int)(osd_res.w * scale + 0.5));
++        osd_res.h = MPMAX(1, (int)(osd_res.h * scale + 0.5));
++        osd_res.ml = (int)(osd_res.ml * scale + 0.5);
++        osd_res.mt = (int)(osd_res.mt * scale + 0.5);
++        osd_res.mr = (int)(osd_res.mr * scale + 0.5);
++        osd_res.mb = (int)(osd_res.mb * scale + 0.5);
++        osd_w = osd_res.w;
++        osd_h = osd_res.h;
 +    }
 +
++    *out = (struct avf_osd_canvas){.w = osd_w, .h = osd_h, .res = osd_res};
 +    return true;
 +}
 +
-+// Render OSD/subtitles synchronously so timed clear samples are never skipped.
++static bool osd_canvas_equal(const struct avf_osd_canvas *a,
++                             const struct avf_osd_canvas *b)
++{
++    return a->w == b->w && a->h == b->h && osd_res_equals(a->res, b->res);
++}
++
++// Forget the displayed subtitle; the inline layer then needs a clear sample.
++static void drop_displayed_subtitle(struct priv *p)
++{
++    p->has_subtitle = false;
++    p->osd_change_id = 0;
++    if (p->cachedSubtitleImage) {
++        CGImageRelease(p->cachedSubtitleImage);
++        p->cachedSubtitleImage = NULL;
++    }
++    if (p->cachedSubtitleBuffer) {
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++        p->cachedSubtitleBuffer = NULL;
++    }
++    if (should_use_inline_osd_layer(p))
++        p->osd_needs_enqueue = true;
++}
++
++// Inline layer: the whole list becomes the overlay buffer the next OSD
++// sample carries.
++static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++
++    int parts = 0;
++    for (int n = 0; n < list->num_items; n++)
++        parts += list->items[n]->num_parts;
++    if (!parts) {
++        if (p->has_subtitle || p->cachedSubtitleImage || p->cachedSubtitleBuffer) {
++            p->perf.empty++;
++            drop_displayed_subtitle(p);
++        }
++        return;
++    }
++
++    if (list->change_id && list->change_id == p->osd_change_id &&
++        p->has_subtitle && p->cachedSubtitleBuffer)
++    {
++        p->perf.skipped++;
++        return;
++    }
++
++    int64_t t_render = mp_time_ns();
++    CVPixelBufferRef subtitleBuffer = render_subtitle_list_pixel_buffer(vo, list);
++    if (!subtitleBuffer)
++        return;
++    if (p->cachedSubtitleBuffer)
++        CVPixelBufferRelease(p->cachedSubtitleBuffer);
++    p->cachedSubtitleBuffer = subtitleBuffer;
++
++    int64_t t_bounds = mp_time_ns();
++    reset_subtitle_bounds(p);
++    for (int n = 0; n < list->num_items; n++)
++        extend_subtitle_bounds(p, list->items[n]);
++    osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
++        p->subtitle_x0, p->subtitle_y0,
++        p->subtitle_x1, p->subtitle_y1});
++    p->perf.bounds_ns += mp_time_ns() - t_bounds;
++
++    int64_t render_ns = mp_time_ns() - t_render;
++    p->perf.renders++;
++    p->perf.total_ns += render_ns;
++    p->perf.max_ns = MPMAX(p->perf.max_ns, render_ns);
++    if (render_ns > MP_TIME_MS_TO_NS(8) && mp_msg_test(vo->log, MSGL_V)) {
++        int64_t now = mp_time_ns();
++        if (now - p->perf.last_spike_ns > MP_TIME_MS_TO_NS(1000)) {
++            p->perf.last_spike_ns = now;
++            MP_VERBOSE(vo, "osd-perf spike: render %.2fms (parts=%d osd=%dx%d)\n",
++                       render_ns / 1e6, parts, p->osd_w, p->osd_h);
++        }
++    }
++
++    p->osd_change_id = list->change_id;
++    p->has_subtitle = true;
++    p->osd_needs_enqueue = true;
++}
++
++// Make list, rendered on canvas, what the next frame shows.
++static void apply_osd_list(struct vo *vo, const struct avf_osd_canvas *canvas,
++                           struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++
++    if (!osd_res_equals(p->osd_res, canvas->res)) {
++        p->osd_res = canvas->res;
++        p->osd_change_id = 0;
++    }
++    p->osd_w = canvas->w;
++    p->osd_h = canvas->h;
++
++    if (should_use_inline_osd_layer(p)) {
++        present_inline_osd_list(vo, list);
++        return;
++    }
++
++    // The composite modes keep per-item images (draw_osd_cb), which the
++    // video sample composites.
++    p->osd_callback_invoked = false;
++    for (int n = 0; n < list->num_items; n++)
++        draw_osd_cb(vo, list->items[n]);
++
++    // If callback wasn't invoked, there are no subtitles for this PTS
++    // Clear any cached subtitle state
++    if (!p->osd_callback_invoked && p->has_subtitle)
++        drop_displayed_subtitle(p);
++}
++
++// Render OSD/subtitles synchronously so timed clear samples are never
++// skipped. Only used when the render-ahead thread is unavailable.
 +static void render_osd(struct vo *vo, double pts)
 +{
 +    struct priv *p = vo->priv;
@@ -1879,8 +3544,267 @@ index 0000000..f3f96cd
 +    int frame_h = p->next_image ? p->next_image->h : 0;
 +    struct avf_render_geometry geometry = get_render_geometry(vo, frame_w, frame_h);
 +
-+    render_osd_with_geometry(vo, pts, geometry);
++    struct avf_osd_canvas canvas;
++    if (!osd_canvas(vo, geometry, frame_h, &canvas))
++        return;
++    struct sub_bitmap_list *list = osd_render(vo->osd, canvas.res, pts, 0, osd_formats);
++    apply_osd_list(vo, &canvas, list);
++    talloc_free(list);
 +}
++
++// --- subtitle render-ahead (osd_ahead.h)
++
++// Render thread: a result was queued. While paused, flip_page runs only for
++// the core's redraws, so nothing would show a result that missed its frame;
++// wake the VO thread to present it.
++static void ahead_result_posted(void *ctx)
++{
++    struct vo *vo = ctx;
++    struct priv *p = vo->priv;
++    if (!atomic_load(&p->ahead_paused))
++        return;
++    atomic_store(&p->ahead_late_result, true);
++    vo_wakeup(vo);
++}
++
++// Locked.
++static void ahead_latch_canvas(void *ctx)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    p->ahead_render_canvas = p->ahead_canvas;
++}
++
++static void ahead_canvas_size(void *ctx, int *w, int *h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    *w = p->ahead_render_canvas.w;
++    *h = p->ahead_render_canvas.h;
++}
++
++static struct mp_osd_res ahead_canvas_res(void *ctx, int w, int h)
++{
++    struct priv *p = ((struct vo *)ctx)->priv;
++    return p->ahead_render_canvas.res;
++}
++
++static void ahead_start(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    if (!vo->osd)
++        return;
++    p->ahead.log = vo->log;
++    p->ahead.osd = vo->osd;
++    p->ahead.formats = osd_formats;
++    p->ahead.cb = (struct osd_ahead_callbacks){
++        .ctx = vo,
++        .latch_canvas = ahead_latch_canvas,
++        .canvas_size = ahead_canvas_size,
++        .canvas_res = ahead_canvas_res,
++        .result_posted = ahead_result_posted,
++    };
++    p->ahead_last_pts = MP_NOPTS_VALUE;
++    if (!osd_ahead_start(&p->ahead))
++        MP_WARN(vo, "Subtitle render thread unavailable; rendering on the VO thread\n");
++}
++
++// File this frame's subtitles with the render thread: pinned to the frame
++// for a new one, an immediate repaint for a redraw. flip_page presents them.
++static void ahead_file_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++
++    p->ahead_req.valid = false;
++    if (!s->started || !p->next_image || p->ahead_replay)
++        return;
++
++    int frame_h = p->next_image->h;
++    struct avf_render_geometry geometry =
++        get_render_geometry(vo, p->next_image->w, frame_h);
++    struct avf_osd_canvas canvas;
++    if (!osd_canvas(vo, geometry, frame_h, &canvas))
++        return;
++
++    double pts = p->next_pts;
++    bool redraw = frame->redraw;
++    if (!redraw) {
++        if (pts == MP_NOPTS_VALUE)
++            osd_cadence_reset(&p->ahead_cadence);
++        else
++            osd_cadence_observe(&p->ahead_cadence, frame->frame_id, pts);
++    }
++
++    mp_mutex_lock(&s->lock);
++    if (!p->ahead_canvas_valid || !osd_canvas_equal(&p->ahead_canvas, &canvas)) {
++        // Nothing rendered for the old canvas may reach this one.
++        p->ahead_canvas = canvas;
++        p->ahead_canvas_valid = true;
++        osd_ahead_invalidate(s, pts);
++    }
++    osd_ahead_file_request(s, (struct osd_request){
++        .pts = pts,
++        .delta = redraw ? 0 : osd_cadence_delta(&p->ahead_cadence),
++        .seq = redraw ? 0 : ++p->ahead_frame_seq,
++        .epoch = s->epoch,
++    });
++    if (!redraw)
++        s->stats.frames++;
++    // What the filing became: a repaint moves to a new epoch, or adopts a
++    // pending frame of the same pts.
++    p->ahead_req.valid = true;
++    p->ahead_req.seq = s->request.seq;
++    p->ahead_req.epoch = s->request.epoch;
++    // While paused a new frame (a seek) is shown at once: there is no queue
++    // lead to protect.
++    p->ahead_req.timed = !redraw && frame->pts > 0 && !s->paused;
++    mp_mutex_unlock(&s->lock);
++    p->ahead_last_pts = pts;
++}
++
++// Present what the render thread has for this frame, waiting only as long
++// as avf_osd_wait_until allows. A result that arrives later is shown with a
++// later frame; of several ready ones only the newest is drawn.
++static void ahead_present(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    bool composite = should_composite_into_video(p);
++
++    mp_mutex_lock(&s->lock);
++    if (p->ahead_req.valid && p->ahead_req.seq) {
++        osd_ahead_publish_release(s, (struct osd_release){
++            .seq = p->ahead_req.seq,
++            .timestamp = p->next_present_host_ns,
++        });
++    }
++    if (p->ahead_req.valid) {
++        int64_t now = mp_time_ns();
++        bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
++                      s->served_seq + 1 < p->ahead_req.seq;
++        int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
++            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), p->ahead_req.timed,
++            composite, behind);
++        if (behind)
++            p->ahead_perf.behind++;
++        if (until > now) {
++            bool served = osd_ahead_wait_served(s, p->ahead_req.epoch,
++                                                p->ahead_req.seq, until);
++            int64_t waited = mp_time_ns() - now;
++            p->ahead_perf.waited++;
++            p->ahead_perf.wait_ns += waited;
++            p->ahead_perf.wait_max_ns = MPMAX(p->ahead_perf.wait_max_ns, waited);
++            if (!served)
++                p->ahead_perf.gave_up++;
++        }
++    }
++    int dropped;
++    struct osd_result r = osd_ahead_take_newest(s, &dropped);
++    struct sub_bitmap_list *list = r.slot >= 0 ? s->slots[r.slot].sbs : NULL;
++    mp_mutex_unlock(&s->lock);
++    p->ahead_req.valid = false;
++    p->ahead_perf.dropped += dropped;
++
++    // The taken slot stays immutable while it is present_slot.
++    if (!list)
++        return;
++    p->ahead_perf.presented++;
++    if (r.seq && r.seq < p->ahead_frame_seq) {
++        int late = (int)(p->ahead_frame_seq - r.seq);
++        p->ahead_perf.late++;
++        p->ahead_perf.max_late = MPMAX(p->ahead_perf.max_late, late);
++    }
++    apply_osd_list(vo, &p->ahead_canvas, list);
++}
++
++// Nothing the render thread has rendered or is rendering counts as shown any
++// more: repaint in full at pts.
++static void ahead_invalidate(struct priv *p, double pts)
++{
++    if (!p->ahead.started)
++        return;
++    mp_mutex_lock(&p->ahead.lock);
++    osd_ahead_invalidate(&p->ahead, pts);
++    mp_mutex_unlock(&p->ahead.lock);
++}
++
++static void ahead_set_paused(struct priv *p, bool paused)
++{
++    if (!p->ahead.started)
++        return;
++    mp_mutex_lock(&p->ahead.lock);
++    p->ahead.paused = paused;
++    mp_cond_broadcast(&p->ahead.wakeup);
++    mp_mutex_unlock(&p->ahead.lock);
++    atomic_store(&p->ahead_paused, paused);
++    // A result queued just before the pause saw playback still running and
++    // is waiting for a frame that will not come.
++    if (paused)
++        atomic_store(&p->ahead_late_result, true);
++}
++
++static void flip_page(struct vo *vo);
++static bool draw_frame(struct vo *vo, struct vo_frame *frame);
++
++// Paused: redraw the frame on screen with a result that arrived after it, as
++// the core's redraw would, but without filing a request. A filing is a
++// repaint, which would discard the very result that is ready and render it
++// again.
++static void ahead_present_late(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    if (!s->started || !p->ahead_shown_image)
++        return;
++    mp_mutex_lock(&s->lock);
++    struct osd_result *head = osd_result_head(&s->results);
++    bool ready = s->paused && head && (!head->seq || head->release.seq == head->seq);
++    mp_mutex_unlock(&s->lock);
++    if (!ready)
++        return;
++    struct vo_frame frame = {
++        .pts = 0,
++        .duration = -1,
++        .redraw = true,
++        .still = true,
++        .current = p->ahead_shown_image,
++        .num_frames = 1,
++        .frames = {p->ahead_shown_image},
++    };
++    p->ahead_replay = true;
++    if (draw_frame(vo, &frame))
++        flip_page(vo);
++    p->ahead_replay = false;
++}
++
++static void report_ahead_perf(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    struct osd_ahead *s = &p->ahead;
++    if (!s->started || !mp_msg_test(vo->log, MSGL_V))
++        return;
++    mp_mutex_lock(&s->lock);
++    struct osd_ahead_stats st = s->stats;
++    struct osd_spec spec = s->spec;
++    uint32_t prefetch = s->prefetch.count;
++    mp_mutex_unlock(&s->lock);
++    int nw = MPMAX(p->ahead_perf.waited, 1);
++    MP_VERBOSE(vo, "osd-ahead: presented=%d waited=%d (avg %.2fms max %.2fms) "
++               "gave_up=%d behind=%d dropped=%d late=%d (max %d frames) | "
++               "renders=%u/%u maxMs=%d hist=%u,%u,%u,%u,%u spec=%u/%u/%u "
++               "horizonSkips=%u prefetch=%u coalesced=%u stale=%u\n",
++               p->ahead_perf.presented, p->ahead_perf.waited,
++               p->ahead_perf.wait_ns / nw / 1e6, p->ahead_perf.wait_max_ns / 1e6,
++               p->ahead_perf.gave_up, p->ahead_perf.behind, p->ahead_perf.dropped,
++               p->ahead_perf.late, p->ahead_perf.max_late,
++               st.renders_changed, st.renders, (int)(st.render_ns_max / 1000000),
++               st.render_hist[0], st.render_hist[1], st.render_hist[2],
++               st.render_hist[3], st.render_hist[4],
++               spec.hits, spec.misses, spec.skips, spec.horizon_skips, prefetch,
++               st.coalesced, st.stale);
++    memset(&p->ahead_perf, 0, sizeof(p->ahead_perf));
++}
++
++// --- end subtitle render-ahead
 +
 +static bool ensure_ci_compositor(struct vo *vo)
 +{
@@ -1944,33 +3868,17 @@ index 0000000..f3f96cd
 +    int srcH = src.y1 - src.y0;
 +    int dstW = dst.x1 - dst.x0;
 +    int dstH = dst.y1 - dst.y0;
-+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
++
++    struct mp_rect sub = {p->subtitle_x0, p->subtitle_y0,
++                          p->subtitle_x1, p->subtitle_y1};
++    struct mp_rect target;
++    if (!avf_map_subtitle_rect(geometry, sub, subW, subH, videoW, videoH, &target))
 +        return NULL;
 +
-+    int video_x0 = MPCLAMP(src.x0, 0, videoW);
-+    int video_y0 = MPCLAMP(src.y0, 0, videoH);
-+    int video_x1 = MPCLAMP(src.x1, 0, videoW);
-+    int video_y1 = MPCLAMP(src.y1, 0, videoH);
-+    if (video_x1 <= video_x0 || video_y1 <= video_y0)
-+        return NULL;
-+
-+    int osd_x0 = MPMAX(p->subtitle_x0, MPMAX(dst.x0, 0));
-+    int osd_y0 = MPMAX(p->subtitle_y0, MPMAX(dst.y0, 0));
-+    int osd_x1 = MPMIN(p->subtitle_x1, MPMIN(dst.x1, subW));
-+    int osd_y1 = MPMIN(p->subtitle_y1, MPMIN(dst.y1, subH));
-+    if (osd_x1 <= osd_x0 || osd_y1 <= osd_y0)
-+        return NULL;
-+
-+    int vx0 = src.x0 + (int)(((int64_t)(osd_x0 - dst.x0) * srcW) / dstW) - 1;
-+    int vy0 = src.y0 + (int)(((int64_t)(osd_y0 - dst.y0) * srcH) / dstH) - 1;
-+    int vx1 = src.x0 + (int)((((int64_t)(osd_x1 - dst.x0) * srcW) + dstW - 1) / dstW) + 1;
-+    int vy1 = src.y0 + (int)((((int64_t)(osd_y1 - dst.y0) * srcH) + dstH - 1) / dstH) + 1;
-+    vx0 = MPCLAMP(vx0, video_x0, video_x1);
-+    vy0 = MPCLAMP(vy0, video_y0, video_y1);
-+    vx1 = MPCLAMP(vx1, video_x0, video_x1);
-+    vy1 = MPCLAMP(vy1, video_y0, video_y1);
-+    if (vx1 <= vx0 || vy1 <= vy0)
-+        return NULL;
++    int vx0 = target.x0;
++    int vy0 = target.y0;
++    int vx1 = target.x1;
++    int vy1 = target.y1;
 +
 +    CVPixelBufferRef outputBuffer = NULL;
 +    if (in_place) {
@@ -2277,6 +4185,9 @@ index 0000000..f3f96cd
 +    });
 +    [displayLayer release];
 +    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    p->ready_queue = dispatch_queue_create("avfoundation ready",
++        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
++                                                QOS_CLASS_USER_INTERACTIVE, 0));
 +    update_avfoundation_geometry(vo);
 +
 +    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
@@ -2285,6 +4196,7 @@ index 0000000..f3f96cd
 +    // The OSD layer's lifetime follows the option: created here, kept in step
 +    // by sync_osd_layer_frame.
 +    ensure_osd_layer(vo);
++    ahead_start(vo);
 +
 +    vo->hwdec_devs = hwdec_devices_create();
 +    p->hwctx = (struct mp_hwdec_ctx){
@@ -2319,6 +4231,27 @@ index 0000000..f3f96cd
 +    });
 +#endif
 +
++    atomic_init(&p->pending_layer_geometry_sync, false);
++    {
++        MPVLayerGeometryObserver *observer = [[MPVLayerGeometryObserver alloc] init];
++        observer->vo = vo;
++        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
++        dispatch_main_sync_safe(^{
++            [observedLayer addObserver:observer
++                            forKeyPath:@"bounds"
++                               options:NSKeyValueObservingOptionOld |
++                                       NSKeyValueObservingOptionNew
++                               context:NULL];
++            [observedLayer addObserver:observer
++                            forKeyPath:@"contentsScale"
++                               options:NSKeyValueObservingOptionOld |
++                                       NSKeyValueObservingOptionNew
++                               context:NULL];
++        });
++        [observedLayer release];
++        p->layer_geometry_observer = observer;
++    }
++
 +    return 0;
 +}
 +
@@ -2348,6 +4281,20 @@ index 0000000..f3f96cd
 +        bool needsRelease = false;
 +
 +        bool applyGeometry = should_apply_video_geometry(vo);
++        // Apple Dolby Vision passthrough buffers (native dvh1 decode) carry
++        // per-frame RPU metadata that only survives an untouched enqueue; a
++        // Core Image re-render feeds the DV display pipeline frames the RPU
++        // no longer describes and the picture collapses to near-black.
++        // Prefer an unzoomed but correct picture.
++        if (applyGeometry && pixbuf &&
++            CVBufferGetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), NULL)) {
++            if (!p->dovi_geometry_skip_logged) {
++                MP_WARN(vo, "Dolby Vision passthrough frame; ignoring video "
++                            "zoom/pan instead of destroying DV output\n");
++                p->dovi_geometry_skip_logged = true;
++            }
++            applyGeometry = false;
++        }
 +        if (applyGeometry) {
 +            CVPixelBufferRef rendered = render_video_geometry_frame(vo, pixbuf, p->has_subtitle);
 +            if (rendered) {
@@ -2385,6 +4332,25 @@ index 0000000..f3f96cd
 +        if (!needsRelease && !applyGeometry && should_composite_into_video(p)) {
 +            // In compositing modes, composite the subtitle rendered for this flip.
 +            CVPixelBufferRef composited = composite_frame(vo, pixbuf);
++            if (composited && should_use_frame_space_osd(p) &&
++                (CVPixelBufferGetWidth(composited) != CVPixelBufferGetWidth(pixbuf) ||
++                 CVPixelBufferGetHeight(composited) != CVPixelBufferGetHeight(pixbuf))) {
++                // The system sizes the PiP window from the enqueued samples, so a
++                // composite that changed them would resize the window on every
++                // cue. Present the frame without the overlay instead.
++                if (!p->composite_size_mismatch_logged) {
++                    MP_WARN(vo, "Composited frame is %zux%zu instead of the frame's "
++                                "%zux%zu; dropping the overlay to keep the sample "
++                                "size steady\n",
++                            CVPixelBufferGetWidth(composited),
++                            CVPixelBufferGetHeight(composited),
++                            CVPixelBufferGetWidth(pixbuf),
++                            CVPixelBufferGetHeight(pixbuf));
++                    p->composite_size_mismatch_logged = true;
++                }
++                CVPixelBufferRelease(composited);
++                composited = NULL;
++            }
 +            if (composited) {
 +                finalBuffer = composited;
 +                needsRelease = true;
@@ -2401,20 +4367,41 @@ index 0000000..f3f96cd
 +        // ratio; AVSampleBufferDisplayLayer only honors it via a buffer attachment.
 +        tag_pixel_buffer_pixel_aspect(vo, finalBuffer);
 +
-+        CMSampleBufferRef buf = NULL;
-+        CMFormatDescriptionRef format = NULL;
-+        OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, finalBuffer, &format);
-+        if (err != noErr || !format) {
-+            MP_ERR(vo, "Failed to create format description: %d\n", (int)err);
-+            if (needsRelease)
-+                CVPixelBufferRelease(finalBuffer);
-+            if (pixbufNeedsRelease)
-+                CVPixelBufferRelease(pixbuf);
-+            return NULL;
-+        }
++        // Profile 5 may retain its RPU while losing VideoToolbox's PQ tag.
++        // Its color primaries and matrix must remain unspecified.
++        if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX && finalBuffer == pixbuf)
++            restore_dolby_vision_transfer(finalBuffer, &mpi->params);
 +
-+        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, finalBuffer, format, &info, &buf);
-+        CFRelease(format);
++        // The format description is stable across frames from the same pool.
++        // CMSampleBufferCreateReadyWithImageBuffer checks the buffer against
++        // it (dimensions, pixel format and the relevant attachments) and
++        // refuses a mismatch with kCMSampleBufferError_InvalidMediaFormat, so
++        // the cache is rebuilt only on that refusal (reconfig, geometry or
++        // composite output, color tags) rather than checked twice per frame.
++        CMSampleBufferRef buf = NULL;
++        OSStatus err = kCMSampleBufferError_InvalidMediaFormat;
++        if (p->video_format_desc) {
++            err = CMSampleBufferCreateReadyWithImageBuffer(
++                NULL, finalBuffer, p->video_format_desc, &info, &buf);
++        }
++        if (err == kCMSampleBufferError_InvalidMediaFormat) {
++            CMVideoFormatDescriptionRef new_format = NULL;
++            OSStatus desc_err = CMVideoFormatDescriptionCreateForImageBuffer(
++                NULL, finalBuffer, &new_format);
++            if (desc_err != noErr || !new_format) {
++                MP_ERR(vo, "Failed to create format description: %d\n", (int)desc_err);
++                if (needsRelease)
++                    CVPixelBufferRelease(finalBuffer);
++                if (pixbufNeedsRelease)
++                    CVPixelBufferRelease(pixbuf);
++                return NULL;
++            }
++            if (p->video_format_desc)
++                CFRelease(p->video_format_desc);
++            p->video_format_desc = new_format;
++            err = CMSampleBufferCreateReadyWithImageBuffer(
++                NULL, finalBuffer, new_format, &info, &buf);
++        }
 +
 +        if (err != noErr || !buf) {
 +            MP_ERR(vo, "Failed to create sample buffer: %d\n", (int)err);
@@ -2424,6 +4411,11 @@ index 0000000..f3f96cd
 +                CVPixelBufferRelease(pixbuf);
 +            return NULL;
 +        }
++
++        // Geometry and composite renders keep the frame's PQ tags, and the
++        // metadata describes the scene rather than the pixel grid, so it
++        // applies to whichever buffer is enqueued.
++        attach_hdr10plus_metadata(vo, mpi, finalBuffer, buf);
 +
 +        // Release composited output buffer (always owned by us)
 +        if (needsRelease)
@@ -2449,6 +4441,41 @@ index 0000000..f3f96cd
 +    return true;
 +}
 +
++// OSD perf summary; counters always accumulate, formatting is gated on -v.
++static void report_osd_perf(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->perf.renders <= 0)
++        return;
++
++    if (mp_msg_test(vo->log, MSGL_V)) {
++        double n = p->perf.renders;
++        double nf = MPMAX(p->perf.frames, 1);
++        double ne = MPMAX(p->perf.enq_count, 1);
++        MP_VERBOSE(vo,
++            "osd-perf: n=%d avg=%.2fms max=%.2fms "
++            "[clear %.2f blend %.2f cg %.2f bounds %.2f] enq %.2f | "
++            "vid %.3f (/frame) | "
++            "margin avg=%.1f min=%.1fms drops=%d | "
++            "skip=%d empty=%d osd=%dx%d\n",
++            p->perf.renders,
++            p->perf.total_ns / n / 1e6,
++            p->perf.max_ns / 1e6,
++            p->perf.clear_ns / n / 1e6,
++            p->perf.blend_ns / n / 1e6,
++            p->perf.cg_ns / n / 1e6,
++            p->perf.bounds_ns / n / 1e6,
++            p->perf.enqueue_ns / n / 1e6,
++            p->perf.video_sample_ns / nf / 1e6,
++            p->perf.lead_sum_ns / ne / 1e6,
++            p->perf.enq_count ? p->perf.lead_min_ns / 1e6 : 0.0,
++            p->perf.enq_drops,
++            p->perf.skipped, p->perf.empty, p->osd_w, p->osd_h);
++    }
++    memset(&p->perf, 0, sizeof(p->perf));
++}
++
 +static void flip_page(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
@@ -2456,16 +4483,28 @@ index 0000000..f3f96cd
 +    if (atomic_exchange(&p->pending_presentation_resync, false))
 +        recover_display_layer(vo, "presentation resume", true);
 +
++    report_presentation_diagnostics(vo);
++
 +    if (p->next_image) {
 +        CMSampleBufferRef osd_buf = NULL;
 +        bool osd_needed = false;
 +
-+        render_osd(vo, p->next_pts);
++        // The OSD is enqueued before the video sample on purpose: the
++        // adjacent enqueues are what keep subtitle changes presenting on the
++        // exact frame they belong to. The subtitles were rendered ahead;
++        // when they are late, the video goes without them (ahead_present).
++        if (p->ahead.started) {
++            ahead_present(vo);
++        } else {
++            render_osd(vo, p->next_pts);
++        }
 +
-+        osd_buf = create_osd_sample_buffer(vo,
-+            sample_presentation_pts_ns(p), &osd_needed);
++        int64_t osd_pts_ns = sample_presentation_pts_ns(p);
++        osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
 +
++        int64_t t = mp_time_ns();
 +        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
++        p->perf.video_sample_ns += mp_time_ns() - t;
 +
 +        bool osd_enqueued = !osd_needed;
 +
@@ -2474,9 +4513,21 @@ index 0000000..f3f96cd
 +                update_media_timebase_for_frame(vo);
 +
 +            if (osd_buf) {
++                t = mp_time_ns();
 +                osd_enqueued = enqueue_osd_sample(vo, osd_buf);
-+                if (osd_enqueued)
++                p->perf.enqueue_ns += mp_time_ns() - t;
++                if (osd_enqueued) {
 +                    p->osd_needs_enqueue = false;
++                    // Margin between the OSD/video enqueue pair and the
++                    // frame's intended presentation time (same clock).
++                    int64_t lead = p->next_present_host_ns - mp_time_ns();
++                    if (!p->perf.enq_count || lead < p->perf.lead_min_ns)
++                        p->perf.lead_min_ns = lead;
++                    p->perf.lead_sum_ns += lead;
++                    p->perf.enq_count++;
++                } else {
++                    p->perf.enq_drops++;
++                }
 +            }
 +
 +            enqueue_video_sample(vo, video_buf);
@@ -2489,6 +4540,8 @@ index 0000000..f3f96cd
 +            CFRelease(osd_buf);
 +        if (video_buf)
 +            CFRelease(video_buf);
++
++        p->perf.frames++;
 +    }
 +
 +    // Flush excess buffers every ~60 frames to prevent memory growth
@@ -2501,9 +4554,22 @@ index 0000000..f3f96cd
 +            CVPixelBufferPoolFlush(p->osdPool, kCVPixelBufferPoolFlushExcessBuffers);
 +        if (p->swUploadPool)
 +            CVPixelBufferPoolFlush(p->swUploadPool, kCVPixelBufferPoolFlushExcessBuffers);
++        prune_osd_buf_states(p, mp_time_ns());
 +    }
 +
-+    mp_image_unrefp(&p->next_image);
++    // Report often enough that short capture sessions still carry data.
++    if (p->perf.renders >= 32 ||
++        (p->perf.renders > 0 && p->perf.frames >= 300))
++    {
++        report_osd_perf(vo);
++        report_ahead_perf(vo);
++    }
++
++    if (p->next_image) {
++        mp_image_unrefp(&p->ahead_shown_image);
++        p->ahead_shown_image = p->next_image;
++        p->next_image = NULL;
++    }
 +}
 +
 +static bool draw_frame(struct vo *vo, struct vo_frame *frame)
@@ -2516,6 +4582,7 @@ index 0000000..f3f96cd
 +        p->next_pts = MP_NOPTS_VALUE;
 +        p->next_present_host_ns = mp_time_ns();
 +        p->next_media_pts_valid = false;
++        p->next_timebase_rate_valid = false;
 +        return true;
 +    }
 +
@@ -2533,20 +4600,35 @@ index 0000000..f3f96cd
 +    p->next_media_pts_ns = p->next_media_pts_valid
 +        ? media_pts_to_ns(pts)
 +        : current_media_time_ns(p);
++    p->next_timebase_rate_valid = false;
++    if (p->next_media_pts_valid) {
++        int64_t frame_duration_ns = frame->display_synced &&
++                                    frame->ideal_frame_duration > 0.0
++            ? MP_TIME_S_TO_NS(frame->ideal_frame_duration)
++            : frame->duration > 0.0 ? (int64_t)llrint(frame->duration) : 0;
++        p->next_timebase_rate_valid = avf_rate_sample(
++            &p->rate_est, p->next_media_pts_ns, frame_duration_ns,
++            p->timebase_rate > 0.0 ? p->timebase_rate : 1.0,
++            &p->next_timebase_rate);
++    }
++    ahead_file_frame(vo, frame);
 +    return true;
 +}
 +
 +static int query_format(struct vo *vo, int format)
 +{
-+    switch (format) {
-+        case IMGFMT_VIDEOTOOLBOX:  // Hardware decoded (zero-copy)
-+        case IMGFMT_NV12:          // Software decoded (common)
-+        case IMGFMT_420P:          // YUV420P (very common)
-+        case IMGFMT_P010:          // 10-bit (HDR software decode)
-+            return 1;
-+        default:
-+            return 0;
-+    }
++    // Accepting the planar 10/12-bit decoder output formats directly matters
++    // for performance: it keeps mpv's autoconvert filter (scalar libswscale
++    // pass on the decode thread) out of the chain, and the upload fuses the
++    // biplanar conversion into the one unavoidable copy.
++    if (format == IMGFMT_VIDEOTOOLBOX ||   // Hardware decoded (zero-copy)
++        format == IMGFMT_NV12 ||           // Software decoded (common)
++        format == IMGFMT_420P ||           // YUV420P (very common)
++        format == IMGFMT_P010 ||           // 10-bit biplanar
++        format == imgfmt_420p10() ||       // 10-bit planar (AV1/HEVC SW decode)
++        format == imgfmt_420p12())         // 12-bit planar
++        return 1;
++    return 0;
 +}
 +
 +static void clear_subtitle_cache(struct priv *p)
@@ -2564,6 +4646,7 @@ index 0000000..f3f96cd
 +    p->osd_needs_enqueue = false;
 +    p->osd_callback_invoked = false;
 +    p->subtitle_x0 = p->subtitle_y0 = p->subtitle_x1 = p->subtitle_y1 = 0;
++    ahead_invalidate(p, p->ahead_last_pts);
 +}
 +
 +// Helper to clear all subtitle state (called on video change/stop)
@@ -2589,6 +4672,10 @@ index 0000000..f3f96cd
 +    MP_VERBOSE(vo, "reconfig: %dx%d\n", params->w, params->h);
 +
 +    // Clear subtitles when video configuration changes
++    struct priv *p = vo->priv;
++    p->ahead_last_pts = MP_NOPTS_VALUE;
++    osd_cadence_reset(&p->ahead_cadence);
++    mp_image_unrefp(&p->ahead_shown_image);
 +    clear_subtitle_state(vo);
 +    sync_osd_layer_frame(vo);
 +
@@ -2598,6 +4685,12 @@ index 0000000..f3f96cd
 +static void uninit(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
++
++    report_osd_perf(vo);
++    report_ahead_perf(vo);
++    if (p->ahead.started)
++        osd_ahead_stop(&p->ahead);
++    osd_ahead_destroy(&p->ahead);
 +
 +#if TARGET_OS_IPHONE
 +    if (p->app_resign_observer || p->app_active_observer) {
@@ -2617,7 +4710,20 @@ index 0000000..f3f96cd
 +    }
 +#endif
 +
++    if (p->layer_geometry_observer) {
++        MPVLayerGeometryObserver *observer = p->layer_geometry_observer;
++        p->layer_geometry_observer = nil;
++        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
++        dispatch_main_sync_safe(^{
++            [observedLayer removeObserver:observer forKeyPath:@"bounds"];
++            [observedLayer removeObserver:observer forKeyPath:@"contentsScale"];
++        });
++        [observedLayer release];
++        [observer release];
++    }
++
 +    mp_image_unrefp(&p->next_image);
++    mp_image_unrefp(&p->ahead_shown_image);
 +    sample_buffer_renderer_flush(p->displayLayer, true);
 +    sample_buffer_renderer_flush(p->osdLayer, true);
 +
@@ -2653,10 +4759,16 @@ index 0000000..f3f96cd
 +        CVPixelBufferPoolRelease(p->osdPool);
 +        p->osdPool = NULL;
 +    }
++    reset_osd_buf_states(p);
 +
 +    if (p->swUploadPool) {
 +        CVPixelBufferPoolRelease(p->swUploadPool);
 +        p->swUploadPool = NULL;
++    }
++
++    if (p->video_format_desc) {
++        CFRelease(p->video_format_desc);
++        p->video_format_desc = NULL;
 +    }
 +
 +    release_osd_layer(vo);
@@ -2665,6 +4777,11 @@ index 0000000..f3f96cd
 +    p->ciContext = nil;
 +    [p->mtlDevice release];
 +    p->mtlDevice = nil;
++
++    if (p->ready_queue) {
++        dispatch_release(p->ready_queue);
++        p->ready_queue = NULL;
++    }
 +
 +    [p->displayLayer release];
 +    p->displayLayer = nil;
@@ -2685,7 +4802,11 @@ index 0000000..f3f96cd
 +    case VOCTRL_CHECK_EVENTS:
 +        if (atomic_exchange(&p->pending_presentation_resync, false))
 +            recover_display_layer(vo, "presentation resume", true);
++        if (atomic_exchange(&p->pending_layer_geometry_sync, false))
++            handle_layer_geometry_change(vo);
 +        update_avfoundation_options(vo);
++        if (atomic_exchange(&p->ahead_late_result, false))
++            ahead_present_late(vo);
 +        return VO_TRUE;
 +    case VOCTRL_VO_OPTS_CHANGED:
 +        update_avfoundation_options(vo);
@@ -2697,7 +4818,15 @@ index 0000000..f3f96cd
 +        sync_osd_layer_frame(vo);
 +        return VO_TRUE;
 +    case VOCTRL_RESET:
-+        // Called when playback stops or video changes
++        // Fired by vo_seek_reset() on every seek (and on stop/track change).
++        // Flush queued-but-undisplayed samples without removing the on-screen
++        // frame: removing it blanks the layer to black until the first
++        // post-seek frame survives demux+decode, a visible flash on every
++        // skip. Reference VOs (gpu/gpu-next) hold the last frame through
++        // seeks; the OSD layer still drops so stale subtitles don't linger
++        // over the held frame.
++        p->ahead_last_pts = MP_NOPTS_VALUE;
++        osd_cadence_reset(&p->ahead_cadence);
 +        clear_subtitle_state(vo);
 +        p->not_ready_drop_count = 0;
 +        p->last_not_ready_drop_ns = 0;
@@ -2708,7 +4837,7 @@ index 0000000..f3f96cd
 +        bool was_paused = p->playback_paused;
 +        reset_media_timing(p);
 +        p->playback_paused = was_paused;
-+        sample_buffer_renderer_flush(p->displayLayer, true);
++        sample_buffer_renderer_flush(p->displayLayer, false);
 +        sample_buffer_renderer_flush(p->osdLayer, true);
 +        if (p->presentation_host && p->timebase) {
 +            // Fresh host-time samples arrive with future timestamps; the
@@ -2724,10 +4853,12 @@ index 0000000..f3f96cd
 +    case VOCTRL_PAUSE:
 +        if (!p->presentation_host)
 +            set_media_timebase_paused(vo, true);
++        ahead_set_paused(p, true);
 +        return VO_TRUE;
 +    case VOCTRL_RESUME:
 +        if (!p->presentation_host)
 +            set_media_timebase_paused(vo, false);
++        ahead_set_paused(p, false);
 +        return VO_TRUE;
 +    case VOCTRL_REDRAW:
 +        p->osd_change_id = 0;
@@ -2753,6 +4884,12 @@ index 0000000..f3f96cd
 +    {"presentation", OPT_CHOICE(presentation,
 +        {"media", AVF_PRESENTATION_MEDIA},
 +        {"host", AVF_PRESENTATION_HOST})},
++    // Cap the OSD/subtitle rasterization height (0 = display resolution).
++    // Inline OSD layer mode only; the layer upscales the result.
++    {"osd-max-height", OPT_INT(osd_max_height), M_RANGE(0, 4320)},
++    // Rasterize the OSD at the video's pixel density instead of the
++    // display's (1:1 over the on-screen video rect).
++    {"osd-video-res", OPT_BOOL(osd_video_res)},
 +    {0},
 +};
 +
