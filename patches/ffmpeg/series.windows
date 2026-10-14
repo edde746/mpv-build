@@ -1,6 +1,5 @@
 # Windows patch series for ffmpeg, applied after series.common (the
-# videotoolbox/dolby-vision stack lives in series.apple). Entries are staged
-# into the mpv-winbuild-cmake checkout and applied with `git apply` by the
-# injected PATCH_COMMAND (see platforms/windows/pin_packages.py).
-# Shared with series.apple and series.android (see series.apple).
-0035-tls-openssl-read-ahead.patch
+# videotoolbox/dolby-vision stack lives in series.apple). Empty today: nothing
+# is Windows-only yet. Entries are staged into the mpv-winbuild-cmake checkout
+# and applied with `git apply` by the injected PATCH_COMMAND (see
+# platforms/windows/pin_packages.py).
