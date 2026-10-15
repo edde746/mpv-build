@@ -257,6 +257,22 @@ with tempfile.TemporaryDirectory() as tmp:
     check(before["libmpv"] != after["libmpv"], "SpatialAudioBridge source moves libmpv's key")
     check(before["FFmpeg"] == after["FFmpeg"], "SpatialAudioBridge source does not move FFmpeg")
 
+# A renderer integration patch is another input to libmpv, but not FFmpeg.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_repo(tmp)
+    before = keys(repo)
+    pool = repo / "patches/spatialaudiobridge/pool"
+    pool.mkdir(parents=True)
+    patch = pool / "progress.patch"
+    patch.write_text("first renderer patch\n")
+    check(keys(repo) == before, "unreferenced SAB patches do not affect keys")
+    (pool.parent / "series.apple").write_text("progress.patch\n")
+    added = keys(repo)
+    check(added["libmpv"] != before["libmpv"], "SAB patch series moves libmpv")
+    check(added["FFmpeg"] == before["FFmpeg"], "SAB patches do not move FFmpeg")
+    patch.write_text("changed renderer patch\n")
+    check(keys(repo)["libmpv"] != added["libmpv"], "SAB patch bytes move libmpv")
+
 # 2. The committed manifest describes the published apple assets.
 committed = root / "artifacts.json"
 if committed.is_file():

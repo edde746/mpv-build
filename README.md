@@ -130,6 +130,22 @@ reproduce the merged assets already published under its name.
 
 ## How to build
 
+For Apple source builds, select the intended Xcode with `xcode-select` and
+install [rustup](https://rustup.rs/) first. Before `make build`, provision the
+compiler pinned by this checkout and the targets used by its spatial slices:
+
+```bash
+rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+test -n "$rust_version"
+rustup toolchain install "$rust_version" --profile minimal
+rustup target add --toolchain "$rust_version" \
+  aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+  aarch64-apple-tvos aarch64-apple-tvos-sim
+```
+
+These are the same toolchain and target prerequisites installed by Apple CI.
+Repeat this setup after changing checkouts if their `rust` pin differs.
+
 ```bash
 make build
 # specified platforms (ios,macos,tvos,tvsimulator,isimulator,maccatalyst,xros,xrsimulator)
@@ -454,20 +470,51 @@ so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
-(macOS). It compiles `audio/out/ao_spatial.m` (patch 0039) against a real
-`AVSampleBufferRenderSynchronizer` and a fake renderer: TrueHD and DTS-HD
-bursts reach the renderer unchanged, the clock waits until the renderer is ready and
-then runs in real time, pause, seek, underrun and end of stream each keep or
-begin the right timeline, and a renderer failure latches the format so the reopen
-refuses it and mpv decodes the track, until that player probes PCM and clears
-its latch. A second player neither inherits nor clears that failure.
-Pass an already-patched source directory to run offline.
+(macOS). It checks admission, submitted-output accounting, empty EOF, gapless
+handoff, pause/reset and per-player fallback with a fake renderer.
+`bash scripts/test_spatial_feed.sh` exercises the complete production Swift
+bridge and pinned IEC unpacker with a fake renderer/activator, without media or
+audio output. It covers empty/filler/null/pre-major-sync EOF, bounded admission,
+suspended enqueue/final flush, delayed activator attachment, cancellation and
+errors. Its real CoreMedia clock checks early holds, terminal late submission,
+pause/reset, finalization races, empty/priming-only output and stale callbacks.
+`bash scripts/test_spatial_submission.sh` compiles the complete patched renderer
+with synthetic codec/output doubles. It checks true/false/throw admission,
+invocation counts, cancellation/reset, pending route refill, final events and
+queues filling mid-batch/below the resume lead. This focused Swift 6 harness
+treats compiler warnings as errors.
+Neither test opens an audio device or establishes receiver behavior.
 
-`bash scripts/test_spatial_feed.sh` exercises the production Swift feeder and
-pinned IEC unpacker with a fake renderer and synthetic bursts, without media
-or audio output. Empty, filler, null and pre-major-sync tails must become ready
-at EOF, so the AO clock can drain; failures, flushing and cancelled generations
-remain distinct. The publish workflow runs this regression too.
+The Apple-only `spatialaudiobridge` patch adds a synchronous per-timeline
+submission hook. Its nonescaping enqueue closure stays on the renderer actor;
+refusal retries asynchronously outside the callback and host lock. The host
+serializes actual enqueue with clock checks. Progress is the APAC presentation
+end after encoder priming, not consumed IEC bytes. Both sides of enqueue check
+OLD coverage; a late packet cannot conceal an earlier underrun.
+
+Ordinary holds preserve the synchronizer anchor. A 10 ms AO wakeup requests a
+stop with 100 ms of coverage remaining; unfinished playback resumes with at
+least 250 ms of coverage. Readiness comes from submitted playable output, not
+completion of an encoder batch or final flush. Apple specifies no minimum queue
+capacity: a held, requested timeline with submitted buffers but insufficient
+lead fails to PCM after two seconds, including a queue full of priming buffers.
+Pausing cancels this wait; final completion releases short tails. These are
+scheduling policies, not timing or queue-capacity guarantees.
+A missed horizon is terminal: stop, reject further data and request mpv's
+same-track PCM fallback. This may interrupt playback, require resynchronization
+and lose Atmos/object output. A later device reload or track change can retry
+spatial audio; seamless underrun recovery is not promised.
+
+The final encoder packet atomically declares the terminal horizon with enqueue;
+a zero-output completion declares the existing horizon terminal. During final
+encoding only, an exhausted horizon is held provisionally: empty completion may
+drain it, but any later packet still fails the old-coverage check. Final tails
+bypass the normal resume-lead policy. Reset/cancellation suppress old callbacks,
+and route replay does not add submission credit. Asynchronous route-flush
+interruptions and hardware continuity remain unvalidated. This does not measure device
+latency, lip-sync, placement or endurance. The patch participates in libmpv's
+Apple content key. The SAB pin and Rust core are unchanged; the hook is compiled
+privately into MPVSpatial.
 
 The output is self-contained: `scripts/build_spatial.py` compiles the
 SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and

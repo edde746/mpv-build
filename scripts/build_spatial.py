@@ -98,6 +98,14 @@ def build(root, source, output, mpv, target, sdk, rust_target):
     if revision != pin["commit"]:
         raise SystemExit(f"{source}: expected {pin['commit']}, found {revision}")
 
+    series = [root / "patches/spatialaudiobridge/pool" / name
+              for name in patches.resolve("spatialaudiobridge", "apple")]
+    if series and subprocess.run(["git", "-C", str(source), "apply", "--reverse", "--check",
+                                  *map(str, reversed(series))], capture_output=True).returncode:
+        if subprocess.run(["git", "-C", str(source), "diff", "--quiet", "HEAD"]).returncode:
+            raise SystemExit(f"{source}: source patches differ; preserve edits and use a fresh source checkout")
+        patches.cmd_apply("spatialaudiobridge", "apple", str(source), False)
+
     toolchain = dict(line.split("=", 1) for line in (root / "toolchain/apple.txt").read_text().splitlines()
                      if line and not line.startswith("#"))
     rust = toolchain["rust"]

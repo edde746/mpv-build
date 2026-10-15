@@ -21,11 +21,15 @@ int main(int argc, char **argv)
         if (!sink) return 3;
         mp_spatial_volume(sink, 0);
         for (int seek = 0; seek < 3; seek++) {
-            mp_spatial_begin(sink, seek * INT64_C(1000000000));
+            mp_spatial_begin(sink, seek * INT64_C(1000000000), bursts.length);
             // Split across IEC headers and payloads, as mpv may do.
             for (size_t offset = 0; offset < bursts.length; offset += 8191) {
                 size_t size = MIN(8191, bursts.length - offset);
-                mp_spatial_write(sink, (const char *)bursts.bytes + offset, size);
+                if (!mp_spatial_write(sink, (const char *)bursts.bytes + offset, size)) {
+                    fprintf(stderr, "unexpected input refusal\n");
+                    mp_spatial_destroy(sink);
+                    return 6;
+                }
             }
             mp_spatial_end(sink);
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10];
@@ -44,7 +48,7 @@ int main(int argc, char **argv)
         for (int iteration = 0; iteration < 20; iteration++) {
             sink = mp_spatial_create(codec, (__bridge void *)clock);
             if (!sink) return 5;
-            mp_spatial_begin(sink, 0);
+            mp_spatial_begin(sink, 0, bursts.length);
             mp_spatial_destroy(sink);
         }
         pump(0.5);

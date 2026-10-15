@@ -65,6 +65,9 @@ jobs:
       - name: Test spatial feeder end of stream
         run: bash ./scripts/test_spatial_feed.sh
 
+      - name: Test spatial renderer submission contract
+        run: bash ./scripts/test_spatial_submission.sh
+
       - name: Test spatial audio session ownership
         run: bash ./scripts/test_spatial_session.sh
 

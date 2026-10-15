@@ -459,6 +459,9 @@ def key_inputs(root: Path, group: Group, artifact: str) -> str:
     ]
     for name, digest in patch_entries(root, component, group.name):
         text.append(f"patch={name}:{digest}")
+    if group.name == "apple" and artifact == "libmpv":
+        for name, digest in patch_entries(root, "spatialaudiobridge", group.name):
+            text.append(f"patch=spatialaudiobridge/{name}:{digest}")
     return "\n".join(text) + "\n"
 
 

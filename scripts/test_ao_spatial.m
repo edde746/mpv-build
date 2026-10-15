@@ -26,12 +26,14 @@ const char *af_fmt_to_str(int format) { return "spdif"; }
 
 struct fake_sink {
     struct mpv_global player;
-    bool refuse, ready, failed, defer_ready;
+    bool refuse, ready, failed, defer_ready, finished;
+    size_t capacity, pending;
     int codec;
     AVSampleBufferRenderSynchronizer *synchronizer;
     int begins, closes, ends, volumes;
     float volume;
-    int64_t begin_time;
+    int64_t begin_time, position, submitted;
+    bool drained;
     NSMutableData *received;
 };
 
@@ -45,17 +47,30 @@ void *mp_spatial_create(int codec, void *synchronizer)
     s->synchronizer = synchronizer;
     return s->refuse ? NULL : s;
 }
-void mp_spatial_begin(void *ctx, int64_t time)
+void mp_spatial_begin(void *ctx, int64_t time, size_t capacity)
 {
     struct fake_sink *s = ctx;
     s->begins++;
     s->begin_time = time;
+    s->position = time;
+    s->submitted = time;
+    s->drained = false;
+    s->ready = false;
+    s->capacity = capacity;
+    s->pending = 0;
+    s->finished = false;
     [s->received setLength:0];
 }
-void mp_spatial_write(void *ctx, const void *data, size_t size)
+bool mp_spatial_write(void *ctx, const void *data, size_t size)
 {
     [((struct fake_sink *)ctx)->received appendBytes:data length:size];
+    return true;
 }
+size_t mp_spatial_pending(void *ctx) { return ((struct fake_sink *)ctx)->pending; }
+bool mp_spatial_finished(void *ctx) { return ((struct fake_sink *)ctx)->finished; }
+int64_t mp_spatial_time(void *ctx, bool playing, bool paused) { return ((struct fake_sink *)ctx)->position; }
+int64_t mp_spatial_submitted(void *ctx) { return ((struct fake_sink *)ctx)->submitted; }
+bool mp_spatial_drained(void *ctx) { return ((struct fake_sink *)ctx)->drained; }
 bool mp_spatial_ready(void *ctx) { return ((struct fake_sink *)ctx)->ready; }
 bool mp_spatial_failed(void *ctx) { return ((struct fake_sink *)ctx)->failed; }
 void mp_spatial_destroy(void *ctx) { ((struct fake_sink *)ctx)->closes++; }
@@ -70,8 +85,10 @@ void mp_spatial_end(void *ctx)
 {
     struct fake_sink *s = ctx;
     s->ends++;
-    if (!s->defer_ready)
+    if (!s->defer_ready) {
         s->ready = true;
+        s->finished = true;
+    }
 }
 
 static int failures;
@@ -189,93 +206,57 @@ int main(void)
         CHECK(fabs(state_of(ao).delay - 0.2) < 0.001, "the clock does not move while waiting");
         CHECK(atomic_load(&wakeups) > before, "the ao thread is nudged while waiting");
 
-        // Once ready, the clock runs from the timeline's start. Sleeps on a
-        // busy machine overshoot, so the delay is checked against the time
-        // that actually passed.
+        // Feeder output is deliberately behind accepted carrier input. Only
+        // the actual submitted clock advances mpv's audio/video position.
         s->ready = true;
+        s->submitted = s->begin_time + 80000000;
+        s->position = s->submitted;
         st = state_of(ao);
-        CFTimeInterval started = CACurrentMediaTime();
-        CHECK(p->synchronizer.rate == 1, "the clock starts when the renderer is ready");
-        usleep(50 * 1000);
-        double delay = state_of(ao).delay;
-        double expected = MPMAX(0.2 - (CACurrentMediaTime() - started), 0);
-        CHECK(fabs(delay - expected) < 0.02, "delay falls in real time (%f, expected %f)", delay, expected);
-        usleep(15 * 1000); // lets a timer tick already in flight land
-        before = atomic_load(&wakeups);
-        usleep(40 * 1000);
-        CHECK(atomic_load(&wakeups) == before, "no nudging once the clock runs");
-
-        // Pause stops the clock, resume restarts it.
-        set_pause(ao, true);
-        CHECK(p->synchronizer.rate == 0, "pause stops the clock");
-        delay = state_of(ao).delay;
-        usleep(50 * 1000);
-        CHECK(fabs(state_of(ao).delay - delay) < 0.002, "the clock holds while paused");
-        set_pause(ao, false);
-        CHECK(p->synchronizer.rate == 1, "resume restarts the clock");
-
-        // Playing out everything ends the stream: mpv reads that as EOF.
-        usleep(150 * 1000);
-        st = state_of(ao);
-        CHECK(!st.playing && st.delay == 0, "all audio played ends playback (%f)", st.delay);
-
-        // Audio after an underrun would land in the past on the old timeline,
-        // so it starts a new one, which waits for the renderer again.
+        CHECK(fabs(st.delay - 0.12) < 0.001, "encoder-held carrier stays queued");
+        CHECK(st.playing, "waiting for later output is not EOF");
         int begins = s->begins;
-        s->ready = false;
         write_burst(ao, 2);
-        CHECK(s->begins == begins + 1, "a write after an underrun begins a new timeline");
-        CHECK(!p->clock_running && p->synchronizer.rate == 0, "the new timeline waits for the renderer");
-        // mpv may not have seen the underrun, and then calls no start().
-        CHECK(p->playing && atomic_load(&p->waiting), "playback stays active across the new timeline");
-        CHECK(fabs(state_of(ao).delay - 0.02) < 0.001, "only the new audio is queued");
+        CHECK(s->begins == begins, "an underrun preserves decoder/parser state");
+        CHECK(fabs(state_of(ao).delay - 0.14) < 0.001, "late carrier extends the same timeline");
 
-        // A seek begins a new timeline at the current time and waits for the renderer again.
-        begins = s->begins;
-        reset(ao);
-        CHECK(s->begins == begins + 1 && s->received.length == 0, "reset begins a new timeline");
-        CHECK(p->synchronizer.rate == 0 && !p->clock_running, "reset stops the clock");
-        CHECK(s->begin_time == ns_from_time(CMTimebaseGetTime(p->synchronizer.timebase)), "the timeline starts at the clock's time");
-        for (int i = 0; i < 3; i++)
-            write_burst(ao, 1);
-        start(ao);
-        CHECK(fabs(state_of(ao).delay - 0.06) < 0.001, "delay restarts from the new timeline");
-
-        // At the end the renderer lets go of what it holds back, so audio shorter
-        // than its startup buffer still plays.
+        s->pending = s->capacity;
+        CHECK(state_of(ao).free_samples == 0, "full feeder cannot admit more carrier");
+        s->pending -= 3840 * 16;
+        CHECK(state_of(ao).free_samples == 3840, "only returned byte credit admits a burst");
+        s->pending = 0;
         s->defer_ready = true;
         end_of_stream(ao);
-        CHECK(s->ends == 1, "the renderer hears the end");
-        state_of(ao);
-        CHECK(!p->clock_running && atomic_load(&p->waiting), "EOF waits for the feeder to finish");
-        CHECK(state_of(ao).free_samples == 0, "an unfinished feeder cannot admit the next file");
-        // The production Swift feeder test covers readiness with no decoded
-        // audio, including a tail that ends before a TrueHD major sync.
-        s->ready = true;
-        state_of(ao);
-        CHECK(p->clock_running && p->synchronizer.rate == 1, "the clock starts once the renderer has flushed");
-        CHECK(state_of(ao).free_samples == 0, "the next file waits until this one has played out");
-        set_pause(ao, true);
-        state_of(ao);
-        CHECK(!atomic_load(&p->waiting), "no nudging while paused at the end, as nothing plays out");
-        set_pause(ao, false);
-        CHECK(state_of(ao).delay > 0 && atomic_load(&p->waiting), "nudging resumes with playback");
-        int nudged = atomic_load(&wakeups);
-        usleep(100 * 1000);
-        CHECK(atomic_load(&wakeups) > nudged, "the ao thread is nudged until the ended timeline has played out");
-        state_of(ao);
-        CHECK(!atomic_load(&p->waiting), "and no longer once it has");
+        CHECK(state_of(ao).playing && state_of(ao).free_samples == 0, "final flush keeps EOF pending");
+        s->finished = true;
+        s->submitted = s->begin_time + 230000000; // final APAC packet may include padding
+        s->position = s->begin_time + 220000000;
+        CHECK(fabs(state_of(ao).delay - 0.01) < 0.001 && state_of(ao).playing,
+              "final output, rather than carrier count, gates drain");
+        s->position = s->submitted;
+        s->drained = true;
+        st = state_of(ao);
+        CHECK(!st.playing && st.delay == 0 && st.free_samples > 0, "submitted output drain releases next file");
         begins = s->begins;
         write_burst(ao, 3);
-        CHECK(s->begins == begins + 1 && !p->ended, "the next file begins a new timeline");
-        CHECK(p->playing, "and keeps playing, as mpv sends no start() between gapless files");
+        CHECK(s->begins == begins + 1 && !p->ended && p->playing, "gapless next file resets and keeps playing");
 
-        // A long run stays representable: 14 h at 192 kHz overflows written * 1e9.
         reset(ao);
-        CMTime now = CMTimebaseGetTime(p->synchronizer.timebase);
-        p->timeline = CMTimeSubtract(now, CMTimeMake(14 * 3600, 1));
-        p->written = INT64_C(192000) * 14 * 3600 + 19200; // and 0.1 s still to play
-        CHECK(fabs(state_of(ao).delay - 0.1) < 0.001, "a 14 h timeline keeps its delay (%f)", state_of(ao).delay);
+        CHECK(s->received.length == 0 && !p->playing, "seek discards old carrier");
+        for (int i = 0; i < 3; i++) write_burst(ao, 1);
+        start(ao);
+        end_of_stream(ao);
+        CHECK(state_of(ao).playing, "empty decoder result still waits for feeder completion");
+        s->finished = true;
+        s->drained = true; // no APAC was produced
+        CHECK(!state_of(ao).playing && state_of(ao).delay == 0, "empty EOF needs no nonexistent audio clock");
+        set_pause(ao, true);
+        CHECK(!atomic_load(&p->waiting), "paused output does not poll");
+
+        reset(ao);
+        p->timeline = CMTimeMake(0, 1);
+        p->written = INT64_C(192000) * 14 * 3600 + 19200;
+        s->position = INT64_C(14) * 3600 * 1000000000;
+        CHECK(fabs(state_of(ao).delay - 0.1) < 0.001, "14 h carrier accounting remains representable");
 
         // A renderer failure asks mpv to reopen the output, once.
         s->failed = true;
