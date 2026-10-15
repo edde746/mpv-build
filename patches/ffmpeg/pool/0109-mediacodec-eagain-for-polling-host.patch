@@ -116,7 +116,7 @@ index 21ed553..c7a7c42 100644
                      continue;
                  return ret;
              }
-@@ -1112,6 +1127,17 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
+@@ -1112,6 +1116,17 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
      NULL
  };
  
@@ -135,7 +135,7 @@ index 21ed553..c7a7c42 100644
  #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
  static const AVOption ff_mediacodec_vdec_options[] = {
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index c1021f1..5dfe7c7 100644
+index c1021f1..1aa08f7 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -22,7 +22,6 @@
@@ -199,6 +199,31 @@ index c1021f1..5dfe7c7 100644
          if (need_draining) {
              uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
  
+@@ -1087,7 +1103,14 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+         return AVERROR_EOF;
+     }
+ 
+-    if (s->draining) {
++    if (s->draining && ff_mediacodec_dec_host_polls(s)) {
++        /* A polling host asks again as soon as this returns, so one normal
++         * poll is all it is held for. Whatever waits on the host's decoding
++         * thread (a seek, a property read, its teardown) waits this out,
++         * and while the host keeps the codec's output buffers (a paused
++         * player) the last frames do not come. */
++        output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
++    } else if (s->draining) {
+         /* If the codec is flushing or need to be flushed, block for a fair
+          * amount of time to ensure we got a frame */
+         output_dequeue_timeout_us = OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US;
+@@ -1167,7 +1190,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+     } else if (ff_AMediaCodec_infoOutputBuffersChanged(codec, index)) {
+         ff_AMediaCodec_cleanOutputBuffers(codec);
+     } else if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
+-        if (s->draining) {
++        if (s->draining && output_dequeue_timeout_us == OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US) {
+             av_log(avctx, AV_LOG_ERROR, "Failed to dequeue output buffer within %" PRIi64 "ms "
+                                         "while draining remaining frames, output will probably lack frames\n",
+                                         output_dequeue_timeout_us / 1000);
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
 index 512601f..69c7905 100644
 --- a/libavcodec/mediacodecdec_common.h

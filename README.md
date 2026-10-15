@@ -322,6 +322,19 @@ seeks too, so mpv's hardware-decoding fallback runs; a seek without an error
 decodes on. Pass an already-patched source directory as the first argument
 to run offline.
 
+Run the MediaCodec drain regression with `bash scripts/test_mediacodec_drain.sh`.
+It fetches the pinned ffmpeg revision, applies the Android series, and drives
+the production receive_frame callback, the codec callbacks and both dequeues
+on a virtual clock through a drain the codec cannot finish because the host
+holds its output buffers (a player paused within the file's last second).
+Every call holds the decoding thread at most 10 ms (mpv's seeks, property
+reads, window changes and teardown wait on that thread); the polled codec,
+which mpv asks again after every EAGAIN past its end of stream, is asked at
+most 125 times a second and logs no error line; the asynchronous codec
+answers at once and wakes the host only when its output comes; and the drain
+ends once the host lets the buffers go. Pass an already-patched source
+directory as the first argument to run offline.
+
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
 placeholder crop is ignored, but decoded output crops remove buffer padding

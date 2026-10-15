@@ -189,6 +189,14 @@ static void mediacodec_dec_fail(MediaCodecDecContext *s, int err)
         s->async_error = err;
 }
 
+// No host registered a wakeup: the drain waits as long as the codec lets it,
+// which the wait above never does. test_mediacodec_drain.c drives a host
+// that registered.
+static int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s)
+{
+    return 0;
+}
+
 static int64_t av_rescale_q(int64_t a, AVRational bq, AVRational cq)
 {
     return a * bq.num * cq.den / ((int64_t)bq.den * cq.num);

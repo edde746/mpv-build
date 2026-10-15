@@ -104,6 +104,9 @@ jobs:
       - name: Test MediaCodec errors across a flush
         run: bash ./scripts/test_mediacodec_error.sh
 
+      - name: Test MediaCodec drain with the output buffers held
+        run: bash ./scripts/test_mediacodec_drain.sh
+
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh
 
