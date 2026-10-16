@@ -19,7 +19,8 @@
 # Usage: test_build_date.sh [--day YYYY-MM-DD]... [asset...]
 #
 # Every run first proves the scan on synthetic assets. Then each asset given
-# (.tar.gz, .tar.zst or .zip) is unpacked in memory and searched for:
+# (.tar.gz, .tar.zst, .zip or .aar, whose classes.jar is searched too) is
+# unpacked in memory and searched for:
 #   - a clock reading spelled as text: __DATE__ ("Oct 13 2026"), asctime and
 #     ctime (OpenSSL's mkbuildinf.pl, __TIMESTAMP__), ISO 8601 with a time of
 #     day, RFC 2822 (date -R). Bare dates are left alone, since that is how
@@ -262,23 +263,31 @@ def header_fields(data):
         return  # not the binary its magic claimed: the text scan still covers it
 
 
+def zip_entries(archive, prefix=""):
+    """zip members, and the members of every .jar inside (an AAR's classes.jar)."""
+    for info in archive.infolist():
+        stamps = []
+        y, mo, d, h, mi, s = info.date_time
+        local = dt.datetime(y, mo, d, h, mi, s)
+        stamps.append(("zip entry date", local.replace(tzinfo=dt.timezone.utc).timestamp()))
+        extra = info.extra
+        while len(extra) >= 4:
+            tag, size = struct.unpack_from("<HH", extra)
+            if tag == 0x5455 and size >= 5 and extra[4] & 1:
+                stamps.append(("zip extended mtime", u32(extra, 5)))
+            extra = extra[4 + size:]
+        data = b"" if info.is_dir() else archive.read(info)
+        yield prefix + info.filename, stamps, data
+        if info.filename.endswith(".jar"):
+            with zipfile.ZipFile(io.BytesIO(data)) as nested:
+                yield from zip_entries(nested, f"{prefix}{info.filename}!/")
+
+
 def entries(path):
     """(name, mtime or None, extra stamps, data) for every member of an asset."""
-    if path.endswith(".zip"):
+    if path.endswith((".zip", ".aar")):
         with zipfile.ZipFile(path) as archive:
-            for info in archive.infolist():
-                stamps = []
-                y, mo, d, h, mi, s = info.date_time
-                local = dt.datetime(y, mo, d, h, mi, s)
-                stamps.append(("zip entry date", local.replace(tzinfo=dt.timezone.utc).timestamp()))
-                extra = info.extra
-                while len(extra) >= 4:
-                    tag, size = struct.unpack_from("<HH", extra)
-                    if tag == 0x5455 and size >= 5 and extra[4] & 1:
-                        stamps.append(("zip extended mtime", u32(extra, 5)))
-                    extra = extra[4 + size:]
-                data = b"" if info.is_dir() else archive.read(info)
-                yield info.filename, stamps, data
+            yield from zip_entries(archive)
         return
     if path.endswith(".zst"):
         raw = subprocess.run(["zstd", "-dc", path], check=True, capture_output=True).stdout
@@ -396,6 +405,15 @@ with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "mtime.zip"
         zipped(path, {"include/probe.h": b"\n"}, date=(day.year, day.month, day.day, 12, 0, 0))
         check("zip entry date" in {hit[1] for hit in scan(str(path))[0]}, f"self-test: a zip date of {day} is not detected")
+        # An AAR: the classes.jar inside is searched too.
+        jar = Path(tmp) / "classes.jar"
+        zipped(jar, {"com/example/Probe.class": b"\n"}, date=(day.year, day.month, day.day, 12, 0, 0))
+        path = Path(tmp) / "probe.aar"
+        zipped(path, {"classes.jar": jar.read_bytes()})
+        check(
+            "classes.jar!/com/example/Probe.class" in {hit[0] for hit in scan(str(path))[0]},
+            f"self-test: a zip date of {day} inside an AAR's classes.jar is not detected",
+        )
     fixed = (
         b"\x7fELF\0\0built on: Wed Jan  1 00:00:00 2020 UTC\0OpenSSL 4.0.3 1 Oct 2026\0"
         b"Jan  1 2020 00:00:00\0LIB Build date: %s %s\0Jan  1 2020\x0000:00:00\0"

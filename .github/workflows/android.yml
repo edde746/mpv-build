@@ -1,0 +1,141 @@
+name: Android build
+
+# The android group's build, one definition for publish.yml (main) and ci.yml
+# (pull requests): the four libmpv-android tarballs, then the mpv-android AAR
+# that packs them with the JNI glue. Nothing here records, uploads to a
+# release or commits; the callers do that from the workflow artifacts:
+#
+#   android-<abi>  the unkeyed tarball dist/release/libmpv-android-<abi>.tar.gz
+#   android-aar    the unkeyed dist/release/mpv-android.aar
+#   device-test-android  (device-tests only) the AAR's androidTest APK; named
+#                  off the android-* glob the publish job collects
+on:
+  workflow_call:
+    inputs:
+      natives:
+        description: >-
+          Build the four tarballs. False when the libmpv-android key at this
+          commit is published already: the AAR then packs the published
+          tarballs artifacts.json pins.
+        type: boolean
+        required: true
+      device-tests:
+        description: Also build the device tests' APK and upload it.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  natives:
+    name: Build android ${{ matrix.abi }}
+    if: inputs.natives
+    runs-on: ubuntu-latest
+    # One job per ABI: the driver builds one architecture per --arch invocation
+    # (platforms/android/build.sh), the ABIs share nothing but sources, and the
+    # dependency graph is expensive enough that four runners beat one.
+    strategy:
+      fail-fast: false
+      matrix:
+        # arch is the driver's spelling (loadarch.sh), abi the group.json
+        # variant the tarball and the manifest are named by.
+        include:
+          - arch: arm64
+            abi: arm64-v8a
+          - arch: armv7l
+            abi: armeabi-v7a
+          - arch: x86
+            abi: x86
+          - arch: x86_64
+            abi: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      # Host build tools from apt plus the exact NDK pinned in
+      # toolchain/android.txt (part of every android content key).
+      - name: Install host toolchain and pinned NDK
+        run: bash platforms/android/include/download-sdk.sh
+
+      - name: Fetch and patch pinned sources
+        run: bash platforms/android/download.sh
+
+      - name: Build libmpv-android (${{ matrix.abi }})
+        run: bash platforms/android/build.sh --arch ${{ matrix.arch }}
+
+      # package.sh emits the unkeyed name (libmpv-android-<abi>.tar.gz): the
+      # content key covers the published driver, which this leg cannot know is
+      # final yet. The build leg uploads it as-is and record-platform renames
+      # it to the group.json assetPattern's content-addressed spelling.
+      - name: Package per-ABI tarball (${{ matrix.abi }})
+        run: bash platforms/android/package.sh --arch ${{ matrix.arch }}
+
+      # A rebuild of a published key has to reproduce its bytes (publish-assets
+      # refuses anything else), so no file may carry a build's clock. A stamp
+      # publishes fine once and fails only the rebuild, weeks later.
+      - name: Check the tarball for a build date (${{ matrix.abi }})
+        run: bash scripts/test_build_date.sh dist/release/libmpv-android-${{ matrix.abi }}.tar.gz
+
+      - name: Upload platform build (${{ matrix.abi }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: ./dist/release/*.tar.gz
+          if-no-files-found: error
+
+  aar:
+    name: Build mpv-android AAR
+    needs: natives
+    # always(): natives is skipped when the tarballs are published already;
+    # a failed tarball leg leaves nothing to pack.
+    if: always() && !cancelled() && needs.natives.result != 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download the tarballs this run built
+        if: needs.natives.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: android-*
+          path: ./dist/tarballs
+          merge-multiple: true
+
+      # The JVM tests ride along: they need no tarball, and a failure stops the
+      # AAR. Gradle installs the pinned NDK and CMake into the runner's SDK.
+      - name: Build the AAR and run its JVM tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARBALLS: ${{ needs.natives.result == 'success' && 'dist/tarballs' || '' }}
+          DEVICE_TESTS: ${{ inputs.device-tests && 'assembleDebugAndroidTest' || '' }}
+        run: |
+          bash platforms/android/lib/build-aar.sh ${TARBALLS:+--tarballs "$TARBALLS"} \
+            -- testReleaseUnitTest ${DEVICE_TESTS}
+
+      - name: Check the AAR for a build date
+        run: bash scripts/test_build_date.sh dist/release/mpv-android.aar
+
+      - name: List the AAR
+        run: |
+          ls -l dist/release/mpv-android.aar
+          unzip -l dist/release/mpv-android.aar
+
+      - name: Upload the AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aar
+          path: ./dist/release/mpv-android.aar
+          if-no-files-found: error
+
+      - name: Upload the device tests' APK
+        if: inputs.device-tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-test-android
+          path: ./platforms/android/lib/build/outputs/apk/androidTest/debug/*.apk
+          if-no-files-found: error
