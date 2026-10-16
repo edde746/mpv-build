@@ -1,0 +1,8 @@
+# Gradle, CMake and IDE output; the fetched tarballs live in build/tarballs/.
+/build/
+/.gradle/
+/.cxx/
+/.kotlin/
+/local.properties
+/.idea/
+*.iml

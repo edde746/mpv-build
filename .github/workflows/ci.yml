@@ -125,6 +125,10 @@ jobs:
                 # both android trees.
                 subprocess.run(['bash', 'scripts/test_mediacodec_paused.sh', str(dest),
                                 str(work / 'ffmpeg-android')], check=True)
+                # The mpv-android AAR's JNI glue against fakes, with the
+                # patched mpv and FFmpeg headers of both android trees.
+                subprocess.run(['bash', 'scripts/test_android_glue.sh', str(dest),
+                                str(work / 'ffmpeg-android')], check=True)
               if component == 'ffmpeg' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_mediacodec_input.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_mediacodec_eos.sh', str(dest)], check=True)
@@ -142,6 +146,42 @@ jobs:
           print(f'checked {checked} series')
           shutil.rmtree(work, ignore_errors=True)
           PY
+
+  android-plan:
+    name: Android plan
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      natives: ${{ steps.stale.outputs.natives }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tarballs are built only when this tree moves their key (a pin,
+      # patch, driver or toolchain change): the AAR must build against the
+      # natives the merge will publish. Otherwise it packs the published ones.
+      - name: Is the libmpv-android key published?
+        id: stale
+        shell: bash
+        run: |
+          stale="$(python3 scripts/keys.py stale --platform-group android)"
+          if grep -qx libmpv-android <<< "${stale}"; then
+            echo "natives=true" >> "$GITHUB_OUTPUT"
+            echo "libmpv-android is stale: building the tarballs" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "natives=false" >> "$GITHUB_OUTPUT"
+            echo "libmpv-android is published: the AAR packs those tarballs" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  android:
+    name: Android
+    needs: android-plan
+    permissions:
+      contents: read
+    uses: ./.github/workflows/android.yml
+    with:
+      natives: ${{ needs.android-plan.outputs.natives == 'true' }}
+      device-tests: true
 
   build:
     name: Demo apps
