@@ -27,3 +27,6 @@
 0013-sd-ass-isolate-event-prefetch-renderer.patch
 0014-ass-mp-compact-high-overdraw-atlases.patch
 0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
+# deinterlace=ivtc and the ivtc-active property (needs the fieldmatch and
+# decimate filters every group's FFmpeg enables).
+0207-f-auto-filters-inverse-telecine-deinterlace-mode.patch

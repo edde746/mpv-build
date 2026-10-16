@@ -1,0 +1,337 @@
+f_auto_filters: add deinterlace=ivtc, an inverse telecine mode
+
+DVD film is 23.976 fps telecined to 29.97 interlaced: three of every five
+frames are whole film frames split across two fields, two are mixes of
+neighbouring film frames. Every deinterlace mode treats it as video, so
+the rebuilt frames keep jagged outlines in animation and motion judders,
+and the stream is presented at 59.94 fields per second instead of the
+23.976 frames it carries (edde746/plezy#2710). Running fieldmatch and
+decimate through --vf instead does not compose with deinterlace=auto: the
+auto deinterlacer sits before the user filters and feeds them fields.
+
+deinterlace=ivtc behaves like auto, except that interlaced video at
+29.97 or 30 fps gets inverse telecine in place of the deinterlacer:
+fieldmatch rebuilds each film frame from its two fields, bwdif
+deinterlaces only the frames left combed (fades, video-shot inserts), and
+decimate drops the repeated frame in each cycle of five. Once engaged it
+stays on for the rest of the stream, because hard-telecined streams often
+flag only the combed frames of each cycle as interlaced. Input is
+converted to 8-bit planar YUV first (fieldmatch takes nothing else),
+downloading hardware frames, so libavfilter needs no scale filter. When
+the chain cannot be built the frame is deinterlaced as with auto.
+
+deinterlace-active stays no while inverse telecine runs, and the new
+ivtc-active property says it does, so an embedder matching the display
+rate presents four fifths of container-fps rather than twice it.
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index 25b42c1..ee7aecf 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2458,7 +2458,11 @@ Property list
+ ``deinterlace-active``
+     Returns ``yes``/true if mpv's deinterlacing filter is active. Note that it
+     will not detect any manually inserted deinterlacing filters done via
+-    ``--vf``.
++    ``--vf``, and that it is ``no`` while ``ivtc-active`` is ``yes``.
++
++``ivtc-active``
++    Returns ``yes``/true if ``--deinterlace=ivtc`` engaged inverse telecine,
++    so the video is presented at four fifths of ``container-fps``.
+ 
+ ``idle-active``
+     Returns ``yes``/true if no file is loaded, but the player is staying around
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 545b46e..a1a3c29 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -1781,7 +1781,7 @@ Video
+ 
+         Works in ``--correct-pts=no`` mode only.
+ 
+-``--deinterlace=<yes|no|auto>``
++``--deinterlace=<yes|no|auto|ivtc>``
+     Enable or disable deinterlacing (default: no).
+     Interlaced video shows ugly comb-like artifacts, which are visible on
+     fast movement. Enabling this typically inserts the bwdif video filter in
+@@ -1794,6 +1794,17 @@ Video
+     despite the video not actually being so. This is why ``auto`` is not the
+     default value.
+ 
++    ``ivtc`` behaves like ``auto``, except that interlaced video at 29.97 or
++    30 fps gets inverse telecine instead: the lavfi ``fieldmatch`` filter
++    rebuilds 3:2 telecined film frames from their fields, ``bwdif``
++    deinterlaces the frames that cannot be matched, and ``decimate`` drops the
++    repeated frame in every five, so the output runs at 23.976 or 24 fps.
++    Once engaged it stays on for the rest of the stream. Video that is truly
++    interlaced at that rate (sports, live broadcasts) loses motion this way,
++    so only use it for film content. Hardware frames are downloaded first.
++    If the filters are unavailable, the video is deinterlaced as with
++    ``auto``.
++
+     Keep in mind that using this filter **will** conflict with any manually
+     inserted deinterlacing filters, and that this will make video look worse if
+     it's not actually interlaced.
+diff --git a/filters/f_auto_filters.c b/filters/f_auto_filters.c
+index d7ee230..19b27c9 100644
+--- a/filters/f_auto_filters.c
++++ b/filters/f_auto_filters.c
+@@ -1,5 +1,7 @@
+ #include <math.h>
+ 
++#include <libavutil/pixfmt.h>
++
+ #include "audio/aframe.h"
+ #include "audio/format.h"
+ #include "common/common.h"
+@@ -7,6 +9,7 @@
+ #include "options/m_config.h"
+ #include "options/options.h"
+ #include "video/filter/refqueue.h"
++#include "video/fmt-conversion.h"
+ #include "video/mp_image.h"
+ #include "video/mp_image_pool.h"
+ 
+@@ -23,9 +26,65 @@ struct deint_priv {
+     struct mp_subfilter sub;
+     int prev_imgfmt;
+     bool deinterlace_active;
++    // deinterlace=ivtc was in effect when the current filter was chosen.
++    bool ivtc_mode;
++    // The current filter is the inverse telecine chain, not a deinterlacer.
++    bool ivtc_active;
+     struct m_config_cache *opts;
+ };
+ 
++// Interlaced video at this rate may be 3:2 telecined film (23.976 or 24 fps
++// carried as 29.97 or 30 fps); at any other rate it never is.
++static bool is_telecine_carrier_rate(double fps)
++{
++    return fps > 29.9 && fps < 30.1;
++}
++
++// Inverse telecine: fieldmatch rebuilds each film frame from the two fields
++// that belong to it, bwdif deinterlaces only the frames fieldmatch could not
++// match (fades, video-shot inserts) and flagged interlaced, and decimate
++// drops the one duplicate in every five, restoring 23.976/24 fps. Returns
++// NULL when the input cannot be converted or the graph cannot be built (an
++// FFmpeg without these filters); the caller deinterlaces instead.
++static struct mp_filter *create_ivtc(struct mp_filter *f, struct mp_image *img,
++                                     const char *field_parity)
++{
++    struct mp_filter *subf = mp_bidir_dummy_filter_create(f);
++    struct mp_filter *filters[2] = {0};
++
++    struct mp_autoconvert *ac = mp_autoconvert_create(subf);
++    if (!ac)
++        goto fail;
++    filters[0] = ac->f;
++    // fieldmatch takes 8-bit planar YUV only. Converting here (swscale, or
++    // a download of hardware frames) keeps libavfilter from needing its own
++    // scale filter, which builds that prune their filter list leave out.
++    static const enum AVPixelFormat formats[] = {
++        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P,
++        AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
++    };
++    for (int n = 0; n < MP_ARRAY_SIZE(formats); n++)
++        mp_autoconvert_add_imgfmt(ac, pixfmt2imgfmt(formats[n]), 0);
++    if (!mp_autoconvert_probe_input_video(ac, img))
++        goto fail;
++
++    char *graph = talloc_asprintf(subf,
++        "fieldmatch=order=%s:combmatch=full,"
++        "bwdif=mode=send_frame:parity=%s:deint=interlaced,"
++        "decimate", field_parity, field_parity);
++    char *args[] = {"graph", graph, NULL};
++    filters[1] = mp_create_user_filter(subf, MP_OUTPUT_CHAIN_VIDEO, "lavfi", args);
++    if (!filters[1])
++        goto fail;
++
++    mp_chain_filters(subf->ppins[0], subf->ppins[1], filters, 2);
++    return subf;
++
++fail:
++    talloc_free(subf);
++    return NULL;
++}
++
+ static void deint_process(struct mp_filter *f)
+ {
+     struct deint_priv *p = f->priv;
+@@ -51,13 +110,20 @@ static void deint_process(struct mp_filter *f)
+ 
+     m_config_cache_update(p->opts);
+     struct filter_opts *opts = p->opts->opts;
+-    bool should_deinterlace = (opts->deinterlace == -1 && interlaced) ||
+-                               opts->deinterlace == 1;
++    bool ivtc_mode = opts->deinterlace == 2;
++    // Inverse telecine, once engaged, stays for the rest of the stream:
++    // field matching needs every frame, and hard-telecined streams often
++    // flag only the combed frames of each cycle as interlaced.
++    bool keep_ivtc = ivtc_mode && p->ivtc_active;
++    bool should_deinterlace = ((opts->deinterlace == -1 || ivtc_mode) && interlaced) ||
++                               keep_ivtc || opts->deinterlace == 1;
+ 
+     if (!should_deinterlace)
+         mp_subfilter_destroy(&p->sub);
+ 
+-    if (img->imgfmt == p->prev_imgfmt && p->deinterlace_active == should_deinterlace) {
++    if (img->imgfmt == p->prev_imgfmt && p->deinterlace_active == should_deinterlace &&
++        p->ivtc_mode == ivtc_mode)
++    {
+         mp_subfilter_continue(&p->sub);
+         return;
+     }
+@@ -69,6 +135,8 @@ static void deint_process(struct mp_filter *f)
+ 
+     p->prev_imgfmt = img->imgfmt;
+     p->deinterlace_active = should_deinterlace;
++    p->ivtc_mode = ivtc_mode;
++    p->ivtc_active = false;
+     if (!p->deinterlace_active) {
+         mp_subfilter_continue(&p->sub);
+         return;
+@@ -86,6 +154,17 @@ static void deint_process(struct mp_filter *f)
+         field_parity = "auto";
+     }
+ 
++    if (ivtc_mode && is_telecine_carrier_rate(img->nominal_fps)) {
++        p->sub.filter = create_ivtc(f, img, field_parity);
++        if (p->sub.filter) {
++            p->ivtc_active = true;
++            mp_subfilter_continue(&p->sub);
++            return;
++        }
++        MP_WARN(f, "inverse telecine unavailable (input %s), deinterlacing\n",
++                mp_imgfmt_to_name(img->imgfmt));
++    }
++
+     bool has_filter = true;
+     if (img->imgfmt == IMGFMT_VDPAU) {
+         char *args[] = {"deint", "yes",
+@@ -188,7 +267,13 @@ static const struct mp_filter_info deint_filter = {
+ bool mp_deint_active(struct mp_filter *f)
+ {
+     struct deint_priv *p = f->priv;
+-    return p->deinterlace_active;
++    return p->deinterlace_active && !p->ivtc_active;
++}
++
++bool mp_deint_ivtc_active(struct mp_filter *f)
++{
++    struct deint_priv *p = f->priv;
++    return p->ivtc_active;
+ }
+ 
+ struct mp_filter *mp_deint_create(struct mp_filter *parent)
+diff --git a/filters/f_auto_filters.h b/filters/f_auto_filters.h
+index 485cd27..a370180 100644
+--- a/filters/f_auto_filters.h
++++ b/filters/f_auto_filters.h
+@@ -15,4 +15,7 @@ struct mp_filter *mp_autorotate_create(struct mp_filter *parent);
+ // Insert a filter that inserts scaletempo2 depending on speed settings.
+ struct mp_filter *mp_autoaspeed_create(struct mp_filter *parent);
+ 
++// A deinterlacer is active (inverse telecine does not count).
+ bool mp_deint_active(struct mp_filter *parent);
++// deinterlace=ivtc engaged inverse telecine.
++bool mp_deint_ivtc_active(struct mp_filter *parent);
+diff --git a/filters/f_output_chain.c b/filters/f_output_chain.c
+index 4bbbdde..67fc73f 100644
+--- a/filters/f_output_chain.c
++++ b/filters/f_output_chain.c
+@@ -524,15 +524,26 @@ double mp_output_get_measured_total_delay(struct mp_output_chain *c)
+     return delay;
+ }
+ 
+-bool mp_output_chain_deinterlace_active(struct mp_output_chain *c)
++static struct mp_filter *find_deint(struct chain *p)
+ {
+-    struct chain *p = c->f->priv;
+     for (int n = 0; n < p->num_all_filters; n++) {
+         struct mp_user_filter *u = p->all_filters[n];
+         if (strcmp(u->name, "userdeint") == 0)
+-            return mp_deint_active(u->f);
++            return u->f;
+     }
+-    return false;
++    return NULL;
++}
++
++bool mp_output_chain_deinterlace_active(struct mp_output_chain *c)
++{
++    struct mp_filter *deint = find_deint(c->f->priv);
++    return deint && mp_deint_active(deint);
++}
++
++bool mp_output_chain_ivtc_active(struct mp_output_chain *c)
++{
++    struct mp_filter *deint = find_deint(c->f->priv);
++    return deint && mp_deint_ivtc_active(deint);
+ }
+ 
+ bool mp_output_chain_update_filters(struct mp_output_chain *c,
+diff --git a/filters/f_output_chain.h b/filters/f_output_chain.h
+index f313f9a..69c1960 100644
+--- a/filters/f_output_chain.h
++++ b/filters/f_output_chain.h
+@@ -88,3 +88,6 @@ double mp_output_get_measured_total_delay(struct mp_output_chain *p);
+ 
+ // Check if deinterlace user filter is inserted
+ bool mp_output_chain_deinterlace_active(struct mp_output_chain *p);
++
++// Check if deinterlace=ivtc engaged inverse telecine
++bool mp_output_chain_ivtc_active(struct mp_output_chain *p);
+diff --git a/options/options.c b/options/options.c
+index 91c223a..4df87e5 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -460,7 +460,7 @@ const struct m_sub_options cuda_conf = {
+ const struct m_sub_options filter_conf = {
+     .opts = (const struct m_option[]){
+         {"deinterlace", OPT_CHOICE(deinterlace,
+-            {"no", 0}, {"yes", 1}, {"auto", -1})},
++            {"no", 0}, {"yes", 1}, {"auto", -1}, {"ivtc", 2})},
+         {"deinterlace-field-parity", OPT_CHOICE(field_parity,
+             {"tff", MP_FIELD_PARITY_TFF},
+             {"bff", MP_FIELD_PARITY_BFF},
+diff --git a/player/command.c b/player/command.c
+index e75d144..20e8829 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -1414,6 +1414,18 @@ static int mp_property_deinterlace(void *ctx, struct m_property *prop,
+     return m_property_bool_ro(action, arg, deinterlace_active);
+ }
+ 
++static int mp_property_ivtc(void *ctx, struct m_property *prop,
++                            int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct vo_chain *vo_c = mpctx->vo_chain;
++    if (!vo_c)
++        return M_PROPERTY_UNAVAILABLE;
++
++    bool ivtc_active = mp_output_chain_ivtc_active(vo_c->filter);
++    return m_property_bool_ro(action, arg, ivtc_active);
++}
++
+ static int mp_property_idle(void *ctx, struct m_property *prop,
+                             int action, void *arg)
+ {
+@@ -4440,6 +4452,7 @@ static const struct m_property mp_properties_base[] = {
+     {"seekable", mp_property_seekable},
+     {"partially-seekable", mp_property_partially_seekable},
+     {"deinterlace-active", mp_property_deinterlace},
++    {"ivtc-active", mp_property_ivtc},
+     {"idle-active", mp_property_idle},
+     {"window-id", mp_property_window_id},
+     {"display-swapchain", mp_property_vo_display_swapchain},
+@@ -4623,7 +4636,7 @@ static const char *const *const mp_event_property_change[] = {
+       "decoder-frame-drop-count", "frame-drop-count", "video-frame-info",
+       "vf-metadata", "af-metadata", "sub-start", "sub-end", "secondary-sub-start",
+       "secondary-sub-end", "video-out-params", "video-dec-params", "video-params",
+-      "deinterlace-active", "video-target-params"),
++      "deinterlace-active", "ivtc-active", "video-target-params"),
+     E(MP_EVENT_DURATION_UPDATE, "duration"),
+     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
+       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
