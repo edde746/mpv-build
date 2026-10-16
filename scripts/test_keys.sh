@@ -793,6 +793,156 @@ with tempfile.TemporaryDirectory() as tmp:
     check("assetPattern" in result.stderr, "a pattern without {variant} is rejected")
     print("group.json: malformed definitions are rejected loudly")
 
+# 14. Package artifacts: one asset built from other artifacts of the group plus
+#     sources of its own (the mpv-android AAR). Its key covers its inputs' keys
+#     and its sources, so a source edit moves it alone.
+PACKAGE_GROUP_JSON = json.loads(json.dumps(GROUP_JSON))
+PACKAGE_GROUP_JSON["artifacts"]["mpv-android"] = {
+    "inputs": ["libmpv-android"],
+    "sources": ["platforms/android/lib"],
+    "assetPattern": "mpv-android-{key}.aar",
+}
+
+
+def make_package_repo(directory):
+    repo = make_android_repo(directory)
+    write_group_json(repo, PACKAGE_GROUP_JSON)
+    lib = repo / "platforms" / "android" / "lib"
+    (lib / "src").mkdir(parents=True)
+    (lib / "src" / "glue.cpp").write_text("int glue;\n", encoding="utf-8")
+    (lib / "build.gradle.kts").write_text("// build\n", encoding="utf-8")
+    (lib / ".gitignore").write_text("/build/\n", encoding="utf-8")
+    # Directory sources are what git tracks or would track: the fixture is a
+    # repository, and the tracked set is committed.
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    return repo
+
+
+def package_keys(repo):
+    return keys(repo, "--platform-group", "android")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_package_repo(tmp)
+    lib = repo / "platforms" / "android" / "lib"
+    before = package_keys(repo)
+    check(sorted(before) == ["libmpv-android", "mpv-android"], f"android keys: {sorted(before)}")
+    check(package_keys(repo) == before, "package keys must be reproducible for the same tree")
+    check(
+        run(repo, "variants", "--platform-group", "android").stdout.split() == ["arm64-v8a", "x86_64"],
+        "a package adds no variants to the group",
+    )
+    inputs = run(repo, "keys", "--platform-group", "android", "--show-inputs").stdout
+    check(f"input=libmpv-android:{before['libmpv-android']}" in inputs, "package inputs carry the input key")
+    check("source=platforms/android/lib/src/glue.cpp:" in inputs, "package inputs carry each source file")
+    check(
+        inputs.index("source=platforms/android/lib/.gitignore")
+        < inputs.index("source=platforms/android/lib/build.gradle.kts")
+        < inputs.index("source=platforms/android/lib/src/glue.cpp"),
+        "source lines are sorted by path",
+    )
+
+    (lib / "src" / "glue.cpp").write_text("int glue; // edit\n", encoding="utf-8")
+    edited = package_keys(repo)
+    check(edited["mpv-android"] != before["mpv-android"], "a source edit must move the package key")
+    check(edited["libmpv-android"] == before["libmpv-android"], "a source edit must not move its input's key")
+    (lib / "src" / "glue.cpp").write_text("int glue;\n", encoding="utf-8")
+
+    (lib / "src" / "new.kt").write_text("// new\n", encoding="utf-8")
+    check(package_keys(repo)["mpv-android"] != before["mpv-android"], "an untracked source file counts")
+    (lib / "src" / "new.kt").unlink()
+    (lib / "build").mkdir()
+    (lib / "build" / "out.aar").write_text("output\n", encoding="utf-8")
+    check(package_keys(repo) == before, "ignored build output is not source")
+
+    (repo / "platforms" / "android" / "build.sh").write_text("#!/bin/bash\nbuild # tweak\n", encoding="utf-8")
+    moved = package_keys(repo)
+    check(
+        moved["libmpv-android"] != before["libmpv-android"] and moved["mpv-android"] != before["mpv-android"],
+        "a driver edit moves the input key and with it the package key",
+    )
+    (repo / "platforms" / "android" / "build.sh").write_text("#!/bin/bash\nbuild\n", encoding="utf-8")
+    check(package_keys(repo) == before, "restoring the driver restores both keys")
+    print("package artifacts: keys cover inputs and sources, and nothing else moves")
+
+# 15. The package record flow, beside the per-variant one.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_package_repo(tmp)
+    current = package_keys(repo)
+    stale = run(repo, "stale", "--platform-group", "android").stdout.split()
+    check(stale == ["libmpv-android", "mpv-android"], f"a fresh package repo is stale: {stale}")
+
+    release = repo / "dist" / "release"
+    release.mkdir(parents=True)
+    for variant in ("arm64-v8a", "x86_64"):
+        (release / f"libmpv-android-{variant}.tar.gz").write_bytes(variant.encode())
+        run(
+            repo, "record-platform", "--platform-group", "android",
+            "--platform", variant, "--release-dir", "dist/release",
+        )
+    check(
+        run(repo, "stale", "--platform-group", "android").stdout.split() == ["mpv-android"],
+        "recording the tarballs leaves the package stale",
+    )
+    result = run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    check("not built in this run" in result.stdout, "a package that was not built keeps its entry")
+
+    (release / "mpv-android.aar").write_bytes(b"aar bytes")
+    run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    aar = f"mpv-android-{current['mpv-android']}.aar"
+    check((release / aar).is_file(), "the unkeyed AAR is renamed by content")
+    entry = manifest_of(repo)["platforms"]["android"]["libraries"]["mpv-android"]
+    check(
+        entry == {
+            "key": current["mpv-android"],
+            "asset": aar,
+            "checksum": hashlib.sha256(b"aar bytes").hexdigest(),
+        },
+        f"the package entry: {entry}",
+    )
+    check(run(repo, "stale", "--platform-group", "android").stdout.strip() == "", "nothing is stale")
+    run(repo, "verify", "--platform-group", "android")
+
+    manifest = manifest_of(repo)
+    manifest["platforms"]["android"]["libraries"]["mpv-android"]["checksum"] = "zz"
+    (repo / "artifacts.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    result = run(repo, "verify", "--platform-group", "android", expect=1)
+    check("mpv-android: checksum" in result.stdout, "a bad package checksum is reported")
+
+    (repo / "platforms" / "android" / "lib" / "src" / "glue.cpp").write_text("int moved;\n", encoding="utf-8")
+    check(
+        run(repo, "stale", "--platform-group", "android").stdout.split() == ["mpv-android"],
+        "a glue edit makes the package alone stale",
+    )
+    result = run(repo, "record-packages", "--platform-group", "apple", "--release-dir", "dist/release")
+    check("no package artifacts" in result.stdout, "record-packages is a no-op for a group without packages")
+    print("record-packages: rename, checksum, gate and staleness hold")
+
+# 16. Malformed package artifacts fail loudly.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_package_repo(tmp)
+    for change, needle in (
+        ({"variants": ["arm64-v8a"]}, "no components or variants"),
+        ({"assetPattern": "mpv-android-{key}-{variant}.aar"}, "no {variant}"),
+        ({"inputs": ["missing"]}, "is not a component artifact"),
+        ({"sources": []}, "needs inputs and sources"),
+    ):
+        broken = json.loads(json.dumps(PACKAGE_GROUP_JSON))
+        broken["artifacts"]["mpv-android"].update(change)
+        write_group_json(repo, broken)
+        result = run(repo, "keys", expect=1)
+        check(needle in result.stderr, f"{change} is rejected: {result.stderr.strip()}")
+    write_group_json(repo, PACKAGE_GROUP_JSON)
+    (repo / "platforms" / "android" / "lib" / "src" / "glue.cpp").unlink()
+    (repo / "platforms" / "android" / "lib" / "build.gradle.kts").unlink()
+    (repo / "platforms" / "android" / "lib" / ".gitignore").unlink()
+    result = run(repo, "keys", "--platform-group", "android", expect=1)
+    check("holds no files" in result.stderr, "an empty source directory is rejected")
+    print("package artifacts: malformed definitions are rejected loudly")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

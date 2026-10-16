@@ -108,6 +108,38 @@ variant into one release dir and runs it once per variant). `verify` and
 frameworks concept outside apple (record-frameworks refuses these groups) and
 render is a no-op for them.
 
+Package artifacts -- one asset assembled from other artifacts of the same
+group plus sources of its own, such as the mpv-android AAR built from the
+libmpv-android tarballs and the JNI glue in platforms/android/lib:
+
+    "mpv-android": {
+      "inputs": ["libmpv-android"],         # artifacts of this group it packs
+      "sources": ["platforms/android/lib"], # files or directories it builds
+      "assetPattern": "mpv-android-{key}.aar"
+    }
+
+A package has no components and no variants: its pattern carries {key}
+only. Its key-input text (schema 2):
+
+    schema=2
+    artifact=<artifact id>
+    input=<input artifact id>:<its key>   # every input, sorted
+    source=<path>:<sha256>                # every file of the sources, sorted
+                                          #   by path; a directory stands for
+                                          #   its files git tracks or would
+                                          #   track (not ignored)
+
+so an edit to its sources moves its key alone, and anything that moves an
+input's key (the group driver and toolchain included) moves it too.
+record-packages renames the unkeyed `<artifact><ext>` (the pattern's text
+after {key}) and records
+
+    platforms.<group>.libraries.<artifact> = {
+      "key": <key>, "asset": <name>, "checksum": <sha256 of the asset file>
+    }
+
+`stale`, `verify` and `publish-assets` treat it like any other library.
+
 Deliberately coarse: the key hashes the group's whole build driver, so editing
 any of its sources invalidates every self-built library in the group.
 Under-invalidation would mean silently shipping stale binaries;
@@ -150,7 +182,11 @@ canonical_component = patches.canonical_component
 
 @dataclass(frozen=True)
 class Artifact:
-    """One multi-component artifact of a group.json-defined group."""
+    """One artifact of a group.json-defined group.
+
+    Either a multi-component build (components and variants, one asset per
+    variant) or a package (inputs and sources, one asset).
+    """
 
     # Canonical versions.json component names compiled into every asset.
     components: tuple[str, ...]
@@ -159,6 +195,14 @@ class Artifact:
     # Asset name template; {key} and {variant} are substituted. The pattern,
     # including its extension, is authoritative.
     asset_pattern: str
+    # Packages: the artifacts of the same group whose keys feed this key.
+    inputs: tuple[str, ...] = ()
+    # Packages: the files and directories whose bytes key this artifact.
+    sources: tuple[Path, ...] = ()
+
+    @property
+    def is_package(self) -> bool:
+        return bool(self.inputs)
 
 
 @dataclass(frozen=True)
@@ -236,15 +280,37 @@ def _group_from_json(path: Path) -> Group:
     for artifact_id, spec in sorted(field("artifacts").items()):
         components = tuple(spec.get("components") or ())
         variants = tuple(spec.get("variants") or ())
+        inputs = tuple(spec.get("inputs") or ())
+        sources = tuple(Path(entry) for entry in spec.get("sources") or ())
         pattern = spec.get("assetPattern") or ""
-        if not components or not variants:
-            raise SystemExit(f"{path}: artifact {artifact_id!r} needs components and variants")
-        if "{key}" not in pattern or "{variant}" not in pattern:
-            raise SystemExit(
-                f"{path}: artifact {artifact_id!r} assetPattern must contain "
-                "{key} and {variant}"
-            )
-        artifacts[artifact_id] = Artifact(components, variants, pattern)
+        if inputs or sources:
+            if components or variants or not inputs or not sources:
+                raise SystemExit(
+                    f"{path}: package artifact {artifact_id!r} needs inputs and sources "
+                    "and has no components or variants"
+                )
+            if "{key}" not in pattern or "{variant}" in pattern:
+                raise SystemExit(
+                    f"{path}: package artifact {artifact_id!r} assetPattern must contain "
+                    "{key} and no {variant}"
+                )
+        else:
+            if not components or not variants:
+                raise SystemExit(f"{path}: artifact {artifact_id!r} needs components and variants")
+            if "{key}" not in pattern or "{variant}" not in pattern:
+                raise SystemExit(
+                    f"{path}: artifact {artifact_id!r} assetPattern must contain "
+                    "{key} and {variant}"
+                )
+        artifacts[artifact_id] = Artifact(components, variants, pattern, inputs, sources)
+
+    for artifact_id, spec in artifacts.items():
+        for name in spec.inputs:
+            if name not in artifacts or artifacts[name].is_package:
+                raise SystemExit(
+                    f"{path}: package artifact {artifact_id!r} input {name!r} is not a "
+                    "component artifact of this group"
+                )
 
     # The group-wide platform tuple is the ordered union of every artifact's
     # variants; per-artifact checks always use the artifact's own tuple.
@@ -427,8 +493,56 @@ def _artifact_key_inputs(root: Path, group: Group, artifact: str) -> str:
     return "\n".join(text) + "\n"
 
 
+def package_source_files(root: Path, sources: tuple[Path, ...]) -> list[str]:
+    """Every file a package's sources name, repository-relative and sorted.
+
+    A file stands for itself; a directory for the files under it that git
+    tracks or would track (untracked but not ignored), so build output inside
+    it is not source while a new file counts before it is committed.
+    """
+    files: set[str] = set()
+    for source in sources:
+        path = root / source
+        if path.is_file():
+            files.add(source.as_posix())
+            continue
+        if not path.is_dir():
+            raise SystemExit(f"missing package source: {source}")
+        listing = subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+             source.as_posix()],
+            cwd=root,
+            capture_output=True,
+        )
+        if listing.returncode != 0:
+            raise SystemExit(
+                f"git ls-files {source} failed: {listing.stderr.decode().strip()}"
+            )
+        found = [
+            name for name in listing.stdout.decode().split("\0")
+            if name and (root / name).is_file()
+        ]
+        if not found:
+            raise SystemExit(f"package source {source} holds no files")
+        files.update(found)
+    return sorted(files)
+
+
+def _package_key_inputs(root: Path, group: Group, artifact: str) -> str:
+    """Key-input text for a package artifact: its inputs' keys and its sources."""
+    spec = group.artifacts[artifact]
+    text = [f"schema={SCHEMA}", f"artifact={artifact}"]
+    for name in sorted(spec.inputs):
+        text.append(f"input={name}:{library_key(root, group, name)}")
+    for name in package_source_files(root, spec.sources):
+        text.append(f"source={name}:{_sha256_file(root / name)}")
+    return "\n".join(text) + "\n"
+
+
 def key_inputs(root: Path, group: Group, artifact: str) -> str:
     if group.artifacts is not None:
+        if group.artifacts[artifact].is_package:
+            return _package_key_inputs(root, group, artifact)
         return _artifact_key_inputs(root, group, artifact)
 
     component = canonical_component(artifact)
@@ -537,6 +651,15 @@ def _artifact_entry_problems(entry: dict, key: str, spec: Artifact) -> list[str]
     problems = []
     if entry.get("key") != key:
         problems.append(f"key {entry.get('key')!r} != {key!r}")
+
+    if spec.is_package:
+        asset = entry.get("asset")
+        if asset != spec.asset_pattern.format(key=key):
+            problems.append(f"asset {asset!r} does not match the key")
+        checksum = entry.get("checksum", "")
+        if not CHECKSUM_RE.match(checksum):
+            problems.append(f"checksum {checksum!r} is not a sha256")
+        return problems
 
     prebuilt = entry.get("prebuilt") or {}
     for variant in spec.variants:
@@ -682,11 +805,55 @@ def cmd_record_platform(args, root: Path, group: Group) -> int:
     return 0
 
 
+def cmd_record_packages(args, root: Path, group: Group) -> int:
+    """Name every package artifact's asset by content and record it.
+
+    The build leaves the unkeyed `<artifact><ext>` (or the keyed name) in the
+    release dir; a package this run did not build keeps its recorded entry.
+    """
+    packages = [
+        artifact_id for artifact_id, spec in (group.artifacts or {}).items() if spec.is_package
+    ]
+    if not packages:
+        print(f"the {group.name} group has no package artifacts")
+        return 0
+
+    release = root / args.release_dir
+    manifest = load_manifest(root)
+    section = group_section(manifest, group)
+    recorded = 0
+    for artifact_id in packages:
+        spec = group.artifacts[artifact_id]
+        key = library_key(root, group, artifact_id)
+        target = release / spec.asset_pattern.format(key=key)
+        unkeyed = release / (artifact_id + spec.asset_pattern.split("{key}", 1)[1])
+        if unkeyed.is_file():
+            if target.exists():
+                target.unlink()
+            unkeyed.rename(target)
+            print(f"{unkeyed.name} -> {target.name}")
+        if not target.is_file():
+            print(f"{artifact_id}: not built in this run, keeping the recorded entry")
+            continue
+        section["libraries"][artifact_id] = {
+            "key": key,
+            "asset": target.name,
+            "checksum": _sha256_file(target),
+        }
+        recorded += 1
+        print(f"{artifact_id}: key {key} -> {target.name}")
+
+    if recorded:
+        save_manifest(root, manifest)
+        print(f"wrote {MANIFEST_PATH}")
+    return 0
+
+
 def cmd_record_frameworks(args, root: Path, group: Group) -> int:
     if group.artifacts is not None:
         raise SystemExit(
-            f"the {group.name} group has no frameworks; "
-            "record-platform per variant is its only record verb"
+            f"the {group.name} group has no frameworks; record-platform per "
+            "variant and record-packages are its record verbs"
         )
     release = root / args.release_dir
     keys = all_keys(root, group)
@@ -866,14 +1033,14 @@ def cmd_stale(args, root: Path, group: Group) -> int:
 def _wanted_assets(section: dict) -> list[tuple[str, str]]:
     """(library, asset) for every asset the manifest pins, deduplicated in order.
 
-    Two entry shapes reach here: the apple group records `prebuilt` as a
-    platform -> asset-name map, while a group.json group records a
-    variant -> {asset, checksum} map.
+    Three entry shapes reach here: the apple group records `prebuilt` as a
+    platform -> asset-name map, a group.json group records a variant ->
+    {asset, checksum} map, and a package records its one `asset`.
     """
     wanted = []
     seen = set()
     for library, entry in sorted(section["libraries"].items()):
-        assets = []
+        assets = [entry["asset"]] if entry.get("asset") else []
         for value in sorted((entry.get("prebuilt") or {}).items()):
             recorded = value[1]
             assets.append(recorded["asset"] if isinstance(recorded, dict) else recorded)
@@ -1087,6 +1254,14 @@ def main(argv: list[str]) -> int:
     record_platform.add_argument("--platform", required=True)
     record_platform.add_argument("--release-dir", default="dist/release")
     record_platform.set_defaults(func=cmd_record_platform)
+
+    record_packages = subparsers.add_parser(
+        "record-packages",
+        parents=[common],
+        help="name the group's package artifacts (e.g. the mpv-android AAR) by content",
+    )
+    record_packages.add_argument("--release-dir", default="dist/release")
+    record_packages.set_defaults(func=cmd_record_packages)
 
     record_frameworks = subparsers.add_parser(
         "record-frameworks",

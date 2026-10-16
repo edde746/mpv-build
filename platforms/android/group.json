@@ -35,6 +35,11 @@
       ],
       "variants": ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"],
       "assetPattern": "libmpv-android-{key}-{variant}.tar.gz"
+    },
+    "mpv-android": {
+      "inputs": ["libmpv-android"],
+      "sources": ["platforms/android/lib"],
+      "assetPattern": "mpv-android-{key}.aar"
     }
   }
 }
