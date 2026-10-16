@@ -10,7 +10,7 @@
 #                    records for each asset
 #   --tarballs <dir> local tarballs, e.g. dist/release after package.sh (libmpv-android-<abi>.tar.gz) or a
 #                    directory of published ones (libmpv-android-<key>-<abi>.tar.gz)
-#   -- <args>        passed to Gradle after assembleRelease (CI adds testReleaseUnitTest assembleDebugAndroidTest)
+#   -- <args>        passed to Gradle after assembleRelease (CI adds testDebugUnitTest assembleDebugAndroidTest)
 # Needs JDK 17 or newer and an Android SDK (ANDROID_HOME, or sdk.dir in platforms/android/lib/local.properties);
 # Gradle installs the NDK toolchain/android.txt pins and CMake 4.1.2 when the SDK lacks them.
 set -euo pipefail

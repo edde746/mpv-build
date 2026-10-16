@@ -605,7 +605,8 @@ pattern `[artifact]-[revision].[ext]`) with `<name>` as the version.
 Tests: `bash scripts/test_android_glue.sh` builds and runs the glue's host
 C++ tests (`src/test/cpp`: session lifecycle, event order with the error
 end-file drain, UTF-8 conversion) against fakes, with the patched mpv and
-FFmpeg headers; `./gradlew testReleaseUnitTest` (in `platforms/android/lib`)
+FFmpeg headers; `./gradlew testDebugUnitTest` (in `platforms/android/lib`;
+AGP 9 runs a library's unit tests against its debug build type only)
 runs the JVM tests of the listener delivery and hook rules; the device test
 (`src/androidTest`) creates a player, plays the media given as the
 instrumentation argument `mediaUrl`, attaches and replaces surfaces and

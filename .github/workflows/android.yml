@@ -115,7 +115,7 @@ jobs:
           DEVICE_TESTS: ${{ inputs.device-tests && 'assembleDebugAndroidTest' || '' }}
         run: |
           bash platforms/android/lib/build-aar.sh ${TARBALLS:+--tarballs "$TARBALLS"} \
-            -- testReleaseUnitTest ${DEVICE_TESTS}
+            -- testDebugUnitTest ${DEVICE_TESTS}
 
       - name: Check the AAR for a build date
         run: bash scripts/test_build_date.sh dist/release/mpv-android.aar
