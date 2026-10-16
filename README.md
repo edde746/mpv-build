@@ -322,18 +322,22 @@ seeks too, so mpv's hardware-decoding fallback runs; a seek without an error
 decodes on. Pass an already-patched source directory as the first argument
 to run offline.
 
-Run the MediaCodec drain regression with `bash scripts/test_mediacodec_drain.sh`.
-It fetches the pinned ffmpeg revision, applies the Android series, and drives
-the production receive_frame callback, the codec callbacks and both dequeues
-on a virtual clock through a drain the codec cannot finish because the host
-holds its output buffers (a player paused within the file's last second).
-Every call holds the decoding thread at most 10 ms (mpv's seeks, property
-reads, window changes and teardown wait on that thread); the polled codec,
-which mpv asks again after every EAGAIN past its end of stream, is asked at
-most 125 times a second and logs no error line; the asynchronous codec
-answers at once and wakes the host only when its output comes; and the drain
-ends once the host lets the buffers go. Pass an already-patched source
-directory as the first argument to run offline.
+Run the paused MediaCodec regression with `bash scripts/test_mediacodec_paused.sh`.
+It fetches the pinned mpv and ffmpeg revisions, applies their Android series,
+and drives mpv's decoder filter step and wakeup registration over FFmpeg's
+production receive_frame callback, codec callbacks, dequeues, busy answer and
+buffer releases, against a fake codec on a virtual clock, with a player that
+holds the codec's output buffers mid-file and in a drain at the end of the
+file. In both codec modes the paused decoder is not asked at all from 2 s on
+until the player gives a buffer back (rendered at a time, rendered, or
+dropped), a run for any other reason asks once, every call holds the decoding
+thread at most 10 ms (mpv's seeks, property reads, window changes and teardown
+wait on that thread), no error line is logged, and a resumed decoder picks up
+the codec's next frame within one 8 ms poll. A synchronous codec still
+decoding its last frames, falling behind with no buffer held, or taking input
+without handing out a frame is asked until its frame comes; a paused seek
+decodes at once. Pass an already-patched mpv tree and an FFmpeg tree as the
+first two arguments to run offline.
 
 Run the MediaCodec output-crop regression with `bash scripts/test_mediacodec_crop.sh`.
 It exercises the production FFmpeg format parser: MediaTek's configured
@@ -438,13 +442,13 @@ directory to run offline.
 
 Run the decoder busy-policy regression with `bash scripts/test_lavc_busy_policy.sh`.
 It compiles mpv's `lavc_process` against scripted send/receive callbacks and
-a recording filter graph, and drives the policy a MediaCodec decoder runs
-under: a polled decoder that still answers EAGAIN after the EOF packet was
-accepted is asked again until it delivers its last frames and EOF (nothing
-upstream will ever call it otherwise), is not spun while the demuxer starves
-it, and has a refused packet put back and retried; a decoder that wakes the
-filter itself and an ordinary libavcodec decoder are left alone. Pass an
-already-patched source directory to run offline.
+a recording filter graph: a decoder that wakes the filter itself (MediaCodec,
+either codec mode) has a refused packet put back without a retry and is not
+asked again past the EOF packet until it wakes the filter, then delivers its
+last frames and a single EOF; an ordinary libavcodec decoder refusing a packet
+gets a warning and an immediate retry and is left alone past EOF; neither is
+spun while the demuxer starves it. Pass an already-patched source directory
+to run offline.
 
 Run the frame-queue regression with `bash scripts/test_player_queue_frames.sh`.
 It compiles the core's frame-queue gate and frame-duration code

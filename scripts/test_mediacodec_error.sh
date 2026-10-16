@@ -23,17 +23,19 @@ if [[ -z "$source_dir" ]]; then
 fi
 
 # The production decode path, sliced out of the patched tree by the shared
-# extractor: the timeouts and generation shift it reads, the timestamp
-# tagging, the codec callbacks and the host wakeup, the asynchronous setup,
-# both dequeues, the flush, send and receive, and the receive_frame callback
-# that strings them together. The return types are named so a rewritten
-# function fails here rather than matching something else nearby.
+# extractor: the timeouts, park time and generation shift it reads, the
+# timestamp tagging, the codec callbacks and the host wakeup, the asynchronous
+# setup, the busy answer, both dequeues, the flush, send and receive, and the
+# receive_frame callback that strings them together. The return types are
+# named so a rewritten function fails here rather than matching something
+# else nearby.
 E="$root/scripts/extract.py"
 common="$source_dir/libavcodec/mediacodecdec_common.c"
 inc="$workdir/mediacodec_error.inc"
 python3 "$E" define "$common" "$inc" \
     --name MEDIACODEC_GENERATION_SHIFT --name INPUT_DEQUEUE_TIMEOUT_US \
-    --name OUTPUT_DEQUEUE_TIMEOUT_US --name OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US
+    --name OUTPUT_DEQUEUE_TIMEOUT_US --name OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US \
+    --name MEDIACODEC_PARK_US
 python3 "$E" define "$source_dir/libavcodec/mediacodecdec_common.h" "$inc" --append \
     --name MEDIACODEC_ASYNC_FORMAT_CHANGED
 python3 "$E" type "$common" "$inc" --append --member MEDIACODEC_OUTPUT_TRY_AGAIN
@@ -44,6 +46,7 @@ for fn in mediacodec_dec_tag_pts:int64_t mediacodec_dec_pts_generation:int \
           mediacodec_dec_on_error:void mediacodec_dec_init_async:void \
           mediacodec_dec_uninit_async:void mediacodec_dec_may_block:int \
           mediacodec_dec_async_wait:int ff_mediacodec_dec_host_polls:int \
+          ff_mediacodec_dec_busy:void \
           ff_mediacodec_dec_dequeue_input:ssize_t mediacodec_dec_dequeue_output:int \
           mediacodec_dec_flush_codec:int ff_mediacodec_dec_flush:int \
           ff_mediacodec_dec_is_flushing:int ff_mediacodec_dec_send:int \

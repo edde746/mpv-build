@@ -14,10 +14,10 @@ dequeue: no flush clears it, and a failed flush or restart sets it and, in
 asynchronous mode, wakes the host.
 
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index 502299c..27e2eb0 100644
+index 10613ac..c2dd604 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -893,6 +893,19 @@ static void mediacodec_dec_wake_host(MediaCodecDecContext *s)
+@@ -901,6 +901,19 @@ static void mediacodec_dec_wake_host(MediaCodecDecContext *s)
          ff_cond_broadcast(&s->async_cond);
  }
  
@@ -37,7 +37,7 @@ index 502299c..27e2eb0 100644
  static void mediacodec_dec_on_input_available(FFAMediaCodec *codec, void *userdata,
                                                int32_t index)
  {
-@@ -946,10 +959,7 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
+@@ -954,10 +967,7 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
  
      av_log(codec, AV_LOG_ERROR, "Codec error %s (%s)\n", av_err2str(error), detail);
      ff_mutex_lock(&s->async_lock);
@@ -49,7 +49,7 @@ index 502299c..27e2eb0 100644
      ff_mutex_unlock(&s->async_lock);
  }
  
-@@ -1057,7 +1067,12 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+@@ -1108,7 +1118,12 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
      int ret;
  
      if (!s->async_mode) {
@@ -63,7 +63,7 @@ index 502299c..27e2eb0 100644
          if (ff_AMediaCodec_infoTryAgainLater(s->codec, idx))
              return AVERROR(EAGAIN);
          if (idx < 0)
-@@ -1099,7 +1114,10 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1151,7 +1166,10 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
  
      if (!s->async_mode) {
          FFAMediaCodec *codec = s->codec;
@@ -72,10 +72,10 @@ index 502299c..27e2eb0 100644
 +        if (s->async_error)
 +            return s->async_error;
 +        idx = ff_AMediaCodec_dequeueOutputBuffer(codec, info, timeout_us);
-         if (idx >= 0) {
-             *index = idx;
-             timing->output_ns = mediacodec_monotonic_ns();
-@@ -1176,25 +1194,31 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+         if (ff_AMediaCodec_infoTryAgainLater(codec, idx))
+             return MEDIACODEC_OUTPUT_TRY_AGAIN;
+         s->progress++;
+@@ -1229,25 +1247,31 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      status = ff_AMediaCodec_flush(codec);
      if (status < 0) {
          av_log(avctx, AV_LOG_ERROR, "Failed to flush codec\n");
@@ -116,7 +116,7 @@ index 502299c..27e2eb0 100644
  }
  
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 0df6644..6d278db 100644
+index 26d0de2..e9b1418 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -106,7 +106,10 @@ typedef struct MediaCodecDecContext {

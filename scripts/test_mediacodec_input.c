@@ -67,6 +67,7 @@ typedef struct MediaCodecDecContext {
     int eos;
     ssize_t current_input_buffer;
     int input_since_flush;
+    uint64_t progress; // the polled dequeues count it (ff_mediacodec_dec_busy)
     // Asynchronous mode is never taken here (see the stubs below); the paths
     // that consult it, and the sticky codec error the polled dequeue
     // answers, are extracted production code, so the state exists.

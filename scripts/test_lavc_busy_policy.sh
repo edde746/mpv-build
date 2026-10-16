@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Compile mpv's lavc_process against scripted send/receive callbacks and drive
-# the busy policy a MediaCodec decoder is run under: when a both-port EAGAIN
-# gets a re-poll, a wakeup wait, or nothing. Pass an already-patched mpv tree
-# for offline use; otherwise fetch and patch the pinned source.
+# the busy policies: a decoder that wakes the filter itself (MediaCodec) is
+# left alone while it answers EAGAIN on both ports, an ordinary one gets a
+# warning and a retry. Pass an already-patched mpv tree for offline use;
+# otherwise fetch and patch the pinned source.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${1:-}"

@@ -119,6 +119,7 @@ typedef struct MediaCodecDecContext {
     uint64_t output_buffer_count;
     ssize_t current_input_buffer;
     int input_since_flush;
+    uint64_t progress; // the polled dequeues count it (ff_mediacodec_dec_busy)
     bool delay_flush;
     atomic_int serial;
     int async_mode;

@@ -86,7 +86,7 @@ jobs:
       - name: Test MediaCodec OSD-plane letterbox fill
         run: bash ./scripts/test_mediacodec_letterbox.sh
 
-      - name: Test decoder busy policy past end of stream
+      - name: Test the decoder busy policies
         run: bash ./scripts/test_lavc_busy_policy.sh
 
       - name: Test MediaCodec Dolby Vision packet filter
@@ -104,8 +104,8 @@ jobs:
       - name: Test MediaCodec errors across a flush
         run: bash ./scripts/test_mediacodec_error.sh
 
-      - name: Test MediaCodec drain with the output buffers held
-        run: bash ./scripts/test_mediacodec_drain.sh
+      - name: Test a paused MediaCodec decoder with the output buffers held
+        run: bash ./scripts/test_mediacodec_paused.sh
 
       - name: Test MediaCodec output crop transitions
         run: bash ./scripts/test_mediacodec_crop.sh

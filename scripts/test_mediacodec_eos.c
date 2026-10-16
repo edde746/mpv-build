@@ -121,6 +121,7 @@ typedef struct MediaCodecDecContext {
     uint64_t output_buffer_count;
     ssize_t current_input_buffer;
     int input_since_flush;
+    uint64_t progress; // the polled dequeues count it (ff_mediacodec_dec_busy)
     atomic_int serial;
     int async_mode;
     AVMutex async_lock;
@@ -190,8 +191,8 @@ static void mediacodec_dec_fail(MediaCodecDecContext *s, int err)
 }
 
 // No host registered a wakeup: the drain waits as long as the codec lets it,
-// which the wait above never does. test_mediacodec_drain.c drives a host
-// that registered.
+// which the wait above never does. test_mediacodec_paused.c drives a host
+// that registered, mpv's decoder filter, through a drain it cannot finish.
 static int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s)
 {
     return 0;

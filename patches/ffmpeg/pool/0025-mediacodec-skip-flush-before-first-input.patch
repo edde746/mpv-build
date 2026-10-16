@@ -16,10 +16,10 @@ flush clears the mark. Once any slot has been handed out, including the one
 an oversized access unit is dropped from, flushing is unchanged.
 
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index ad5a3f2..d597294 100644
+index b4ef2be..88ea150 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -971,7 +971,8 @@ int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s)
+@@ -1022,7 +1022,8 @@ void ff_mediacodec_dec_released(MediaCodecDecContext *s)
  }
  
  // A free input slot: the index, AVERROR(EAGAIN) when none is available within
@@ -29,19 +29,15 @@ index ad5a3f2..d597294 100644
  ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout_us)
  {
      int32_t index;
-@@ -981,7 +982,10 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
-         ssize_t idx = ff_AMediaCodec_dequeueInputBuffer(s->codec, timeout_us);
-         if (ff_AMediaCodec_infoTryAgainLater(s->codec, idx))
+@@ -1034,6 +1035,7 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
              return AVERROR(EAGAIN);
--        return idx < 0 ? AVERROR_EXTERNAL : idx;
-+        if (idx < 0)
-+            return AVERROR_EXTERNAL;
+         if (idx < 0)
+             return AVERROR_EXTERNAL;
 +        s->input_since_flush = 1;
-+        return idx;
+         s->progress++;
+         return idx;
      }
- 
-     ff_mutex_lock(&s->async_lock);
-@@ -989,7 +993,10 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+@@ -1043,7 +1045,10 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
      if (ret >= 0)
          ret = av_fifo_read(s->async_input, &index, 1) >= 0 ? 0 : AVERROR(EAGAIN);
      ff_mutex_unlock(&s->async_lock);
@@ -53,7 +49,7 @@ index ad5a3f2..d597294 100644
  }
  
  enum {
-@@ -1073,6 +1080,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -1128,6 +1133,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      atomic_fetch_add(&s->serial, 1);
      atomic_init(&s->hw_buffer_count, 0);
      s->current_input_buffer = -1;
@@ -61,7 +57,7 @@ index ad5a3f2..d597294 100644
      // Every shed frame the codec had yet to pass is moot after a flush.
      s->pending_drops = 0;
  
-@@ -1585,6 +1593,17 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1649,6 +1655,17 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
  */
  int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
  {
@@ -80,7 +76,7 @@ index ad5a3f2..d597294 100644
          int ret;
  
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index afaa9e6..ab520fb 100644
+index 459493a..6903095 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -79,6 +79,9 @@ typedef struct MediaCodecDecContext {

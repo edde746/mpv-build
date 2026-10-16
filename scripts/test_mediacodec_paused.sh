@@ -7,12 +7,12 @@
 # the file (a drain the codec cannot finish): once the codec can make no
 # progress the decoder must not be asked again until the player gives a
 # buffer back or seeks, every call must hand the decoding thread back within
-# one poll, a codec still working must be asked until its output comes, and
-# the drain must end once the player resumes. Pass an already-patched mpv
-# tree and ffmpeg tree for offline use; otherwise fetch and patch the pinned
-# Android sources in a temporary directory. No Android device or JNI runtime
-# is needed: the MediaCodec wrapper is stubbed by the test, and time is a
-# virtual clock the waits advance.
+# one poll, a codec still working or still taking input must be asked until
+# its output comes, and the drain must end once the player resumes. Pass an
+# already-patched mpv tree and ffmpeg tree for offline use; otherwise fetch
+# and patch the pinned Android sources in a temporary directory. No Android
+# device or JNI runtime is needed: the MediaCodec wrapper is stubbed by the
+# test, and time is a virtual clock the waits advance.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,10 +39,11 @@ fi
 # timeouts, park time and generation shift the decode path reads, the
 # timestamp tagging, the codec callbacks and the host wakeup, the asynchronous
 # setup and wait, the busy answer and the release that wakes a parked host,
-# both dequeues, flush, send and receive, the receive_frame callback that
-# strings them together, and the release the video output gives a frame back
-# through. The return types are named so a rewritten function fails here
-# rather than matching something else nearby.
+# the release on a frame's last reference, both dequeues, flush, send and
+# receive, the receive_frame callback that strings them together, and the
+# two releases a video output gives a shown frame back through. The return
+# types are named so a rewritten function fails here rather than matching
+# something else nearby.
 E="$root/scripts/extract.py"
 host="$workdir/mediacodec_paused_host.inc"
 python3 "$E" type "$mpv_dir/filters/f_decoder_wrapper.h" "$host" \
@@ -72,6 +73,7 @@ for fn in mediacodec_dec_tag_pts:int64_t mediacodec_dec_pts_generation:int \
           mediacodec_dec_uninit_async:void mediacodec_dec_may_block:int \
           mediacodec_dec_async_wait:int ff_mediacodec_dec_host_polls:int \
           ff_mediacodec_dec_busy:void ff_mediacodec_dec_released:void \
+          mediacodec_buffer_release:void \
           ff_mediacodec_dec_dequeue_input:ssize_t mediacodec_dec_dequeue_output:int \
           mediacodec_dec_flush_codec:int ff_mediacodec_dec_flush:int \
           ff_mediacodec_dec_is_flushing:int ff_mediacodec_dec_send:int \
@@ -81,7 +83,8 @@ done
 python3 "$E" symbol "$ffmpeg_dir/libavcodec/mediacodecdec.c" "$dec" --append \
     --fn mediacodec_receive_frame --return int
 python3 "$E" symbol "$ffmpeg_dir/libavcodec/mediacodec.c" "$dec" --append \
-    --fn av_mediacodec_set_wakeup_callback --fn av_mediacodec_release_buffer --return int
+    --fn av_mediacodec_set_wakeup_callback --fn av_mediacodec_release_buffer \
+    --fn av_mediacodec_render_buffer_at_time --return int
 
 # FFmpeg builds its own sources without -Wsign-compare.
 cc -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare \

@@ -169,6 +169,12 @@ typedef struct MediaCodecDecContext {
     void (*wakeup)(void *opaque);
     void *wakeup_opaque;
     int wakeup_in_flight;
+    uint64_t progress;
+    uint64_t released;
+    uint64_t stall_mark;
+    int64_t stall_start;
+    bool stalled;
+    bool parked;
     int64_t pending_drop_pts[8];
     int pending_drops;
     // Presentation-order recovery (mediacodec_reorder.h) and the input-time

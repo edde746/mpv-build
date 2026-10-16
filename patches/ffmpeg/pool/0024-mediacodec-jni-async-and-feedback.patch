@@ -146,10 +146,10 @@ index 955cd28..e4ba8ea 100644
 +
  #endif /* AVCODEC_JNI_H */
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index 9fd8e84..5bc0d96 100644
+index 30c0d00..8199ab5 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
-@@ -165,7 +165,7 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+@@ -169,7 +169,7 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
      unsigned head, tail;
      int n = 0;
  
@@ -159,7 +159,7 @@ index 9fd8e84..5bc0d96 100644
      if (max < 0)
          return AVERROR(EINVAL);
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 53c5c65..260bf3e 100644
+index 5cbdb87..072df17 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
 @@ -131,10 +131,12 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
@@ -179,7 +179,7 @@ index 53c5c65..260bf3e 100644
   */
  const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
  
-@@ -169,7 +171,8 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -175,7 +177,8 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
   *
   * @return 0 when the platform accepted the parameter, AVERROR(ENOSYS) when
   * `avctx` is not an opened MediaCodec decoder or the platform predates
@@ -694,10 +694,10 @@ index 1cdf601..2170f33 100644
  };
  
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 7744c7b..e0a602c 100644
+index 2cf12b8..1a204c8 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -1199,8 +1199,9 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -1208,8 +1208,9 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                       OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
      { "ndk_codec", "Use MediaCodec from NDK",
                     OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
@@ -710,10 +710,10 @@ index 7744c7b..e0a602c 100644
              OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
      { "frame_rate", "The stream's frame rate, informational to the codec (MediaFormat frame-rate), zero for unspecified",
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index a9d2fe7..ad5a3f2 100644
+index a4e5457..b4ef2be 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -876,7 +876,9 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
+@@ -884,7 +884,9 @@ static void mediacodec_dec_on_error(FFAMediaCodec *codec, void *userdata,
  }
  
  // Between configure and start, where the platform accepts the callback.
@@ -724,7 +724,7 @@ index a9d2fe7..ad5a3f2 100644
  static void mediacodec_dec_init_async(AVCodecContext *avctx, MediaCodecDecContext *s)
  {
      static const FFAMediaCodecOnAsyncNotifyCallback cb = {
-@@ -889,10 +891,6 @@ static void mediacodec_dec_init_async(AVCodecContext *avctx, MediaCodecDecContex
+@@ -897,10 +899,6 @@ static void mediacodec_dec_init_async(AVCodecContext *avctx, MediaCodecDecContex
  
      if (!s->use_async)
          return;
@@ -733,9 +733,9 @@ index a9d2fe7..ad5a3f2 100644
 -        return;
 -    }
  
-     ff_cond_init(&s->async_cond, NULL);
      s->async_input = av_fifo_alloc2(16, sizeof(int32_t), AV_FIFO_FLAG_AUTO_GROW);
-@@ -1225,6 +1223,8 @@ static void mediacodec_dec_on_frame_rendered(FFAMediaCodec *codec, void *userdat
+     s->async_output = av_fifo_alloc2(16, sizeof(MediaCodecAsyncOutput),
+@@ -1280,6 +1278,8 @@ static void mediacodec_dec_on_frame_rendered(FFAMediaCodec *codec, void *userdat
  
  // Only a surface-backed video codec renders anything. Registration failures
  // are diagnostics, never errors: the decoder is complete without feedback.
@@ -744,7 +744,7 @@ index a9d2fe7..ad5a3f2 100644
  static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
                                               MediaCodecDecContext *s)
  {
-@@ -1234,10 +1234,6 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
+@@ -1289,10 +1289,6 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
          s->rendered_source = "off:surface";
          return;
      }
@@ -755,7 +755,7 @@ index a9d2fe7..ad5a3f2 100644
      ret = ff_AMediaCodec_setOnFrameRenderedCallback(s->codec,
              mediacodec_dec_on_frame_rendered, s);
      if (ret == AVERROR(ENOSYS)) {
-@@ -1245,7 +1241,7 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
+@@ -1300,7 +1296,7 @@ static void mediacodec_dec_register_rendered(AVCodecContext *avctx,
      } else if (ret < 0) {
          s->rendered_source = "off:codec";
      } else {
@@ -765,10 +765,10 @@ index a9d2fe7..ad5a3f2 100644
      av_log(avctx, AV_LOG_VERBOSE, "Frame-rendered feedback: %s\n",
             s->rendered_source);
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index f096c73..afaa9e6 100644
+index 37c2a67..459493a 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
-@@ -114,7 +114,7 @@ typedef struct MediaCodecDecContext {
+@@ -127,7 +127,7 @@ typedef struct MediaCodecDecContext {
      AVBufferRef *device_ref;
  
      // Frame-rendered feedback; see av_mediacodec_drain_rendered.

@@ -333,10 +333,11 @@ static MediaCodecDecContext *ff_mediacodec_dec_from_avctx(AVCodecContext *avctx)
 
 // --- MediaCodec fake. The codec's own thread is the test. A queued access
 // unit becomes a frame in any free output buffer at once, unless the codec is
-// still working (working_until); after the end-of-stream input it reports the
-// end of stream once its frames are out. Polled, the dequeues find what is
-// ready or wait out their whole timeout; asynchronously, pump() reports it
-// through the production callbacks.
+// still working (working_until), when one with a deep pipeline may still take
+// input (intake_us); after the end-of-stream input it reports the end of
+// stream once its frames are out. Polled, the dequeues find what is ready or
+// wait out their whole timeout; asynchronously, pump() reports it through the
+// production callbacks.
 
 enum {
     INFO_TRY_AGAIN_LATER = -1,
@@ -352,6 +353,8 @@ static struct {
     int held;                // output buffers handed out and not given back
     bool eos_queued, eos_out;
     int64_t working_until;   // nothing comes out before this
+    int64_t intake_from;     // while working, one more access unit fits in
+    int64_t intake_us;       // every intake_us from intake_from on
     int late_after;          // from this many frames on the codec takes...
     int64_t late_us;         // ...this long for each next output
     int frames_out;
@@ -370,9 +373,19 @@ static bool eos_ready(void)
     return codec.eos_queued && !codec.in_codec && !codec.eos_out;
 }
 
+// The access units a codec still working has taken into its pipeline beyond
+// its slots.
+static int swallowed(void)
+{
+    int64_t until = FFMIN(now_us, codec.working_until);
+    if (!codec.intake_us || until <= codec.intake_from)
+        return 0;
+    return (until - codec.intake_from) / codec.intake_us;
+}
+
 static bool slot_free(void)
 {
-    return !codec.eos_queued && codec.in_codec + codec.slots_out < SLOTS;
+    return !codec.eos_queued && codec.in_codec + codec.slots_out < SLOTS + swallowed();
 }
 
 static int64_t mediacodec_dec_tag_pts(const MediaCodecDecContext *s, int64_t pts);
@@ -486,6 +499,11 @@ static int ff_AMediaCodec_releaseOutputBuffer(FFAMediaCodec *c, size_t index, in
     return 0;
 }
 
+static int ff_AMediaCodec_releaseOutputBufferAtTime(FFAMediaCodec *c, size_t index, int64_t time)
+{
+    return ff_AMediaCodec_releaseOutputBuffer(c, index, 1);
+}
+
 static int ff_AMediaCodec_getBufferFlagEndOfStream(FFAMediaCodec *c)
 {
     return EOS_FLAG;
@@ -545,7 +563,7 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
 }
 
 // What the production wrapper keeps of a decoded buffer: the index to give
-// back, and the flush generation it belongs to.
+// back, the flush generation it belongs to, and its reference on the decoder.
 static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx, MediaCodecDecContext *s,
                                      ssize_t index, FFAMediaCodecBufferInfo *info,
                                      const AVMediaCodecBufferTiming *timing,
@@ -557,6 +575,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx, MediaCodecDecContext
     buffer->serial = atomic_load(&s->serial);
     atomic_init(&buffer->released, 0);
     atomic_fetch_add(&s->hw_buffer_count, 1);
+    atomic_fetch_add(&s->refcount, 1);
     frame->buffer = buffer;
     return 0;
 }
@@ -591,6 +610,13 @@ static int ff_decode_get_packet(AVCodecContext *avctx, AVPacket *pkt)
 static void av_packet_unref(AVPacket *pkt)
 {
     *pkt = (AVPacket){ 0 };
+}
+
+// A frame's last reference gone (mediacodec_buffer_release); the test owns
+// the decoder itself.
+static void ff_mediacodec_dec_unref(MediaCodecDecContext *s)
+{
+    atomic_fetch_sub(&s->refcount, 1);
 }
 
 #include "mediacodec_paused_decoder.inc"
@@ -812,22 +838,36 @@ static int run_until(int64_t until)
     return runs;
 }
 
-// The player shows its oldest frame and the video output gives the buffer
-// back, as vo_mediacodec does once the frame is on screen.
-static void give_back(void)
+// How the player gives its oldest frame's buffer back: shown at a time, as
+// vo_mediacodec renders; shown at once, as the GL output does; or dropped
+// unshown, the buffer going back when the frame's last reference does.
+enum give_back_how { RENDERED_AT_A_TIME, RENDERED, DROPPED };
+static const char *const give_back_names[] = { "rendered at a time", "rendered", "dropped" };
+
+static void give_back_as(enum give_back_how how)
 {
     MediaCodecBuffer *buffer = player.held[0];
     checkf(player.n > 0, "the player holds a frame to give back");
     memmove(player.held, player.held + 1, --player.n * sizeof(player.held[0]));
-    av_mediacodec_release_buffer(buffer, 1);
-    free(buffer);
+    if (how == RENDERED_AT_A_TIME)
+        av_mediacodec_render_buffer_at_time(buffer, now_us * 1000);
+    else if (how == RENDERED)
+        av_mediacodec_release_buffer(buffer, 1);
+    mediacodec_buffer_release(buffer, NULL);
     if (player.n == PLAYER_QUEUE - 1)
         graph.woken = true;
 }
 
+static void give_back(void)
+{
+    give_back_as(RENDERED);
+}
+
 // The player paused, for a minute, with the codec's buffers all held: past
-// IDLE_AFTER_US the decoder is not asked at all, and no call before holds
-// the thread longer than one poll.
+// IDLE_AFTER_US the decoder is not asked at all; a run of the decoder filter
+// for any other reason meanwhile (mpv runs it whenever something else in its
+// graph moves) asks once and leaves it alone again; and no call holds the
+// thread longer than one poll, which is what a close waits on that thread.
 static void hold_paused(const char *where)
 {
     int64_t start = now_us;
@@ -842,6 +882,13 @@ static void hold_paused(const char *where)
            where, idle, codec.dequeues - dequeues, (60000000 - IDLE_AFTER_US) / 1000000,
            IDLE_AFTER_US / 1000000,
            (codec.dequeues - dequeues) / ((60000000.0 - IDLE_AFTER_US) / 1000000), settle);
+    // One run: an output dequeue, an input dequeue, the output dequeue that
+    // waits its poll out.
+    graph.woken = true;
+    int other = run_until(now_us + 10 * 1000000LL);
+    checkf(other == 1 && codec.dequeues - dequeues <= 3,
+           "paused %s, a run for another reason set the decoder filter running %d times "
+           "and the codec was asked %d times", where, other, codec.dequeues - dequeues);
     checkf(worst_hold <= HOLD_BOUND_US,
            "paused %s, one call held the decoding thread %" PRId64 " ms, more than %d ms",
            where, worst_hold / 1000, HOLD_BOUND_US / 1000);
@@ -859,26 +906,28 @@ static void test_paused_mid_file(int async_mode)
     checkf(player.n == OUTPUT_BUFFERS && codec.in_codec == SLOTS,
            "the codec's buffers end up with the paused player and its input fills "
            "(player %d, queued %d)", player.n, codec.in_codec);
-    hold_paused("mid-file");
 
-    // Resumed: the first buffer given back wakes the decoder (a polled codec
-    // through the release, an asynchronous one through its report), and the
-    // codec's next frame, which takes it 50 ms to decode into that buffer, is
-    // picked up within one poll of being ready though the codec stalled long
-    // ago.
-    int frames = codec.frames_out;
-    int64_t ready = now_us + 50000;
-    codec.working_until = ready;
-    give_back();
-    checkf(async_mode || graph.woken, "giving a buffer back wakes the decoder");
-    run_until(ready);
-    pump();  // asynchronous: the codec reports the frame once it has it
-    run_until(now_us + 100000);
-    checkf(codec.frames_out == frames + 1 && player.n == OUTPUT_BUFFERS &&
-           codec.out_at <= ready + OUTPUT_DEQUEUE_TIMEOUT_US,
-           "and the codec's next frame comes within one poll (%d frames, player %d, "
-           "%" PRId64 " ms after it was ready)",
-           codec.frames_out - frames, player.n, (codec.out_at - ready) / 1000);
+    // Paused, then resumed, once for each way the player gives a buffer
+    // back: that buffer wakes the decoder (a polled codec through the
+    // release, an asynchronous one through its report), and the codec's next
+    // frame, which takes it 50 ms to decode into it, is picked up within one
+    // poll of being ready though the codec stalled long ago.
+    for (int how = RENDERED_AT_A_TIME; how <= DROPPED; how++) {
+        hold_paused("mid-file");
+        int frames = codec.frames_out;
+        int64_t ready = now_us + 50000;
+        codec.working_until = ready;
+        give_back_as(how);
+        checkf(async_mode || graph.woken, "a buffer %s wakes the decoder", give_back_names[how]);
+        run_until(ready);
+        pump();  // asynchronous: the codec reports the frame once it has it
+        run_until(now_us + 100000);
+        checkf(codec.frames_out == frames + 1 && player.n == OUTPUT_BUFFERS &&
+               codec.out_at <= ready + OUTPUT_DEQUEUE_TIMEOUT_US,
+               "and after a buffer %s, the codec's next frame comes within one poll "
+               "(%d frames, player %d, %" PRId64 " ms after it was ready)", give_back_names[how],
+               codec.frames_out - frames, player.n, (codec.out_at - ready) / 1000);
+    }
     close_codec();
 }
 
@@ -948,6 +997,35 @@ static void test_codec_falling_behind_with_no_buffer_held(void)
     close_codec();
 }
 
+static void test_codec_taking_input_without_output(void)
+{
+    // A synchronous codec with a deep pipeline, paused with all but one of
+    // its buffers held (one given back as the player showed it): it keeps
+    // taking an access unit every 200 ms but hands out no frame for a second
+    // and a half. Taking input is progress, so it is asked until its frame
+    // comes and the frame is picked up within one poll of being ready; then,
+    // with every buffer held, it is left alone like any paused codec.
+    open_codec(0, 1000, false);
+    run_until(now_us + 100000);
+    int64_t ready = now_us + 1500000;
+    codec.working_until = ready;
+    codec.intake_from = now_us;
+    codec.intake_us = 200000;
+    give_back();
+    graph.woken = true;  // the player's queue asks for more
+    int frames = codec.frames_out, queued = codec.in_codec;
+    run_until(ready + 100000);
+    checkf(codec.in_codec + (codec.frames_out - frames) - queued >= 5,
+           "the codec takes input while it works (%d access units)",
+           codec.in_codec + (codec.frames_out - frames) - queued);
+    checkf(codec.frames_out == frames + 1 && codec.out_at <= ready + OUTPUT_DEQUEUE_TIMEOUT_US,
+           "a codec taking input without handing out a frame is asked until its frame comes "
+           "(%d frames, %" PRId64 " ms after it was ready)",
+           codec.frames_out - frames, (codec.out_at - ready) / 1000);
+    hold_paused("after taking input without output");
+    close_codec();
+}
+
 static void test_seek_while_paused(void)
 {
     // Paused long enough for the decoder to be left alone, then a seek: the
@@ -982,11 +1060,13 @@ int main(void)
     test_paused_at_the_end(1);
     test_codec_finishing_its_last_frames();
     test_codec_falling_behind_with_no_buffer_held();
+    test_codec_taking_input_without_output();
     test_seek_while_paused();
     printf("PASS: paused with the codec's buffers held, mid-file and at the end, the decoder "
-           "is not asked again %d s on until the player gives a buffer back, no call holds "
-           "the decoding thread more than %d ms, a codec still working is asked until its "
-           "frames come, and a paused seek decodes at once\n",
+           "is not asked again %d s on until the player gives a buffer back, a run for any "
+           "other reason asks once, no call holds the decoding thread more than %d ms, a "
+           "codec still working or still taking input is asked until its frames come, and "
+           "a paused seek decodes at once\n",
            IDLE_AFTER_US / 1000000, HOLD_BOUND_US / 1000);
     return 0;
 }
