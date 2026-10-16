@@ -12,9 +12,17 @@
 #                 exact libc++ per ABI)
 #   include/mpv/  client.h render.h render_gl.h stream_cb.h, as installed
 #                 into the prefix from the pinned mpv source by the build
+#   include/libav*/, include/libsw*/
+#                 the installed headers of the ffmpeg libraries in lib/, from
+#                 the patched source (libavcodec/jni.h declares
+#                 av_jni_set_mediacodec_callback_class, which the android
+#                 series adds): what the mpv-android AAR's JNI glue
+#                 (platforms/android/lib) and any other native consumer of
+#                 these libraries compile against, so nobody vendors them
 #
-# This replaces the fork's Gradle AAR assembly (scripts/mpv-android.sh): the
-# consumer unpacks these trees directly.
+# The mpv-android AAR (platforms/android/lib/build-aar.sh) is assembled from
+# these tarballs; a consumer that needs only the native trees unpacks them
+# directly.
 #
 # Usage: package.sh [--arch <arch>]   (default: all four)
 set -euo pipefail
@@ -53,6 +61,8 @@ mkdir -p "$release_dir"
 libs=(libmpv.so libavcodec.so libavdevice.so libavfilter.so libavformat.so
       libavutil.so libswresample.so libswscale.so)
 headers=(client.h render.h render_gl.h stream_cb.h)
+ffmpeg_headers=(libavcodec libavdevice libavfilter libavformat libavutil
+                libswresample libswscale)
 
 for arch in "${archs[@]}"; do
 	loadarch "$arch"
@@ -64,6 +74,9 @@ for arch in "${archs[@]}"; do
 	cp "$toolchain/sysroot/usr/lib/$ndk_triple/libc++_shared.so" "$staging/lib/"
 	for header in "${headers[@]}"; do
 		cp "prefix/$prefix_name/include/mpv/$header" "$staging/include/mpv/"
+	done
+	for dir in "${ffmpeg_headers[@]}"; do
+		cp -R "prefix/$prefix_name/include/$dir" "$staging/include/"
 	done
 	asset="libmpv-android-$prefix_name.tar.gz"
 	# Reproducible bytes: the release skips re-uploading an existing
