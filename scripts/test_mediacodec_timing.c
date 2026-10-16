@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+// The timing core holds Choreographer samples to their grid with the shared
+// render-ahead pipeline's median (osd_median_ns).
+#include "mediacodec_timing_cadence.inc"
 #include "mediacodec_timing_core.inc"
 #include "mediacodec_stats_core.inc"
 
@@ -576,8 +579,6 @@ static unsigned info_lines;
 #define MP_INFO(vo, ...) \
     ((void)(vo), info_lines++, snprintf(info_line, sizeof(info_line), __VA_ARGS__))
 
-#include "mediacodec_timing_cadence.inc"
-
 typedef struct {
     int releases;
     int64_t timestamp;
@@ -634,6 +635,7 @@ struct priv {
     bool cur_synthetic, osd_threads_created, osd_missing_logged;
     bool vsync_attached;
     int64_t vsync_sample, queue_period, queue_mode, queue_period_changed, queue_offset;
+    struct mediacodec_phase vsync_phase;
     struct mediacodec_timing timing;
     struct osd_cadence cadence;
     struct osd_ahead osd;
@@ -1211,6 +1213,126 @@ static void test_choreographer_grid_rules(void)
              "a gap between whole vsyncs is not a vsync gap");
 }
 
+// One Choreographer resample as the sampler takes it: the first vsync of
+// `grid` at least 500 ms after *t, then the API 33 timeline callback's a
+// vsync later. Returns the first; *t ends on the second.
+static int64_t next_resample(int64_t *t, int64_t grid)
+{
+    int64_t vsync = EPOCH + ((*t + 500 * MS - EPOCH) / grid + 1) * grid;
+    *t = vsync + grid;
+    return vsync;
+}
+
+static void test_choreographer_excursions_never_reach_a_release(void)
+{
+    // Plezy #2654: a MediaTek projector's Choreographer stepped 0.4 to 0.5 of
+    // a vsync off its grid for one resample every few seconds, both
+    // callbacks agreeing, sometimes after a smaller step the resample
+    // before. Offsets from the grid in hundredths of a vsync, one per
+    // resample, and the grid releases snap to: an excursion keeps the grid
+    // the resample before left, and a quarter vsync or less still moves it.
+    const int offsets[] = {0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 15, 42, 1, 0, 0,
+                           0, 0, 46, 0, 0, 0, 0, 16, -32, 2, 0};
+    const int snapped[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 15, 1, 0, 0,
+                           0, 0, 0, 0, 0, 0, 0, 16, 16, 2, 0};
+    const int64_t period = 16666667;
+    struct mediacodec_phase phase = {0};
+    int64_t t = EPOCH;
+    for (size_t i = 0; i < MP_ARRAY_SIZE(offsets); i++) {
+        int64_t vsync = next_resample(&t, period);
+        for (int callback = 0; callback < 2; callback++) {
+            int64_t line = vsync + callback * period;
+            CHECK_EQ(mediacodec_phase_filter(&phase, line + offsets[i] * period / 100,
+                                             period),
+                     line + snapped[i] * period / 100,
+                     "a resample off the grid never moves it");
+        }
+    }
+}
+
+static void test_choreographer_step_is_followed_a_resample_late(void)
+{
+    // A grid that really moved: the first resample on the new grid is held,
+    // and the next one, still off the old grid, settles it.
+    const int64_t period = 16666667, step = period / 2;
+    struct mediacodec_phase phase = {0};
+    int64_t t = EPOCH;
+    for (int i = 0; i < 10; i++) {
+        int64_t vsync = next_resample(&t, period);
+        int64_t shift = i >= 5 ? step : 0;
+        for (int callback = 0; callback < 2; callback++) {
+            int64_t line = vsync + callback * period;
+            CHECK_EQ(mediacodec_phase_filter(&phase, line + shift, period),
+                     i == 5 ? line : line + shift,
+                     "a step holds for one resample, then the grid follows it");
+        }
+    }
+}
+
+static void test_choreographer_drift_is_not_an_excursion(void)
+{
+    // A Pixel 7's panel runs at 11.057 ms under its 11.111 ms 90 Hz mode,
+    // and releases snap with the mode's period, so its Choreographer moves
+    // about a quarter vsync off that grid every resample, plus a millisecond
+    // of jitter either way. Once the drift is learned, every sample is the
+    // grid.
+    const int64_t mode = 11111111, panel = 11057000;
+    struct mediacodec_phase phase = {0};
+    int64_t t = EPOCH;
+    unsigned held = 0;
+    for (int i = 0; i < 40; i++) {
+        int64_t vsync = next_resample(&t, panel);
+        int64_t jitter = i % 2 ? MS : -MS;
+        for (int callback = 0; callback < 2; callback++) {
+            int64_t sample = vsync + callback * panel + jitter;
+            int64_t snap = mediacodec_phase_filter(&phase, sample, mode);
+            if (i <= MEDIACODEC_PHASE_MIN_MOVES)
+                held += snap != sample;
+            else
+                CHECK_EQ(snap, sample, "learned drift moves the grid every resample");
+        }
+    }
+    CHECK_EQ(held > 0, true, "before the drift is learned, its larger moves are held");
+}
+
+static void test_choreographer_grid_restarts(void)
+{
+    const int64_t period = 16666667, shift = period * 45 / 100;
+    struct mediacodec_phase phase = {0};
+    int64_t t = EPOCH;
+    int64_t last = 0;
+    for (int i = 0; i < 6; i++) {
+        int64_t vsync = next_resample(&t, period);
+        mediacodec_phase_filter(&phase, vsync, period);
+        last = vsync + period;
+        mediacodec_phase_filter(&phase, last, period);
+    }
+    // SurfaceFlinger refits its model by microseconds; the grid stands, now
+    // extrapolated with the refit period.
+    const int64_t refit = period + 6000;
+    int64_t vsync = next_resample(&t, period);
+    CHECK_EQ(mediacodec_phase_offset(
+                 mediacodec_phase_filter(&phase, vsync + shift, refit) - last, refit),
+             0, "a refit still holds an excursion");
+    // A switch between the mode's period and the timelines' spacing is a
+    // new grid, and its first sample is adopted whatever its phase.
+    const int64_t spacing = period * 94 / 100;
+    vsync = next_resample(&t, spacing);
+    CHECK_EQ(mediacodec_phase_filter(&phase, vsync + shift, spacing), vsync + shift,
+             "a new grid adopts its first sample");
+    for (int i = 0; i < 6; i++) {
+        vsync = next_resample(&t, spacing) + shift;
+        CHECK_EQ(mediacodec_phase_filter(&phase, vsync, spacing), vsync,
+                 "and follows the samples on it");
+    }
+    // A grid not sampled for longer than extrapolates (the VO paused) does
+    // not judge the next sample.
+    t += 2000 * MS;
+    vsync = next_resample(&t, spacing);
+    CHECK_EQ(mediacodec_phase_filter(&phase, vsync, spacing), vsync,
+             "after a gap the first sample is adopted");
+}
+
 static void test_releases_follow_an_off_mode_choreographer(void)
 {
     // An Amlogic box's SurfaceFlinger fits 15.71 ms to a 59.94 Hz mode for
@@ -1276,6 +1398,48 @@ static void test_releases_follow_an_off_mode_choreographer(void)
     }
     vsync_sampler.vsync_period = vsync_sampler.vsync_spacing = 0;
     vsync_sampler.client = NULL;
+}
+
+static void test_releases_keep_their_grid_through_an_excursion(void)
+{
+    // Plezy #2654 at the release: 24 fps on a 60 Hz projector, resampled
+    // every 13 frames, and one resample 0.42 of a vsync off the grid.
+    // Preparation and release both read the excursion; neither aims a frame
+    // off the grid.
+    const int64_t period = 16666667;
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, period, 0};
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    const int64_t duration = llround(1e9 / 24);
+    for (int i = 0; i < 52; i++) {
+        AVMediaCodecBuffer buffer = {.pts = llround(i * duration / 1e3)};
+        struct mp_image image = {.pts = i * duration / 1e9, .planes[3] = &buffer,
+                                 .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 1 + i,
+            .pts = EPOCH + 1000 * MS + i * duration, .duration = duration};
+        in.frame_queued = &frame;
+        if (!i)
+            clock_ns = frame.pts - 200 * MS;
+        CHECK_EQ(present_queued(&vo), false, "the frame waits for its window");
+        clock_ns = in.wakeup_pts;
+        if (i % 13 == 0) {
+            p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period) * period;
+            if (i == 26)
+                p.vsync_sample += period * 42 / 100;
+        }
+        CHECK_EQ(present_queued(&vo), true, "the frame is released");
+        CHECK_EQ(buffer.timestamp != 0, true, "the release is timed");
+        CHECK_EQ((published.vsync - EPOCH) % period, 0,
+                 "every release targets a vsync of the grid");
+        // The first frame has no grid yet (see test_driver_refresh_and_cadence).
+        if (i && buffer.timestamp - clock_ns < MEDIACODEC_CODEC_LEAD_NS) {
+            fprintf(stderr, "FAIL: frame %d submitted %" PRId64 "us before its "
+                    "timestamp\n", i, (buffer.timestamp - clock_ns) / 1000);
+            exit(1);
+        }
+    }
 }
 
 static void test_drop_pause_redraw_resume(void)
@@ -1522,7 +1686,12 @@ int main(void)
     test_refresh_transition_and_late_frame();
     test_choreographer_period_and_cadence_across_a_switch();
     test_choreographer_grid_rules();
+    test_choreographer_excursions_never_reach_a_release();
+    test_choreographer_step_is_followed_a_resample_late();
+    test_choreographer_drift_is_not_an_excursion();
+    test_choreographer_grid_restarts();
     test_releases_follow_an_off_mode_choreographer();
+    test_releases_keep_their_grid_through_an_excursion();
     test_drop_pause_redraw_resume();
     test_clock_domain_drift();
     test_speed_change_admission();
@@ -1535,7 +1704,8 @@ int main(void)
     test_present_trace_lines();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
-         "dropped still redraw/resume, sparse statistics and video-plane "
-         "presentation feedback with its per-frame trace");
+         "dropped still redraw/resume, Choreographer grid excursions, sparse "
+         "statistics and video-plane presentation feedback with its per-frame "
+         "trace");
     return 0;
 }

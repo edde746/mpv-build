@@ -1,0 +1,209 @@
+Subject: [PATCH] vo_mediacodec: hold back a vsync sample that steps off the grid
+
+On a MediaTek projector (Plezy #2654), 24 fps on a 60 Hz mode stutters.
+The per-frame present trace shows the VO moving its vsync grid by 0.4 to
+0.5 of a vsync for exactly one 500 ms Choreographer resample, then back:
+eight times in a 51 s run, mostly 128 frames apart. For that resample
+every frame aimed at the other side of its vsync, and the display's holds
+went from 2.41/2.59 vsyncs to 3.41/1.59.
+
+A sample now moves the grid only when it lands within a quarter vsync of
+it. A farther one is held back, and releases keep the grid's vsync
+nearest to it, until a later resample settles where the grid is: its
+sample is adopted whether it is back on the grid or still off it. A
+one-resample excursion never reaches a release, and a real step is
+followed one resample late.
+
+The grid is extrapolated with the median of the last eight
+resample-to-resample moves rather than held fixed. Where SurfaceFlinger's
+vsync runs off the period releases snap with (a Pixel 7's 11.057 ms
+panel under its 11.111 ms mode moves a quarter vsync between resamples),
+every sample would otherwise look like an excursion. A mode change, a
+switch between the mode's period and the timelines' spacing, or a gap of
+more than a second starts the grid over.
+
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 2a214ff..165e9d0 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -220,6 +220,120 @@ static int64_t mediacodec_grid_period(int64_t spacing_ns, int64_t nominal_ns)
+     return diff * 50 <= nominal_ns || diff * 4 > nominal_ns ? nominal_ns : measured;
+ }
+ 
++// Choreographer frame times come from SurfaceFlinger's vsync model, and the
++// model can step off its own grid for one resample and come back. On a
++// MediaTek projector (Plezy #2654), every few seconds one 500 ms resample
++// landed 0.4 to 0.5 of a vsync off the resamples on either side of it.
++// Snapped to it, every frame of that resample aimed at the other side of its
++// vsync, and the display's 24 fps holds went from 2.41/2.59 vsyncs to
++// 3.41/1.59 until the next resample put the grid back. A sample within a
++// quarter vsync of the grid moves the grid, as every sample used to. A
++// farther one is held back, and releases keep the grid's vsync nearest to it
++// until a later resample settles where the grid is: one back on the grid is
++// adopted, and so is one still off it. A one-resample excursion never
++// reaches a release, and a real step takes effect one resample late.
++//
++// The grid is extrapolated with the drift of the recent resamples rather
++// than held fixed. SurfaceFlinger's vsync can run off the period releases
++// snap with by less than mediacodec_grid_period corrects: a Pixel 7's
++// 11.057 ms panel moves about a quarter of its 11.111 ms mode's vsync
++// between resamples. The drift is the median move of the newest even count
++// of the last MEDIACODEC_PHASE_MOVES resamples. The median keeps an
++// excursion's move out and back from bending it, and an even count gives
++// moves that alternate between two values (jitter that flips sign every
++// resample) their midpoint rather than one of them.
++#define MEDIACODEC_PHASE_MOVES 8 // even, and at most OSD_MEDIAN_MAX
++#define MEDIACODEC_PHASE_MIN_MOVES 4
++// The sampler resamples every 500 ms, and its API 33 timeline callback
++// follows its frame callback by one vsync: two samples this far apart come
++// from different resamples.
++#define MEDIACODEC_PHASE_RESAMPLE_NS INT64_C(250000000)
++// Past this the grid is too old to extrapolate, and the sample is adopted.
++#define MEDIACODEC_PHASE_MAX_GAP_NS INT64_C(1000000000)
++// Beyond 2% mediacodec_grid_period snaps with the timelines' spacing.
++#define MEDIACODEC_PHASE_MAX_DRIFT_PPB INT64_C(20000000)
++
++struct mediacodec_phase {
++    int64_t period;   // the period the moves were measured against
++    int64_t anchor;   // the newest sample adopted, 0 when none
++    int64_t held;     // the first sample off its grid since then, 0 when none
++    int64_t resample; // the first sample seen of the newest resample
++    int64_t moves[MEDIACODEC_PHASE_MOVES]; // resample to resample, ppb
++    int count;
++    int next;
++};
++
++// delta's offset from the nearest multiple of period_ns.
++static int64_t mediacodec_phase_offset(int64_t delta, int64_t period_ns)
++{
++    int64_t half = period_ns / 2;
++    int64_t off = delta % period_ns;
++    if (off >= period_ns - half)
++        off -= period_ns;
++    else if (off < -half)
++        off += period_ns;
++    return off;
++}
++
++// The vsync sample releases snap to, given the newest fresh Choreographer
++// sample (0 for none) and the period releases snap with: that sample, or
++// while it is held back, the grid's vsync nearest to it.
++static int64_t mediacodec_phase_filter(struct mediacodec_phase *phase,
++                                       int64_t sample_ns, int64_t period_ns)
++{
++    if (!sample_ns || period_ns <= 0)
++        return sample_ns;
++    // Switching between the mode's period and the timelines' spacing is a
++    // new grid, not a refit: the moves were measured against the old one.
++    int64_t refit = period_ns > phase->period ? period_ns - phase->period
++                                              : phase->period - period_ns;
++    if (refit * 1000 > period_ns)
++        *phase = (struct mediacodec_phase){0};
++    phase->period = period_ns;
++
++    int64_t drift = 0;
++    if (phase->count >= MEDIACODEC_PHASE_MIN_MOVES) {
++        // An odd count only occurs before the ring wraps, where the oldest
++        // move is the first.
++        drift = osd_median_ns(phase->moves + (phase->count & 1),
++                              phase->count & ~1);
++        if (drift > MEDIACODEC_PHASE_MAX_DRIFT_PPB)
++            drift = MEDIACODEC_PHASE_MAX_DRIFT_PPB;
++        else if (drift < -MEDIACODEC_PHASE_MAX_DRIFT_PPB)
++            drift = -MEDIACODEC_PHASE_MAX_DRIFT_PPB;
++    }
++
++    // Every resample measures the drift, held ones included.
++    int64_t since = sample_ns - phase->resample;
++    if (!phase->resample || since < 0 || since > MEDIACODEC_PHASE_MAX_GAP_NS) {
++        phase->resample = sample_ns;
++    } else if (since >= MEDIACODEC_PHASE_RESAMPLE_NS) {
++        int64_t expect = drift * since / INT64_C(1000000000);
++        int64_t move = mediacodec_phase_offset(since - expect, period_ns) + expect;
++        phase->moves[phase->next] = move * INT64_C(1000000000) / since;
++        phase->next = (phase->next + 1) % MEDIACODEC_PHASE_MOVES;
++        if (phase->count < MEDIACODEC_PHASE_MOVES)
++            phase->count++;
++        phase->resample = sample_ns;
++    }
++
++    int64_t age = sample_ns - phase->anchor;
++    if (phase->anchor && age >= 0 && age <= MEDIACODEC_PHASE_MAX_GAP_NS) {
++        int64_t off = mediacodec_phase_offset(
++            age - drift * age / INT64_C(1000000000), period_ns);
++        bool settled = phase->held &&
++                       sample_ns - phase->held >= MEDIACODEC_PHASE_RESAMPLE_NS;
++        if ((off > period_ns / 4 || off < -(period_ns / 4)) && !settled) {
++            if (!phase->held)
++                phase->held = sample_ns;
++            return sample_ns - off;
++        }
++    }
++    phase->anchor = sample_ns;
++    phase->held = 0;
++    return sample_ns;
++}
++
+ // Release timestamp, on now_ns's clock, for a frame due at raw_target_ns;
+ // 0 releases untimed, i.e. at the next vsync. sample_ns is a vsync timestamp
+ // on that clock, or 0 when none is fresh; period_ns is the display period, or
+@@ -804,6 +918,7 @@ struct priv {
+     int64_t queue_period; // the grid releases snap with
+     int64_t queue_mode;   // the display mode's period it was taken under
+     int64_t queue_period_changed; // when queue_mode last changed
++    struct mediacodec_phase vsync_phase; // the grid samples are held to
+     int64_t queue_offset;
+     struct m_config_cache *opts_cache;
+ 
+@@ -2876,6 +2991,17 @@ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+            sample <= mono_now + p->queue_period;
+ }
+ 
++// The vsync sample releases snap to now, 0 when none is fresh. Preparation
++// and release read it alike: the filter follows the samples, not the frames,
++// so the first read of a sample decides it for both.
++static int64_t snap_vsync_sample(struct priv *p, int64_t mono_now)
++{
++    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
++    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
++        sample = 0;
++    return mediacodec_phase_filter(&p->vsync_phase, sample, p->queue_period);
++}
++
+ // The display mode's period: the Choreographer's where it reports one; else
+ // the core's display_fps (the embedder's --display-fps-override, or what
+ // VOCTRL_GET_DISPLAY_FPS returned) as a plausibility-bounded interval.
+@@ -2906,8 +3032,10 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
+     bool was_timelines = !mode_changed && p->queue_period != nominal;
+     if (mode_changed) {
+         // The media cadence anchor is period-independent; only the vsync
+-        // sample and the snap preference were taken against the old mode.
++        // sample, its grid and the snap preference were taken against the
++        // old mode.
+         p->timing.vsync_hysteresis_offset_ns = 0;
++        p->vsync_phase = (struct mediacodec_phase){0};
+         p->queue_period_changed = monotonic_now_ns();
+         p->queue_mode = nominal;
+         request_vsync_sample(vo);
+@@ -2952,9 +3080,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
+ 
+     int64_t mono_now = monotonic_now_ns();
+     int64_t raw_target = mp_time_to_monotonic_ns(pts);
+-    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
+-    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
+-        sample = 0;
++    int64_t sample = snap_vsync_sample(p, mono_now);
+ 
+     result.timestamp = mediacodec_timing_release(
+         &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
+@@ -3051,9 +3177,7 @@ static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
+     if (mono_now <= 0)
+         return raw_deadline;
+ 
+-    int64_t sample = p->queue_period > 0 ? read_vsync_sample(p) : 0;
+-    if (sample && !vsync_sample_is_fresh(p, sample, mono_now))
+-        sample = 0;
++    int64_t sample = snap_vsync_sample(p, mono_now);
+ 
+     int64_t timestamp = mediacodec_timing_preview(
+         &p->timing, mp_time_to_monotonic_ns(frame->pts), frame->frame_id,
