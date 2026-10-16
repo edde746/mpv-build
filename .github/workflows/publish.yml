@@ -65,6 +65,9 @@ jobs:
       - name: Test AVFoundation PiP frame-space OSD
         run: ./scripts/test_avf_pip_frame_space_osd.sh
 
+      - name: Test AVFoundation OSD layer geometry under host zoom
+        run: ./scripts/test_avf_osd_layer_geometry.sh
+
       - name: Test AVFoundation subtitle wait policy
         run: ./scripts/test_avf_osd_ahead.sh
 

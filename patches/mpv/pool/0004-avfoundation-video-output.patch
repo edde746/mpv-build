@@ -248,6 +248,35 @@ Folded in, in series order:
     6.2-7.7 ms on the first file, and 124-129 averaging 32-33 ms at speed=2,
     with no deadline drops.
 
+* 0039-avfoundation-osd-layer-ignores-display-layer-transform:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Fri, 16 Oct 2026 20:59:34 +0200
+    Subject: [PATCH] vo_avfoundation: place the OSD layer from the display
+     layer's untransformed geometry
+
+    A host may zoom by scaling the display layer with a transform: mpv's
+    --video-zoom sends every frame through the Core Image re-render, which
+    breaks HDR and Dolby Vision passthrough. ensure_osd_layer() and
+    sync_osd_layer_frame() copied the display layer's frame to the OSD
+    layer, and under a transform that frame is the transformed bounding
+    box, while the subtitle canvas is sized from the layer's bounds. The
+    OSD layer stretched the unzoomed canvas over the zoomed box. At 120%
+    zoom, subtitles came back 1.2x larger and scaled away from the centre,
+    and a two-line subtitle lost its second line below the screen
+    (plezy#2693). Any geometry sync while zoomed caused it: a VO recreated
+    when the host re-enables video after the app was backgrounded (iOS
+    lock and unlock), a rotation or window resize, or an aspect-override
+    change.
+
+    Place the OSD layer from the display layer's bounds, position and
+    anchorPoint instead, which is its frame with the transform ignored, so
+    the subtitles stay where mpv laid them out over the unzoomed picture.
+    Without a transform the result equals the frame, so unzoomed hosts and
+    the macOS PiP window, which receives both layers unzoomed, see no
+    change. scripts/test_avf_osd_layer_geometry.sh compiles the helper and
+    checks it against real Core Animation layers.
+
 diff --git a/meson.build b/meson.build
 index f6f8e7f..55612b4 100644
 --- a/meson.build
@@ -310,10 +339,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..d2736e7
+index 0000000..0d1e9ad
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4608 @@
+@@ -0,0 +1,4624 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -1497,6 +1526,22 @@ index 0000000..d2736e7
 +    return p->render_geometry;
 +}
 +
++// Where `layer` sits in its superlayer with its transform ignored. A host may
++// scale the display layer itself (viewer zoom that keeps the sample-buffer
++// scanout path), and `frame` is then the transformed bounding box: an OSD
++// layer given that frame stretches its canvas, which is sized from `bounds`,
++// by the zoom and pushes the bottom subtitle lines off screen. The OSD stays
++// over the untransformed picture, where mpv laid the subtitles out.
++static CGRect layer_untransformed_frame(CALayer *layer)
++{
++    CGSize size = layer.bounds.size;
++    CGPoint anchor = layer.anchorPoint;
++    CGPoint position = layer.position;
++    return CGRectMake(position.x - anchor.x * size.width,
++                      position.y - anchor.y * size.height,
++                      size.width, size.height);
++}
++
 +// Create the timed OSD sample-buffer layer, in inline mode only. Its lifetime
 +// follows the composite_osd/pip_composite_osd options, so sync_osd_layer_frame
 +// can call this again after the user turns compositing back off.
@@ -1511,7 +1556,7 @@ index 0000000..d2736e7
 +    CMTimebaseRef osdTimebase = p->timebase;
 +    dispatch_main_sync_safe(^{
 +        AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
-+        osdLayer.frame = osdDisplayLayer.frame;
++        osdLayer.frame = layer_untransformed_frame(osdDisplayLayer);
 +        osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
 +#if !TARGET_OS_IPHONE
 +        osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
@@ -1554,7 +1599,7 @@ index 0000000..d2736e7
 +    }
 +}
 +
-+// Helper to sync OSD layer frame with display layer frame.
++// Keep the OSD layer over the display layer's untransformed geometry.
 +static void sync_osd_layer_frame(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
@@ -1584,7 +1629,7 @@ index 0000000..d2736e7
 +        if (osdLayer.superlayer == displayLayer) {
 +            osdLayer.frame = displayLayer.bounds;
 +        } else {
-+            osdLayer.frame = displayLayer.frame;
++            osdLayer.frame = layer_untransformed_frame(displayLayer);
 +            osdLayer.zPosition = displayLayer.zPosition + 1;
 +        }
 +        osdLayer.contentsScale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
