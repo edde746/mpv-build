@@ -17,5 +17,6 @@
 # recovers, and waiting out its error burst only delays the software fallback.
 0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch
 0028-ao-coreaudio-uninit-on-init-failure.patch
+0037-ao-coreaudio-typed-channel-map.patch
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch

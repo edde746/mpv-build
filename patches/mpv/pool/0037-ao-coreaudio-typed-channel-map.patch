@@ -1,0 +1,143 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:30:00 +0200
+Subject: [PATCH] ao_coreaudio: pass the channel map as SInt32 channel indices
+
+On macOS 27, ao_coreaudio fails to open for any planar or mono format,
+which is what the AAC, AC3, E-AC3, DTS and Opus decoders produce:
+
+  unable to set the input channel layout on the audio unit (-50)
+
+so nearly every video ends up on ao_avfoundation instead
+(mpv-player/mpv#18384, still open upstream). 0028 only stopped the
+failed init from crashing on the next hotplug event.
+
+kAudioOutputUnitProperty_ChannelMap takes one SInt32 per device-side
+channel naming the client channel that feeds it, or -1. Upstream
+06fe665b, the fix for mpv-player/mpv#15584, passes an AudioChannelLayout
+there instead; macOS 27 now rejects that blob. Build the typed map from
+the device's active layout and the negotiated client layout, set it
+only when one is a reordering of the other, and treat a refusal as a
+warning so the unit's default mapping plays rather than the AO failing.
+ca_get_acl() stays for ao_avfoundation, which uses it as a real layout.
+
+Checked on macOS 27.0.1 (Apple silicon) by swapping this object into
+the published Libmpv archive: AAC stereo, mono and 5.1 now open
+ao_coreaudio on AirPods Pro and the built-in speakers (the unpatched
+object fails all three with -50); a left-only and a right-only tone
+land on the matching tapped output channel; mono plays in both.
+---
+ audio/out/ao_coreaudio.c | 80 ++++++++++++++++++++++++++++++++--------
+ 1 file changed, 65 insertions(+), 15 deletions(-)
+
+diff --git a/audio/out/ao_coreaudio.c b/audio/out/ao_coreaudio.c
+index 7d42139..cbc2b78 100644
+--- a/audio/out/ao_coreaudio.c
++++ b/audio/out/ao_coreaudio.c
+@@ -136,7 +136,7 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
+     return CONTROL_UNKNOWN;
+ }
+ 
+-static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd, AudioChannelLayout *layout, size_t layout_size);
++static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd);
+ static void init_physical_format(struct ao *ao);
+ static void reinit_latency(struct ao *ao);
+ static bool register_hotplug_cb(struct ao *ao);
+@@ -176,13 +176,7 @@ static int init(struct ao *ao)
+ 
+     AudioStreamBasicDescription asbd;
+     ca_fill_asbd(ao, &asbd);
+-    size_t layout_size;
+-    AudioChannelLayout *layout = ca_get_acl(ao, &layout_size);
+-
+-    bool r = init_audiounit(ao, asbd, layout, layout_size);
+-    talloc_free(layout);
+-
+-    if (!r)
++    if (!init_audiounit(ao, asbd))
+         goto coreaudio_error;
+ 
+     if (!register_hotplug_cb(ao))
+@@ -279,7 +273,68 @@ coreaudio_error:
+     talloc_free(tmp);
+ }
+ 
+-static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd, AudioChannelLayout *layout, size_t layout_size)
++// kAudioOutputUnitProperty_ChannelMap is an array of SInt32, one per channel
++// on the device side of the unit, each naming the client channel that feeds
++// it (-1 for none). Setting it is what keeps channel order right on a device
++// whose speakers were remapped in Audio MIDI Setup (mpv-player/mpv#15584).
++// Upstream passes an AudioChannelLayout as the map instead; macOS 27 rejects
++// that blob with paramErr for planar and mono formats, which fails the whole
++// AO (mpv-player/mpv#18384).
++//
++// A map is only built when the device side carries exactly the client's
++// speakers in some order. Anything else, and a map the OS still refuses,
++// keeps the unit's default mapping: losing the remap on such a device is
++// better than losing this AO.
++static void set_channel_map(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    OSStatus err;
++
++    AudioStreamBasicDescription dev_asbd;
++    uint32_t size = sizeof(dev_asbd);
++    err = AudioUnitGetProperty(p->audio_unit, kAudioUnitProperty_StreamFormat,
++                               kAudioUnitScope_Output, 0, &dev_asbd, &size);
++    if (!CHECK_CA_WARN("unable to get the device format of the audio unit"))
++        return;
++
++    int num = dev_asbd.mChannelsPerFrame;
++    if (num != ao->channels.num) {
++        MP_VERBOSE(ao, "device side has %d channels, client %d: default channel map\n",
++                   num, ao->channels.num);
++        return;
++    }
++
++    struct mp_chmap dev_map;
++    ca_get_active_chmap(ao, p->device, num, &dev_map);
++
++    // Each client channel feeds one device channel, so unlabeled (NA)
++    // speakers pair up in order instead of all reading the first one.
++    SInt32 map[MP_NUM_CHANNELS];
++    bool used[MP_NUM_CHANNELS] = {0};
++    for (int n = 0; n < num; n++) {
++        map[n] = -1;
++        for (int i = 0; i < num; i++) {
++            if (!used[i] && ao->channels.speaker[i] == dev_map.speaker[n]) {
++                map[n] = i;
++                used[i] = true;
++                break;
++            }
++        }
++        if (map[n] < 0) {
++            MP_VERBOSE(ao, "device layout %s is not a reordering of %s: default channel map\n",
++                       mp_chmap_to_str(&dev_map), mp_chmap_to_str(&ao->channels));
++            return;
++        }
++    }
++
++    err = AudioUnitSetProperty(p->audio_unit, kAudioOutputUnitProperty_ChannelMap,
++                               kAudioUnitScope_Global, 0, map, num * sizeof(map[0]));
++    if (CHECK_CA_WARN("unable to set the channel map on the audio unit"))
++        MP_VERBOSE(ao, "channel map %s -> device %s\n", mp_chmap_to_str(&ao->channels),
++                   mp_chmap_to_str(&dev_map));
++}
++
++static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd)
+ {
+     OSStatus err;
+     uint32_t size;
+@@ -323,12 +378,7 @@ static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd, Audi
+     CHECK_CA_ERROR_L(coreaudio_error_audiounit,
+                      "can't link audio unit to selected device");
+ 
+-    err = AudioUnitSetProperty(p->audio_unit,
+-                               kAudioOutputUnitProperty_ChannelMap,
+-                               kAudioUnitScope_Global, 0, layout, layout_size);
+-
+-    CHECK_CA_ERROR_L(coreaudio_error_audiounit,
+-                     "unable to set the input channel layout on the audio unit");
++    set_channel_map(ao);
+ 
+     AURenderCallbackStruct render_cb = (AURenderCallbackStruct) {
+         .inputProc       = render_cb_lpcm,
