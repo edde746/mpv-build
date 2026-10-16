@@ -207,6 +207,7 @@ GROUPS = {
             # The publish job's XCFramework merge writes the bytes of every
             # framework asset, so it keys them like the driver that compiles them.
             Path("scripts/merge_xcframeworks.py"),
+            Path("scripts/build_spatial.py"),
         ),
         package=Path("Package.swift"),
     ),
@@ -441,6 +442,10 @@ def key_inputs(root: Path, group: Group, artifact: str) -> str:
         f"component={component}",
     ]
     text.extend(_pin_lines(pins))
+    if group.name == "apple" and artifact == "libmpv":
+        # The Swift renderer and Rust core are folded into libmpv.a.
+        text.append("component=spatialaudiobridge")
+        text.extend(_pin_lines(resolved_pins(load_versions(root), "spatialaudiobridge", group.name)))
     text += [
         # Every build is GPL: the apple driver hardcodes --enable-gpl/-Dgpl=true
         # and the group.json builds have no flag matrix, so these two lines are
@@ -454,6 +459,9 @@ def key_inputs(root: Path, group: Group, artifact: str) -> str:
     ]
     for name, digest in patch_entries(root, component, group.name):
         text.append(f"patch={name}:{digest}")
+    if group.name == "apple" and artifact == "libmpv":
+        for name, digest in patch_entries(root, "spatialaudiobridge", group.name):
+            text.append(f"patch=spatialaudiobridge/{name}:{digest}")
     return "\n".join(text) + "\n"
 
 

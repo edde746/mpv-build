@@ -12,3 +12,4 @@
 # way that matters (SDK requirements for App Store submission, a codegen fix, a
 # miscompile).
 generation=1
+rust=1.99.0

@@ -90,6 +90,10 @@ VERSIONS = {
             # An override for another group must not touch apple's key.
             "overrides": {"android": {"version": "0.18.3-ndk"}},
         },
+        "spatialaudiobridge": {
+            "kind": "git", "version": "1.6.1", "url": "https://example.invalid/spatial",
+            "ref": "1" * 40, "commit": "1" * 40, "platforms": ["apple"],
+        },
         # A prebuilt dependency keys.py must leave alone.
         "libplacebo": {
             "kind": "prebuilt",
@@ -140,6 +144,7 @@ def make_repo(directory):
     repo = Path(directory)
     (repo / "scripts").mkdir(parents=True)
     shutil.copy2(tool, repo / "scripts" / "keys.py")
+    (repo / "scripts/build_spatial.py").write_text("# source build\n")
     # keys.py reads the series format through patches.py, so the fixture carries
     # it too; the sandbox mirrors the real scripts/ layout.
     shutil.copy2(root / "scripts" / "patches.py", repo / "scripts" / "patches.py")
@@ -238,6 +243,35 @@ if (root / "versions.json").is_file() and (root / "toolchain" / "apple.txt").is_
     print(f"real repo: {json.dumps(real, sort_keys=True)}")
 else:
     print("real repo: skipped (versions.json / toolchain/apple.txt not landed yet)")
+
+# The source compiled into libmpv is part of its key, independently of mpv's own pin.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = Path(tmp)
+    make_repo(repo)
+    before = keys(repo)
+    path = repo / "versions.json"
+    pins = json.loads(path.read_text())
+    pins["components"]["spatialaudiobridge"]["commit"] = "2" * 40
+    path.write_text(json.dumps(pins))
+    after = keys(repo)
+    check(before["libmpv"] != after["libmpv"], "SpatialAudioBridge source moves libmpv's key")
+    check(before["FFmpeg"] == after["FFmpeg"], "SpatialAudioBridge source does not move FFmpeg")
+
+# A renderer integration patch is another input to libmpv, but not FFmpeg.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_repo(tmp)
+    before = keys(repo)
+    pool = repo / "patches/spatialaudiobridge/pool"
+    pool.mkdir(parents=True)
+    patch = pool / "progress.patch"
+    patch.write_text("first renderer patch\n")
+    check(keys(repo) == before, "unreferenced SAB patches do not affect keys")
+    (pool.parent / "series.apple").write_text("progress.patch\n")
+    added = keys(repo)
+    check(added["libmpv"] != before["libmpv"], "SAB patch series moves libmpv")
+    check(added["FFmpeg"] == before["FFmpeg"], "SAB patches do not move FFmpeg")
+    patch.write_text("changed renderer patch\n")
+    check(keys(repo)["libmpv"] != added["libmpv"], "SAB patch bytes move libmpv")
 
 # 2. The committed manifest describes the published apple assets.
 committed = root / "artifacts.json"

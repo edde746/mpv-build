@@ -19,3 +19,4 @@
 0028-ao-coreaudio-uninit-on-init-failure.patch
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
+0039-ao-spatial-render-truehd-atmos-and-dts-x.patch
