@@ -6,7 +6,7 @@
 
 One repository for every mpv supply chain Plezy ships: the upstream pins, the
 patch series, and the build drivers that turn them into `libmpv` binaries for
-Apple (XCFrameworks), Android (per-ABI native trees), Linux (prefix bundles)
+Apple (XCFrameworks), Android (per-ABI native trees and the mpv-android AAR), Linux (prefix bundles)
 and Windows (MinGW dev packages), each under `platforms/` or
 `Sources/BuildScripts/`.
 
@@ -31,7 +31,7 @@ Development history up to the unification lives in those repositories.
 | `artifacts.json` | Committed manifest of the published binaries, one section per platform group. |
 | `Package.swift` | SwiftPM manifest, rendered from the apple section of `artifacts.json`. |
 | `Sources/BuildScripts/` | The Apple build driver (SwiftPM package that compiles and packages the XCFrameworks). |
-| `platforms/` | The Android, Linux and Windows build drivers, one `group.json`-defined group per directory. |
+| `platforms/` | The Android, Linux and Windows build drivers, one `group.json`-defined group per directory; `platforms/android/lib/` is the mpv-android library (JNI glue and Kotlin API) packed into the AAR. |
 
 ## Installation
 
@@ -168,8 +168,9 @@ byte for byte, so no Android library may record when it was built: mpv is
 configured with `-Dbuild-date=false`, and OpenSSL, whose "built on" date ffmpeg
 links into `libavformat.so`, builds with `SOURCE_DATE_EPOCH` fixed to the
 tarballs' 2020-01-01 mtime. Every build leg of every group (and the Apple
-merge) runs `bash scripts/test_build_date.sh <asset>...` before uploading. It
-unpacks each `.tar.gz`, `.tar.zst` or `.zip` and fails when a file carries a
+merge and the AAR build) runs `bash scripts/test_build_date.sh <asset>...`
+before uploading. It unpacks each `.tar.gz`, `.tar.zst`, `.zip` or `.aar`
+(and the `.jar` inside) and fails when a file carries a
 clock reading from any day since 2020-01-02: `__DATE__`, asctime, ISO 8601 or
 RFC 2822 text, a PE or COFF `TimeDateStamp`, an ar member mtime, a Mach-O dylib
 timestamp, or an archive entry's own mtime. The range reaches back that far
@@ -251,8 +252,8 @@ retirement waits for the old producer, releases its window exactly once, and
 starts the replacement without stale requests or timing state. An
 already-patched source directory may be passed for offline runs.
 
-Live OSD replacement requires the matching Plezy JNI surface-generation
-handoff. Update the application and Android libmpv artifacts together; a
+Live OSD replacement requires the matching JNI surface-generation handoff,
+which ships in the same commit's mpv-android AAR (`platforms/android/lib`); a
 timeout quarantines a live producer rather than releasing resources it may
 still use.
 
@@ -497,6 +498,124 @@ split units and units cross frames), a pickup mid-burst that must resume on a
 major sync, a damaged MAT code, and a 44.1 kHz stream that must demote.
 Pass an already-patched source directory as the first argument to run
 offline, and a media file as the second to check its first audio track too.
+
+### Android library (mpv-android AAR)
+
+`platforms/android/lib/` is the Android library both apps play through: the
+JNI glue `libplayer.so` (C++, `src/main/cpp`) and its Kotlin API in package
+`com.edde746.mpv` (`src/main/kotlin`). It lives here because it depends on this
+repository's patches (mpv's `vo-mediacodec-osd-surface`,
+`vo-mediacodec-video-rect` and `vo-format-rejected`, FFmpeg's
+`av_jni_set_mediacodec_callback_class`), so it is built and versioned with
+them. The AAR is self-contained: per ABI (`arm64-v8a`, `armeabi-v7a`, `x86`,
+`x86_64`) it carries `libplayer.so`, `libmpv.so`, the seven FFmpeg libraries
+and `libc++_shared.so`, plus `classes.jar` and the consumer R8 rules that keep
+every member the JNI code reaches. It needs nothing at run time beyond the
+Kotlin standard library; minSdk 25. The glue derives in part from
+libmpv-android (MIT); `platforms/android/lib/NOTICE` carries its notice.
+
+The API, one `MpvPlayer` per native session:
+
+```kotlin
+val player = MpvPlayer.create(context, listener, hookTimeoutMillis = 3_000) {
+    setOption("vo", "gpu")            // pre-init options; create() sets none of its own
+}
+player.observeProperty("pause", PropertyFormat.Flag)
+player.command("loadfile", url)       // the playlist entry id, or null
+player.attachSurfaces(videoSurface, osdSurface, videoGeneration, osdGeneration)
+player.close()
+```
+
+- Every call blocks; run them off the Android main thread (create,
+  attachSurfaces, observeProperty, setLogLevel and close refuse it).
+- `MpvPlayer.Listener` receives `onPropertyChange`, `onEvent` (log lines arrive
+  as `MpvEvent.LogMessage` in the same stream, so a line explaining a failed
+  open comes before its end-file) and `onHook`, on one library-owned thread per
+  session, in mpv's order. mpv's event thread only enqueues: it never blocks
+  and nothing is dropped.
+- mpv holds playback at a hook (`on_preloaded`) until `continueHook(id)`;
+  with `hookTimeoutMillis > 0` the library continues it itself that long after
+  `onHook` was called, and a throwing `onHook` is continued at once.
+- `close()` waits for the native teardown; once it starts no listener call
+  starts, and every unanswered hook is continued.
+
+`mpv-android` is a package artifact of the android group (`group.json`): its
+key covers the libmpv-android key and every file under `platforms/android/lib`
+that git tracks, so editing the glue moves the AAR's key alone, and anything
+that moves the tarballs' key moves it too. It publishes to
+`binaries-android` as `mpv-android-<key>.aar` and is recorded in
+`artifacts.json` beside the tarballs:
+
+```json
+"mpv-android": {"key": "<key>", "asset": "mpv-android-<key>.aar", "checksum": "<sha256>"}
+```
+
+```bash
+python3 scripts/keys.py keys --platform-group android   # libmpv-android and mpv-android
+```
+
+An app resolves it with Gradle through an Ivy repository on the release URL,
+the key as the version, no authentication:
+
+```kotlin
+// settings.gradle.kts
+dependencyResolutionManagement {
+    repositories {
+        ivy {
+            url = uri("https://github.com/edde746/mpv-build/releases/download")
+            patternLayout { artifact("binaries-android/[artifact]-[revision].[ext]") }
+            metadataSources { artifact() }
+            content { includeModule("edde746", "mpv-android") }
+        }
+    }
+}
+// build.gradle.kts
+dependencies { implementation("edde746:mpv-android:<key>@aar") }
+```
+
+The sha256 from `artifacts.json` goes into the app's pin (its
+`mpv-build.lock.json`) and Gradle's dependency verification.
+
+Publishing: `.github/workflows/android.yml` builds the four tarballs (when
+libmpv-android is stale) and then the AAR (`platforms/android/lib/build-aar.sh`,
+with the JVM tests), from that run's tarballs or the published ones
+`artifacts.json` pins. `publish.yml` runs it for main, records the AAR with
+`keys.py record-packages`, verifies and uploads it with the tarballs; `ci.yml`
+runs it for pull requests (tarballs only when the change moves their key) and
+also builds the device tests' APK. The AAR's `.so` files compile against the
+tarball's `include/`, which carries mpv's headers and the patched FFmpeg's
+(`libavcodec/jni.h` among them): no header is vendored.
+
+Building it locally needs JDK 17+ and an Android SDK (`ANDROID_HOME`); Gradle
+installs the NDK `toolchain/android.txt` pins:
+
+```bash
+# the tarballs this checkout's artifacts.json pins (fetched, sha256-checked)
+bash platforms/android/lib/build-aar.sh
+# any published tarball key, or tarballs built here (package.sh)
+bash platforms/android/lib/build-aar.sh --key <libmpv-android key>
+bash platforms/android/lib/build-aar.sh --tarballs dist/release
+```
+
+The result is `dist/release/mpv-android.aar`. To try it in an app before it is
+published, copy it to a directory as `mpv-android-<name>.aar` and point the
+app's Ivy repository at that directory (`url = uri("file:///that/dir")`,
+pattern `[artifact]-[revision].[ext]`) with `<name>` as the version.
+
+Tests: `bash scripts/test_android_glue.sh` builds and runs the glue's host
+C++ tests (`src/test/cpp`: session lifecycle, event order with the error
+end-file drain, UTF-8 conversion) against fakes, with the patched mpv and
+FFmpeg headers; `./gradlew testReleaseUnitTest` (in `platforms/android/lib`)
+runs the JVM tests of the listener delivery and hook rules; the device test
+(`src/androidTest`) creates a player, plays the media given as the
+instrumentation argument `mediaUrl`, attaches and replaces surfaces and
+destroys it:
+
+```bash
+./gradlew -Pmpv.tarballs=<dir> assembleDebugAndroidTest
+adb install -r -t build/outputs/apk/androidTest/debug/mpv-android-debug-androidTest.apk
+adb shell am instrument -w -e mediaUrl <url> com.edde746.mpv.test/androidx.test.runner.AndroidJUnitRunner
+```
 
 ## Make demo app using the local build version
 
