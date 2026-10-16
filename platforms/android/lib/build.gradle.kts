@@ -126,6 +126,11 @@ androidComponents {
 // configures.
 tasks.matching { it.name.contains("CMake") }.configureEach { dependsOn(extractMpvNatives) }
 
+// Each JVM test's outcome in the build log (CI's only record of them).
+tasks.withType<Test>().configureEach {
+    testLogging { events("passed", "skipped", "failed") }
+}
+
 dependencies {
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("junit:junit:4.13.2")

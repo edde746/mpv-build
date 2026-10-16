@@ -11,6 +11,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -188,16 +190,17 @@ class MpvPlayerDeviceTest {
     private open class Recorder : MpvPlayer.Listener {
         val calls = CopyOnWriteArrayList<String>()
         val threads = CopyOnWriteArrayList<String>()
-        private val lock = Object()
+        private val lock = ReentrantLock()
+        private val arrived = lock.newCondition()
         private val events = ArrayList<MpvEvent>()
         private val changes = ArrayList<PropertyChange>()
         private val logs = ArrayList<String>()
 
         override fun onPropertyChange(change: PropertyChange) {
             note("property ${change.name}")
-            synchronized(lock) {
+            lock.withLock {
                 changes += change
-                lock.notifyAll()
+                arrived.signalAll()
             }
         }
 
@@ -211,9 +214,9 @@ class MpvPlayerDeviceTest {
                     is MpvEvent.LogMessage -> "log"
                 },
             )
-            synchronized(lock) {
+            lock.withLock {
                 if (event is MpvEvent.LogMessage) logs += "[${event.prefix}] ${event.text}" else events += event
-                lock.notifyAll()
+                arrived.signalAll()
             }
         }
 
@@ -237,13 +240,13 @@ class MpvPlayerDeviceTest {
 
         private fun await(what: String, satisfied: () -> Boolean) {
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
-            synchronized(lock) {
+            lock.withLock {
                 while (!satisfied()) {
                     val failed = events.filterIsInstance<MpvEvent.EndFile>().firstOrNull { it.reason == EndFileReason.Error }
                     if (failed != null) fail("Playback failed while waiting for $what: $failed; log: ${logs.takeLast(20)}")
-                    val leftMillis = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
-                    if (leftMillis <= 0) fail("Timed out waiting for $what; callbacks: ${calls.takeLast(30)}; log: ${logs.takeLast(20)}")
-                    lock.wait(leftMillis)
+                    val leftNanos = deadline - System.nanoTime()
+                    if (leftNanos <= 0) fail("Timed out waiting for $what; callbacks: ${calls.takeLast(30)}; log: ${logs.takeLast(20)}")
+                    arrived.awaitNanos(leftNanos)
                 }
             }
         }
