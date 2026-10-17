@@ -518,6 +518,16 @@ MT5895) is free when the next file opens one; a GL VO keeps its last frame for
 redraws; no video chain touches nothing. Pass an already-patched source
 directory to run offline.
 
+Run the refresh-seek regression with `bash scripts/test_demux_refresh.sh`. It
+compiles `add_packet_locked()` and `clear_queue()` (`demux/demux.c`, patch
+0208) and replays what a refresh seek reads back, set up as the cache-join
+resume and a track switch set it up: a stream that was already selected drops
+exactly the packets at or before its old position, so video reading its old
+tail back queues nothing twice, and keeps the first packet past it, which for a
+subtitle stream with no packet between the seek target and its old position is
+its next line. Streams with DTS and position-only streams are both covered.
+Pass an already-patched source directory to run offline.
+
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
 (macOS). It drives the driver with a real synchronizer and a fake sink:
 admission and the bytes waiting for a full sink, the clock's start, holds and

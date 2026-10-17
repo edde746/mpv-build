@@ -147,6 +147,9 @@ jobs:
       - name: Test the video chain releasing the frame that holds its decoder
         run: bash ./scripts/test_player_release_held_frame.sh
 
+      - name: Test the packets a refresh seek reads back
+        run: bash ./scripts/test_demux_refresh.sh
+
       - name: Test the codec profile the demuxers publish at load
         run: bash ./scripts/test_demux_codec_profile.sh
 

@@ -1,0 +1,54 @@
+demux: keep the first new packet after a refresh seek
+
+Subtitle lines went missing in Plezy, most often the first line after the
+opening minute of an episode, and only on some plays (edde746/plezy#2717).
+Seeking back within the cache did not bring the line back; switching to
+another subtitle track and back, then seeking, did.
+
+A refresh seek re-reads the file from before the current read position. It
+runs after a track switch, and when a seek joins a new cache range to an
+existing one ("ranges joined!") and reading resumes from the end of the
+cached data. Streams that were already selected drop the re-read packets
+until they reach the position they had before, last_dts or last_pos. The
+packet that ends that search was dropped as well, even when it lay past the
+old position and was new. Video and audio read their old last packet back,
+so for them that drop removes a duplicate. A subtitle stream usually has no
+packet between the seek target and its old position, so the first packet it
+reads back is the next subtitle line, and that line was never queued. It
+never reached the cache either, which is why seeking back within the cache
+could not show it.
+
+Drop only the packets at or before the old position. Packet DTS and pos are
+strictly increasing whenever the refresh uses them (correct_dts,
+correct_pos), so "at or before" matches the old packet exactly. mpv master
+has the same code.
+
+diff --git a/demux/demux.c b/demux/demux.c
+index d1accba..dc36193 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -2027,17 +2027,21 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
+ 
+     if (!drop && ds->refreshing) {
+         // Resume reading once the old position was reached (i.e. we start
+-        // returning packets where we left off before the refresh).
+-        // If it's the same position, drop, but continue normally next time.
++        // returning packets where we left off before the refresh). Drop the
++        // packet at the old position, but keep the first one past it: a
++        // sparse stream (subtitles) often has no packet between the seek
++        // target and the old position, so its first packet is already new.
+         if (queue->correct_dts) {
+             ds->refreshing = dp->dts < queue->last_dts;
++            drop = dp->dts <= queue->last_dts;
+         } else if (queue->correct_pos) {
+             ds->refreshing = dp->pos < queue->last_pos;
++            drop = dp->pos <= queue->last_pos;
+         } else {
+             ds->refreshing = false; // should not happen
+             MP_WARN(in, "stream %d: demux refreshing failed\n", ds->index);
++            drop = true;
+         }
+-        drop = true;
+     }
+ 
+     if (drop) {
