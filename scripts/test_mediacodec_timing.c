@@ -208,6 +208,8 @@ static void test_cadence_boundaries(void)
 }
 
 #define MAX_AHEAD (500 * MS)
+// Media3's VSYNC_OFFSET_PERCENTAGE, the --vo-mediacodec-release-offset default.
+#define DEFAULT_OFFSET MEDIACODEC_RELEASE_OFFSET_DEFAULT
 
 // The vsync a SurfaceView shows a buffer on: the first grid line at or after
 // its timestamp (an untimed release has none) that is still after now.
@@ -244,7 +246,7 @@ static void test_release_survives_late_submission(void)
                 int64_t now = raw - 2 * period + late;
                 int64_t release = mediacodec_timing_release(
                     &timing, raw, now, 1000 + i, duration, EPOCH, period,
-                    MAX_AHEAD);
+                    MAX_AHEAD, DEFAULT_OFFSET);
                 int64_t shown = presented_vsync(release, now, EPOCH, period);
                 if (late == 0) {
                     reference[i] = shown;
@@ -289,13 +291,15 @@ static void test_late_frames_keep_cadence(void)
         struct mediacodec_timing timing = {0};
         int64_t raw = base + period / 2 - MS;
         CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - on_time, 10,
-                                           period, EPOCH, period, MAX_AHEAD),
+                                           period, EPOCH, period, MAX_AHEAD,
+                                           DEFAULT_OFFSET),
                  base - period * 8 / 10, "prime cadence and snap preference");
 
         raw = base + period + period / 2 + MS;
         int64_t now = raw + cases[i].now_offset;
         int64_t release = mediacodec_timing_release(
-            &timing, raw, now, 11, period, EPOCH, period, MAX_AHEAD);
+            &timing, raw, now, 11, period, EPOCH, period, MAX_AHEAD,
+            DEFAULT_OFFSET);
         CHECK_EQ(release, cases[i].now_offset >= 0 ? 0 : base + period / 5,
                  cases[i].name);
         CHECK_EQ(presented_vsync(release, now, EPOCH, period), base + 2 * period,
@@ -304,7 +308,8 @@ static void test_late_frames_keep_cadence(void)
         // Raw is 1ms past the midpoint: a reset would snap it to base + 3p.
         raw = base + 2 * period + period / 2 + MS;
         CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - on_time, 12,
-                                           period, EPOCH, period, MAX_AHEAD),
+                                           period, EPOCH, period, MAX_AHEAD,
+                                           DEFAULT_OFFSET),
                  base + 2 * period - period * 8 / 10, cases[i].name);
     }
 }
@@ -316,12 +321,14 @@ static void test_release_discontinuities(void)
     struct mediacodec_timing timing = {0};
     int64_t raw = base + period / 2 - MS;
     CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 10,
-                                       period, EPOCH, period, MAX_AHEAD),
+                                       period, EPOCH, period, MAX_AHEAD,
+                                       DEFAULT_OFFSET),
              base - period * 8 / 10, "prime before discontinuities");
 
     raw = base + period + period / 2 + MS;
     CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - MAX_AHEAD - MS, 11,
-                                       period, EPOCH, period, MAX_AHEAD),
+                                       period, EPOCH, period, MAX_AHEAD,
+                                       DEFAULT_OFFSET),
              0, "deadline beyond the surface window releases untimed");
     CHECK_EQ(mediacodec_timing_snap(&timing, raw, EPOCH, period),
              base + 2 * period, "deadline beyond the surface window resets");
@@ -329,10 +336,10 @@ static void test_release_discontinuities(void)
     timing = (struct mediacodec_timing){0};
     raw = base + period / 2 - MS;
     mediacodec_timing_release(&timing, raw, raw - 2 * period, 10, period,
-                              EPOCH, period, MAX_AHEAD);
+                              EPOCH, period, MAX_AHEAD, DEFAULT_OFFSET);
     raw = base + period + period / 2 + MS;
     CHECK_EQ(mediacodec_timing_release(&timing, raw, 0, 11, period, EPOCH,
-                                       period, MAX_AHEAD),
+                                       period, MAX_AHEAD, DEFAULT_OFFSET),
              0, "unknown clock releases untimed");
     CHECK_EQ(mediacodec_timing_snap(&timing, raw, EPOCH, period),
              base + 2 * period, "unknown clock resets");
@@ -340,12 +347,44 @@ static void test_release_discontinuities(void)
     timing = (struct mediacodec_timing){0};
     raw = base + period / 2 - MS;
     CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 10,
-                                       period, EPOCH, 0, MAX_AHEAD),
+                                       period, EPOCH, 0, MAX_AHEAD,
+                                       DEFAULT_OFFSET),
              raw, "unknown display period releases at the target");
     raw = base + period + period / 2 + MS;
     CHECK_EQ(mediacodec_timing_release(&timing, raw, raw - 2 * period, 11,
-                                       period, 0, period, MAX_AHEAD),
+                                       period, 0, period, MAX_AHEAD,
+                                       DEFAULT_OFFSET),
              raw - 2 * MS, "stale vsync sample releases at the cadence target");
+}
+
+// --vo-mediacodec-release-offset moves the timestamp within the period
+// before the chosen vsync and nothing else: the vsync, and so the cadence,
+// is the default's, admission previews the same timestamp the release
+// commits, and a SurfaceView still shows every offset on that vsync.
+static void test_release_offset_moves_only_the_timestamp(void)
+{
+    const int64_t period = 16666667, duration = 41666667;
+    const int offsets[] = {10, 50, DEFAULT_OFFSET, 90};
+    for (size_t o = 0; o < sizeof(offsets) / sizeof(offsets[0]); o++) {
+        struct mediacodec_timing timing = {0}, reference = {0};
+        for (int i = 0; i < 24; i++) {
+            int64_t raw = EPOCH + 100 * period + i * duration + (i % 2 ? MS : -MS);
+            int64_t now = raw - 3 * period;
+            int64_t vsync = mediacodec_timing_release(
+                &reference, raw, now, 1000 + i, duration, EPOCH, period,
+                MAX_AHEAD, DEFAULT_OFFSET) + period * DEFAULT_OFFSET / 100;
+            int64_t preview = mediacodec_timing_preview(
+                &timing, raw, 1000 + i, duration, EPOCH, period, offsets[o]);
+            int64_t release = mediacodec_timing_release(
+                &timing, raw, now, 1000 + i, duration, EPOCH, period,
+                MAX_AHEAD, offsets[o]);
+            CHECK_EQ(preview, release, "admission previews the offset release");
+            CHECK_EQ(release, vsync - period * offsets[o] / 100,
+                     "the timestamp sits the offset before the default's vsync");
+            CHECK_EQ(presented_vsync(release, now, EPOCH, period), vsync,
+                     "every offset is shown on the same vsync");
+        }
+    }
 }
 
 static void test_stats_log_on_failure_or_heartbeat(void)
@@ -645,6 +684,7 @@ struct priv {
     const char *present_source;
     bool present_trace;
     int64_t trace_vsync;
+    int release_offset;
     int64_t prepared_seen_ns, cur_seen_ns;
     int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
 };
@@ -850,7 +890,8 @@ static bool present_queued(struct vo *vo)
 
 static void test_preparation_does_not_submit_early(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -888,9 +929,42 @@ static void test_preparation_does_not_submit_early(void)
     CHECK_EQ(image.refs, 1, "balanced image ownership");
 }
 
+// The offset reaches the codec, the OSD plane and admission together: the
+// buffer and the OSD swap carry the moved timestamp, both aim at the vsync
+// the default would, and the codec still gets its full lead before it.
+static void test_release_offset_reaches_codec_osd_and_admission(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true,
+                     .release_offset = 50};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffer = {0};
+    struct mp_image image = {.pts = 12.5, .planes[3] = &buffer, .refs = 1};
+    struct vo_frame frame = {.current = &image, .frame_id = 1,
+                              .pts = EPOCH + 1000 * MS, .duration = 40 * MS};
+    in.frame_queued = &frame;
+    clock_ns = frame.pts - 120 * MS;
+    p.vsync_sample = frame.pts - 2 * 40 * MS;
+    CHECK_EQ(present_queued(&vo), false, "preparation waits for the codec window");
+    CHECK_EQ(in.wakeup_pts, frame.pts - 20 * MS - 50 * MS,
+             "admission counts back from the moved timestamp");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the frame is released");
+    CHECK_EQ(buffer.releases, 1, "submit once");
+    CHECK_EQ(buffer.timestamp, frame.pts - 20 * MS,
+             "the codec gets the vsync minus half a period");
+    CHECK_EQ(published.timestamp, buffer.timestamp,
+             "the OSD plane takes the same timestamp");
+    CHECK_EQ(published.vsync, frame.pts, "both aim at the default's vsync");
+    CHECK_EQ(p.present.ring[0].vsync, frame.pts,
+             "the present intent keeps the vsync, not the timestamp");
+    CHECK_EQ(image.refs, 1, "balanced image ownership");
+}
+
 static void test_flip_records_intents_and_drains_reports(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {.pts = 12500000};
@@ -1032,7 +1106,7 @@ static void test_driver_refresh_and_cadence(void)
     for (size_t r = 0; r < sizeof(rates) / sizeof(rates[0]); r++) {
         int64_t period = llround(1e9 / rates[r].hz);
         int64_t duration = llround(1e9 / rates[r].fps);
-        struct priv p = {.vsync_attached = true};
+        struct priv p = {.vsync_attached = true, .release_offset = DEFAULT_OFFSET};
         struct vo_internal in = {0};
         struct vo vo = {&p, &in, &driver, period, 0};
         struct mediacodec_timing reference = {0};
@@ -1058,7 +1132,7 @@ static void test_driver_refresh_and_cadence(void)
             }
             int64_t expected = mediacodec_timing_release(&reference, frame.pts,
                 clock_ns, frame.frame_id, duration, p.vsync_sample, period,
-                mediacodec_release_horizon(period));
+                mediacodec_release_horizon(period), DEFAULT_OFFSET);
             CHECK_EQ(buffer.timestamp, expected, "admission preserves cadence/snap");
             // The whole point of admitting against the corrected timestamp:
             // MediaCodec must still get its full lead of notice. The first
@@ -1087,7 +1161,8 @@ static void test_driver_refresh_and_cadence(void)
 
 static void test_refresh_transition_and_late_frame(void)
 {
-    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -1143,7 +1218,8 @@ static void test_choreographer_period_and_cadence_across_a_switch(void)
 {
     // The Choreographer's own period wins over what the core assumes, and a
     // frame that lands on its vsync is not a drop.
-    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     const int64_t period120 = llround(1e9 / 120);
@@ -1339,7 +1415,8 @@ static void test_releases_follow_an_off_mode_choreographer(void)
     // whole sessions; its Choreographer ticks on that grid, and it latches
     // against it. Every release across resamples stays on that grid.
     const int64_t mode = 16683350, grid = 15708000;
-    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 1e9 / 59.94, 0};
     vsync_sampler.vsync_period = mode;
@@ -1407,7 +1484,8 @@ static void test_releases_keep_their_grid_through_an_excursion(void)
     // Preparation and release both read the excursion; neither aims a frame
     // off the grid.
     const int64_t period = 16666667;
-    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, period, 0};
     rendered_source = "ndk";
@@ -1445,7 +1523,8 @@ static void test_releases_keep_their_grid_through_an_excursion(void)
 static void test_drop_pause_redraw_resume(void)
 {
     const int64_t period = 40 * MS, base = EPOCH + 1000 * MS;
-    struct priv p = {.vsync_attached = true, .osd_threads_created = true};
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, period, 0};
     AVMediaCodecBuffer a = {0}, b = {0}, c = {0};
@@ -1528,7 +1607,7 @@ static void test_clock_domain_drift(void)
     const int64_t period = 16666667, duration = 41708333;
     const int64_t drifts[] = {37 * MS, -37 * MS};
     for (size_t d = 0; d < sizeof(drifts) / sizeof(drifts[0]); d++) {
-        struct priv p = {.vsync_attached = true};
+        struct priv p = {.vsync_attached = true, .release_offset = DEFAULT_OFFSET};
         struct vo_internal in = {0};
         struct vo vo = {&p, &in, &driver, period, 0};
         for (int i = 0; i < 24; i++) {
@@ -1567,7 +1646,7 @@ static void test_speed_change_admission(void)
     const int64_t period = 16666667;
     const int64_t durations[] = {41708333, 41708333, 41708333, 41708333,
                                  20854166, 20854166, 20854166, 20854166};
-    struct priv p = {.vsync_attached = true};
+    struct priv p = {.vsync_attached = true, .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, period, 0};
     int64_t pts = EPOCH + 1000 * period;
@@ -1599,7 +1678,8 @@ static void test_speed_change_admission(void)
 // frame that no longer exists, and nothing may reach the codec.
 static void test_seek_during_preparation(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -1626,7 +1706,8 @@ static void test_seek_during_preparation(void)
 // core cannot hand over another frame while frame_queued is occupied.
 static void test_expired_deadline_does_not_idle_the_vo(void)
 {
-    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true,
+                     .release_offset = DEFAULT_OFFSET};
     struct vo_internal in = {0};
     struct vo vo = {&p, &in, &driver, 40 * MS, 0};
     AVMediaCodecBuffer buffer = {0};
@@ -1681,7 +1762,9 @@ int main(void)
     test_release_survives_late_submission();
     test_late_frames_keep_cadence();
     test_release_discontinuities();
+    test_release_offset_moves_only_the_timestamp();
     test_preparation_does_not_submit_early();
+    test_release_offset_reaches_codec_osd_and_admission();
     test_driver_refresh_and_cadence();
     test_refresh_transition_and_late_frame();
     test_choreographer_period_and_cadence_across_a_switch();
@@ -1704,8 +1787,8 @@ int main(void)
     test_present_trace_lines();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
-         "dropped still redraw/resume, Choreographer grid excursions, sparse "
-         "statistics and video-plane presentation feedback with its per-frame "
-         "trace");
+         "dropped still redraw/resume, Choreographer grid excursions, the "
+         "release offset, sparse statistics and video-plane presentation "
+         "feedback with its per-frame trace");
     return 0;
 }

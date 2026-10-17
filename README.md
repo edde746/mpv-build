@@ -195,8 +195,11 @@ samples that step off the grid for one resample (a MediaTek projector's, 0.4
 to 0.5 of a vsync every few seconds) never move a release, while a step a
 later resample confirms is followed one resample late and a steady drift off
 the snap period (a Pixel 7's 11.057 ms panel under its 11.111 ms mode) is
-followed every resample; the sparse statistics cadence (a line when a failure
-counter moves, on the first tick, and as a 60 s heartbeat otherwise), and the
+followed every resample; `--vo-mediacodec-release-offset` moves only the
+timestamp within the period before the chosen vsync, so the vsync, the OSD
+plane's vsync and the codec's 50 ms of notice before the timestamp all hold
+at every offset; the sparse statistics cadence (a line when a failure counter
+moves, on the first tick, and as a 60 s heartbeat otherwise), and the
 video-plane presentation feedback: a release records the vsync it aimed at,
 the codec's rendered report is matched back by presentation time and bucketed
 by vsync error, and a reset forgets intents but keeps the counters. Pass an
@@ -249,7 +252,8 @@ Run the OSD surface-retirement regression with
 `bash scripts/test_mediacodec_rebind.sh`. It applies the full Android series
 and exercises live OSD replacement without rebuilding the video decoder:
 retirement waits for the old producer, releases its window exactly once, and
-starts the replacement without stale requests or timing state. An
+starts the replacement without stale requests or timing state; the present
+trace and release offset follow their options without an OSD plane. An
 already-patched source directory may be passed for offline runs.
 
 Live OSD replacement requires the matching JNI surface-generation handoff,

@@ -31,6 +31,7 @@ typedef struct window { int refs; bool entered, release; } ANativeWindow;
 struct mediacodec_geometry { int width; };
 struct mediacodec_opts {
     char *video_rect; int osd_vsync_delay; int64_t osd_surface; bool present_trace;
+    int release_offset;
 };
 struct m_config_cache { struct mediacodec_opts *opts; bool dirty; };
 struct mp_osd_res { int w, h; };
@@ -65,6 +66,7 @@ struct priv {
     struct mediacodec_geometry osd_geometry;
     int osd_vsync_delay;
     bool present_trace;
+    int release_offset;
     struct osd_plane_stats plane;
     double osd_pts;
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
@@ -205,12 +207,13 @@ int main(void)
     cache.dirty = true;
     update_opts(&vo);
     assert(!p.osd_threads_created && !p.osd_window && b.refs == 0);
-    // The present trace is a video-plane switch: it follows the option with
-    // no OSD plane at all.
+    // The present trace and the release offset are video-plane settings:
+    // they follow their options with no OSD plane at all.
     opts.present_trace = true;
+    opts.release_offset = 50;
     cache.dirty = true;
     update_opts(&vo);
-    assert(p.present_trace);
+    assert(p.present_trace && p.release_offset == 50);
     osd_uninit(&vo);
     assert(freed == 1);
 
@@ -227,6 +230,7 @@ int main(void)
     osd_uninit(&vo);
     assert(b.refs == 0);
     puts("PASS: OSD rebind waits for producer retirement, releases once, restarts without "
-         "stale state, and the present trace follows its option without an OSD plane");
+         "stale state, and the present trace and release offset follow their options "
+         "without an OSD plane");
     return 0;
 }
