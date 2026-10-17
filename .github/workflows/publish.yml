@@ -66,14 +66,8 @@ jobs:
       - name: Test spatial audio output
         run: bash ./scripts/test_ao_spatial.sh
 
-      - name: Test spatial feeder end of stream
+      - name: Test spatial audio bridge
         run: bash ./scripts/test_spatial_feed.sh
-
-      - name: Test spatial renderer submission contract
-        run: bash ./scripts/test_spatial_submission.sh
-
-      - name: Test spatial audio session ownership
-        run: bash ./scripts/test_spatial_session.sh
 
       - name: Test build process output capture
         run: bash ./scripts/test_build_process.sh

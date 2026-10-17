@@ -90,7 +90,34 @@ def prelink_core(archive, output, target, sdk, environment):
     print(f"{target}: prelinked core exports {', '.join(exported)}; personality is weak", flush=True)
 
 
-def build(root, source, output, mpv, target, sdk, rust_target):
+def compile_bridge(root, source, output, mpv, target, sdk, environment):
+    """Compile ao_spatial's Swift side with the renderer sources it uses."""
+    # Only the passthrough path is linked; HLS, networking and SwiftPM
+    # resource accessors are not part of this audio output.
+    names = ["Types", "Decoder", "APACEncoder", "SampleBuffer", "IEC61937Unpacker",
+             "SpatialAudioRenderer", "SpatialAudioPassthroughSink", "SpatialAudioTranscoder", "FragmentTrim"]
+    sources = [source / f"Sources/SpatialAudioBridge/{name}.swift" for name in names]
+    sources += [source / "Sources/SpatialAudioPlayback/AtmosOutputActivator.swift", mpv / "audio/out/ao_spatial.swift"]
+    silent = source / "Sources/SpatialAudioPlayback/Resources/silent-atmos.mp4"
+    resources = output / "SpatialResources.swift"
+    resources.write_text('import Foundation\nlet mpSpatialSilentAtmos = Data(base64Encoded: "' +
+                         base64.b64encode(silent.read_bytes()).decode() + '")!\n')
+    # Since 2.0 the source ships a framework module map for its release
+    # framework. The core is linked statically here, so import its header
+    # through a plain module of the same name.
+    include = output / "include/SpatialAudioCore"
+    include.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / "Rust/SpatialAudioCore/include/SpatialAudioCore/SpatialAudioCore.h", include)
+    (include / "module.modulemap").write_text(
+        'module SpatialAudioCore {\n    header "SpatialAudioCore.h"\n    export *\n}\n')
+    run("xcrun", "swiftc", "-swift-version", "6", "-O", "-whole-module-optimization",
+        "-parse-as-library", "-emit-library", "-static", "-module-name", "MPVSpatial",
+        "-file-prefix-map", f"{root}=/mpv-build", "-file-prefix-map", f"{source}=/spatial-audio-bridge",
+        "-target", target, "-sdk", sdk, "-I", output / "include",
+        *sources, resources, "-o", output / "libmpv_spatial.a", env=environment)
+
+
+def build(root, source, output, mpv, target, sdk, rust_target, bridge_only=False):
     pin = patches.component_pins("spatialaudiobridge", "apple")
     if not source.exists():
         patches.cmd_fetch("spatialaudiobridge", "apple", str(source))
@@ -106,24 +133,29 @@ def build(root, source, output, mpv, target, sdk, rust_target):
             raise SystemExit(f"{source}: source patches differ; preserve edits and use a fresh source checkout")
         patches.cmd_apply("spatialaudiobridge", "apple", str(source), False)
 
+    output.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ, MACOSX_DEPLOYMENT_TARGET="11.0", IPHONEOS_DEPLOYMENT_TARGET="14.0",
+                       TVOS_DEPLOYMENT_TARGET="14.0", SDKROOT=str(sdk), ZERO_AR_DATE="1")
+    if bridge_only:
+        compile_bridge(root, source, output, mpv, target, sdk, environment)
+        return
+
     toolchain = dict(line.split("=", 1) for line in (root / "toolchain/apple.txt").read_text().splitlines()
                      if line and not line.startswith("#"))
     rust = toolchain["rust"]
-    rustup = Path.home() / ".cargo/bin/rustup"
+    # The Apple driver forwards these from its own environment.
+    cargo_home = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo")
+    rustup = cargo_home / "bin/rustup"
     if not rustup.exists():
         rustup = Path(shutil.which("rustup") or "rustup")
-    output.mkdir(parents=True, exist_ok=True)
     cargo_target = output / "cargo-target"
     manifest = source / "Rust/SpatialAudioCore/Cargo.toml"
-    environment = dict(os.environ, CARGO_TARGET_DIR=str(cargo_target),
-                       CARGO_PROFILE_RELEASE_LTO="fat",
-                       MACOSX_DEPLOYMENT_TARGET="11.0", IPHONEOS_DEPLOYMENT_TARGET="14.0",
-                       TVOS_DEPLOYMENT_TARGET="14.0", SDKROOT=str(sdk), ZERO_AR_DATE="1")
+    environment.update(CARGO_TARGET_DIR=str(cargo_target), CARGO_PROFILE_RELEASE_LTO="fat")
     environment.pop("RUSTFLAGS", None)
     sysroot = subprocess.check_output([str(rustup), "run", rust, "rustc", "--print", "sysroot"], text=True).strip()
     environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([
         f"--remap-path-prefix={source}=/spatial-audio-bridge",
-        f"--remap-path-prefix={Path.home() / '.cargo'}=/cargo",
+        f"--remap-path-prefix={cargo_home}=/cargo",
         f"--remap-path-prefix={sysroot}=/rust",
     ])
     try:
@@ -137,21 +169,8 @@ def build(root, source, output, mpv, target, sdk, rust_target):
     finally:
         shutil.rmtree(cargo_target, ignore_errors=True)
 
-    # Only the renderer path is linked; HLS, networking and SwiftPM resource
-    # accessors are not part of this audio output.
-    names = ["Types", "Decoder", "APACEncoder", "SampleBuffer", "IEC61937Unpacker",
-             "SpatialAudioRenderer", "SpatialAudioTranscoder", "FragmentTrim"]
-    sources = [source / f"Sources/SpatialAudioBridge/{name}.swift" for name in names]
-    sources += [source / "Sources/SpatialAudioPlayback/AtmosOutputActivator.swift", mpv / "audio/out/ao_spatial.swift"]
-    silent = source / "Sources/SpatialAudioPlayback/Resources/silent-atmos.mp4"
-    resources = output / "SpatialResources.swift"
-    resources.write_text('import Foundation\nlet mpSpatialSilentAtmos = Data(base64Encoded: "' +
-                         base64.b64encode(silent.read_bytes()).decode() + '")!\n')
-    run("xcrun", "swiftc", "-swift-version", "6", "-O", "-whole-module-optimization",
-        "-parse-as-library", "-emit-library", "-static", "-module-name", "MPVSpatial",
-        "-file-prefix-map", f"{root}=/mpv-build", "-file-prefix-map", f"{source}=/spatial-audio-bridge",
-        "-target", target, "-sdk", sdk, "-I", source / "Rust/SpatialAudioCore/include",
-        *sources, resources, "-o", output / "libmpv_spatial.a", env=environment)
+    compile_bridge(root, source, output, mpv, target, sdk, environment)
+
     # libmpv's Meson link uses this for its executable. The install step folds
     # both archives into libmpv.a, so consumers need no extra linker options.
     pkgconfig = output / "pkgconfig"
@@ -170,12 +189,16 @@ def main():
     parser.add_argument("--mpv", type=Path, required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--sdk", required=True)
-    parser.add_argument("--rust-target", required=True)
+    parser.add_argument("--rust-target")
+    parser.add_argument("--bridge-only", action="store_true",
+                        help="compile only the Swift bridge, as a check without Rust")
     args = parser.parse_args()
+    if not args.bridge_only and not args.rust_target:
+        parser.error("--rust-target is required unless --bridge-only is given")
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
     build(root, args.source.resolve(), args.output.resolve(), args.mpv.resolve(),
-          args.target, args.sdk, args.rust_target)
+          args.target, args.sdk, args.rust_target, args.bridge_only)
 
 
 if __name__ == "__main__":

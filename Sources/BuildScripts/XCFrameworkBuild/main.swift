@@ -198,13 +198,16 @@ private class BuildMPV: BaseBuild {
     override func build(platform: PlatformType, arch: ArchType) throws {
         let spatial = spatialDirectory(platform: platform, arch: arch)
         if let target = spatialTarget(platform: platform, arch: arch) {
+            // Utility.launch passes only HOME and a default PATH; keep a
+            // non-default Rust installation reachable.
+            let rust = ProcessInfo.processInfo.environment.filter { ["CARGO_HOME", "RUSTUP_HOME"].contains($0.key) }
             try Utility.launch(path: "python3", arguments: [
                 (URL.currentDirectory + "../scripts/build_spatial.py").path,
                 "--source", (URL.currentDirectory + "SpatialAudioBridge-\(Versions.pin("spatialaudiobridge").commit!)").path,
                 "--output", spatial.path, "--mpv", directoryURL.path,
                 "--target", platform.deploymentTarget(arch), "--sdk", platform.isysroot,
                 "--rust-target", target,
-            ])
+            ], environment: rust)
         }
         try super.build(platform: platform, arch: arch)
         if spatialTarget(platform: platform, arch: arch) != nil {

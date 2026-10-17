@@ -496,66 +496,46 @@ so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
-(macOS). It checks admission, submitted-output accounting, empty EOF, gapless
-handoff, pause/reset and per-player fallback with a fake renderer.
-`bash scripts/test_spatial_feed.sh` exercises the complete production Swift
-bridge and pinned IEC unpacker with a fake renderer/activator, without media or
-audio output. It covers empty/filler/null/pre-major-sync EOF, bounded admission,
-suspended enqueue/final flush, delayed activator attachment, cancellation and
-errors. Its real CoreMedia clock checks early holds, terminal late submission,
-pause/reset, finalization races, empty/priming-only output and stale callbacks.
-`bash scripts/test_spatial_submission.sh` compiles the complete patched renderer
-with synthetic codec/output doubles. It checks true/false/throw admission,
-invocation counts, cancellation/reset, pending route refill, final events and
-queues filling mid-batch/below the resume lead. This focused Swift 6 harness
-treats compiler warnings as errors.
-Neither test opens an audio device or establishes receiver behavior.
+(macOS). It drives the driver with a real synchronizer and a fake sink:
+admission and the bytes waiting for a full sink, the clock's start, holds and
+resumes, pause, silence-only input, gaps, empty and gapless EOF, and the
+per-player fallback latch. `bash scripts/test_spatial_feed.sh` compiles the
+production Swift bridge with SpatialAudioBridge's pinned passthrough sink and
+IEC unpacker and a fake renderer: unpacking, progress and queue coverage, the
+end, new timelines, gaps, failures, volume and close. Neither test opens an
+audio device or establishes receiver behavior. CI runs both on pull requests,
+and compiles the bridge for tvOS against the pinned SpatialAudioBridge.
 
-The Apple-only `spatialaudiobridge` patch adds a synchronous per-timeline
-submission hook. Its nonescaping enqueue closure stays on the renderer actor;
-refusal retries asynchronously outside the callback and host lock. The host
-serializes actual enqueue with clock checks. Progress is the APAC presentation
-end after encoder priming, not consumed IEC bytes. Both sides of enqueue check
-OLD coverage; a late packet cannot conceal an earlier underrun.
+`ao_spatial` hands mpv's IEC 61937 bursts to SpatialAudioBridge's
+`SpatialAudioPassthroughSink`, which unpacks, converts and queues APAC on the
+output's synchronizer. The driver owns that synchronizer's rate. It reads the
+sink's progress (how far enqueued audio reaches, and whether the end of the
+stream is enqueued) and the renderer's queue, which also misses audio a route
+change flushed until it is enqueued again. The clock starts once the sink is
+ready, stops with 250 ms of that audio left, and resumes with 500 ms queued, or
+when the renderer takes no more. A slow conversion therefore holds playback
+instead of letting the renderer drop late audio; a finished stream plays out to
+its end once the renderer holds all of it, and drains when the clock passes it. mpv's ao thread checks the output every 125 ms while it streams. These
+are scheduling policies, not timing or queue-capacity guarantees.
 
-Ordinary holds preserve the synchronizer anchor. A 10 ms AO wakeup requests a
-stop with 100 ms of coverage remaining; unfinished playback resumes with at
-least 250 ms of coverage. Readiness comes from submitted playable output, not
-completion of an encoder batch or final flush. Apple specifies no minimum queue
-capacity: a held, requested timeline with submitted buffers but insufficient
-lead fails to PCM after two seconds, including a queue full of priming buffers.
-Pausing cancels this wait; final completion releases short tails. These are
-scheduling policies, not timing or queue-capacity guarantees.
-A missed horizon is terminal: stop, reject further data and request mpv's
-same-track PCM fallback. This may interrupt playback, require resynchronization
-and lose Atmos/object output. A later device reload or track change can retry
-spatial audio; seamless underrun recovery is not promised.
-
-The final encoder packet atomically declares the terminal horizon with enqueue;
-a zero-output completion declares the existing horizon terminal. During final
-encoding only, an exhausted horizon is held provisionally: empty completion may
-drain it, but any later packet still fails the old-coverage check. Final tails
-bypass the normal resume-lead policy. Reset/cancellation suppress old callbacks,
-and route replay does not add submission credit. Asynchronous route-flush
-interruptions and hardware continuity remain unvalidated. This does not measure device
-latency, lip-sync, placement or endurance. The patch participates in libmpv's
-Apple content key. The SAB pin and Rust core are unchanged; the hook is compiled
-privately into MPVSpatial.
+What the sink cannot take yet, about half a second, waits in the output and
+counts against `free_samples`; the sink itself buffers a second ahead of the
+renderer. Silence converts to nothing, so the clock idles at the end of the
+converted audio without failing. The output opts out of
+`audio-stream-silence`: it feeds no receiver, and with streamed silence mpv
+would write zeros through a pause instead of pausing it. An IEC 61937 pause
+burst or format change starts a new timeline; any other sink failure latches
+the format and reloads the output for mpv's PCM decode path.
 
 The output is self-contained: `scripts/build_spatial.py` compiles the
 SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
-the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are
-folded into `Libmpv`; that source pin is part of libmpv's content key. There is
-no application callback or separate SpatialAudioBridge package. The binary
-includes the silent Atmos clip and its license notices. When the last overlapping
-output closes, it restores audio-session settings that still match what it
-installed: category, mode and options as one group, multichannel independently.
-Differing host settings are preserved. Matching values cannot prove that another
-caller left the session untouched. Opening activates the session; closing never
-deactivates it, because the host may already own activation. Deactivation remains the host
-application's responsibility. `bash scripts/test_spatial_session.sh` exercises
-active/inactive host sessions, host configuration changes, overlapping outputs
-and failed-open rollback with a fake session, without playing audio.
+the Rust version in `toolchain/apple.txt`. Its Rust core and Swift sink are
+folded into `Libmpv`; that source pin and the build script are part of
+libmpv's content key, and of no other library's. There is no application
+callback or separate SpatialAudioBridge package. The binary includes the
+silent Atmos clip and its license notices. Like mpv's other Apple outputs, it
+sets the audio session's category, mode and multichannel support and activates
+it when it opens, and leaves it to the host afterwards.
 
 The Rust core is built as a staticlib alone with fat LTO, then prelinked into
 one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak

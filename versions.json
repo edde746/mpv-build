@@ -402,11 +402,11 @@
     },
     "spatialaudiobridge": {
       "kind": "git",
-      "version": "1.6.1",
+      "version": "2.0.0",
       "url": "https://github.com/kristofferR/SpatialAudioBridge",
-      "ref": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
-      "commit": "8d8f21a35d27179fe1b04a6c24a9db89b1d2a364",
-      "provenance": "Source of 1.6.1, before the release-only binary Package.swift. Includes the DTS-HD seek fix; Cargo.lock pins both decoder repositories and every crate. Built with Rust 1.99.0.",
+      "ref": "f0d376a8de4ef3dccb21ad66f45dad734f6b8809",
+      "commit": "f0d376a8de4ef3dccb21ad66f45dad734f6b8809",
+      "provenance": "Source of 2.0.0. The annotated tag 2.0.0 (object 20e21ddae92836354d78634b491be041a4f0150d, by the release workflow) dereferences to 61ed9b602b0736954d34288aa635731a67217a59, a release-only commit whose sole parent is this commit and which changes only Package.swift, to download the prebuilt core; this pin builds the core from source instead. Resolved 2026-10-17 with `git ls-remote https://github.com/kristofferR/SpatialAudioBridge 'refs/tags/2.0.0*'`. Cargo.lock and the dependencies in Cargo.toml are unchanged since 1.6.1: the lock pins both decoder repositories by commit and every crate by checksum. Built with Rust 1.99.0.",
       "platforms": [
         "apple"
       ]
