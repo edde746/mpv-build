@@ -290,8 +290,8 @@ jobs:
           rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
           test -n "$rust_version"
           rustup toolchain install "$rust_version" --profile minimal
+          # Only the slices with spatial audio build Rust; see spatialTarget().
           rustup target add --toolchain "$rust_version" \
-            aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
             aarch64-apple-tvos aarch64-apple-tvos-sim
 
@@ -351,10 +351,18 @@ jobs:
       - name: Verify manifest matches this commit
         run: python3 scripts/keys.py verify --platform-group apple
 
-      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+      # Pinned by release and archive checksum, since it gates publish-assets.
+      - name: Install XcodeGen 2.46.0
         run: |
-          brew install xcodegen
-          bash scripts/test_spatial_swiftpm.sh dist/release
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $RUNNER_TEMP/xcodegen.zip" \
+            | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload binaries that are not published yet
         if: github.ref == 'refs/heads/main'
