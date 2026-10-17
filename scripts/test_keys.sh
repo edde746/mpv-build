@@ -257,6 +257,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check(before["libmpv"] != after["libmpv"], "SpatialAudioBridge source moves libmpv's key")
     check(before["FFmpeg"] == after["FFmpeg"], "SpatialAudioBridge source does not move FFmpeg")
 
+# The script that builds it is too, and keys nothing else.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_repo(tmp)
+    before = keys(repo)
+    (repo / "scripts/build_spatial.py").write_text("# changed source build\n")
+    after = keys(repo)
+    check(before["libmpv"] != after["libmpv"], "the spatial build script moves libmpv's key")
+    check(before["FFmpeg"] == after["FFmpeg"] and before["libass"] == after["libass"],
+          "the spatial build script does not move FFmpeg or libass")
+
 # A renderer integration patch is another input to libmpv, but not FFmpeg.
 with tempfile.TemporaryDirectory() as tmp:
     repo = make_repo(tmp)
