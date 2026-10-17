@@ -4,30 +4,30 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
       "libraries": {
         "libmpv-android": {
-          "key": "6540f711577e",
+          "key": "53952f8695ed",
           "prebuilt": {
             "arm64-v8a": {
-              "asset": "libmpv-android-6540f711577e-arm64-v8a.tar.gz",
-              "checksum": "fb2782cec30a885decbc9630439fa815e441106fff7f6ecc47c000286989e9fa"
+              "asset": "libmpv-android-53952f8695ed-arm64-v8a.tar.gz",
+              "checksum": "c332cd55a7cffd09a4e42723b28a7a2f1f4e6a41bc7ea896b7e902ea768d5522"
             },
             "armeabi-v7a": {
-              "asset": "libmpv-android-6540f711577e-armeabi-v7a.tar.gz",
-              "checksum": "56d24c4ba2f1564ef844c862eea958eba01817144d6c28f96c1fd110aa57da2f"
+              "asset": "libmpv-android-53952f8695ed-armeabi-v7a.tar.gz",
+              "checksum": "8c638b953a140075d8a530f0819d88af864aeb20ae82bb1e12e973dde9d56517"
             },
             "x86": {
-              "asset": "libmpv-android-6540f711577e-x86.tar.gz",
-              "checksum": "f8e62bea3c3deb47945e3543bb50e07297f62fe9431dc59a922338147d23c2e6"
+              "asset": "libmpv-android-53952f8695ed-x86.tar.gz",
+              "checksum": "42426ac0083b1cb0db005259b56b73479fd806ef6e70bc20b76fab1734b1595b"
             },
             "x86_64": {
-              "asset": "libmpv-android-6540f711577e-x86_64.tar.gz",
-              "checksum": "b877410a311b07880976650633f4082996043e51bab94cd81a842d140f066284"
+              "asset": "libmpv-android-53952f8695ed-x86_64.tar.gz",
+              "checksum": "5f410b76ee29b6093a41bcfb6fcc33ede156708503761d47d889cd282eda3768"
             }
           }
         },
         "mpv-android": {
-          "asset": "mpv-android-4d63385d2f7f.aar",
-          "checksum": "65e5bd1edff2de277d4c4980a138b8a15b89bb47cea45879abcfffd7f63627cc",
-          "key": "4d63385d2f7f"
+          "asset": "mpv-android-504d364899fe.aar",
+          "checksum": "b8a5d65b57c0c9fd01c92703e27e185ae0e717b1607b4402a64d43dcd6cc2180",
+          "key": "504d364899fe"
         }
       }
     },
