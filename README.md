@@ -130,6 +130,22 @@ reproduce the merged assets already published under its name.
 
 ## How to build
 
+For Apple source builds, select the intended Xcode with `xcode-select` and
+install [rustup](https://rustup.rs/) first. Before `make build`, provision the
+compiler pinned by this checkout and the targets used by its spatial slices:
+
+```bash
+rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+test -n "$rust_version"
+rustup toolchain install "$rust_version" --profile minimal
+rustup target add --toolchain "$rust_version" \
+  aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+  aarch64-apple-tvos aarch64-apple-tvos-sim
+```
+
+These are the same toolchain and target prerequisites installed by Apple CI.
+Repeat this setup after changing checkouts if their `rust` pin differs.
+
 ```bash
 make build
 # specified platforms (ios,macos,tvos,tvsimulator,isimulator,maccatalyst,xros,xrsimulator)
@@ -478,6 +494,135 @@ a reload while the ao filter still holds a frame meant for the old AO releases
 that frame once, wakes the ao filter, and leaves the output chain asked for data,
 so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
+
+Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
+(macOS). It checks admission, submitted-output accounting, empty EOF, gapless
+handoff, pause/reset and per-player fallback with a fake renderer.
+`bash scripts/test_spatial_feed.sh` exercises the complete production Swift
+bridge and pinned IEC unpacker with a fake renderer/activator, without media or
+audio output. It covers empty/filler/null/pre-major-sync EOF, bounded admission,
+suspended enqueue/final flush, delayed activator attachment, cancellation and
+errors. Its real CoreMedia clock checks early holds, terminal late submission,
+pause/reset, finalization races, empty/priming-only output and stale callbacks.
+`bash scripts/test_spatial_submission.sh` compiles the complete patched renderer
+with synthetic codec/output doubles. It checks true/false/throw admission,
+invocation counts, cancellation/reset, pending route refill, final events and
+queues filling mid-batch/below the resume lead. This focused Swift 6 harness
+treats compiler warnings as errors.
+Neither test opens an audio device or establishes receiver behavior.
+
+The Apple-only `spatialaudiobridge` patch adds a synchronous per-timeline
+submission hook. Its nonescaping enqueue closure stays on the renderer actor;
+refusal retries asynchronously outside the callback and host lock. The host
+serializes actual enqueue with clock checks. Progress is the APAC presentation
+end after encoder priming, not consumed IEC bytes. Both sides of enqueue check
+OLD coverage; a late packet cannot conceal an earlier underrun.
+
+Ordinary holds preserve the synchronizer anchor. A 10 ms AO wakeup requests a
+stop with 100 ms of coverage remaining; unfinished playback resumes with at
+least 250 ms of coverage. Readiness comes from submitted playable output, not
+completion of an encoder batch or final flush. Apple specifies no minimum queue
+capacity: a held, requested timeline with submitted buffers but insufficient
+lead fails to PCM after two seconds, including a queue full of priming buffers.
+Pausing cancels this wait; final completion releases short tails. These are
+scheduling policies, not timing or queue-capacity guarantees.
+A missed horizon is terminal: stop, reject further data and request mpv's
+same-track PCM fallback. This may interrupt playback, require resynchronization
+and lose Atmos/object output. A later device reload or track change can retry
+spatial audio; seamless underrun recovery is not promised.
+
+The final encoder packet atomically declares the terminal horizon with enqueue;
+a zero-output completion declares the existing horizon terminal. During final
+encoding only, an exhausted horizon is held provisionally: empty completion may
+drain it, but any later packet still fails the old-coverage check. Final tails
+bypass the normal resume-lead policy. Reset/cancellation suppress old callbacks,
+and route replay does not add submission credit. Asynchronous route-flush
+interruptions and hardware continuity remain unvalidated. This does not measure device
+latency, lip-sync, placement or endurance. The patch participates in libmpv's
+Apple content key. The SAB pin and Rust core are unchanged; the hook is compiled
+privately into MPVSpatial.
+
+The output is self-contained: `scripts/build_spatial.py` compiles the
+SpatialAudioBridge source commit in `versions.json`, with `cargo --locked` and
+the Rust version in `toolchain/apple.txt`. Its Rust core and Swift renderer are
+folded into `Libmpv`; that source pin is part of libmpv's content key. There is
+no application callback or separate SpatialAudioBridge package. The binary
+includes the silent Atmos clip and its license notices. When the last overlapping
+output closes, it restores audio-session settings that still match what it
+installed: category, mode and options as one group, multichannel independently.
+Differing host settings are preserved. Matching values cannot prove that another
+caller left the session untouched. Opening activates the session; closing never
+deactivates it, because the host may already own activation. Deactivation remains the host
+application's responsibility. `bash scripts/test_spatial_session.sh` exercises
+active/inactive host sessions, host configuration changes, overlapping outputs
+and failed-open rollback with a fake session, without playing audio.
+
+The Rust core is built as a staticlib alone with fat LTO, then prelinked into
+one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak
+`rust_eh_personality` remain global. This avoids collisions with libdovi's Rust
+runtime while preserving decoder panic handling. The build checks the exported
+symbols and weak personality for every supported slice.
+After a full platform build, `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`
+checks the installed slices and links their sink with force-loaded libdovi,
+without media. It also links an Objective-C-only Clang consumer using the
+packaged `mpv.pc`, including a toolchain path containing spaces. The prelink
+log records the Mach-O platform and minimum OS.
+The SwiftPM wrapper contains Swift source so C/Objective-C consumers also get
+the Swift runtime and back-deployment libraries. After packaging,
+`bash scripts/test_spatial_swiftpm.sh <release-dir>` links an Objective-C-only
+app on iOS and tvOS against the packaged frameworks (requires XcodeGen).
+
+Static pkg-config consumers must configure the install paths in
+`pkgconfig-example` and select their Xcode toolchain. `mpv.pc` supplies both
+Swift runtime and platform-specific compatibility-library flags; its distributed
+`swift_toolchain` value is a placeholder, not the build machine's Xcode path.
+Set that variable in the installed file or override it when invoking pkg-config:
+
+```bash
+swift_compiler="$(xcrun --find swiftc)"
+swift_toolchain="$(dirname "$(dirname "$(dirname "$swift_compiler")")")"
+pkg-config --define-variable="swift_toolchain=$swift_toolchain" --static --libs mpv
+```
+
+Use the metadata for the target slice: device and simulator Swift libraries
+live in different toolchain directories. The selected Xcode must be compatible
+with the compiler used to build the binaries.
+
+Spatial playback requires OS 26 and a supported Rust target: arm64 tvOS and
+its simulator, or iOS and its simulators. macOS, Mac Catalyst, arm64e and Intel
+tvOS retain their other audio outputs. mpv's macOS build includes LuaJIT, and
+LuaJIT, C++, Objective-C and the core's Rust would require four unwind
+personality routines, exceeding the binary's compact-unwind limit of three.
+Ordinary TrueHD/DTS-HD and conversion failures fall back to PCM on the spatial
+path. Source inspection confirms that a tvOS consumer using `ao=spatial,`
+also reaches PCM when the spatial driver is absent:
+the trailing comma enables ordinary output probing; AudioUnit rejects every
+SPDIF format (`audio/out/ao_audiounit.m:116`), and AVFoundation accepts only
+AC-3/E-AC-3 (`audio/out/ao_avfoundation.m:1180`). With no output accepting
+TrueHD/DTS-HD passthrough, `player/audio.c:467` disables SPDIF and reinitializes
+the decoder. These are lines in the patched mpv tree. This path can log output
+probe refusals; it does not return the playback error below the PCM retry.
+The unsupported slices were inspected, not run.
+
+macOS needs a different guard: CoreAudio redirects non-PCM to
+`coreaudio_exclusive` (`audio/out/ao_coreaudio.c:162`), which accepts SPDIF
+(`audio/out/ao_coreaudio_exclusive.c:295`) and may retain that format for a
+compressed device stream (`:356`). Plezy never requests passthrough on macOS:
+its macOS player selects `coreaudio,avfoundation`
+(`macos/Runner/MpvPlayer/MpvPlayerCore.swift:125`), and
+`PlatformDetector.supportsAudioPassthrough()` excludes macOS
+(`lib/utils/platform_detector.dart:312`), gating `audio-spdif` in
+`lib/screens/video_player_screen.dart:1981`. This is source inspection of
+Plezy's configuration, not a guarantee that arbitrary mpv passthrough settings
+fall back to PCM.
+
+For a real muted renderer test, build
+the macOS dependency with `build_spatial.py`, then run
+`bash scripts/test_spatial_renderer.sh <patched-mpv> <built-spatial-dir> <IEC-file> <codec> <expect-failure>`.
+Codec is 1 for TrueHD or 2 for DTS-HD; the final argument is 0 or 1. Supply
+IEC 61937 generated by FFmpeg's `spdif` muxer, with `-dtshd_rate 768000` for DTS-HD.
+An optional final libdovi archive argument force-loads its Rust runtime too,
+so the same test checks that the prelinked core coexists with it.
 
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,

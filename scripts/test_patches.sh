@@ -202,6 +202,28 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     print("apply --check is sound for stacked series and unwinds on failure")
 
+# Fetch an untagged source commit, and still refuse a mismatched commit pin.
+with tempfile.TemporaryDirectory() as tmp:
+    sandbox = Path(tmp)
+    source = sandbox / "origin"
+    subprocess.run(["git", "init", "--quiet", str(source)], check=True)
+    (source / "source.txt").write_text("pinned source\n")
+    subprocess.run(["git", "-C", str(source), "add", "source.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "Source fixture"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    pin = {"kind": "git", "version": "1.0", "url": source.as_uri(),
+           "ref": commit, "commit": commit, "platforms": ["apple"]}
+    manifest = sandbox / "versions.json"
+    manifest.write_text(json.dumps({"components": {"widget": pin}}))
+    destination = sandbox / "checkout"
+    run(sandbox, "fetch-pinned", "widget", "apple", str(destination))
+    check((destination / "source.txt").read_text() == "pinned source\n", "raw commit fetch must retain source")
+    pin["commit"] = "0" * 40
+    manifest.write_text(json.dumps({"components": {"widget": pin}}))
+    run(sandbox, "fetch-pinned", "widget", "apple", str(sandbox / "mismatch"), expect=1)
+    print("fetch-pinned accepts untagged commits and rejects a mismatched pin")
+
 # 4c. fetch-pinned's archive path. The strip has to leave exactly the source
 # tree the drivers build, and every way of getting that wrong has to fail loudly
 # rather than publish the wrong tree as a fetched success. These run against

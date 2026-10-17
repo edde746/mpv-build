@@ -63,6 +63,18 @@ jobs:
       - name: Test AO probe refusal
         run: ./scripts/test_ao_probe_refusal.sh
 
+      - name: Test spatial audio output
+        run: bash ./scripts/test_ao_spatial.sh
+
+      - name: Test spatial feeder end of stream
+        run: bash ./scripts/test_spatial_feed.sh
+
+      - name: Test spatial renderer submission contract
+        run: bash ./scripts/test_spatial_submission.sh
+
+      - name: Test spatial audio session ownership
+        run: bash ./scripts/test_spatial_session.sh
+
       - name: Test build process output capture
         run: bash ./scripts/test_build_process.sh
 
@@ -279,6 +291,16 @@ jobs:
       # published per-platform zips. No version= argument: the URLs the build
       # script would spell from it are replaced by the manifest's
       # content-addressed ones in the publish job.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+          test -n "$rust_version"
+          rustup toolchain install "$rust_version" --profile minimal
+          rustup target add --toolchain "$rust_version" \
+            aarch64-apple-darwin x86_64-apple-darwin \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+            aarch64-apple-tvos aarch64-apple-tvos-sim
+
       - name: Build GPL version (${{ matrix.name }})
         run: |
           make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
@@ -334,6 +356,11 @@ jobs:
 
       - name: Verify manifest matches this commit
         run: python3 scripts/keys.py verify --platform-group apple
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: |
+          brew install xcodegen
+          bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload binaries that are not published yet
         if: github.ref == 'refs/heads/main'
