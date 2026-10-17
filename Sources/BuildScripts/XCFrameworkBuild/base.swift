@@ -212,10 +212,10 @@ class BaseBuild {
         }
 
         // pull code from git
-        try! Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
+        try Utility.launch(path: "/usr/bin/git", arguments: ["-c", "advice.detachedHead=false", "clone", "--recursive", "--depth", "1", "--branch", library.version, library.url, directoryURL.path])
 
         for patchFile in patchFiles {
-            try! Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
+            try Utility.launch(path: "/usr/bin/git", arguments: ["apply", patchFile.path], currentDirectoryURL: directoryURL)
         }
 
         if let expectedPatchState {
@@ -1277,6 +1277,9 @@ enum Utility {
         var outputBuffer = Data()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let drained = DispatchGroup()
+        drained.enter()
+        drained.enter()
         task.standardOutput = outputPipe
         task.standardError = errorPipe
         
@@ -1307,6 +1310,7 @@ enum Utility {
                 // Close the read capability processing program and clean up resources.
                 fileHandle.readabilityHandler = nil
                 fileHandle.closeFile()
+                drained.leave()
             }
         }
         errorPipe.fileHandleForReading.readabilityHandler = { fileHandle in
@@ -1323,6 +1327,7 @@ enum Utility {
                 // Close the read capability processing program and clean up resources.
                 fileHandle.readabilityHandler = nil
                 fileHandle.closeFile()
+                drained.leave()
             }
         }
     
@@ -1337,6 +1342,9 @@ enum Utility {
         task.executableURL = executableURL
         try task.run()
         task.waitUntilExit()
+        // Process exit does not wait for the asynchronous pipe handlers.
+        // Drain both before reading captured output or reporting a failure.
+        drained.wait()
         if task.terminationStatus == 0 {
             if isOutput {
                 let result = String(data: outputBuffer, encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? ""
