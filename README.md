@@ -544,7 +544,7 @@ one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak
 `rust_eh_personality` remain global. This avoids collisions with libdovi's Rust
 runtime while preserving decoder panic handling. The build checks the exported
 symbols and weak personality for every supported slice.
-After each Apple platform build, the publish workflow runs
+After each Apple platform build that compiles libmpv, the publish workflow runs
 `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`, which checks the installed slices and links their sink with force-loaded libdovi,
 without media. It also links an Objective-C-only Clang consumer using the
 packaged `mpv.pc`, including a toolchain path containing spaces. The prelink

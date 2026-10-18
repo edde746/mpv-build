@@ -301,8 +301,12 @@ jobs:
 
       # Each spatial slice: the prelinked core's exports, a link with libdovi's
       # Rust runtime force-loaded, and an Objective-C consumer through the
-      # packaged mpv.pc. Slices without spatial audio are skipped.
+      # packaged mpv.pc. Slices without spatial audio are skipped. Only a leg
+      # that compiled libmpv has the patched source and packaged mpv.pc this
+      # needs; a libmpv restored from its published zips was checked when it
+      # was built. stale_apple has no delimiters, so add them for an exact test.
       - name: Check spatial slices and combined archive links (${{ matrix.platform_type }})
+        if: contains(format(',{0},', needs.plan.outputs.stale_apple), ',libmpv,')
         shell: bash
         run: |
           mpv_version="$(python3 -c 'import json; print(json.load(open("versions.json"))["components"]["mpv"]["version"])')"
