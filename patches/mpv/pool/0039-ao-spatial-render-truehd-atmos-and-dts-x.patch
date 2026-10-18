@@ -1,0 +1,768 @@
+From: kristofferR <481270+kristofferR@users.noreply.github.com>
+Subject: [PATCH] ao_spatial: render TrueHD Atmos and DTS:X with SpatialAudioBridge
+
+The output owns SpatialAudioBridge's passthrough sink, its synchronizer and
+the clock. SpatialAudioBridge is compiled from pinned sources by mpv-build.
+There is no application callback, raw-address option or installed
+spatial-audio header. The clock runs only over audio the renderer holds,
+from the sink's progress and queue. A refused stream latches its format and
+reopens for mpv's PCM decode path. Volume changes and end-of-stream reach the
+sink through private functions.
+
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..0fd3c87 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -41,6 +41,7 @@ extern const struct ao_driver audio_out_audiounit;
+ extern const struct ao_driver audio_out_coreaudio;
+ extern const struct ao_driver audio_out_coreaudio_exclusive;
+ extern const struct ao_driver audio_out_avfoundation;
++extern const struct ao_driver audio_out_spatial;
+ extern const struct ao_driver audio_out_rsound;
+ extern const struct ao_driver audio_out_pipewire;
+ extern const struct ao_driver audio_out_sndio;
+@@ -107,6 +108,9 @@ static const struct ao_driver * const audio_out_drivers[] = {
+     &audio_out_null,
+ #if HAVE_COREAUDIO
+     &audio_out_coreaudio_exclusive,
++#endif
++#if HAVE_SPATIAL_AUDIO
++    &audio_out_spatial,
+ #endif
+     &audio_out_pcm,
+     &audio_out_lavc,
+@@ -613,6 +617,8 @@ void ao_print_devices(struct mpv_global *global, struct mp_log *log,
+ void ao_set_gain(struct ao *ao, float gain)
+ {
+     atomic_store(&ao->gain, gain);
++    if (ao->driver->set_gain)
++        ao->driver->set_gain(ao, gain);
+ }
+ 
+ #define MUL_GAIN_i(d, num_samples, gain, low, center, high)                     \
+diff --git a/audio/out/ao_spatial.h b/audio/out/ao_spatial.h
+new file mode 100644
+index 0000000..e9d11c0
+--- /dev/null
++++ b/audio/out/ao_spatial.h
+@@ -0,0 +1,28 @@
++// Private interface between ao_spatial and its Swift sink. Not installed.
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++enum {
++    MP_SPATIAL_OK,
++    // The timeline stopped at a gap in the audio; begin another.
++    MP_SPATIAL_DISCONTINUITY,
++    // The stream cannot be rendered; fall back to PCM.
++    MP_SPATIAL_FAILED,
++};
++
++void *mp_spatial_create(int codec, void *synchronizer, size_t buffer_limit);
++void mp_spatial_destroy(void *output);
++void mp_spatial_begin(void *output, int64_t nanoseconds);
++size_t mp_spatial_write(void *output, const void *bytes, size_t size);
++void mp_spatial_end(void *output);
++void mp_spatial_volume(void *output, float volume);
++// Returns MP_SPATIAL_*. Times are nanoseconds on the synchronizer clock, or
++// INT64_MIN before the timeline has reset the renderer: *covered is how far
++// the renderer holds audio, *end how far the enqueued audio reaches.
++// *final: the end of the stream has been enqueued.
++int mp_spatial_poll(void *output, bool *ready, int64_t *covered, int64_t *end,
++                    bool *final);
++// Describes the current failure for the log, or returns NULL. free() it.
++char *mp_spatial_failure(void *output);
+diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
+new file mode 100644
+index 0000000..e889485
+--- /dev/null
++++ b/audio/out/ao_spatial.m
+@@ -0,0 +1,376 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// Converts TrueHD Atmos and DTS:X to APAC with SpatialAudioBridge's
++// passthrough sink and keeps mpv's audio clock on the sink's synchronizer.
++//
++// The clock runs only over audio the renderer already holds: it stops short
++// of the end of that audio and resumes once enough is queued again, so slow
++// conversion holds playback instead of letting the renderer drop late audio.
++//
++// A stream the sink fails on falls back to PCM the way avfoundation's
++// compressed sink does: the format is latched and the output reloaded, the
++// reopen refuses it, and mpv decodes the track instead. A later PCM
++// initialization clears the latch, so the next track or file tries again.
++// The latch belongs to this mpv player and survives AO reconstruction.
++
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "ao.h"
++#include "audio/format.h"
++#include "common/common.h"
++#include "common/global.h"
++#include "common/msg.h"
++#include "internal.h"
++#include "ao_spatial.h"
++
++#import <AVFoundation/AVFoundation.h>
++#import <CoreMedia/CoreMedia.h>
++
++// mpv's ao thread checks the output at least every quarter of the device
++// buffer while it streams, 125 ms here, so stopping with 250 ms of audio left
++// leaves one more check in hand. These are scheduling policies.
++#define STOP_LEAD   INT64_C(250000000)
++#define RESUME_LEAD INT64_C(500000000)
++
++struct priv {
++    void *output;
++    AVSampleBufferRenderSynchronizer *synchronizer;
++    int sstride;
++    // Bytes mpv has written that the sink has not taken yet.
++    uint8_t *staged;
++    size_t staged_size;
++    size_t staged_capacity;
++    // The sink refused bytes at the last offer: the renderer is full, or
++    // conversion is behind.
++    bool full;
++    // The current timeline's start on the synchronizer clock, and the samples
++    // written to it since.
++    int64_t timeline;
++    int64_t written;
++    bool playing;
++    bool paused;
++    bool running;
++    bool started;
++    // mpv has written the last audio; the next write begins another timeline.
++    bool ended;
++    bool end_sent;
++    bool reload_requested;
++};
++
++static int spatial_latch_index(int format)
++{
++    return format == AF_FORMAT_S_DTSHD;
++}
++
++static int64_t ns_from_time(CMTime time)
++{
++    return CMTimeConvertScale(time, 1000000000, kCMTimeRoundingMethod_Default).value;
++}
++
++// Starts a timeline at the clock's current time. Bytes the sink has not taken
++// yet are its first audio.
++static void begin_timeline(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    CMTime now = [p->synchronizer currentTime];
++    [p->synchronizer setRate:0 time:now];
++    p->timeline = ns_from_time(now);
++    p->written = p->staged_size / p->sstride;
++    p->full = false;
++    p->running = false;
++    p->started = false;
++    p->end_sent = false;
++    mp_spatial_begin(p->output, p->timeline);
++}
++
++static void offer_staged(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    if (p->staged_size) {
++        size_t taken = mp_spatial_write(p->output, p->staged, p->staged_size);
++        p->staged_size -= taken;
++        memmove(p->staged, p->staged + taken, p->staged_size);
++    }
++    p->full = p->staged_size > 0;
++    // The renderer holds back the start of a stream, and its encoder the
++    // latest audio, until it has more; at the end it has to let both go.
++    if (p->ended && !p->end_sent && !p->staged_size) {
++        mp_spatial_end(p->output);
++        p->end_sent = true;
++    }
++}
++
++// The synchronizer applies rate changes asynchronously, so every change goes
++// through setRate:time:, in order, and the driver tracks what it asked for.
++static void set_running(struct priv *p, bool running)
++{
++    if (p->running == running)
++        return;
++    [p->synchronizer setRate:running ? 1 : 0 time:kCMTimeInvalid];
++    p->running = running;
++    p->started |= running;
++}
++
++// covered: how far the renderer holds audio, or INT64_MIN if unknown yet.
++// tail: it holds everything up to the end of the stream.
++static void update_clock(struct ao *ao, bool ready, int64_t covered, bool tail,
++                         int64_t now)
++{
++    struct priv *p = ao->priv;
++
++    bool wanted = p->playing && !p->paused && !p->reload_requested;
++    int64_t lead = covered == INT64_MIN ? 0 : covered - now;
++    bool running = p->running;
++    if (running) {
++        // A held tail plays out to its end.
++        if (!wanted || (!tail && lead < STOP_LEAD))
++            running = false;
++    } else if (wanted && lead > 0) {
++        // The first start waits for the renderer's own readiness. A full sink
++        // may mean the renderer holds all it can, so it need not reach the
++        // resume lead; it may also mean conversion is behind, so it still
++        // needs the stop lead, which leaves the next check in hand.
++        running = tail || ((ready || p->started) &&
++                           (lead >= RESUME_LEAD || (p->full && lead >= STOP_LEAD)));
++    }
++    set_running(p, running);
++}
++
++static int init(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    int codec;
++    if (ao->format == AF_FORMAT_S_TRUEHD) {
++        codec = 1;
++    } else if (ao->format == AF_FORMAT_S_DTSHD) {
++        codec = 2;
++    } else {
++        if (!af_fmt_is_spdif(ao->format)) {
++            atomic_store(&ao->global->spatial_format_latch[0], false);
++            atomic_store(&ao->global->spatial_format_latch[1], false);
++        }
++        MP_VERBOSE(ao, "only TrueHD and DTS-HD passthrough are handed to the renderer\n");
++        return -1;
++    }
++    if (atomic_load(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)])) {
++        MP_INFO(ao, "%s failed in the renderer; decoding it instead\n",
++                af_fmt_to_str(ao->format));
++        return -1;
++    }
++
++    // ao->sstride is set only after init().
++    p->sstride = af_fmt_to_bytes(ao->format) * ao->channels.num;
++    p->synchronizer = [[AVSampleBufferRenderSynchronizer alloc] init];
++    // The clock starts only once the renderer holds enough audio anyway.
++    p->synchronizer.delaysRateChangeUntilHasSufficientMediaData = NO;
++    // The sink buffers a second of passthrough ahead of the renderer.
++    p->output = mp_spatial_create(codec, (void *)p->synchronizer,
++                                  (size_t)ao->samplerate * p->sstride);
++    if (!p->output) {
++        MP_VERBOSE(ao, "the renderer refused the stream\n");
++        [p->synchronizer release];
++        p->synchronizer = nil;
++        return -1;
++    }
++
++#if TARGET_OS_IPHONE
++    // As mpv's other Apple outputs do when they open.
++    AVAudioSession *session = AVAudioSession.sharedInstance;
++    [session setCategory:AVAudioSessionCategoryPlayback
++                    mode:AVAudioSessionModeMoviePlayback
++                 options:0
++                   error:nil];
++    if (@available(iOS 15.0, tvOS 15.0, *))
++        [session setSupportsMultichannelContent:YES error:nil];
++    [session setActive:YES error:nil];
++#endif
++
++    // The output is APAC on the synchronizer, not a bitstream a receiver has
++    // to stay locked to. With streamed silence mpv would never pause it, but
++    // write zeros the sink skips while the clock played on.
++    ao->stream_silence = false;
++
++    // What waits here while the sink is full.
++    ao->device_buffer = ao->samplerate / 2;
++    p->staged_capacity = (size_t)ao->device_buffer * p->sstride;
++    p->staged = malloc(p->staged_capacity);
++    if (!p->staged) {
++        mp_spatial_destroy(p->output);
++        p->output = NULL;
++        [p->synchronizer release];
++        p->synchronizer = nil;
++        return -1;
++    }
++
++    mp_spatial_volume(p->output, atomic_load(&ao->gain));
++    begin_timeline(ao);
++    return 0;
++}
++
++static void uninit(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    // Not set when init() failed.
++    if (!p->output)
++        return;
++    [p->synchronizer setRate:0 time:kCMTimeInvalid];
++    mp_spatial_destroy(p->output);
++    [p->synchronizer release];
++    free(p->staged);
++}
++
++static void reset(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    p->staged_size = 0;
++    p->playing = false;
++    p->paused = false;
++    p->ended = false;
++    begin_timeline(ao);
++}
++
++static void start(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    p->playing = true;
++}
++
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++
++    p->paused = paused;
++    // Resuming waits for the next get_state(), which checks the lead.
++    if (paused)
++        set_running(p, false);
++    return true;
++}
++
++static bool audio_write(struct ao *ao, void **data, int samples)
++{
++    struct priv *p = ao->priv;
++
++    // get_state() admits no more until the previous stream has played out.
++    if (p->ended) {
++        MP_VERBOSE(ao, "beginning a new timeline\n");
++        p->ended = false;
++        begin_timeline(ao);
++    }
++    size_t size = (size_t)samples * p->sstride;
++    if (size > p->staged_capacity - p->staged_size)
++        return false;
++    memcpy(p->staged + p->staged_size, data[0], size);
++    p->staged_size += size;
++    p->written += samples;
++    offer_staged(ao);
++    return true;
++}
++
++static void end_of_stream(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    p->ended = true;
++    offer_staged(ao);
++}
++
++// mpv's software volume never reaches a bitstream, so the renderer applies it.
++// mpv calls this whenever it changes, paused or not.
++static void set_gain(struct ao *ao, float gain)
++{
++    struct priv *p = ao->priv;
++
++    // ao_alloc() sets the gain before init() has opened the output.
++    if (!p->output)
++        return;
++    mp_spatial_volume(p->output, gain);
++}
++
++static void get_state(struct ao *ao, struct mp_pcm_state *state)
++{
++    struct priv *p = ao->priv;
++
++    offer_staged(ao);
++    bool ready = false, final = false;
++    int64_t covered = INT64_MIN, end_time = INT64_MIN;
++    int failure = mp_spatial_poll(p->output, &ready, &covered, &end_time, &final);
++    if (failure == MP_SPATIAL_DISCONTINUITY) {
++        // The queued audio is lost; what mpv writes next starts a new timeline.
++        MP_VERBOSE(ao, "gap in the passthrough stream, beginning a new timeline\n");
++        begin_timeline(ao);
++        offer_staged(ao);
++        ready = final = false;
++        covered = end_time = INT64_MIN;
++    } else if (failure == MP_SPATIAL_FAILED && !p->reload_requested) {
++        char *reason = mp_spatial_failure(p->output);
++        MP_WARN(ao, "the renderer failed (%s), falling back to PCM\n",
++                reason ? reason : "unknown error");
++        free(reason);
++        p->reload_requested = true;
++        atomic_store(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)], true);
++        ao_request_reload(ao);
++    }
++
++    int64_t now = ns_from_time([p->synchronizer currentTime]);
++    // A route change can flush part of a finished stream; the tail plays
++    // out only once the renderer holds all of it again.
++    update_clock(ao, ready, covered, final && covered >= end_time, now);
++    now = ns_from_time([p->synchronizer currentTime]);
++
++    bool drained = p->ended && final && end_time <= now;
++    // buffer.c no longer pauses an output it counts as stopped.
++    if (drained)
++        set_running(p, false);
++    // Split so that days of 192 kHz audio stay within int64.
++    int64_t written = p->written / ao->samplerate * INT64_C(1000000000) +
++                      p->written % ao->samplerate * INT64_C(1000000000) / ao->samplerate;
++    int64_t end = MPMAX(p->timeline + written, covered);
++    int64_t queued = drained ? 0 : MPMAX(end - now, 0);
++
++    state->queued_samples = queued * ao->samplerate / INT64_C(1000000000);
++    int period = ao->samplerate / 100;
++    state->free_samples = (p->staged_capacity - p->staged_size) / p->sstride / period * period;
++    // The next file's audio waits until this one has played out.
++    if (p->ended && !drained)
++        state->free_samples = 0;
++    state->delay = queued / 1e9;
++    state->playing = p->playing && !drained;
++}
++
++const struct ao_driver audio_out_spatial = {
++    .description = "TrueHD and DTS-HD passthrough to Apple spatial audio",
++    .name        = "spatial",
++    .init        = init,
++    .uninit      = uninit,
++    .reset       = reset,
++    .start       = start,
++    .set_pause   = set_pause,
++    .write       = audio_write,
++    .get_state   = get_state,
++    .end_of_stream = end_of_stream,
++    .set_gain    = set_gain,
++    .priv_size   = sizeof(struct priv),
++};
+diff --git a/audio/out/ao_spatial.swift b/audio/out/ao_spatial.swift
+new file mode 100644
+index 0000000..a7fd3f1
+--- /dev/null
++++ b/audio/out/ao_spatial.swift
+@@ -0,0 +1,204 @@
++@preconcurrency import AVFoundation // Xcode 26 SDKs omit the synchronizer's Sendable annotation.
++import Synchronization
++
++// Compiled with SpatialAudioBridge's sources into libmpv. The C side owns this
++// object and the synchronizer, and runs the clock; asynchronous work never
++// calls mpv.
++@available(macOS 26, iOS 26, tvOS 26, *)
++private final class SpatialOutput: Sendable {
++    private struct State {
++        var generation = 0
++        // The end of the audio the renderer held at the last poll of its
++        // asynchronous queuedAhead, for the current timeline.
++        var queuedEnd: CMTime?
++        // That poll began after the end of the stream was enqueued.
++        var queuedAfterFinal = false
++        var closed = false
++        var poller: Task<Void, Never>?
++        var activator: AtmosOutputActivator?
++        var resourceDirectory: URL?
++    }
++
++    private let sink: SpatialAudioPassthroughSink
++    private let synchronizer: AVSampleBufferRenderSynchronizer
++    private let state = Mutex(State())
++
++    init(codec: SpatialAudioCodec, synchronizer: AVSampleBufferRenderSynchronizer, bufferLimit: Int) throws {
++        sink = try SpatialAudioPassthroughSink(codec: codec, synchronizer: synchronizer, bufferLimit: bufferLimit)
++        self.synchronizer = synchronizer
++        let poller = Task { [weak self] in
++            while !Task.isCancelled {
++                guard let output = self else { return }
++                await output.pollQueue()
++                try? await Task.sleep(for: .milliseconds(50))
++            }
++        }
++        state.withLock { $0.poller = poller }
++        // The activator follows the synchronizer's rate from whenever it
++        // attaches, so the clock does not wait for the main thread.
++        Task { @MainActor [weak self] in
++            guard let self else { return }
++            // AVPlayer needs a file URL. The build embeds the pinned silent
++            // clip so a static libmpv needs no application resource bundle.
++            var directory: URL?
++            do {
++                guard !self.state.withLock({ $0.closed }) else { return }
++                let root = FileManager.default.temporaryDirectory
++                    .appendingPathComponent("mpv-spatial-\(UUID().uuidString)", isDirectory: true)
++                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false,
++                    attributes: [.posixPermissions: 0o700])
++                directory = root
++                let stream = root.appendingPathComponent("silent-atmos.mp4")
++                try mpSpatialSilentAtmos.write(to: stream, options: .atomic)
++                let activator = AtmosOutputActivator(silentAtmosStream: stream)
++                activator.attach(to: synchronizer)
++                let current = self.state.withLock { state in
++                    guard !state.closed else { return false }
++                    state.activator = activator
++                    state.resourceDirectory = root
++                    return true
++                }
++                if current { directory = nil } else { activator.detach() }
++            } catch {
++                // Audio still plays; only the receiver's Atmos indication is lost.
++                NSLog("[ao_spatial] Cannot attach the Atmos output activator: %@", String(describing: error))
++            }
++            if let directory { try? FileManager.default.removeItem(at: directory) }
++        }
++    }
++
++    private func pollQueue() async {
++        let generation = state.withLock { $0.generation }
++        let final = sink.progress?.isFinal == true
++        // Read first, so the result never overstates the queue.
++        let now = synchronizer.currentTime()
++        let ahead = await sink.queuedAhead
++        state.withLock { state in
++            guard state.generation == generation else { return }
++            state.queuedEnd = now + ahead
++            state.queuedAfterFinal = final
++        }
++    }
++
++    func begin(at time: CMTime) {
++        state.withLock { state in
++            state.generation += 1
++            state.queuedEnd = nil
++            state.queuedAfterFinal = false
++            sink.begin(at: time)
++        }
++    }
++
++    func write(_ bytes: Data) -> Int { sink.write(bytes) }
++    func end() { sink.end() }
++    func setVolume(_ volume: Float) { sink.setVolume(volume) }
++
++    var failure: (any Error)? { sink.failure }
++
++    func poll(ready: inout Bool, covered: inout Int64, end: inout Int64, final: inout Bool) -> Int32 {
++        let (queuedEnd, queuedAfterFinal) = state.withLock { ($0.queuedEnd, $0.queuedAfterFinal) }
++        let failure = sink.failure
++        ready = sink.isReady
++        guard let progress = sink.progress else {
++            covered = .min
++            end = .min
++            final = false
++            return Self.kind(of: failure)
++        }
++        // Progress counts what was enqueued; the queue also misses audio
++        // a route change flushed until the renderer has enqueued it again.
++        // The polled queue lags new audio, which only makes it cautious, so
++        // the end counts only once the queue has been measured after it.
++        final = progress.isFinal && queuedAfterFinal
++        covered = Self.nanoseconds(min(progress.submittedEnd, queuedEnd ?? progress.timelineStart))
++        end = Self.nanoseconds(progress.submittedEnd)
++        return Self.kind(of: failure)
++    }
++
++    func close() {
++        let old = state.withLock { state in
++            defer { state = State(generation: state.generation + 1, closed: true) }
++            return state
++        }
++        old.poller?.cancel()
++        sink.close()
++        Task { @MainActor in
++            old.activator?.detach()
++            if let directory = old.resourceDirectory {
++                try? FileManager.default.removeItem(at: directory)
++            }
++        }
++    }
++
++    private static func kind(of failure: (any Error)?) -> Int32 {
++        guard let failure else { return 0 } // MP_SPATIAL_OK
++        if case .discontinuity? = failure as? SpatialAudioError { return 1 } // MP_SPATIAL_DISCONTINUITY
++        return 2 // MP_SPATIAL_FAILED
++    }
++
++    static func nanoseconds(_ time: CMTime) -> Int64 {
++        CMTimeConvertScale(time, timescale: 1_000_000_000, method: .default).value
++    }
++}
++
++@_cdecl("mp_spatial_create")
++func mpSpatialCreate(_ codec: Int32, _ pointer: UnsafeMutableRawPointer, _ bufferLimit: Int) -> UnsafeMutableRawPointer? {
++    guard #available(macOS 26, iOS 26, tvOS 26, *), let codec = SpatialAudioCodec(rawValue: UInt32(codec)) else { return nil }
++    let synchronizer = Unmanaged<AVSampleBufferRenderSynchronizer>.fromOpaque(pointer).takeUnretainedValue()
++    do {
++        return Unmanaged.passRetained(try SpatialOutput(codec: codec, synchronizer: synchronizer, bufferLimit: bufferLimit)).toOpaque()
++    } catch {
++        NSLog("[ao_spatial] Cannot open output: %@", String(describing: error))
++        return nil
++    }
++}
++
++@_cdecl("mp_spatial_destroy")
++func mpSpatialDestroy(_ pointer: UnsafeMutableRawPointer) {
++    if #available(macOS 26, iOS 26, tvOS 26, *) {
++        Unmanaged<SpatialOutput>.fromOpaque(pointer).takeRetainedValue().close()
++    }
++}
++
++@_cdecl("mp_spatial_begin")
++func mpSpatialBegin(_ pointer: UnsafeMutableRawPointer, _ nanoseconds: Int64) {
++    if #available(macOS 26, iOS 26, tvOS 26, *) {
++        Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().begin(at: CMTime(value: nanoseconds, timescale: 1_000_000_000))
++    }
++}
++
++@_cdecl("mp_spatial_write")
++func mpSpatialWrite(_ pointer: UnsafeMutableRawPointer, _ bytes: UnsafeRawPointer, _ size: Int) -> Int {
++    if #available(macOS 26, iOS 26, tvOS 26, *) {
++        return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().write(Data(bytes: bytes, count: size))
++    }
++    return 0
++}
++
++@_cdecl("mp_spatial_end")
++func mpSpatialEnd(_ pointer: UnsafeMutableRawPointer) {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().end() }
++}
++
++@_cdecl("mp_spatial_volume")
++func mpSpatialVolume(_ pointer: UnsafeMutableRawPointer, _ volume: Float) {
++    if #available(macOS 26, iOS 26, tvOS 26, *) { Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().setVolume(volume) }
++}
++
++@_cdecl("mp_spatial_poll")
++func mpSpatialPoll(_ pointer: UnsafeMutableRawPointer, _ ready: UnsafeMutablePointer<Bool>,
++                   _ covered: UnsafeMutablePointer<Int64>, _ end: UnsafeMutablePointer<Int64>,
++                   _ final: UnsafeMutablePointer<Bool>) -> Int32 {
++    if #available(macOS 26, iOS 26, tvOS 26, *) {
++        return Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue()
++            .poll(ready: &ready.pointee, covered: &covered.pointee, end: &end.pointee, final: &final.pointee)
++    }
++    return 2
++}
++
++@_cdecl("mp_spatial_failure")
++func mpSpatialFailure(_ pointer: UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>? {
++    guard #available(macOS 26, iOS 26, tvOS 26, *),
++          let failure = Unmanaged<SpatialOutput>.fromOpaque(pointer).takeUnretainedValue().failure else { return nil }
++    return strdup(String(describing: failure))
++}
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b524..a7e38f9 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -685,8 +685,11 @@ static bool ao_play_data(struct ao *ao)
+     MP_TRACE(ao, "in=%d space=%d(%d) pl=%d, eof=%d\n",
+              samples, space, state.free_samples, p->playing, got_eof);
+ 
+-    if (got_eof)
++    if (got_eof) {
++        if (ao->driver->end_of_stream)
++            ao->driver->end_of_stream(ao);
+         goto eof;
++    }
+ 
+     return samples > 0 && (samples < space || ao->untimed);
+ 
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa777..7b64ea3 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -173,6 +173,13 @@ struct ao_driver {
+     bool (*write)(struct ao *ao, void **data, int samples);
+     // push based: return mandatory stream information
+     void (*get_state)(struct ao *ao, struct mp_pcm_state *state);
++    // push based, optional: the audio has ended, and nothing more is written
++    // until reset(). For drivers that hold audio back until they get more.
++    void (*end_of_stream)(struct ao *ao);
++
++    // optional: mpv's software volume changed (ao_set_gain()). For drivers
++    // whose output it never reaches, such as a bitstream the host renders.
++    void (*set_gain)(struct ao *ao, float gain);
+ 
+     // Return the list of devices currently available in the system. Use
+     // ao_device_list_add() to add entries. The selected device will be set as
+diff --git a/common/global.h b/common/global.h
+index c05b70e..7a029b0 100644
+--- a/common/global.h
++++ b/common/global.h
+@@ -1,6 +1,8 @@
+ #ifndef MPV_MPV_H
+ #define MPV_MPV_H
+ 
++#include <stdatomic.h>
++
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
+@@ -11,6 +13,9 @@ struct mpv_global {
+     char *configdir;
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
++    // Per-player failure state must survive destruction/recreation of its AO.
++    // Only ao_spatial reads/writes it (on the AO and player threads).
++    atomic_bool spatial_format_latch[2];
+ };
+ 
+ #endif
+diff --git a/meson.build b/meson.build
+index 04ed6b0..5748825 100644
+--- a/meson.build
++++ b/meson.build
+@@ -824,6 +824,14 @@ if features['avfoundation']
+     sources += files('audio/out/ao_avfoundation.m')
+ endif
+ 
++# Built from pinned Rust and Swift sources by mpv-build's Apple driver.
++spatial_audio = dependency('mpv-spatial', required: get_option('spatial-audio'))
++features += {'spatial-audio': avfoundation.found() and spatial_audio.found()}
++if features['spatial-audio']
++    dependencies += spatial_audio
++    sources += files('audio/out/ao_spatial.m')
++endif
++
+ vo_avfoundation_frameworks = ['AVFoundation', 'CoreMedia', 'CoreVideo',
+                              'CoreImage', 'QuartzCore', 'Metal']
+ if cc.has_header('UIKit/UIKit.h')
+diff --git a/meson.options b/meson.options
+index 1ac622a..289c8ea 100644
+--- a/meson.options
++++ b/meson.options
+@@ -126,3 +126,5 @@ option('win32-subsystem', type : 'string', value: 'windows', description : 'Wind
+ option('html-build', type: 'feature', value: 'disabled', description: 'HTML manual generation')
+ option('manpage-build', type: 'feature', value: 'auto', description: 'manpage generation')
+ option('pdf-build', type: 'feature', value: 'disabled', description: 'PDF manual generation')
++
++option('spatial-audio', type: 'feature', value: 'auto', description: 'TrueHD Atmos and DTS:X through SpatialAudioBridge')
+diff --git a/player/main.c b/player/main.c
+index 37eb6b1..51acf4d 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -285,6 +285,8 @@ struct MPContext *mp_create(void)
+     mp_mutex_init(&mpctx->abort_lock);
+ 
+     mpctx->global = talloc_zero(mpctx, struct mpv_global);
++    for (int i = 0; i < 2; i++)
++        atomic_init(&mpctx->global->spatial_format_latch[i], false);
+ 
+     demux_packet_pool_init(mpctx->global);
+     stats_global_init(mpctx->global);

@@ -63,6 +63,15 @@ jobs:
       - name: Test AO probe refusal
         run: ./scripts/test_ao_probe_refusal.sh
 
+      - name: Test spatial audio output
+        run: bash ./scripts/test_ao_spatial.sh
+
+      - name: Test spatial audio bridge
+        run: bash ./scripts/test_spatial_feed.sh
+
+      - name: Test build process output capture
+        run: bash ./scripts/test_build_process.sh
+
       - name: Test AVFoundation timebase servo
         run: ./scripts/test_avf_timebase_servo.sh
 
@@ -276,9 +285,28 @@ jobs:
       # published per-platform zips. No version= argument: the URLs the build
       # script would spell from it are replaced by the manifest's
       # content-addressed ones in the publish job.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+          test -n "$rust_version"
+          rustup toolchain install "$rust_version" --profile minimal
+          # Only the slices with spatial audio build Rust; see spatialTarget().
+          rustup target add --toolchain "$rust_version" \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
+            aarch64-apple-tvos aarch64-apple-tvos-sim
+
       - name: Build GPL version (${{ matrix.name }})
         run: |
           make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
+
+      # Each spatial slice: the prelinked core's exports, a link with libdovi's
+      # Rust runtime force-loaded, and an Objective-C consumer through the
+      # packaged mpv.pc. Slices without spatial audio are skipped.
+      - name: Check spatial slices and combined archive links (${{ matrix.platform_type }})
+        shell: bash
+        run: |
+          mpv_version="$(python3 -c 'import json; print(json.load(open("versions.json"))["components"]["mpv"]["version"])')"
+          bash scripts/test_spatial_archives.sh "dist/libmpv-$mpv_version" "${{ matrix.platform_type }}"
 
       - name: Name per-platform binaries by content (${{ matrix.platform_type }})
         run: |
@@ -331,6 +359,19 @@ jobs:
 
       - name: Verify manifest matches this commit
         run: python3 scripts/keys.py verify --platform-group apple
+
+      # Pinned by release and archive checksum, since it gates publish-assets.
+      - name: Install XcodeGen 2.46.0
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          echo "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  $RUNNER_TEMP/xcodegen.zip" \
+            | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
+        run: bash scripts/test_spatial_swiftpm.sh dist/release
 
       - name: Upload binaries that are not published yet
         if: github.ref == 'refs/heads/main'

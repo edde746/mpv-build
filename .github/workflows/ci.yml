@@ -183,6 +183,31 @@ jobs:
       natives: ${{ needs.android-plan.outputs.natives == 'true' }}
       device-tests: true
 
+  spatial:
+    name: Spatial audio
+    # The harnesses compile Objective-C and Swift against Apple's frameworks.
+    permissions:
+      contents: read
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test spatial audio output
+        run: bash scripts/test_ao_spatial.sh
+
+      - name: Test spatial audio bridge
+        run: bash scripts/test_spatial_feed.sh
+
+      # The Swift side exactly as libmpv's tvOS slice compiles it, against the
+      # pinned SpatialAudioBridge; only the Rust core is left to publish.
+      - name: Compile the spatial bridge for tvOS
+        run: |
+          python3 scripts/patches.py fetch-pinned mpv apple "$RUNNER_TEMP/mpv"
+          python3 scripts/build_spatial.py --bridge-only \
+            --source "$RUNNER_TEMP/spatial-audio-bridge" --output "$RUNNER_TEMP/spatial" \
+            --mpv "$RUNNER_TEMP/mpv" --target arm64-apple-tvos14.0 \
+            --sdk "$(xcrun --sdk appletvos --show-sdk-path)"
+
   build:
     name: Demo apps
     # The demo builds are expensive; keep them on the pushes they always ran
