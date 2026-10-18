@@ -22,3 +22,4 @@
 0135-vo-mediacodec-per-frame-present-trace.patch
 0136-vo-mediacodec-hold-back-a-vsync-sample-off-the-grid.patch
 0137-vo-mediacodec-release-offset-option.patch
+0138-vo-mediacodec-raw-vsync-option.patch

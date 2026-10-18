@@ -1,0 +1,169 @@
+Subject: [PATCH] avcodec/mediacodec: add media3_rate, Media3's rate keys for Matroska
+
+On a MediaTek projector with motion processing on (Plezy #2654), 24 fps
+AV1 in Matroska stutters under mpv and not under ExoPlayer. The two
+configure the decoder differently: mpv passes frame-rate=24 and an
+operating rate of 60 at configure, while Media3 1.11 passes neither for
+a Matroska stream (its extractor declares no frame rate) and sets the
+operating rate to the estimated frame rate once frames are out. If the
+vendor decoder hands the declared rate on to the display's motion
+processing, that difference would matter.
+
+media3_rate (off by default) configures without frame-rate and
+operating-rate, sets the operating rate to frame_rate, rounded (the JNI
+bridge passes it as an integer), through setParameters after the first
+frame, and makes av_mediacodec_set_operating_rate ignore the host's
+rate. The decoder logs each step at info level.
+
+diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
+index 711b816..aaf78aa 100644
+--- a/libavcodec/mediacodec.c
++++ b/libavcodec/mediacodec.c
+@@ -224,6 +224,10 @@ int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
+         return AVERROR(ENOSYS);
+     if (rate <= 0)
+         return AVERROR(EINVAL);
++    if (s->media3_rate) {
++        av_log(avctx, AV_LOG_VERBOSE, "Operating rate %d ignored (media3_rate)\n", rate);
++        return 0;
++    }
+     params = ff_AMediaFormat_new(s->use_ndk_codec);
+     if (!params)
+         return AVERROR(ENOMEM);
+diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
+index e0bfeab..969e65b 100644
+--- a/libavcodec/mediacodec.h
++++ b/libavcodec/mediacodec.h
+@@ -202,7 +202,8 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+  * Vendors use the rate to pick the codec's clock; whether a running
+  * component takes a new value is vendor-defined, and a component that
+  * ignores it reports no error, so the effect is only ever confirmed by
+- * measuring decode time.
++ * measuring decode time. A decoder opened with the media3_rate option
++ * sets its own rate and ignores this call, returning 0.
+  *
+  * @return 0 when the platform accepted the parameter, AVERROR(ENOSYS) when
+  * `avctx` is not an opened MediaCodec decoder or the platform predates
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index ac6d410..1a25ba9 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -108,6 +108,12 @@ typedef struct MediaCodecH264DecContext {
+     MediaCodecStreamColour stream_colour;
+     // Register the frame-rendered listener (on by default).
+     int rendered_feedback;
++    // Media3's rate keys for a container that declares no frame rate
++    // (Matroska): neither frame-rate nor operating-rate at configure, then
++    // the operating rate at the stream's frame rate once a frame is out,
++    // and none of the host's. Off by default.
++    int media3_rate;
++    int media3_rate_pending;
+ } MediaCodecH264DecContext;
+ 
+ // convert: rewrite UNSPEC62 to profile 8.1 and drop UNSPEC63; strip: drop both
+@@ -1120,15 +1126,18 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+         ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
+         ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
+     }
+-    if (s->operating_rate > 0)
++    if (s->operating_rate > 0 && !s->media3_rate)
+         ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
+     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+         // The stream's rate is informational; the operating rate is what
+         // sizes the codec's resources, and a realtime priority is what
+         // some vendors require beside it (a decoder on s5e8835/SA8155P
+         // refuses to configure with a rate and no priority).
+-        if (s->frame_rate > 0)
++        if (s->frame_rate > 0 && !s->media3_rate)
+             ff_AMediaFormat_setFloat(format, "frame-rate", s->frame_rate);
++        if (s->media3_rate)
++            av_log(avctx, AV_LOG_INFO, "Configured without frame-rate and "
++                   "operating-rate (media3_rate)\n");
+         if (s->priority >= 0)
+             ff_AMediaFormat_setInt32(format, "priority", s->priority);
+     }
+@@ -1144,6 +1153,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     s->ctx->use_ndk_codec = s->use_ndk_codec;
+     s->ctx->use_async = s->use_async;
+     s->ctx->rendered_feedback = s->rendered_feedback;
++    s->ctx->media3_rate = s->media3_rate;
++    s->media3_rate_pending = s->media3_rate;
+     s->ctx->profile_override = profile_override;
+     s->ctx->codec_name = codec_name;
+     codec_name = NULL;
+@@ -1336,6 +1347,43 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+     return AVERROR(EAGAIN);
+ }
+ 
++// media3_rate: Media3 declares the operating rate once its frame-rate
++// estimate settles, which for a container without a frame rate is after
++// the codec's first frames. The stream's declared rate stands in for the
++// estimate, rounded: the JNI bridge passes operating-rate as an integer.
++static void apply_media3_rate(AVCodecContext *avctx, MediaCodecH264DecContext *s)
++{
++    const int rate = lrintf(s->frame_rate);
++    FFAMediaFormat *params;
++    int ret = AVERROR(ENOMEM);
++
++    s->media3_rate_pending = 0;
++    if (rate <= 0) {
++        av_log(avctx, AV_LOG_INFO, "No frame rate: operating-rate stays unset "
++               "(media3_rate)\n");
++        return;
++    }
++    params = ff_AMediaFormat_new(s->use_ndk_codec);
++    if (params) {
++        ff_AMediaFormat_setInt32(params, "operating-rate", rate);
++        ret = ff_AMediaCodec_setParameters(s->ctx->codec, params);
++        ff_AMediaFormat_delete(params);
++    }
++    av_log(avctx, ret < 0 ? AV_LOG_WARNING : AV_LOG_INFO,
++           "Operating rate %d after the first frame %s (media3_rate)\n",
++           rate, ret < 0 ? "refused" : "set");
++}
++
++static int mediacodec_receive_frame_cb(AVCodecContext *avctx, AVFrame *frame)
++{
++    MediaCodecH264DecContext *s = avctx->priv_data;
++    int ret = mediacodec_receive_frame(avctx, frame);
++
++    if (ret >= 0 && s->media3_rate_pending)
++        apply_media3_rate(avctx, s);
++    return ret;
++}
++
+ static void mediacodec_decode_flush(AVCodecContext *avctx)
+ {
+     MediaCodecH264DecContext *s = avctx->priv_data;
+@@ -1393,6 +1441,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+             OFFSET(color_keys), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "rendered_feedback", "Register a frame-rendered listener for presentation feedback (av_mediacodec_drain_rendered)",
+             OFFSET(rendered_feedback), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
++    { "media3_rate", "Configure without frame-rate and operating-rate and set the operating rate to frame_rate once a frame is out, as Media3 does for Matroska",
++            OFFSET(media3_rate), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
+                       OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+     { "dv_p7_mode", "Dolby Vision profile 7 handling",
+@@ -1426,7 +1476,7 @@ const FFCodec ff_ ## short_name ## _mediacodec_decoder = {
+     .p.priv_class   = &ff_##short_name##_mediacodec_dec_class,                                 \
+     .priv_data_size = sizeof(MediaCodecH264DecContext),                                        \
+     .init           = mediacodec_decode_init,                                                  \
+-    FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame),                                       \
++    FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame_cb),                                    \
+     .flush          = mediacodec_decode_flush,                                                 \
+     .close          = mediacodec_decode_close,                                                 \
+     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index ac35dfd..4e469de 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -143,6 +143,9 @@ typedef struct MediaCodecDecContext {
+     // option), to compare a decoder's timing without it.
+     bool rendered_feedback;
+     const char *rendered_source;      // "jni", "ndk" or an "off:" reason, never NULL
++    // The media3_rate option: the decoder sets the operating rate itself
++    // and av_mediacodec_set_operating_rate ignores the host's.
++    bool media3_rate;
+     AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
+     atomic_uint rendered_head;        // consumer
+     atomic_uint rendered_tail;        // producer

@@ -31,7 +31,7 @@ typedef struct window { int refs; bool entered, release; } ANativeWindow;
 struct mediacodec_geometry { int width; };
 struct mediacodec_opts {
     char *video_rect; int osd_vsync_delay; int64_t osd_surface; bool present_trace;
-    int release_offset;
+    int release_offset; bool raw_vsync;
 };
 struct m_config_cache { struct mediacodec_opts *opts; bool dirty; };
 struct mp_osd_res { int w, h; };
@@ -67,6 +67,7 @@ struct priv {
     int osd_vsync_delay;
     bool present_trace;
     int release_offset;
+    bool raw_vsync;
     struct osd_plane_stats plane;
     double osd_pts;
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;

@@ -685,6 +685,7 @@ struct priv {
     bool present_trace;
     int64_t trace_vsync;
     int release_offset;
+    bool raw_vsync;
     int64_t prepared_seen_ns, cur_seen_ns;
     int64_t cur_slot_free_ns, cur_queued_ns, cur_woke_ns;
 };
@@ -1520,6 +1521,64 @@ static void test_releases_keep_their_grid_through_an_excursion(void)
     }
 }
 
+static void test_raw_vsync_follows_every_sample_and_spacing(void)
+{
+    // --vo-mediacodec-raw-vsync, Media3's grid. The excursion above reaches
+    // every release of its resample, and the timelines' spacing is the
+    // period even within 2% of the mode's.
+    const int64_t period = 16666667, step = period * 42 / 100;
+    struct priv p = {.vsync_attached = true, .osd_threads_created = true,
+                     .release_offset = DEFAULT_OFFSET, .raw_vsync = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, period, 0};
+    rendered_source = "ndk";
+    rendered_scripted = rendered_drains = 0;
+    const int64_t duration = llround(1e9 / 24);
+    for (int i = 0; i < 52; i++) {
+        AVMediaCodecBuffer buffer = {.pts = llround(i * duration / 1e3)};
+        struct mp_image image = {.pts = i * duration / 1e9, .planes[3] = &buffer,
+                                 .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 1 + i,
+            .pts = EPOCH + 1000 * MS + i * duration, .duration = duration};
+        in.frame_queued = &frame;
+        if (!i)
+            clock_ns = frame.pts - 200 * MS;
+        CHECK_EQ(present_queued(&vo), false, "the frame waits for its window");
+        CHECK_EQ(p.queue_period, period, "without timelines the mode's period stands");
+        clock_ns = in.wakeup_pts;
+        if (i % 13 == 0) {
+            p.vsync_sample = EPOCH + ((clock_ns - EPOCH) / period) * period;
+            if (i == 26)
+                p.vsync_sample += step;
+        }
+        CHECK_EQ(present_queued(&vo), true, "the frame is released");
+        CHECK_EQ(buffer.timestamp != 0, true, "the release is timed");
+        CHECK_EQ((published.vsync - EPOCH) % period, i >= 26 && i < 39 ? step : 0,
+                 "every release targets a vsync of the newest sample");
+    }
+
+    const int64_t spacing = 16820000; // 0.9% off the mode's period
+    vsync_sampler.vsync_period = period;
+    vsync_sampler.vsync_spacing = spacing;
+    for (int raw = 0; raw < 2; raw++) {
+        p.raw_vsync = raw;
+        const int i = 52 + raw;
+        AVMediaCodecBuffer next = {.pts = llround(i * duration / 1e3)};
+        struct mp_image image = {.pts = i * duration / 1e9, .planes[3] = &next,
+                                 .refs = 1};
+        struct vo_frame frame = {.current = &image, .frame_id = 1 + i,
+            .pts = EPOCH + 1000 * MS + i * duration, .duration = duration};
+        in.frame_queued = &frame;
+        if (!present_queued(&vo)) {
+            clock_ns = in.wakeup_pts;
+            CHECK_EQ(present_queued(&vo), true, "the frame is released");
+        }
+        CHECK_EQ(p.queue_period, raw ? spacing : period,
+                 "the spacing is the period only with raw vsync");
+    }
+    vsync_sampler.vsync_period = vsync_sampler.vsync_spacing = 0;
+}
+
 static void test_drop_pause_redraw_resume(void)
 {
     const int64_t period = 40 * MS, base = EPOCH + 1000 * MS;
@@ -1775,6 +1834,7 @@ int main(void)
     test_choreographer_grid_restarts();
     test_releases_follow_an_off_mode_choreographer();
     test_releases_keep_their_grid_through_an_excursion();
+    test_raw_vsync_follows_every_sample_and_spacing();
     test_drop_pause_redraw_resume();
     test_clock_domain_drift();
     test_speed_change_admission();
@@ -1787,8 +1847,8 @@ int main(void)
     test_present_trace_lines();
     puts("PASS: MediaCodec cadence, production admission/draw/flip, the codec "
          "window across clock drift and speed changes, refresh transitions, "
-         "dropped still redraw/resume, Choreographer grid excursions, the "
-         "release offset, sparse statistics and video-plane presentation "
-         "feedback with its per-frame trace");
+         "dropped still redraw/resume, Choreographer grid excursions and raw "
+         "vsync, the release offset, sparse statistics and video-plane "
+         "presentation feedback with its per-frame trace");
     return 0;
 }

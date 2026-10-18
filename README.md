@@ -211,15 +211,17 @@ samples that step off the grid for one resample (a MediaTek projector's, 0.4
 to 0.5 of a vsync every few seconds) never move a release, while a step a
 later resample confirms is followed one resample late and a steady drift off
 the snap period (a Pixel 7's 11.057 ms panel under its 11.111 ms mode) is
-followed every resample; `--vo-mediacodec-release-offset` moves only the
-timestamp within the period before the chosen vsync, so the vsync, the OSD
-plane's vsync and the codec's 50 ms of notice before the timestamp all hold
-at every offset; the sparse statistics cadence (a line when a failure counter
-moves, on the first tick, and as a 60 s heartbeat otherwise), and the
-video-plane presentation feedback: a release records the vsync it aimed at,
-the codec's rendered report is matched back by presentation time and bucketed
-by vsync error, and a reset forgets intents but keeps the counters. Pass an
-already-patched source directory as the first argument to run offline.
+followed every resample, while `--vo-mediacodec-raw-vsync` takes every sample
+and the timelines' spacing as they come, as Media3 does;
+`--vo-mediacodec-release-offset` moves only the timestamp within the period
+before the chosen vsync, so the vsync, the OSD plane's vsync and the codec's
+50 ms of notice before the timestamp all hold at every offset; the sparse
+statistics cadence (a line when a failure counter moves, on the first tick,
+and as a 60 s heartbeat otherwise), and the video-plane presentation
+feedback: a release records the vsync it aimed at, the codec's rendered
+report is matched back by presentation time and bucketed by vsync error, and
+a reset forgets intents but keeps the counters. Pass an already-patched
+source directory as the first argument to run offline.
 
 Run the vsync sampler regression with `bash scripts/test_mediacodec_vsync.sh`.
 It applies the full Android series and extracts vo_mediacodec's
@@ -381,6 +383,17 @@ intended vsync matched to the codec's report, the vsync histogram and the
 `video-present` line, which names its source and on an `off:*` source
 records no intents and keeps only the submission-side `late`/`unsnapped`
 counters live - is covered by `test_mediacodec_timing.sh`. Pass an
+already-patched source directory as the first argument to run offline.
+
+Run the MediaCodec `media3_rate` regression with
+`bash scripts/test_mediacodec_rate.sh`. It applies the Android series to the
+pinned ffmpeg and exercises the production path: with the option on, the
+decoder sets the operating rate to the stream's frame rate, rounded, once,
+after its first frame, a refused rate or a missing frame rate ends the
+attempt without costing the frame, and the host's
+`av_mediacodec_set_operating_rate` never reaches the codec; without it the
+host's rate does and frames set nothing. The keys the option leaves out of
+the configure format are logged by the decoder, not covered here. Pass an
 already-patched source directory as the first argument to run offline.
 
 Run the pre-decode frame shedding regression with
