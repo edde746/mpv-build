@@ -277,14 +277,35 @@ int main(void)
         state_of(ao);
         CHECK(rate_of(ao) == 1 && s->begins == begins, "it resumes with the lead, without a new timeline");
 
-        // A renderer that takes no more holds all it can: resume without the lead.
+        // A full sink means the renderer holds all it can, or conversion is
+        // behind; the driver cannot tell which. Either way the clock never
+        // runs past the converted audio. State reads come every 125 ms, as
+        // mpv's ao thread makes them while it streams.
         s->covered = now_of(ao) + 100 * MS;
         state_of(ao);
         CHECK(rate_of(ao) == 0, "held");
         s->space = 0;
         write_burst(ao, 4);
+        int changes = 0;
+        bool overran = false;
+        for (int n = 0; n < 6; n++) {
+            float before = rate_of(ao);
+            state_of(ao);
+            changes += rate_of(ao) != before;
+            overran |= now_of(ao) > s->covered;
+            usleep(125 * 1000);
+        }
+        CHECK(changes == 0 && !overran && rate_of(ao) == 0,
+              "a full sink below the stop lead keeps the clock held (%d rate changes)", changes);
+        s->covered = now_of(ao) + 300 * MS;
         state_of(ao);
-        CHECK(rate_of(ao) == 1, "a full sink resumes the clock below the lead");
+        CHECK(rate_of(ao) == 1, "a full sink resumes the clock with the stop lead");
+        for (int n = 0; n < 4; n++) {
+            usleep(125 * 1000);
+            state_of(ao);
+            overran |= now_of(ao) > s->covered;
+        }
+        CHECK(!overran && rate_of(ao) == 0, "and holds it again before the converted audio runs out");
         s->space = SIZE_MAX;
         s->covered = now_of(ao) + 2000 * MS;
         state_of(ao);
@@ -358,6 +379,7 @@ int main(void)
         usleep(130 * 1000);
         st = state_of(ao);
         CHECK(!st.playing && st.delay == 0 && st.free_samples > 0, "a drained stream releases the next file");
+        CHECK(rate_of(ao) == 0, "a drained stream stops the clock");
         begins = s->begins;
         write_burst(ao, 7);
         CHECK(s->begins == begins + 1 && !p->ended && p->playing && rate_of(ao) == 0,

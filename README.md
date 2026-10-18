@@ -513,9 +513,11 @@ sink's progress (how far enqueued audio reaches, and whether the end of the
 stream is enqueued) and the renderer's queue, which also misses audio a route
 change flushed until it is enqueued again. The clock starts once the sink is
 ready, stops with 250 ms of that audio left, and resumes with 500 ms queued, or
-when the renderer takes no more. A slow conversion therefore holds playback
+with 250 ms when the sink takes no more, which may mean either a full renderer
+or a conversion that is behind. A slow conversion therefore holds playback
 instead of letting the renderer drop late audio; a finished stream plays out to
-its end once the renderer holds all of it, and drains when the clock passes it. mpv's ao thread checks the output every 125 ms while it streams. These
+its end once the renderer holds all of it, and drains, stopping the clock, when
+the clock passes it. mpv's ao thread checks the output every 125 ms while it streams. These
 are scheduling policies, not timing or queue-capacity guarantees.
 
 What the sink cannot take yet, about half a second, waits in the output and
@@ -542,8 +544,8 @@ one object. Following LibTrueHD's packaging approach, only `sab_*` and a weak
 `rust_eh_personality` remain global. This avoids collisions with libdovi's Rust
 runtime while preserving decoder panic handling. The build checks the exported
 symbols and weak personality for every supported slice.
-After a full platform build, `bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`
-checks the installed slices and links their sink with force-loaded libdovi,
+After each Apple platform build, the publish workflow runs
+`bash scripts/test_spatial_archives.sh <patched-mpv> <platform>`, which checks the installed slices and links their sink with force-loaded libdovi,
 without media. It also links an Objective-C-only Clang consumer using the
 packaged `mpv.pc`, including a toolchain path containing spaces. The prelink
 log records the Mach-O platform and minimum OS.

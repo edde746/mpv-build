@@ -76,10 +76,10 @@ index 0000000..e9d11c0
 +char *mp_spatial_failure(void *output);
 diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
 new file mode 100644
-index 0000000..eea43b1
+index 0000000..e889485
 --- /dev/null
 +++ b/audio/out/ao_spatial.m
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,376 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -139,7 +139,8 @@ index 0000000..eea43b1
 +    uint8_t *staged;
 +    size_t staged_size;
 +    size_t staged_capacity;
-+    // The sink refused bytes at the last offer: the renderer is full.
++    // The sink refused bytes at the last offer: the renderer is full, or
++    // conversion is behind.
 +    bool full;
 +    // The current timeline's start on the synchronizer clock, and the samples
 +    // written to it since.
@@ -226,9 +227,12 @@ index 0000000..eea43b1
 +        if (!wanted || (!tail && lead < STOP_LEAD))
 +            running = false;
 +    } else if (wanted && lead > 0) {
-+        // The first start waits for the renderer's own readiness. A renderer
-+        // that takes no more holds all it can, so it need not reach the lead.
-+        running = tail || ((ready || p->started) && (lead >= RESUME_LEAD || p->full));
++        // The first start waits for the renderer's own readiness. A full sink
++        // may mean the renderer holds all it can, so it need not reach the
++        // resume lead; it may also mean conversion is behind, so it still
++        // needs the stop lead, which leaves the next check in hand.
++        running = tail || ((ready || p->started) &&
++                           (lead >= RESUME_LEAD || (p->full && lead >= STOP_LEAD)));
 +    }
 +    set_running(p, running);
 +}
@@ -419,6 +423,9 @@ index 0000000..eea43b1
 +    now = ns_from_time([p->synchronizer currentTime]);
 +
 +    bool drained = p->ended && final && end_time <= now;
++    // buffer.c no longer pauses an output it counts as stopped.
++    if (drained)
++        set_running(p, false);
 +    // Split so that days of 192 kHz audio stay within int64.
 +    int64_t written = p->written / ao->samplerate * INT64_C(1000000000) +
 +                      p->written % ao->samplerate * INT64_C(1000000000) / ao->samplerate;
