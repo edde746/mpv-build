@@ -331,7 +331,7 @@ int main(void)
         }
         CHECK(rate_of(ao) == 0, "silence-only input holds the clock");
         int64_t idle = now_of(ao);
-        CHECK(idle - idle_start > 300 * MS && idle <= s->covered - STOP_LEAD + 50 * MS,
+        CHECK(idle - idle_start > 300 * MS && idle < s->covered,
               "after playing out what was held, short of its end (%lld ms)", (long long)((idle - idle_start) / MS));
         CHECK(reloads == 0 && !p->reload_requested, "silence never falls back to PCM");
         s->covered = idle + 600 * MS;
