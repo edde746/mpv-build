@@ -299,6 +299,15 @@ jobs:
         run: |
           make build use-prebuilt libs=${{ needs.plan.outputs.stale_apple }} platform=${{ matrix.platforms }}
 
+      # Each spatial slice: the prelinked core's exports, a link with libdovi's
+      # Rust runtime force-loaded, and an Objective-C consumer through the
+      # packaged mpv.pc. Slices without spatial audio are skipped.
+      - name: Check spatial slices and combined archive links (${{ matrix.platform_type }})
+        shell: bash
+        run: |
+          mpv_version="$(python3 -c 'import json; print(json.load(open("versions.json"))["components"]["mpv"]["version"])')"
+          bash scripts/test_spatial_archives.sh "dist/libmpv-$mpv_version" "${{ matrix.platform_type }}"
+
       - name: Name per-platform binaries by content (${{ matrix.platform_type }})
         run: |
           python3 scripts/keys.py record-platform \
