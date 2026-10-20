@@ -1,11 +1,11 @@
 Subject: [PATCH] vo_mediacodec: hold back a vsync sample that steps off the grid
 
 On a MediaTek projector (Plezy #2654), 24 fps on a 60 Hz mode stutters.
-The per-frame present trace shows the VO moving its vsync grid by 0.4 to
-0.5 of a vsync for exactly one 500 ms Choreographer resample, then back:
-eight times in a 51 s run, mostly 128 frames apart. For that resample
-every frame aimed at the other side of its vsync, and the display's holds
-went from 2.41/2.59 vsyncs to 3.41/1.59.
+A per-frame trace of the releases shows the VO moving its vsync grid by
+0.4 to 0.5 of a vsync for exactly one 500 ms Choreographer resample, then
+back: eight times in a 51 s run, mostly 128 frames apart. For that
+resample every frame aimed at the other side of its vsync, and the
+display's holds went from 2.41/2.59 vsyncs to 3.41/1.59.
 
 A sample now moves the grid only when it lands within a quarter vsync of
 it. A farther one is held back, and releases keep the grid's vsync
@@ -23,10 +23,10 @@ switch between the mode's period and the timelines' spacing, or a gap of
 more than a second starts the grid over.
 
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 2a214ff..165e9d0 100644
+index f8a4b40..ab98fb6 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -220,6 +220,120 @@ static int64_t mediacodec_grid_period(int64_t spacing_ns, int64_t nominal_ns)
+@@ -219,6 +219,120 @@ static int64_t mediacodec_grid_period(int64_t spacing_ns, int64_t nominal_ns)
      return diff * 50 <= nominal_ns || diff * 4 > nominal_ns ? nominal_ns : measured;
  }
  
@@ -147,7 +147,7 @@ index 2a214ff..165e9d0 100644
  // Release timestamp, on now_ns's clock, for a frame due at raw_target_ns;
  // 0 releases untimed, i.e. at the next vsync. sample_ns is a vsync timestamp
  // on that clock, or 0 when none is fresh; period_ns is the display period, or
-@@ -804,6 +918,7 @@ struct priv {
+@@ -764,6 +878,7 @@ struct priv {
      int64_t queue_period; // the grid releases snap with
      int64_t queue_mode;   // the display mode's period it was taken under
      int64_t queue_period_changed; // when queue_mode last changed
@@ -155,7 +155,7 @@ index 2a214ff..165e9d0 100644
      int64_t queue_offset;
      struct m_config_cache *opts_cache;
  
-@@ -2876,6 +2991,17 @@ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
+@@ -2835,6 +2950,17 @@ static bool vsync_sample_is_fresh(struct priv *p, int64_t sample,
             sample <= mono_now + p->queue_period;
  }
  
@@ -173,7 +173,7 @@ index 2a214ff..165e9d0 100644
  // The display mode's period: the Choreographer's where it reports one; else
  // the core's display_fps (the embedder's --display-fps-override, or what
  // VOCTRL_GET_DISPLAY_FPS returned) as a plausibility-bounded interval.
-@@ -2906,8 +3032,10 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
+@@ -2865,8 +2991,10 @@ static void update_queue_timing(struct vo *vo, double frame_duration)
      bool was_timelines = !mode_changed && p->queue_period != nominal;
      if (mode_changed) {
          // The media cadence anchor is period-independent; only the vsync
@@ -185,7 +185,7 @@ index 2a214ff..165e9d0 100644
          p->queue_period_changed = monotonic_now_ns();
          p->queue_mode = nominal;
          request_vsync_sample(vo);
-@@ -2952,9 +3080,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
+@@ -2911,9 +3039,7 @@ static struct release_target get_release_target(struct vo *vo, int64_t pts)
  
      int64_t mono_now = monotonic_now_ns();
      int64_t raw_target = mp_time_to_monotonic_ns(pts);
@@ -196,7 +196,7 @@ index 2a214ff..165e9d0 100644
  
      result.timestamp = mediacodec_timing_release(
          &p->timing, raw_target, mono_now, p->cur_frame_id, p->cur_duration,
-@@ -3051,9 +3177,7 @@ static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
+@@ -3009,9 +3135,7 @@ static int64_t submit_deadline(struct vo *vo, struct vo_frame *frame)
      if (mono_now <= 0)
          return raw_deadline;
  

@@ -19,8 +19,5 @@
 0131-player-hand-vo-mediacodec-a-frame-without-waiting-for-the-next.patch
 0132-player-hold-the-video-chain-for-the-embedders-vo-switch.patch
 0133-ao-audiotrack-normalize-loudness-with-the-platform-effect.patch
-0135-vo-mediacodec-per-frame-present-trace.patch
 0136-vo-mediacodec-hold-back-a-vsync-sample-off-the-grid.patch
-0137-vo-mediacodec-release-offset-option.patch
-0138-vo-mediacodec-raw-vsync-option.patch
 0139-player-release-vo-mediacodec-frame-with-the-video-chain.patch

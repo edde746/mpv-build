@@ -20,5 +20,4 @@
 0026-mediacodec-recover-presentation-order.patch
 0028-mediacodec-output-buffer-timing.patch
 0032-mediacodec-keep-codec-errors-across-a-flush.patch
-0037-mediacodec-media3-configuration-keys-and-listener-switch.patch
 0038-mediacodec-media3-rate-switch.patch

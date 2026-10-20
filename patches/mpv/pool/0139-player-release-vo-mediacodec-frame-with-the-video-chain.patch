@@ -107,10 +107,10 @@ index 916a23c..11f2fc7 100644
  void vo_set_paused(struct vo *vo, bool paused);
  int64_t vo_get_drop_count(struct vo *vo);
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
-index 9ba2691..235c2ff 100644
+index ab98fb6..eaca622 100644
 --- a/video/out/vo_mediacodec.c
 +++ b/video/out/vo_mediacodec.c
-@@ -3681,7 +3681,16 @@ const struct vo_driver video_out_mediacodec = {
+@@ -3538,7 +3538,16 @@ const struct vo_driver video_out_mediacodec = {
      // query_format takes MediaCodec buffers only. A stream decoded any other
      // way is the embedder's cue to switch to a GL VO, so CLIENT_FALLBACK
      // holds the chain for that switch instead of dropping the video track.
