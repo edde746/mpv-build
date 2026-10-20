@@ -4,30 +4,30 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
       "libraries": {
         "libmpv-android": {
-          "key": "f16b821414ff",
+          "key": "549ef9718921",
           "prebuilt": {
             "arm64-v8a": {
-              "asset": "libmpv-android-f16b821414ff-arm64-v8a.tar.gz",
-              "checksum": "0a5ff83ded619bb25e6ce8395ee5c05e5d93f9c5d72cdfbd75488f425410d224"
+              "asset": "libmpv-android-549ef9718921-arm64-v8a.tar.gz",
+              "checksum": "1393eee09e2245d6833503a7dcad4e540a7c73066c84c87643f877c3fb7001ab"
             },
             "armeabi-v7a": {
-              "asset": "libmpv-android-f16b821414ff-armeabi-v7a.tar.gz",
-              "checksum": "c5d94272d0092246350a9143e4730d33101ce70e2fb1d94f4b568caf47df4730"
+              "asset": "libmpv-android-549ef9718921-armeabi-v7a.tar.gz",
+              "checksum": "f479b66338358642cea6c8def44da0848c7420766dcb128b995283d7c363ae5f"
             },
             "x86": {
-              "asset": "libmpv-android-f16b821414ff-x86.tar.gz",
-              "checksum": "baa45836de0af485e4bdf5d73bc22a2439308c38852a6441e408745b5b49d3f5"
+              "asset": "libmpv-android-549ef9718921-x86.tar.gz",
+              "checksum": "de6180ab673ff5cebc2d20757c46c04829de0966e4c109e1afc07b041db5ee88"
             },
             "x86_64": {
-              "asset": "libmpv-android-f16b821414ff-x86_64.tar.gz",
-              "checksum": "8eb2132cfdf16544497b0ef335b6a42f044805f910c4d4905907302580015a56"
+              "asset": "libmpv-android-549ef9718921-x86_64.tar.gz",
+              "checksum": "68123bbefdf132c971010270b684a395f196a947ea03931e84a27f790c2c7842"
             }
           }
         },
         "mpv-android": {
-          "asset": "mpv-android-8d21093dc0c0.aar",
-          "checksum": "2848413dd41b34a2d6a6ecc11ca727603ac4038b40eb733e5199397a8f612666",
-          "key": "8d21093dc0c0"
+          "asset": "mpv-android-f7a3c9777708.aar",
+          "checksum": "3cfe25e8751c515fe52ae069832a534a6e0433ff55b42bf65908766d190cc04c",
+          "key": "f7a3c9777708"
         }
       }
     },
