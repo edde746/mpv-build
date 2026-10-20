@@ -16,6 +16,12 @@ set -euo pipefail
 # against is the floor every user inherits. CI wraps this script via
 # platforms/linux/container-build.sh; local runs may do the same when docker
 # is available.
+#
+# SRCDIR, when set, names a directory that must not exist yet; the sources are
+# fetched and built there instead of in a mktemp directory. Compilers record
+# the source path (__FILE__, debug info), so a random one makes every rebuild
+# of a published key differ from the asset already published under it;
+# container-build.sh sets a fixed one.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -199,7 +205,14 @@ main() {
   prefix="$(realpath "$prefix")"
   export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib/$(uname -m)-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-  srcdir="$(mktemp -d)"
+  if [ -n "${SRCDIR:-}" ]; then
+    # A plain mkdir refuses an existing directory, so cleanup below can only
+    # ever remove what this run created.
+    mkdir -- "$SRCDIR"
+    srcdir="$SRCDIR"
+  else
+    srcdir="$(mktemp -d)"
+  fi
   cleanup_srcdir="$srcdir"
   trap cleanup EXIT
   cd "$srcdir"

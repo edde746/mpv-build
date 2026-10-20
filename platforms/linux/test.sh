@@ -412,4 +412,23 @@ assert_argument "$libass_configure" "--disable-shared" "libass's configure"
 assert_argument "$libass_configure" "--with-pic" "libass's configure"
 assert_argument "$libass_configure" "--enable-fontconfig" "libass's configure"
 
+# SRCDIR fixes the source path the libraries record, so a rebuild reproduces
+# the published bytes. The build must use exactly that directory and remove
+# it afterwards, and must refuse one that already exists: its cleanup would
+# otherwise delete a directory this run did not create.
+fixed_srcdir="$temporary/fixed-src"
+if ! SRCDIR="$fixed_srcdir" run_build "$manifest" >"$temporary/srcdir.log" 2>&1; then
+  cat "$temporary/srcdir.log" >&2
+  fail "the stubbed build plan did not run with SRCDIR set"
+fi
+grep -Fxq "==> Sources in $fixed_srcdir" "$temporary/srcdir.log" ||
+  fail "the build did not fetch its sources into SRCDIR"
+assert_absent "$fixed_srcdir"
+mkdir "$fixed_srcdir"
+touch "$fixed_srcdir/keep"
+if SRCDIR="$fixed_srcdir" run_build "$manifest" >"$temporary/srcdir-taken.log" 2>&1; then
+  fail "an existing SRCDIR was accepted"
+fi
+[ -f "$fixed_srcdir/keep" ] || fail "a refused SRCDIR lost its contents"
+
 echo "Linux native acquisition and build plan verification passed"

@@ -57,13 +57,15 @@ libasound2-dev libpulse-dev libpipewire-0.3-dev
 liblua5.2-dev libmujs-dev liblcms2-dev
 '
 
+# The container starts empty, so a fixed source path is always free; the
+# libraries record it, and a mktemp one made every rebuild's bytes differ.
 command='
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -o Acquire::Retries=3 -qq
 # shellcheck disable=SC2086
 apt-get install -y -o Acquire::Retries=3 -qq --no-install-recommends '"$(echo $DEPS)"'
-bash platforms/linux/build.sh
+SRCDIR=/tmp/libmpv-src bash platforms/linux/build.sh
 if [ -n "${KEY:-}" ]; then
   bash platforms/linux/package.sh
 fi
