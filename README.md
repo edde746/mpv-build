@@ -508,6 +508,16 @@ that frame once, wakes the ao filter, and leaves the output chain asked for data
 so the next AO opens; a reload with nothing held keeps the chain asked and drops
 nothing. Pass an already-patched source directory to run offline.
 
+Run the held-frame release regression with `bash scripts/test_player_release_held_frame.sh`.
+It compiles `uninit_video_chain()` (`player/video.c`) and `vo_release_frames()`
+(`video/out/vo.c`, patch 0139) against a decoder whose frames share its
+reference count, as FFmpeg's MediaCodec context does: ending a file under
+`vo_mediacodec` leaves no frame holding the decoder, which is deleted on the VO
+thread with the VO lock released, so a single-instance decoder (MediaTek
+MT5895) is free when the next file opens one; a GL VO keeps its last frame for
+redraws; no video chain touches nothing. Pass an already-patched source
+directory to run offline.
+
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
 (macOS). It drives the driver with a real synchronizer and a fake sink:
 admission and the bytes waiting for a full sink, the clock's start, holds and

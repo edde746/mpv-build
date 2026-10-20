@@ -23,3 +23,4 @@
 0136-vo-mediacodec-hold-back-a-vsync-sample-off-the-grid.patch
 0137-vo-mediacodec-release-offset-option.patch
 0138-vo-mediacodec-raw-vsync-option.patch
+0139-player-release-vo-mediacodec-frame-with-the-video-chain.patch

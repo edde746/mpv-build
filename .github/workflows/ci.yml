@@ -117,6 +117,7 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_lavc_busy_policy.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_player_queue_frames.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_audio_reload_held_frame.sh', str(dest)], check=True)
+                subprocess.run(['bash', 'scripts/test_player_release_held_frame.sh', str(dest)], check=True)
                 # The oracle decoders build from the ffmpeg/android tree
                 # checked above ('ffmpeg' sorts before 'mpv').
                 subprocess.run(['bash', 'scripts/test_demux_codec_profile.sh', str(dest),
