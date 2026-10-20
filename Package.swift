@@ -201,8 +201,8 @@ let package = Package(
 
         .binaryTarget(
             name: "Libmpv",
-            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-8c738b3886a4.xcframework.zip",
-            checksum: "c25897df86dcca3687f7a584ee8d51bf91be8d9b20015f0fb3a17413dc18da59"
+            url: "https://github.com/edde746/mpv-build/releases/download/binaries-apple/Libmpv-4052d98480f9.xcframework.zip",
+            checksum: "8110b2722e19b2b4c92576dcd33d1e5eafdea29b3c85166f01bc525119255895"
         ),
         //AUTO_GENERATE_TARGETS_END//
     ]
