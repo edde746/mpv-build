@@ -126,6 +126,11 @@ TEXT = [
     ("RFC 2822", rf"(?:{WDAY}), (?P<d>\d\d) (?P<b>{MON}) (?P<y>\d{{4}}) {HMS}"),
 ]
 TEXT = [(name, re.compile(pattern.encode())) for name, pattern in TEXT]
+# A define that names a source's own commit time, with a time of day, so it
+# reads as ISO 8601 but is the same in every rebuild: libopenmpt's
+# MPT_SVNDATE ("2024-12-01T13:10:15.135688Z" for 0.7.12), which libmpv-2.pdb
+# keeps in every libopenmpt object's recorded command line.
+SOURCE_DATE_DEFINE = re.compile(rb'MPT_SVNDATE=[\\"]*$')
 
 
 def text_stamps(data):
@@ -133,6 +138,8 @@ def text_stamps(data):
     for name, pattern in TEXT:
         for match in pattern.finditer(data):
             fields = match.groupdict()
+            if SOURCE_DATE_DEFINE.search(data, max(0, match.start() - 40), match.start()):
+                continue
             month = int(fields["m"]) if fields.get("m") else MONTHS.index(fields["b"].decode()) + 1
             try:
                 day = dt.date(int(fields["y"]), month, int(fields["d"]))
@@ -418,6 +425,7 @@ with tempfile.TemporaryDirectory() as tmp:
         b"\x7fELF\0\0built on: Wed Jan  1 00:00:00 2020 UTC\0OpenSSL 4.0.3 1 Oct 2026\0"
         b"Jan  1 2020 00:00:00\0LIB Build date: %s %s\0Jan  1 2020\x0000:00:00\0"
         b"1.6.227 f50435051b72c168\x002020-01-01 00:00:00\0"
+        b'"-D" "MPT_SVNDATE=\\"2024-12-01T13:10:15.135688Z\\""\0'
     )
     clean = {
         "lib/libprobe.so": fixed,
