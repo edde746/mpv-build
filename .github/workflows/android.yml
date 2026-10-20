@@ -6,7 +6,8 @@ name: Android build
 # release or commits; the callers do that from the workflow artifacts:
 #
 #   android-<abi>  the unkeyed tarball dist/release/libmpv-android-<abi>.tar.gz
-#   android-aar    the unkeyed dist/release/mpv-android.aar
+#   android-aar    the unkeyed dist/release/mpv-android.aar and its debug
+#                  symbols, dist/release/mpv-android-<abi>-symbols.zip per ABI
 #   device-test-android  (device-tests only) the AAR's androidTest APK; named
 #                  off the android-* glob the publish job collects
 on:
@@ -117,19 +118,28 @@ jobs:
           bash platforms/android/lib/build-aar.sh ${TARBALLS:+--tarballs "$TARBALLS"} \
             -- testDebugUnitTest ${DEVICE_TESTS}
 
-      - name: Check the AAR for a build date
-        run: bash scripts/test_build_date.sh dist/release/mpv-android.aar
-
-      - name: List the AAR
+      # The symbols zips are named one by one so a missing ABI fails here,
+      # not at record-packages after the merge.
+      - name: Check the AAR and its symbols for a build date
         run: |
-          ls -l dist/release/mpv-android.aar
-          unzip -l dist/release/mpv-android.aar
+          bash scripts/test_build_date.sh dist/release/mpv-android.aar \
+            dist/release/mpv-android-{arm64-v8a,armeabi-v7a,x86,x86_64}-symbols.zip
 
-      - name: Upload the AAR
+      - name: List the AAR and its symbols
+        run: |
+          ls -l dist/release/mpv-android.aar dist/release/mpv-android-*-symbols.zip
+          unzip -l dist/release/mpv-android.aar
+          for symbols in dist/release/mpv-android-*-symbols.zip; do
+            unzip -l "${symbols}"
+          done
+
+      - name: Upload the AAR and its symbols
         uses: actions/upload-artifact@v4
         with:
           name: android-aar
-          path: ./dist/release/mpv-android.aar
+          path: |
+            ./dist/release/mpv-android.aar
+            ./dist/release/mpv-android-*-symbols.zip
           if-no-files-found: error
 
       - name: Upload the device tests' APK

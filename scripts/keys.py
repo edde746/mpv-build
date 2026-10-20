@@ -140,6 +140,25 @@ after {key}) and records
 
 `stale`, `verify` and `publish-assets` treat it like any other library.
 
+Debug symbols -- either kind of artifact may name a symbols zip pattern:
+
+    "symbolsPattern": "libmpv-<group>-{key}-{variant}-symbols.zip"
+
+which publishes one zip per variant (a package's variants are its inputs'),
+holding the debug files of the binaries that variant ships at the archive
+root (scripts/symbols.py packs and checks them). The pattern carries {key}
+and {variant}, ends in .zip and differs from assetPattern, unkeyed spelling
+included; it is not key input, like assetPattern. The record verbs rename the
+unkeyed `<artifact><pattern after {key}>` with the variant substituted (or
+accept the keyed name) and add
+
+      "symbols": {<variant>: {"asset": <name>, "checksum": <sha256>}}
+
+to the entry; an asset whose symbols zip is missing fails the record. `stale`
+and `verify` demand every variant's symbols, so an entry recorded before its
+artifact named a pattern is stale and the next publish builds and uploads
+them, and `publish-assets` uploads them with the other assets.
+
 Deliberately coarse: the key hashes the group's whole build driver, so editing
 any of its sources invalidates every self-built library in the group.
 Under-invalidation would mean silently shipping stale binaries;
@@ -159,7 +178,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 # scripts/patches.py owns the series format; keys.py reads series through it so
@@ -185,7 +204,8 @@ class Artifact:
     """One artifact of a group.json-defined group.
 
     Either a multi-component build (components and variants, one asset per
-    variant) or a package (inputs and sources, one asset).
+    variant) or a package (inputs and sources, one asset). Either may also
+    publish one debug-symbols zip per variant.
     """
 
     # Canonical versions.json component names compiled into every asset.
@@ -199,6 +219,12 @@ class Artifact:
     inputs: tuple[str, ...] = ()
     # Packages: the files and directories whose bytes key this artifact.
     sources: tuple[Path, ...] = ()
+    # Debug-symbols zip name template ({key} and {variant}); empty when the
+    # artifact publishes no symbols. Not part of the key.
+    symbols_pattern: str = ""
+    # The variants a symbols zip is published for: the artifact's own, or a
+    # package's inputs' (the AAR ships one native tree per tarball ABI).
+    symbols_variants: tuple[str, ...] = ()
 
     @property
     def is_package(self) -> bool:
@@ -302,15 +328,42 @@ def _group_from_json(path: Path) -> Group:
                     f"{path}: artifact {artifact_id!r} assetPattern must contain "
                     "{key} and {variant}"
                 )
-        artifacts[artifact_id] = Artifact(components, variants, pattern, inputs, sources)
+        symbols = spec.get("symbolsPattern") or ""
+        # The unkeyed spellings a build leaves behind (the text after {key}
+        # past the artifact id) must differ too, or record would rename one
+        # file as both assets.
+        unkeyed = pattern.split("{key}", 1)[1] if inputs else "-{variant}" + pattern.rsplit("{variant}", 1)[1]
+        if symbols and (
+            "{key}" not in symbols
+            or "{variant}" not in symbols
+            or not symbols.endswith(".zip")
+            or symbols == pattern
+            or symbols.split("{key}", 1)[1] == unkeyed
+        ):
+            raise SystemExit(
+                f"{path}: artifact {artifact_id!r} symbolsPattern must contain "
+                "{key} and {variant}, end in .zip and differ from its assetPattern, "
+                "unkeyed spelling included"
+            )
+        artifacts[artifact_id] = Artifact(
+            components, variants, pattern, inputs, sources,
+            symbols_pattern=symbols, symbols_variants=variants if symbols else (),
+        )
 
-    for artifact_id, spec in artifacts.items():
+    for artifact_id, spec in list(artifacts.items()):
         for name in spec.inputs:
             if name not in artifacts or artifacts[name].is_package:
                 raise SystemExit(
                     f"{path}: package artifact {artifact_id!r} input {name!r} is not a "
                     "component artifact of this group"
                 )
+        if spec.is_package and spec.symbols_pattern:
+            # A package ships what its inputs built, one tree per input
+            # variant, so its symbols come per input variant too.
+            inherited: list[str] = []
+            for name in spec.inputs:
+                inherited += [variant for variant in artifacts[name].variants if variant not in inherited]
+            artifacts[artifact_id] = replace(spec, symbols_variants=tuple(inherited))
 
     # The group-wide platform tuple is the ordered union of every artifact's
     # variants; per-artifact checks always use the artifact's own tuple.
@@ -668,7 +721,7 @@ def _artifact_entry_problems(entry: dict, key: str, spec: Artifact) -> list[str]
         checksum = entry.get("checksum", "")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"checksum {checksum!r} is not a sha256")
-        return problems
+        return problems + _symbols_problems(entry, key, spec)
 
     prebuilt = entry.get("prebuilt") or {}
     for variant in spec.variants:
@@ -682,6 +735,28 @@ def _artifact_entry_problems(entry: dict, key: str, spec: Artifact) -> list[str]
         checksum = recorded.get("checksum", "")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"{variant}: checksum {checksum!r} is not a sha256")
+    return problems + _symbols_problems(entry, key, spec)
+
+
+def _symbols_problems(entry: dict, key: str, spec: Artifact) -> list[str]:
+    """Why an entry's `symbols` map does not describe `key`'s symbols zips.
+
+    An entry recorded before its artifact published symbols has none, so it
+    is stale and the next publish builds and uploads them.
+    """
+    problems = []
+    symbols = entry.get("symbols") or {}
+    for variant in spec.symbols_variants:
+        recorded = symbols.get(variant)
+        if not isinstance(recorded, dict) or not recorded.get("asset"):
+            problems.append(f"no symbols asset for {variant}")
+            continue
+        asset = recorded["asset"]
+        if asset != spec.symbols_pattern.format(key=key, variant=variant):
+            problems.append(f"symbols {variant} asset {asset!r} does not match the key")
+        checksum = recorded.get("checksum", "")
+        if not CHECKSUM_RE.match(checksum):
+            problems.append(f"symbols {variant}: checksum {checksum!r} is not a sha256")
     return problems
 
 
@@ -733,14 +808,43 @@ def frameworks_in_prebuilt(zip_path: Path) -> list[str]:
     return sorted(names)
 
 
+def _record_symbols(
+    release: Path, artifact_id: str, spec: Artifact, key: str, variants: tuple[str, ...]
+) -> dict[str, dict[str, str]]:
+    """Name the symbols zips of `variants` by content; their manifest entries.
+
+    A build leaves the unkeyed `<artifact><pattern after {key}>` with the
+    variant substituted (mpv-android-arm64-v8a-symbols.zip) or the keyed name.
+    An asset is recorded with its symbols or not at all: a build that produced
+    a binary but not the debug files for it fails here.
+    """
+    entries = {}
+    for variant in variants:
+        target = release / spec.symbols_pattern.format(key=key, variant=variant)
+        unkeyed = release / (
+            artifact_id + spec.symbols_pattern.split("{key}", 1)[1].format(variant=variant)
+        )
+        if unkeyed.is_file():
+            if target.exists():
+                target.unlink()
+            unkeyed.rename(target)
+            print(f"{unkeyed.name} -> {target.name}")
+        if not target.is_file():
+            raise SystemExit(
+                f"{artifact_id}: {variant} was built without its symbols zip {target.name}"
+            )
+        entries[variant] = {"asset": target.name, "checksum": _sha256_file(target)}
+    return entries
+
+
 def _record_variant(args, root: Path, group: Group) -> int:
     """Name one variant's assets by content and record them in the manifest.
 
     Unlike apple there is no merge step and no frameworks, so record-platform
     is also the verb that writes the manifest: the publish job collects every
     variant into one release dir and runs this once per variant. An entry
-    whose key moved is restarted from scratch, so a stale variant can never
-    hide under a fresh key.
+    whose key moved is restarted from scratch, symbols included, so a stale
+    variant can never hide under a fresh key.
     """
     release = root / args.release_dir
     keys = all_keys(root, group)
@@ -775,6 +879,10 @@ def _record_variant(args, root: Path, group: Group) -> int:
             "asset": asset,
             "checksum": _sha256_file(target),
         }
+        if spec.symbols_pattern:
+            entry.setdefault("symbols", {}).update(
+                _record_symbols(release, artifact_id, spec, key, (args.platform,))
+            )
         section["libraries"][artifact_id] = entry
         recorded += 1
         print(f"{artifact_id}: key {key}, {args.platform} -> {asset}")
@@ -815,7 +923,7 @@ def cmd_record_platform(args, root: Path, group: Group) -> int:
 
 
 def cmd_record_packages(args, root: Path, group: Group) -> int:
-    """Name every package artifact's asset by content and record it.
+    """Name every package artifact's asset (and symbols zips) by content and record it.
 
     The build leaves the unkeyed `<artifact><ext>` (or the keyed name) in the
     release dir; a package this run did not build keeps its recorded entry.
@@ -844,11 +952,12 @@ def cmd_record_packages(args, root: Path, group: Group) -> int:
         if not target.is_file():
             print(f"{artifact_id}: not built in this run, keeping the recorded entry")
             continue
-        section["libraries"][artifact_id] = {
-            "key": key,
-            "asset": target.name,
-            "checksum": _sha256_file(target),
-        }
+        entry = {"key": key, "asset": target.name, "checksum": _sha256_file(target)}
+        if spec.symbols_pattern:
+            entry["symbols"] = _record_symbols(
+                release, artifact_id, spec, key, spec.symbols_variants
+            )
+        section["libraries"][artifact_id] = entry
         recorded += 1
         print(f"{artifact_id}: key {key} -> {target.name}")
 
@@ -1044,7 +1153,8 @@ def _wanted_assets(section: dict) -> list[tuple[str, str]]:
 
     Three entry shapes reach here: the apple group records `prebuilt` as a
     platform -> asset-name map, a group.json group records a variant ->
-    {asset, checksum} map, and a package records its one `asset`.
+    {asset, checksum} map, and a package records its one `asset`. Either of
+    the last two may add a variant -> {asset, checksum} `symbols` map.
     """
     wanted = []
     seen = set()
@@ -1056,6 +1166,9 @@ def _wanted_assets(section: dict) -> list[tuple[str, str]]:
         assets += [
             framework["asset"]
             for _, framework in sorted((entry.get("frameworks") or {}).items())
+        ]
+        assets += [
+            symbols["asset"] for _, symbols in sorted((entry.get("symbols") or {}).items())
         ]
         for asset in assets:
             if asset not in seen:

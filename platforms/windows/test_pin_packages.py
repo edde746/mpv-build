@@ -211,11 +211,13 @@ class PinPackagesTest(unittest.TestCase):
                 # same glob; one without a patch step gains none.
                 self.assertEqual("PATCH_COMMAND" in pinned, "PATCH_COMMAND" in upstream)
                 self.assertNotIn("git am", pinned)
-        # The two gates main() applies on top of the rewrite: dropping either
-        # call ships a configure failure (ffmpeg aarch64 cuda) or a silently
-        # disabled feature (vapoursynth).
+        # The gates main() applies on top of the rewrite: dropping one ships a
+        # configure failure (ffmpeg aarch64 cuda), a silently disabled feature
+        # (vapoursynth) or a DLL without its PDB (libmpv-2.pdb capture).
         self.assertNotIn("-Dsubrandr=enabled", self.package_text("mpv"))
         self.assertIn("-Dvapoursynth=disabled", self.package_text("mpv"))
+        self.assertIn(pin_packages.MPV_COPY_DEBUG + pin_packages.MPV_COPY_LIBMPV_PDB,
+                      self.package_text("mpv"))
         self.assertNotIn(pin_packages.FFMPEG_CUDA_ORIGINAL, self.package_text("ffmpeg"))
         self.assertTrue(self.package_text("ffmpeg").startswith(pin_packages.FFMPEG_CUDA_GUARD))
         steps = (self.winbuild / "cmake/custom_steps.cmake").read_text(encoding="utf-8")
@@ -309,6 +311,51 @@ class PinPackagesTest(unittest.TestCase):
         self.assertIn("vapoursynth\n", gated)
         self.assertEqual(len(text.splitlines()) - 2, len(gated.splitlines()))
         self.assertEqual(pin_packages.gate_mpv_options(gated), gated)
+
+    def test_libmpv_pdb_is_captured_into_mpv_debug(self):
+        # lld writes libmpv-2.pdb beside the DLL in mpv's build dir, which
+        # cleanup(mpv copy-package-dir) deletes. copy-binary gains one copy of
+        # it into mpv-debug/, the tree copy-package-dir moves to the build
+        # root's mpv-debug-*/, where package.sh packs it.
+        text = (TESTDATA / "mpv.cmake").read_text(encoding="utf-8")
+        self.assertEqual(text.count(pin_packages.MPV_COPY_DEBUG), 1)
+        self.assertEqual(text.count(pin_packages.MPV_MOVE_DEBUG), 1)
+        self.assertNotIn("libmpv-2.pdb", text)
+        captured = pin_packages.capture_libmpv_pdb(text)
+        self.assertIn(pin_packages.MPV_COPY_DEBUG + pin_packages.MPV_COPY_LIBMPV_PDB, captured)
+        self.assertEqual(len(text.splitlines()) + 1, len(captured.splitlines()))
+        # Inside copy-binary, which runs after the link, so the copy can only
+        # read what the link wrote; the move to the build root comes later.
+        step = captured.index("ExternalProject_Add_Step(mpv copy-binary\n")
+        copy = captured.index(pin_packages.MPV_COPY_LIBMPV_PDB)
+        self.assertLess(step, copy)
+        self.assertLess(copy, captured.index("\n)\n", step))
+        self.assertLess(copy, captured.index(pin_packages.MPV_MOVE_DEBUG))
+        self.assertEqual(pin_packages.capture_libmpv_pdb(captured), captured)
+        # Composes with the option gate the way main() applies both.
+        gated = pin_packages.gate_mpv_options(text)
+        self.assertEqual(pin_packages.capture_libmpv_pdb(gated),
+                         pin_packages.gate_mpv_options(captured))
+
+    def test_libmpv_pdb_capture_fails_on_changed_upstream_shape(self):
+        text = (TESTDATA / "mpv.cmake").read_text(encoding="utf-8")
+        copy, move = pin_packages.MPV_COPY_DEBUG, pin_packages.MPV_MOVE_DEBUG
+        captured = pin_packages.capture_libmpv_pdb(text)
+        upstream_pdb_copy = (
+            "    COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv-2.pdb"
+            " ${CMAKE_CURRENT_BINARY_DIR}/mpv-dev/libmpv-2.pdb\n"
+        )
+        for name, changed in (
+            ("debug copy missing", text.replace(copy, "")),
+            ("debug copy duplicated", text.replace(copy, copy + copy)),
+            ("debug tree not moved", text.replace(move, "")),
+            ("debug tree moved twice", text.replace(move, move + move)),
+            ("upstream copies the PDB itself", text.replace(copy, copy + upstream_pdb_copy)),
+            ("capture duplicated", captured.replace(
+                pin_packages.MPV_COPY_LIBMPV_PDB, pin_packages.MPV_COPY_LIBMPV_PDB * 2)),
+        ):
+            with self.subTest(name), self.assertRaises(SystemExit):
+                pin_packages.capture_libmpv_pdb(changed)
 
     def test_davs2_build_time_is_pinned_after_configure(self):
         # version.sh writes `date` into source/version.h from configure; the

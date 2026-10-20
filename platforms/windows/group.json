@@ -4,7 +4,8 @@
   "driver": [
     "platforms/windows/build.sh",
     "platforms/windows/package.sh",
-    "platforms/windows/pin_packages.py"
+    "platforms/windows/pin_packages.py",
+    "scripts/symbols.py"
   ],
   "artifacts": {
     "libmpv-windows": {
@@ -23,7 +24,8 @@
         "x86_64",
         "aarch64"
       ],
-      "assetPattern": "libmpv-windows-{key}-{variant}.zip"
+      "assetPattern": "libmpv-windows-{key}-{variant}.zip",
+      "symbolsPattern": "libmpv-windows-{key}-{variant}-symbols.zip"
     }
   }
 }

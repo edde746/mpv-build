@@ -38,8 +38,9 @@
     },
     "mpv-android": {
       "inputs": ["libmpv-android"],
-      "sources": ["platforms/android/lib"],
-      "assetPattern": "mpv-android-{key}.aar"
+      "sources": ["platforms/android/lib", "scripts/symbols.py"],
+      "assetPattern": "mpv-android-{key}.aar",
+      "symbolsPattern": "mpv-android-{key}-{variant}-symbols.zip"
     }
   }
 }

@@ -17,8 +17,11 @@ $0 clean
 
 # LUA_T= and LUAC_T= to disable building lua & luac
 # -Dgetlocaledecpoint()=('.') fixes bionic missing decimal_point in localeconv
+# -gline-tables-only: source lines for crash frames in the liblua libmpv.so
+# links, on top of the Makefile's own -O2 (loadarch.sh's crossfile does the same
+# for the meson components)
 make CC="$CC" AR="$AR rc" RANLIB="$RANLIB" \
-	MYCFLAGS="-fPIC -Dgetlocaledecpoint\(\)=\(\'.\'\)" \
+	MYCFLAGS="-fPIC -gline-tables-only -Dgetlocaledecpoint\(\)=\(\'.\'\)" \
 	PLAT=linux LUA_T= LUAC_T= -j$cores
 
 # TO_BIN=/dev/null disables installing lua & luac

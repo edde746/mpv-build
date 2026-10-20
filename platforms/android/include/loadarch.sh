@@ -50,8 +50,12 @@ loadarch () {
 	export CXX=$cc_triple-clang++
 	# --icf=safe folds identical code; -z,max-page-size=16384 keeps every .so
 	# loadable on Android 15+ devices with 16 KiB pages (a Plezy packaging
-	# invariant -- do not drop it).
-	export LDFLAGS="-Wl,-O1,--icf=safe -Wl,-z,max-page-size=16384"
+	# invariant -- do not drop it). --build-id=sha1 stamps the GNU build-id a
+	# crash tracker pairs each .so with its debug file by (lib/build-aar.sh
+	# packs those); the NDK's clang passes none by itself, and sha1 hashes the
+	# linked output, so a rebuild still reproduces the bytes. FFmpeg's
+	# configure and meson (mpv) both link with these.
+	export LDFLAGS="-Wl,-O1,--icf=safe -Wl,-z,max-page-size=16384 -Wl,--build-id=sha1"
 	export AR=llvm-ar
 	export RANLIB=llvm-ranlib
 }
@@ -71,6 +75,9 @@ setup_prefix () {
 
 	# meson wants to be spoonfed this file, so create it ahead of time
 	# also define: release build, static libs and no source downloads at runtime(!!!)
+	# -gline-tables-only adds source lines (no types or variables) to the
+	# release build's -O3 objects of mpv and its meson deps, so a crash in
+	# libmpv.so symbolicates to file:line; it does not change the code.
 	cat >"$prefix_dir/crossfile.txt" <<CROSSFILE
 [built-in options]
 prefix = '/usr'
@@ -78,6 +85,8 @@ buildtype = 'release'
 b_ndebug = 'true'
 default_library = 'static'
 wrap_mode = 'nodownload'
+c_args = ['-gline-tables-only']
+cpp_args = ['-gline-tables-only']
 [binaries]
 c = '$CC'
 cpp = '$CXX'

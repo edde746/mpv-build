@@ -37,6 +37,11 @@ jobs:
       - name: Test content keys
         run: bash scripts/test_keys.sh
 
+      # The runner's cc, readelf and objcopy add a real linked ELF to the
+      # synthetic ELF/PE/PDB fixtures.
+      - name: Test debug symbols
+        run: bash scripts/test_symbols.sh
+
       - name: Test windows package pinning
         run: python3 platforms/windows/test_pin_packages.py
 

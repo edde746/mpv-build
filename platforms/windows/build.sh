@@ -24,8 +24,10 @@
 #      -Dlibmpv=true is hard-coded upstream, so this builds libmpv-2.dll
 #      alongside mpv.exe and its copy-binary step assembles
 #      mpv-dev-<cpu>-<date>-git-<10sha>/ (libmpv-2.dll, libmpv.dll.a,
-#      include/mpv/{client,stream_cb,render,render_gl}.h) in the build root.
-#      package.sh zips that tree under its content-addressed asset name.
+#      include/mpv/{client,stream_cb,render,render_gl}.h) in the build root,
+#      plus mpv-debug-<cpu>-<date>-git-<10sha>/ with the libmpv-2.pdb
+#      pin_packages.py has it save. package.sh zips the dev tree under its
+#      content-addressed asset name and the PDB into its symbols zip.
 #
 # Host requirements for a full build: Linux with the mpv-winbuild-cmake README
 # apt package list plus pip meson >= 1.3.0 (configure fails fast otherwise).

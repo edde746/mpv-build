@@ -10,10 +10,12 @@ set -euo pipefail
 # Environment:
 #   JOBS      forwarded to build.sh
 #   KEY       when set, package.sh runs after the build and names the tarball
+#             (and leaves the debug-symbols zip next to it)
 #   PLATFORM  docker --platform (e.g. linux/amd64); defaults to the host arch
 #   PREFIX    in-container install prefix (default /work/libmpv-prefix); give
 #             concurrent runs of different architectures distinct prefixes
-#   OUT_DIR   in-container tarball directory (default /work/dist/release)
+#   OUT_DIR   in-container tarball and symbols zip directory (default
+#             /work/dist/release)
 #
 # The repo is mounted at /work and the build writes the prefix and, when
 # packaging, the tarball directory into it (both gitignored).
@@ -27,11 +29,15 @@ if [ -z "$image" ]; then
   exit 1
 fi
 
-# Everything the seven build steps need, and nothing for the Flutter runner:
+# Everything the seven build steps and packaging need, and nothing for the
+# Flutter runner:
 #   toolchain      build-essential git curl ca-certificates python3 pkg-config
 #                  cmake meson ninja-build nasm autoconf automake libtool
 #                  xz-utils (ffmpeg tarball) zstd (packaging); nv-codec-headers
 #                  is header-only and needs nothing beyond make
+#   symbols        binutils (objcopy --only-keep-debug; build-essential pulls
+#                  it in, listed because package.sh calls it directly) zip
+#                  (scripts/symbols.py pack writes the zip with it)
 #   libass         libfreetype-dev libfribidi-dev libharfbuzz-dev
 #                  libfontconfig-dev (host text stack; see toolchain/linux.txt)
 #   ffmpeg         libgnutls28-dev libva-dev
@@ -42,6 +48,7 @@ fi
 DEPS='
 build-essential git curl ca-certificates python3 pkg-config
 cmake meson ninja-build nasm autoconf automake libtool xz-utils zstd
+binutils zip
 libfreetype-dev libfribidi-dev libharfbuzz-dev libfontconfig-dev
 libgnutls28-dev libva-dev
 libdisplay-info-dev libdrm-dev libwayland-dev wayland-protocols

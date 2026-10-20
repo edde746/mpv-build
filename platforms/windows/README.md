@@ -6,6 +6,7 @@ pinned as the versions.json component `mpv-winbuild-cmake`.
 
     platforms/windows/build.sh <x86_64|aarch64> [--configure-only]
     platforms/windows/package.sh <x86_64|aarch64>   # -> libmpv-windows-<key>-<arch>.zip
+                                                    #  + libmpv-windows-<arch>-symbols.zip
 
 `build.sh` shallow-fetches the pinned winbuild commit, runs `pin_packages.py`
 to rewrite every source winbuild builds onto the versions.json pins -- the
@@ -142,6 +143,35 @@ the pinned winbuild commit name no `GIT_TAG` or `GIT_RESET` and clone a branch
 tip, so a cold rebuild of the same key fetches different sources; see "Key
 coarseness".
 
+### Debug symbols
+
+Each leg also publishes `libmpv-2.pdb`, the PDB lld writes when winbuild
+links mpv with `PDB=1`, so crash reports from the DLL symbolicate. Upstream's
+copy-binary step saves only `mpv.pdb` (`${mpv_copy_debug}`) and
+`cleanup(mpv copy-package-dir)` then deletes the build dir, so `pin_packages.py`
+adds one `cmake -E copy` of `libmpv-2.pdb` into `mpv-debug/` right after that
+line; copy-package-dir moves the tree to `mpv-debug-<cpu>-<date>-git-<sha>/`
+beside the dev tree. The copy only reads what the link wrote, so the DLL's
+bytes are those of a build without it. `package.sh` packs the PDB with
+`scripts/symbols.py pack` into `dist/release/libmpv-windows-<arch>-symbols.zip`,
+which fails unless the PDB's GUID and age are the ones `libmpv-2.dll`'s
+CodeView record names, and `keys.py record-platform` renames it to
+`libmpv-windows-<key>-<arch>-symbols.zip`. The build leg's
+`test_build_date.sh dist/release/*.zip` scans it too.
+
+It reproduces with the DLL: lld sets the PDB's GUID, and so the DLL's
+CodeView record, from a hash of the whole PDB file (the GUID's last eight
+bytes spell `LLD PDB.`), and `symbols.py` writes the zip sorted, `-X`, with
+2020-01-01 mtimes and mode 0644. The corollary is that nothing can shrink the
+PDB without changing the DLL. Expect roughly 350 MiB: zhongfly's mpv.pdb from
+a build of the same recipe measures 352.7 MiB, about 88 MiB zipped. The
+winbuild compiler wrapper appends `-gcodeview` after every package's own
+flags, and as the last `-g` option it turns full debug info on for all of
+them, so libjxl, shaderc and libavcodec dominate that PDB. lld already merges
+types by global hash (`--pdb=` makes it `/DEBUG:FULL`, which implies GHASH; a
+link-time speedup, not a size one), and a package's own `-gline-tables-only`
+would lose to the wrapper's trailing `-gcodeview`.
+
 ## Slimming candidates (later pass, deliberately not wave 2)
 
 The dependency set is full-fat to keep the pinning change isolated. Candidates
@@ -184,4 +214,4 @@ commit, the staged series and its PATCH_COMMAND (injected exactly when the
 resolved series is non-empty), the neutralized check-git step, and a second
 run converging. The remaining tests pin the pure rewrites -- the injected
 block matches the mbedtls idiom, the aarch64 cuda gate, the mpv option
-gate, and the davs2 build-time rewrite.
+gate, the libmpv-2.pdb capture, and the davs2 build-time rewrite.

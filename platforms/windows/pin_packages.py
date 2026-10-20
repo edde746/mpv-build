@@ -378,6 +378,44 @@ def gate_mpv_options(text):
     return text.replace(MPV_VAPOURSYNTH_ENABLED, MPV_VAPOURSYNTH_DISABLED, 1)
 
 
+# winbuild's clang toolchain links mpv with PDB=1, so lld writes libmpv-2.pdb
+# beside libmpv-2.dll in mpv's build dir, but copy-binary saves only mpv.pdb
+# (${mpv_copy_debug}, set in cmake/packages_check.cmake) and
+# cleanup(mpv copy-package-dir) then deletes the build dir. One more copy into
+# the same mpv-debug/ tree, which copy-package-dir moves to
+# mpv-debug-<cpu>-<date>-git-<sha>/ in the build root, keeps the PDB for
+# package.sh's symbols zip. The copy runs after the link and only reads the
+# PDB, so libmpv-2.dll's bytes do not change; `cmake -E copy` fails on a
+# missing source, so a build that stops writing the PDB fails here instead of
+# shipping a DLL without its symbols.
+MPV_COPY_DEBUG = "    ${mpv_copy_debug}\n"
+MPV_COPY_LIBMPV_PDB = (
+    "    COMMAND ${CMAKE_COMMAND} -E copy <BINARY_DIR>/libmpv-2.pdb"
+    " ${CMAKE_CURRENT_BINARY_DIR}/mpv-debug/libmpv-2.pdb\n"
+)
+MPV_MOVE_DEBUG = (
+    "    COMMAND mv ${CMAKE_CURRENT_BINARY_DIR}/mpv-debug"
+    " ${CMAKE_BINARY_DIR}/mpv-debug-${TARGET_CPU}${x86_64_LEVEL}-${BUILDDATE}\n"
+)
+
+
+def capture_libmpv_pdb(text):
+    """mpv.cmake text whose copy-binary step also saves libmpv-2.pdb into
+    mpv-debug/; pure for tests."""
+    captured = MPV_COPY_DEBUG + MPV_COPY_LIBMPV_PDB
+    done = captured in text
+    expected_mentions = MPV_COPY_LIBMPV_PDB.count("libmpv-2.pdb") if done else 0
+    if (text.count(MPV_COPY_DEBUG) != 1
+            or text.count(MPV_MOVE_DEBUG) != 1
+            or text.count("libmpv-2.pdb") != expected_mentions):
+        fail(
+            "packages/mpv.cmake: the mpv-debug copy and move steps no longer "
+            "match the audited shape; re-audit the libmpv-2.pdb capture against "
+            "the new winbuild commit before pinning to it"
+        )
+    return text if done else text.replace(MPV_COPY_DEBUG, captured, 1)
+
+
 def gate_ffmpeg_cuda(text):
     """ffmpeg.cmake text with the cuda enables arch-gated; pure for tests."""
     if FFMPEG_CUDA_GATED in text and text.startswith(FFMPEG_CUDA_GUARD):
@@ -477,7 +515,7 @@ def main(argv):
         if component == "ffmpeg":
             pinned = gate_ffmpeg_cuda(pinned)
         if component == "mpv":
-            pinned = gate_mpv_options(pinned)
+            pinned = capture_libmpv_pdb(gate_mpv_options(pinned))
         if pinned != text:
             package_file.write_text(pinned, encoding="utf-8")
         patched = f", {len(staged)} patch(es) staged" if staged else ""

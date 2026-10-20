@@ -2,11 +2,13 @@
 set -euo pipefail
 
 # Packages the install prefix build.sh produced into one content-addressed
-# tarball per architecture:
+# tarball per architecture, plus a zip of the debug files of the libraries
+# that tarball ships:
 #
 #     libmpv-linux-<key>-<x86_64|aarch64>.tar.zst
+#     libmpv-linux-<x86_64|aarch64>-symbols.zip
 #
-# The artifact serves two roles at once, so it carries two kinds of content:
+# The tarball serves two roles at once, so it carries two kinds of content:
 #
 #   runtime bundle source -- exactly the set plezy's CI copied out of
 #     libmpv-prefix into the Flutter bundle: the versioned libmpv.so* chain
@@ -27,12 +29,24 @@ set -euo pipefail
 #     it cannot fix the literal prefix paths shaderc's cmake bakes into
 #     Cflags outside ${prefix}.
 #
+# The symbols zip is what plezy uploads to its crash tracker so libmpv and
+# FFmpeg frames get names and lines: an `objcopy --only-keep-debug` copy of
+# every shared library in the tarball, under the library's own file name.
+# The tarball keeps its libraries unstripped (plezy strips the copies it
+# bundles, and strip keeps the build-id note). The tracker pairs a debug file
+# with the library a crash names by GNU build-id alone, so a shipped library
+# without one fails the packaging; scripts/symbols.py checks every pairing
+# and writes the zip byte-reproducibly. The zip is left unkeyed: the publish
+# job's `keys.py record-platform` renames it to group.json's symbolsPattern.
+#
 # Environment:
 #   PREFIX   install prefix to package     (default: ./libmpv-prefix)
 #   KEY      content key for the name      (required; from scripts/keys.py)
-#   OUT_DIR  where the tarball lands       (default: ./dist/release)
+#   OUT_DIR  where tarball and zip land    (default: ./dist/release)
 #   ARCH     architecture tag in the name  (default: uname -m)
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 PREFIX="${PREFIX:-$(pwd)/libmpv-prefix}"
 OUT_DIR="${OUT_DIR:-$(pwd)/dist/release}"
 ARCH="${ARCH:-$(uname -m)}"
@@ -57,7 +71,9 @@ esac
 PREFIX="$(realpath "$PREFIX")"
 
 stage="$(mktemp -d)"
-trap 'rm -rf -- "$stage"' EXIT
+# The debug files stay out of the stage, which is tarred whole.
+debug="$(mktemp -d)"
+trap 'rm -rf -- "$stage" "$debug"' EXIT
 
 # Same discovery plezy's CI used: meson installs libmpv under lib/ or the
 # multiarch lib/<triplet>/ depending on the distro layout, so it is found,
@@ -115,6 +131,30 @@ if [ "$found_pkgconfig" -eq 0 ]; then
 fi
 
 mkdir -p "$OUT_DIR"
+
+# Every shared library the tarball ships gets a debug file. They are found in
+# the stage, not listed, so a library staged above later is covered without
+# touching this step; only regular files, the symlinks being the soname chain
+# onto them.
+shipped=()
+while IFS= read -r library; do
+  shipped+=("$library")
+done < <(cd "$stage" && find lib -type f \( -name '*.so' -o -name '*.so.*' \) | LC_ALL=C sort)
+# A library without a build-id could never be paired with its debug file, so
+# a crash in it would stay unnamed for good; that fails here, not in the field.
+if ! (cd "$stage" && python3 "$REPO_ROOT/scripts/symbols.py" id "${shipped[@]}"); then
+  echo "every library the tarball ships needs a GNU build-id note (-Wl,--build-id)" >&2
+  exit 1
+fi
+pairs=()
+for library in "${shipped[@]}"; do
+  objcopy --only-keep-debug "$stage/$library" "$debug/$(basename "$library")"
+  pairs+=(--pair "$stage/$library" "$debug/$(basename "$library")")
+done
+symbols="$OUT_DIR/libmpv-linux-${ARCH}-symbols.zip"
+python3 "$REPO_ROOT/scripts/symbols.py" pack "$symbols" "${pairs[@]}"
+echo "==> Packaged $symbols"
+
 artifact="$OUT_DIR/libmpv-linux-${KEY}-${ARCH}.tar.zst"
 # Reproducible bytes: the release skips re-uploading an existing
 # content-addressed name, so a rebuild of the same key MUST produce the

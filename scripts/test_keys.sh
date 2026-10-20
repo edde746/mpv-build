@@ -987,6 +987,315 @@ with tempfile.TemporaryDirectory() as tmp:
     check("holds no files" in result.stderr, "an empty source directory is rejected")
     print("package artifacts: malformed definitions are rejected loudly")
 
+# 17. Debug symbols: a symbolsPattern publishes one zip per variant beside the
+#     artifact's assets. The pattern is not key input; a record fails without
+#     the zip; stale and verify demand every variant's.
+SYMBOLS_GROUP_JSON = json.loads(json.dumps(GROUP_JSON))
+SYMBOLS_GROUP_JSON["artifacts"]["libmpv-android"]["symbolsPattern"] = (
+    "libmpv-android-{key}-{variant}-symbols.zip"
+)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_manifest(repo, manifest):
+    (repo / "artifacts.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def record_android_variant(repo, variant, expect=0):
+    return run(
+        repo, "record-platform", "--platform-group", "android",
+        "--platform", variant, "--release-dir", "dist/release", expect=expect,
+    )
+
+
+def android_stale(repo):
+    return run(repo, "stale", "--platform-group", "android").stdout.split()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_android_repo(tmp)
+    key = android_key(repo)
+    release = repo / "dist" / "release"
+    release.mkdir(parents=True)
+    # Recorded before the artifact named a pattern: complete then.
+    for variant in ("arm64-v8a", "x86_64"):
+        (release / f"libmpv-android-{variant}.tar.gz").write_bytes(f"{variant} bytes".encode())
+        record_android_variant(repo, variant)
+    check(android_stale(repo) == [], "recorded without a symbolsPattern, nothing is stale")
+
+    write_group_json(repo, SYMBOLS_GROUP_JSON)
+    check(android_key(repo) == key, "a symbolsPattern is not key input")
+    check(android_stale(repo) == ["libmpv-android"], "an entry without its symbols is stale")
+    result = run(repo, "verify", "--platform-group", "android", expect=1)
+    check(
+        "libmpv-android: no symbols asset for arm64-v8a" in result.stdout
+        and "libmpv-android: no symbols asset for x86_64" in result.stdout,
+        f"verify names every variant's missing symbols: {result.stdout}",
+    )
+
+    # A leg that left its binary but not the symbols for it is not recorded.
+    before = (repo / "artifacts.json").read_text()
+    result = record_android_variant(repo, "arm64-v8a", expect=1)
+    check(
+        "libmpv-android: arm64-v8a was built without its symbols zip "
+        f"libmpv-android-{key}-arm64-v8a-symbols.zip" in result.stderr,
+        f"a missing symbols zip fails the record: {result.stderr.strip()}",
+    )
+    check((repo / "artifacts.json").read_text() == before, "a failed record writes no manifest")
+
+    # The unkeyed spelling is renamed by content, the keyed one accepted.
+    (release / "libmpv-android-arm64-v8a-symbols.zip").write_bytes(b"arm64 symbols")
+    result = record_android_variant(repo, "arm64-v8a")
+    arm64_symbols = f"libmpv-android-{key}-arm64-v8a-symbols.zip"
+    check(
+        (release / arm64_symbols).is_file()
+        and not (release / "libmpv-android-arm64-v8a-symbols.zip").exists(),
+        f"the unkeyed symbols zip is renamed by content: {result.stdout}",
+    )
+    entry = manifest_of(repo)["platforms"]["android"]["libraries"]["libmpv-android"]
+    check(
+        entry["symbols"] == {"arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols")}},
+        f"the recorded symbols: {entry.get('symbols')}",
+    )
+    check(
+        sorted(entry["prebuilt"]) == ["arm64-v8a", "x86_64"],
+        "a same-key record keeps the other variants",
+    )
+    check(android_stale(repo) == ["libmpv-android"], "symbols for one variant of two are still stale")
+    result = run(repo, "verify", "--platform-group", "android", expect=1)
+    check(
+        "no symbols asset for x86_64" in result.stdout and "for arm64-v8a" not in result.stdout,
+        f"verify names the variant still missing its symbols: {result.stdout}",
+    )
+
+    x86_64_symbols = f"libmpv-android-{key}-x86_64-symbols.zip"
+    (release / x86_64_symbols).write_bytes(b"x86_64 symbols")
+    record_android_variant(repo, "x86_64")
+    check(android_stale(repo) == [], "every variant's symbols recorded: nothing is stale")
+    run(repo, "verify", "--platform-group", "android")
+
+    good = manifest_of(repo)
+    for mutate, needle in (
+        (lambda entry: entry["symbols"]["x86_64"].update(checksum="zz"), "symbols x86_64: checksum 'zz'"),
+        (
+            lambda entry: entry["symbols"]["x86_64"].update(
+                asset="libmpv-android-000000000000-x86_64-symbols.zip"
+            ),
+            "symbols x86_64 asset 'libmpv-android-000000000000-x86_64-symbols.zip' does not match",
+        ),
+        (lambda entry: entry["symbols"].pop("x86_64"), "no symbols asset for x86_64"),
+        (lambda entry: entry.pop("symbols"), "no symbols asset for arm64-v8a"),
+    ):
+        manifest = json.loads(json.dumps(good))
+        mutate(manifest["platforms"]["android"]["libraries"]["libmpv-android"])
+        write_manifest(repo, manifest)
+        result = run(repo, "verify", "--platform-group", "android", expect=1)
+        check(needle in result.stdout, f"verify reports {needle!r}: {result.stdout}")
+        check(android_stale(repo) == ["libmpv-android"], f"{needle!r} makes the artifact stale")
+    write_manifest(repo, good)
+
+    # A key move restarts the entry, symbols included: an old key's zip can
+    # never stand in for a new key's variant.
+    (repo / "toolchain" / "android.txt").write_text("ndk=29.0.14206865\ngeneration=2\n", encoding="utf-8")
+    new_key = android_key(repo)
+    (release / "libmpv-android-arm64-v8a.tar.gz").write_bytes(b"arm64 rebuild")
+    (release / "libmpv-android-arm64-v8a-symbols.zip").write_bytes(b"arm64 symbols rebuild")
+    record_android_variant(repo, "arm64-v8a")
+    entry = manifest_of(repo)["platforms"]["android"]["libraries"]["libmpv-android"]
+    check(
+        entry["symbols"] == {
+            "arm64-v8a": {
+                "asset": f"libmpv-android-{new_key}-arm64-v8a-symbols.zip",
+                "checksum": sha256(b"arm64 symbols rebuild"),
+            }
+        },
+        f"a key move drops the old key's symbols: {entry['symbols']}",
+    )
+    print("symbols: record renames and checksums them; stale and verify demand every variant's")
+
+# 18. A package's symbols come per input variant (the AAR ships one native
+#     tree per tarball ABI), and publish-assets uploads them with the rest.
+#     publish-assets runs against a fake `gh` that lists a canned release and
+#     logs what it would upload: nothing here reaches GitHub.
+SYMBOLS_PACKAGE_GROUP_JSON = json.loads(json.dumps(PACKAGE_GROUP_JSON))
+SYMBOLS_PACKAGE_GROUP_JSON["artifacts"]["mpv-android"]["symbolsPattern"] = (
+    "mpv-android-{key}-{variant}-symbols.zip"
+)
+
+FAKE_GH = """#!{python}
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] == ["release", "view"] and "--json" in args:
+    with open(os.environ["FAKE_GH_PUBLISHED"], encoding="utf-8") as listing:
+        sys.stdout.write(listing.read())
+"""
+
+
+def publish_assets(repo, bin_dir, published, expect=0):
+    """publish-assets against the fake gh; (result, uploaded file names)."""
+    log = bin_dir / "gh.log"
+    log.write_text("", encoding="utf-8")
+    listing = bin_dir / "published.txt"
+    listing.write_text("".join(f"{name} sha256:{digest}\n" for name, digest in published), encoding="utf-8")
+    result = run(
+        repo, "publish-assets", "--platform-group", "android", "--release-dir", "dist/release",
+        expect=expect,
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_GH_LOG": str(log),
+            "FAKE_GH_PUBLISHED": str(listing),
+        },
+    )
+    uploaded = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        args = json.loads(line)
+        check(args[:2] in (["release", "view"], ["release", "upload"]), f"unexpected gh call: {args}")
+        if args[:2] == ["release", "upload"]:
+            check(args[2] == "binaries-android", f"uploads go to the group's release: {args}")
+            uploaded += [Path(path).name for path in args[3:]]
+    return result, sorted(uploaded)
+
+
+with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_tmp:
+    repo = make_package_repo(tmp)
+    unpatterned = package_keys(repo)
+    write_group_json(repo, SYMBOLS_PACKAGE_GROUP_JSON)
+    current = package_keys(repo)
+    check(current == unpatterned, "a package's symbolsPattern is not key input")
+    key = current["mpv-android"]
+
+    release = repo / "dist" / "release"
+    release.mkdir(parents=True)
+    for variant in ("arm64-v8a", "x86_64"):
+        (release / f"libmpv-android-{variant}.tar.gz").write_bytes(variant.encode())
+        record_android_variant(repo, variant)
+    (release / "mpv-android.aar").write_bytes(b"aar bytes")
+    result = run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release", expect=1)
+    check(
+        f"mpv-android: arm64-v8a was built without its symbols zip mpv-android-{key}-arm64-v8a-symbols.zip"
+        in result.stderr,
+        f"an AAR without its symbols is not recorded: {result.stderr.strip()}",
+    )
+    check(
+        "mpv-android" not in manifest_of(repo)["platforms"]["android"]["libraries"],
+        "a failed package record writes no entry",
+    )
+
+    (release / "mpv-android-arm64-v8a-symbols.zip").write_bytes(b"arm64 symbols")
+    (release / f"mpv-android-{key}-x86_64-symbols.zip").write_bytes(b"x86_64 symbols")
+    run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    aar = f"mpv-android-{key}.aar"
+    arm64_symbols = f"mpv-android-{key}-arm64-v8a-symbols.zip"
+    x86_64_symbols = f"mpv-android-{key}-x86_64-symbols.zip"
+    entry = manifest_of(repo)["platforms"]["android"]["libraries"]["mpv-android"]
+    check(
+        entry == {
+            "key": key,
+            "asset": aar,
+            "checksum": sha256(b"aar bytes"),
+            "symbols": {
+                "arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols")},
+                "x86_64": {"asset": x86_64_symbols, "checksum": sha256(b"x86_64 symbols")},
+            },
+        },
+        f"the package entry carries its inputs' variants' symbols: {entry}",
+    )
+    check(not (release / "mpv-android-arm64-v8a-symbols.zip").exists(), "the unkeyed package symbols are renamed")
+    check(android_stale(repo) == [], "a package recorded with its symbols is not stale")
+    run(repo, "verify", "--platform-group", "android")
+
+    bin_dir = Path(bin_tmp)
+    (bin_dir / "gh").write_text(FAKE_GH.format(python=sys.executable), encoding="utf-8")
+    (bin_dir / "gh").chmod(0o755)
+    tarball = f"libmpv-android-{current['libmpv-android']}-arm64-v8a.tar.gz"
+    published = [
+        (tarball, sha256(b"arm64-v8a")),
+        (arm64_symbols, sha256(b"arm64 symbols")),
+    ]
+    result, uploaded = publish_assets(repo, bin_dir, published)
+    check(
+        uploaded == sorted([aar, f"libmpv-android-{current['libmpv-android']}-x86_64.tar.gz", x86_64_symbols]),
+        f"publish-assets uploads the unpublished assets, symbols included: {uploaded}",
+    )
+    check(
+        f"published {arm64_symbols} (bytes verified)" in result.stdout,
+        f"a published symbols zip is verified against the rebuilt bytes: {result.stdout}",
+    )
+
+    result, uploaded = publish_assets(
+        repo, bin_dir, [(tarball, sha256(b"arm64-v8a")), (arm64_symbols, "0" * 64)], expect=1
+    )
+    check(
+        f"{arm64_symbols}: rebuilt bytes" in result.stderr and uploaded == [],
+        f"a symbols zip whose rebuilt bytes moved stops the upload: {result.stderr.strip()}",
+    )
+
+    (release / x86_64_symbols).unlink()
+    result, uploaded = publish_assets(repo, bin_dir, published, expect=1)
+    check(
+        f"mpv-android: {x86_64_symbols}" in result.stderr and uploaded == [],
+        f"a symbols zip neither built nor published stops the upload: {result.stderr.strip()}",
+    )
+    print("symbols: packages record their inputs' variants; publish-assets uploads and verifies them")
+
+# 19. A malformed symbolsPattern fails loudly.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_package_repo(tmp)
+    for artifact, change in (
+        ("libmpv-android", {"symbolsPattern": "libmpv-android-{variant}-symbols.zip"}),
+        ("libmpv-android", {"symbolsPattern": "libmpv-android-{key}-symbols.zip"}),
+        ("libmpv-android", {"symbolsPattern": "libmpv-android-{key}-{variant}-symbols.tar.gz"}),
+        ("mpv-android", {"symbolsPattern": "mpv-android-{key}-symbols.zip"}),
+        (
+            "libmpv-android",
+            {"assetPattern": "libmpv-android-{key}-{variant}.zip",
+             "symbolsPattern": "libmpv-android-{key}-{variant}.zip"},
+        ),
+        # Different keyed names, one unkeyed name (libmpv-android-<variant>.zip).
+        (
+            "libmpv-android",
+            {"assetPattern": "libmpv-android-{key}-{variant}.zip",
+             "symbolsPattern": "libmpv-android-debug-{key}-{variant}.zip"},
+        ),
+    ):
+        broken = json.loads(json.dumps(SYMBOLS_PACKAGE_GROUP_JSON))
+        broken["artifacts"][artifact].update(change)
+        write_group_json(repo, broken)
+        result = run(repo, "keys", expect=1)
+        check(
+            f"artifact {artifact!r} symbolsPattern must contain" in result.stderr,
+            f"{artifact} {change} is rejected: {result.stderr.strip()}",
+        )
+    print("symbols: malformed patterns are rejected loudly")
+
+# 20. The real group.json files carry the symbols patterns Plezy downloads, and
+#     scripts/symbols.py, which writes those zips' bytes, keys their artifacts.
+for group, artifact, pattern, listed_in in (
+    ("android", "mpv-android", "mpv-android-{key}-{variant}-symbols.zip", "sources"),
+    ("linux", "libmpv-linux", "libmpv-linux-{key}-{variant}-symbols.zip", "driver"),
+    ("windows", "libmpv-windows", "libmpv-windows-{key}-{variant}-symbols.zip", "driver"),
+):
+    path = root / "platforms" / group / "group.json"
+    if not path.is_file():
+        print(f"real {group} symbols: skipped (no group.json)")
+        continue
+    data = json.loads(path.read_text(encoding="utf-8"))
+    spec = data["artifacts"][artifact]
+    check(spec.get("symbolsPattern") == pattern, f"{artifact} symbolsPattern: {spec.get('symbolsPattern')!r}")
+    files = data["driver"] if listed_in == "driver" else spec.get("sources", [])
+    check("scripts/symbols.py" in files, f"{group}: scripts/symbols.py is in {artifact}'s {listed_in}")
+print("real group.json: the symbols patterns match the consumer's")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

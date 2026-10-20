@@ -373,6 +373,15 @@ assert_argument "$ffmpeg_configure" "--enable-libdav1d" "ffmpeg's configure"
 assert_argument "$ffmpeg_configure" "--enable-ffnvcodec" "ffmpeg's configure"
 assert_argument "$ffmpeg_configure" "--enable-nvdec" "ffmpeg's configure"
 
+# FFmpeg's DWARF is what names its frames in libmpv crash reports, and losing
+# it fails as quietly as a lost hwdec: the build still plays, the symbols zip
+# just cannot place a crash inside FFmpeg. configure honours the last debug
+# option it sees, so a --disable-debug anywhere would undo the level.
+assert_argument "$ffmpeg_configure" "--enable-debug=1" "ffmpeg's configure"
+if tail -n +3 "$ffmpeg_configure" | grep -Fxq -- "--disable-debug"; then
+  fail "ffmpeg's configure passes --disable-debug"
+fi
+
 # ffnvcodec is header-only: it must land in the prefix that ffmpeg's configure
 # and mpv's meson resolve pkg-config against.
 nv_codec_headers_make="$(recorded_call make "nv-codec-headers-$nv_codec_headers_version")" ||

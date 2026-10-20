@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Zip the mpv-dev tree a build.sh run assembled under its content-addressed
-# asset name.
+# asset name, and libmpv-2.dll's PDB into the unkeyed symbols zip
+# libmpv-windows-<arch>-symbols.zip beside it, which
+# `scripts/keys.py record-platform` names by the same key.
 #
 # usage: platforms/windows/package.sh <x86_64|aarch64>
 #
@@ -38,10 +40,35 @@ if [[ "${#DEV_DIRS[@]}" -ne 1 ]]; then
 fi
 DEV_DIR="${DEV_DIRS[0]%/}"
 
+# libmpv-2.pdb is the PDB lld wrote when it linked libmpv-2.dll; the
+# copy-binary step pin_packages.py extends saves it into mpv-debug/, which
+# upstream moves to mpv-debug-<cpu>-<date>-git-<sha>/ beside the dev tree.
+shopt -s nullglob
+DEBUG_DIRS=("$BUILD"/mpv-debug-*/)
+shopt -u nullglob
+if [[ "${#DEBUG_DIRS[@]}" -ne 1 ]]; then
+  echo "error: expected exactly one mpv-debug-* tree in $BUILD, found ${#DEBUG_DIRS[@]}; run platforms/windows/build.sh $ARCH first" >&2
+  exit 1
+fi
+PDB="${DEBUG_DIRS[0]%/}/libmpv-2.pdb"
+if [[ ! -f "$PDB" ]]; then
+  echo "error: $PDB is missing; the libmpv-2.pdb capture in pin_packages.py did not run" >&2
+  exit 1
+fi
+
 KEY="$(python3 "$ROOT/scripts/keys.py" keys --platform-group windows |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["libmpv-windows"])')"
 
 mkdir -p "$OUT"
+# Debug symbols first, so a DLL whose PDB does not match never leaves an
+# asset behind: symbols.py fails unless the PDB's GUID and age are the ones
+# libmpv-2.dll's CodeView record names, and writes the zip reproducibly
+# (sorted, -X, 2020-01-01 mtimes, mode 0644). lld derives that GUID from a
+# hash of the whole PDB, so a reproduced DLL implies a reproduced PDB.
+SYMBOLS="$OUT/libmpv-windows-$ARCH-symbols.zip"
+rm -f "$SYMBOLS"
+python3 "$ROOT/scripts/symbols.py" pack "$SYMBOLS" --pair "$DEV_DIR/libmpv-2.dll" "$PDB"
+
 ASSET="$OUT/libmpv-windows-$KEY-$ARCH.zip"
 rm -f "$ASSET"
 # Reproducible bytes: the release skips re-uploading an existing
@@ -54,3 +81,4 @@ rm -f "$ASSET"
   && find . -type f -exec chmod u+rw,go-w,a+rX {} + \
   && find . -type f | LC_ALL=C sort | zip -q -X -9 "$ASSET" -@)
 echo "$ASSET"
+echo "$SYMBOLS"

@@ -258,6 +258,16 @@ main() {
   # vaapi, ffnvcodec and nvdec are all autodetected, and each one missing still
   # configures, builds and plays - on the CPU. Enabling them explicitly turns a
   # missing header into a configure failure instead.
+  #
+  # --enable-debug=1 compiles FFmpeg's C with -g1 (nasm's objects get
+  # `-g -F dwarf` at any level): function and inlined-call DIEs plus line
+  # tables, exactly what a crash tracker reads to name and place an FFmpeg
+  # frame in libmpv. The full -g of a bare --enable-debug only adds variable,
+  # parameter and type DIEs, which nothing symbolicating a crash uses, at a
+  # multiple of the size. Debug info never changes codegen, so the -O level
+  # is FFmpeg's default as before, and --disable-stripping still keeps the
+  # install from stripping anything: package.sh copies the DWARF into the
+  # symbols zip, and the tarball's libmpv.so stays unstripped.
   echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoder-only)..."
   checkout_verified_ref \
     "$FFMPEG_URL" "$FFMPEG_REF" "$FFMPEG_COMMIT" \
@@ -288,7 +298,7 @@ main() {
     --enable-nvdec \
     --enable-libdav1d \
     --disable-vdpau \
-    --disable-debug \
+    --enable-debug=1 \
     --disable-stripping
 
   make -j"$jobs"

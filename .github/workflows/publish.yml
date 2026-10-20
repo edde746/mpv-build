@@ -184,6 +184,9 @@ jobs:
       - name: Test content keys
         run: ./scripts/test_keys.sh
 
+      - name: Test debug symbols
+        run: bash ./scripts/test_symbols.sh
+
       - name: Test apple XCFramework merge reproducibility
         run: ./scripts/test_apple_merge.sh
 
@@ -437,7 +440,9 @@ jobs:
 
       # KEY makes container-build.sh run package.sh inside the container, so
       # the tarball comes out already named by content; ARCH pins the name's
-      # architecture tag to the runner this leg was scheduled on.
+      # architecture tag to the runner this leg was scheduled on. package.sh
+      # also leaves the unkeyed debug-symbols zip
+      # (libmpv-linux-<arch>-symbols.zip) that record-platform names by content.
       - name: Build and package in the pinned container (${{ matrix.arch }})
         run: |
           KEY="$(python3 scripts/keys.py keys --platform-group linux \
@@ -445,15 +450,20 @@ jobs:
           KEY="${KEY}" ARCH=${{ matrix.arch }} bash platforms/linux/container-build.sh
 
       # A rebuild of a published key has to reproduce its bytes (publish-assets
-      # refuses anything else), so no file may carry a build's clock.
-      - name: Check the tarball for a build date (${{ matrix.arch }})
-        run: bash scripts/test_build_date.sh dist/release/*.tar.zst
+      # refuses anything else), so no file may carry a build's clock. Naming
+      # the symbols zip also fails the leg when packaging did not write it.
+      - name: Check the tarball and symbols for a build date (${{ matrix.arch }})
+        run: |
+          bash scripts/test_build_date.sh dist/release/*.tar.zst \
+            dist/release/libmpv-linux-${{ matrix.arch }}-symbols.zip
 
       - name: Upload platform build (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
-          path: ./dist/release/*.tar.zst
+          path: |
+            ./dist/release/*.tar.zst
+            ./dist/release/libmpv-linux-*-symbols.zip
           if-no-files-found: error
 
   build-windows:
@@ -547,15 +557,17 @@ jobs:
         run: bash platforms/windows/build.sh ${{ matrix.arch }}
 
       # package.sh names the zip by content key itself, so the build leg
-      # uploads it as-is; publish records every variant at once.
-      - name: Package dev zip (${{ matrix.arch }})
+      # uploads it as-is; publish records every variant at once. Beside it
+      # goes the unkeyed libmpv-windows-<arch>-symbols.zip (libmpv-2.pdb),
+      # which record-platform names by the same key; *.zip below carries it.
+      - name: Package dev zip and symbols (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
 
       # A rebuild of a published key has to reproduce its bytes (publish-assets
       # refuses anything else), so no file may carry a build's clock. The scan
       # reaches back to 2020: a restored build tree keeps the stamps of the
       # runs that compiled each package, weeks before this one.
-      - name: Check the zip for a build date (${{ matrix.arch }})
+      - name: Check the zips for a build date (${{ matrix.arch }})
         run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Save build state cache
@@ -639,7 +651,9 @@ jobs:
       # merged release dir -- not in the build legs, whose partial manifests
       # would each carry a single variant. record-packages then names and
       # records the group's package artifacts (android: the mpv-android AAR;
-      # nothing for a group without one).
+      # nothing for a group without one). Both name and record each artifact's
+      # debug-symbols zips (linux, windows: one per arch; android: the AAR's,
+      # one per ABI) and fail when a recorded asset arrived without them.
       - name: Record variants in the manifest
         if: steps.stale.outputs.stale == 'true'
         run: |

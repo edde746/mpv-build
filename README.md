@@ -84,6 +84,50 @@ under-invalidating would ship stale binaries. To force a full rebuild without a
 source change -- a new Xcode or SDK, a miscompile -- bump the generation in
 `toolchain/apple.txt`.
 
+### Debug symbols
+
+The android, linux and windows groups also publish one debug-symbols zip per
+variant, so a crash tracker (Sentry or a compatible one) can name the libmpv
+and FFmpeg frames of a crash in the shipped binaries. Each zip holds, at its
+root, the debug files of the binaries that variant ships. A tracker pairs them
+by identity, never by file name: the ELF GNU build-id, or the CodeView GUID
+and age a DLL records and its PDB carries.
+
+| Group | Asset, per variant | Contents |
+| --- | --- | --- |
+| android | `mpv-android-<key>-<abi>-symbols.zip` | a debug ELF for every `.so` in the AAR's `jni/<abi>/`, under the same name (`libc++_shared.so` only when the NDK holds its unstripped copy) |
+| linux | `libmpv-linux-<key>-<arch>-symbols.zip` | a debug ELF for every shared library in the tarball |
+| windows | `libmpv-windows-<key>-<arch>-symbols.zip` | `libmpv-2.pdb`, the PDB of `libmpv-2.dll` |
+
+The key is the one of the artifact they describe (its `symbolsPattern` in
+`group.json`; for the AAR, one zip per ABI of the tarballs it packs). They
+upload beside it and are recorded in its `artifacts.json` entry, the checksum
+being the zip's sha256:
+
+```json
+"libmpv-linux": {
+  "key": "<key>",
+  "prebuilt": {"x86_64": {"asset": "libmpv-linux-<key>-x86_64.tar.zst", "checksum": "<sha256>"}},
+  "symbols": {"x86_64": {"asset": "libmpv-linux-<key>-x86_64-symbols.zip", "checksum": "<sha256>"}}
+}
+```
+
+`keys.py stale` and `verify` treat an entry without every variant's symbols as
+unpublished, and recording a binary whose symbols zip is missing fails.
+Packaging never zips debug files by hand: `scripts/symbols.py pack` refuses a
+debug file whose identity differs from its shipped binary's or that carries no
+symbols, and writes a reproducible zip (sorted members, mode 0644, 2020-01-01
+mtimes), because a rebuilt key has to reproduce its published bytes.
+
+```bash
+# identities, spelled the way the tracker spells them
+python3 scripts/symbols.py id libmpv-2.dll libmpv-2.pdb
+# the candidate with <shipped>'s identity and the most debug information
+python3 scripts/symbols.py match <shipped> <candidate>...
+# a checked, reproducible zip of the debug files
+python3 scripts/symbols.py pack out.zip --pair <shipped> <debug> [--pair <shipped> <debug>]...
+```
+
 ## Patches
 
 Each patched component keeps its patches in one platform-neutral pool with
@@ -119,14 +163,17 @@ the pinned `commit`; an `archive` pin is downloaded, checked against the pinned
 the resolved series. The harnesses that build against a source tree also accept
 an already-patched source directory as their first argument, which is how they
 run offline. The harnesses that slice the patch files directly need no source
-tree at all, and `test_patches.sh`, `test_extract.sh` and `test_keys.sh` are
-regression tests of the Python tools themselves rather than of a source tree:
-`patches.py`'s series rules and archive fetching, `extract.py`'s slicing and
-hunk parsing over the whole pool, and `keys.py`'s content keys and gates.
-`test_apple_merge.sh` (macOS with Xcode) runs the publish job's XCFramework
-merge, `scripts/merge_xcframeworks.py`, twice over the same tiny per-platform
-frameworks and requires byte-identical zips: a rebuilt apple key has to
-reproduce the merged assets already published under its name.
+tree at all, and `test_patches.sh`, `test_extract.sh`, `test_keys.sh` and
+`test_symbols.sh` are regression tests of the Python tools themselves rather
+than of a source tree: `patches.py`'s series rules and archive fetching,
+`extract.py`'s slicing and hunk parsing over the whole pool, `keys.py`'s
+content keys and gates, and `symbols.py`'s identities, matching and zips over
+synthetic ELF, PE and PDB files (plus a real linked ELF where `cc`, `readelf`
+and `objcopy` link one). `test_apple_merge.sh` (macOS with Xcode) runs the
+publish job's XCFramework merge, `scripts/merge_xcframeworks.py`, twice over
+the same tiny per-platform frameworks and requires byte-identical zips: a
+rebuilt apple key has to reproduce the merged assets already published under
+its name.
 
 ## How to build
 
@@ -185,7 +232,8 @@ configured with `-Dbuild-date=false`, and OpenSSL, whose "built on" date ffmpeg
 links into `libavformat.so`, builds with `SOURCE_DATE_EPOCH` fixed to the
 tarballs' 2020-01-01 mtime. Every build leg of every group (and the Apple
 merge and the AAR build) runs `bash scripts/test_build_date.sh <asset>...`
-before uploading. It unpacks each `.tar.gz`, `.tar.zst`, `.zip` or `.aar`
+over its assets, debug-symbols zips included, before uploading. It unpacks
+each `.tar.gz`, `.tar.zst`, `.zip` or `.aar`
 (and the `.jar` inside) and fails when a file carries a
 clock reading from any day since 2020-01-02: `__DATE__`, asctime, ISO 8601 or
 RFC 2822 text, a PE or COFF `TimeDateStamp`, an ar member mtime, a Mach-O dylib
@@ -700,14 +748,24 @@ player.close()
   starts, and every unanswered hook is continued.
 
 `mpv-android` is a package artifact of the android group (`group.json`): its
-key covers the libmpv-android key and every file under `platforms/android/lib`
-that git tracks, so editing the glue moves the AAR's key alone, and anything
-that moves the tarballs' key moves it too. It publishes to
-`binaries-android` as `mpv-android-<key>.aar` and is recorded in
-`artifacts.json` beside the tarballs:
+key covers the libmpv-android key, every file under `platforms/android/lib`
+that git tracks and `scripts/symbols.py`, so editing the glue moves the AAR's
+key alone, and anything that moves the tarballs' key moves it too. It publishes to
+`binaries-android` as `mpv-android-<key>.aar`, with one
+`mpv-android-<key>-<abi>-symbols.zip` per ABI (see
+[Debug symbols](#debug-symbols)), and is recorded in `artifacts.json` beside
+the tarballs:
 
 ```json
-"mpv-android": {"key": "<key>", "asset": "mpv-android-<key>.aar", "checksum": "<sha256>"}
+"mpv-android": {
+  "key": "<key>", "asset": "mpv-android-<key>.aar", "checksum": "<sha256>",
+  "symbols": {
+    "arm64-v8a": {"asset": "mpv-android-<key>-arm64-v8a-symbols.zip", "checksum": "<sha256>"},
+    "armeabi-v7a": {"asset": "mpv-android-<key>-armeabi-v7a-symbols.zip", "checksum": "<sha256>"},
+    "x86": {"asset": "mpv-android-<key>-x86-symbols.zip", "checksum": "<sha256>"},
+    "x86_64": {"asset": "mpv-android-<key>-x86_64-symbols.zip", "checksum": "<sha256>"}
+  }
+}
 ```
 
 ```bash
@@ -739,10 +797,11 @@ The sha256 from `artifacts.json` goes into the app's pin (its
 Publishing: `.github/workflows/android.yml` builds the four tarballs (when
 libmpv-android is stale) and then the AAR (`platforms/android/lib/build-aar.sh`,
 with the JVM tests), from that run's tarballs or the published ones
-`artifacts.json` pins. `publish.yml` runs it for main, records the AAR with
-`keys.py record-packages`, verifies and uploads it with the tarballs; `ci.yml`
-runs it for pull requests (tarballs only when the change moves their key) and
-also builds the device tests' APK. The AAR's `.so` files compile against the
+`artifacts.json` pins. `publish.yml` runs it for main, records the AAR and its
+symbols zips with `keys.py record-packages`, verifies and uploads them with
+the tarballs; `ci.yml` runs it for pull requests (tarballs only when the
+change moves their key) and also builds the device tests' APK. The AAR's
+`.so` files compile against the
 tarball's `include/`, which carries mpv's headers and the patched FFmpeg's
 (`libavcodec/jni.h` among them): no header is vendored.
 
@@ -757,7 +816,15 @@ bash platforms/android/lib/build-aar.sh --key <libmpv-android key>
 bash platforms/android/lib/build-aar.sh --tarballs dist/release
 ```
 
-The result is `dist/release/mpv-android.aar`. To try it in an app before it is
+The result is `dist/release/mpv-android.aar` and, beside it, one
+`dist/release/mpv-android-<abi>-symbols.zip` per ABI: the debug file of every
+`.so` the AAR ships (cut from the tarball's unstripped copy, Gradle's
+`libplayer.so` or the NDK's `libc++_shared.so` with `llvm-objcopy
+--only-keep-debug`), which needs `python3`, `zip` and `unzip`. A library of
+ours without a GNU build-id or a debug file fails the build, so tarballs
+published before the android libraries were linked with `--build-id=sha1`
+(every libmpv-android key published before then, `f16b821414ff` included) no
+longer build an AAR. To try it in an app before it is
 published, copy it to a directory as `mpv-android-<name>.aar` and point the
 app's Ivy repository at that directory (`url = uri("file:///that/dir")`,
 pattern `[artifact]-[revision].[ext]`) with `<name>` as the version.
