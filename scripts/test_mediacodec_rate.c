@@ -1,9 +1,11 @@
 // Behavioral regressions for the production media3_rate path extracted by
-// test_mediacodec_rate.sh: with the option on, the decoder sets the operating
-// rate itself once, after its first frame, and the host's operating-rate call
-// leaves it alone. The configure keys it omits are in mediacodec_decode_init,
-// which needs a codec; the decoder logs them. The codec, the formats and the
-// receive path are fakes recording what reaches the platform.
+// test_mediacodec_rate.sh: auto turns the option on for MediaTek's and
+// MStar's decoders and an explicit value wins; with the option on, the
+// decoder sets the operating rate itself once, after its first frame, and
+// the host's operating-rate call leaves it alone. The configure keys it
+// omits are in mediacodec_decode_init, which needs a codec; the decoder
+// logs them. The codec, the formats and the receive path are fakes
+// recording what reaches the platform.
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +22,7 @@
 #define AV_LOG_WARNING 24
 #define AV_LOG_INFO 32
 #define AV_LOG_VERBOSE 40
+#define FF_ARRAY_ELEMS(a) (sizeof(a) / sizeof((a)[0]))
 
 typedef struct AVFrame { int unused; } AVFrame;
 typedef struct AVCodecContext { void *priv_data; } AVCodecContext;
@@ -47,6 +50,11 @@ static void av_log(void *avctx, int level, const char *fmt, ...)
 {
     if (level <= AV_LOG_INFO)
         infos++;
+}
+
+static int av_strstart(const char *str, const char *pfx, const char **ptr)
+{
+    return !strncmp(str, pfx, strlen(pfx));
 }
 
 // Platform fakes: every setParameters call and the format it carried.
@@ -141,6 +149,42 @@ static void test_rate_follows_the_first_frame_once(void)
     check(set_parameters_calls == 1, "later frames set nothing");
 }
 
+static void test_auto_follows_the_decoders_vendor(void)
+{
+    static const char *const on[] = {
+        "c2.mtk.av1.decoder", "c2.mtk.dvhe.stn.decoder",
+        "OMX.MTK.VIDEO.DECODER.AVC", "OMX.MS.AV1.Decoder",
+    };
+    static const char *const off[] = {
+        "c2.google.av1.decoder", "c2.qti.avc.decoder", "c2.exynos.hevc.decoder",
+        "OMX.amlogic.hevc.decoder.awesome2", "c2.android.av1-dav1d.decoder",
+    };
+
+    open_decoder(false, 24, 0);
+    for (int i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
+        infos = 0;
+        check(media3_rate_resolve(&avctx, -1, on[i]) == 1 && infos == 1,
+              "auto turns media3_rate on for a MediaTek or MStar decoder, and says so");
+    }
+    infos = 0;
+    for (int i = 0; i < sizeof(off) / sizeof(off[0]); i++)
+        check(media3_rate_resolve(&avctx, -1, off[i]) == 0,
+              "auto leaves media3_rate off for every other vendor");
+    check(media3_rate_resolve(&avctx, -1, NULL) == 0,
+          "auto leaves media3_rate off when the decoder could not be named");
+    check(infos == 0, "auto off says nothing");
+}
+
+static void test_an_explicit_value_overrides_auto(void)
+{
+    open_decoder(false, 24, 0);
+    check(media3_rate_resolve(&avctx, 0, "c2.mtk.av1.decoder") == 0,
+          "media3_rate=0 keeps a MediaTek decoder on the host's rate");
+    check(media3_rate_resolve(&avctx, 1, "c2.google.av1.decoder") == 1,
+          "media3_rate=1 turns it on for any decoder");
+    check(infos == 0, "an explicit value is not announced as a default");
+}
+
 static void test_host_rate_is_ignored_only_under_media3_rate(void)
 {
     open_decoder(true, 24, 0);
@@ -178,10 +222,13 @@ static void test_no_frame_rate_or_a_refusal_ends_the_attempt(void)
 
 int main(void)
 {
+    test_auto_follows_the_decoders_vendor();
+    test_an_explicit_value_overrides_auto();
     test_rate_follows_the_first_frame_once();
     test_host_rate_is_ignored_only_under_media3_rate();
     test_no_frame_rate_or_a_refusal_ends_the_attempt();
-    puts("PASS: media3_rate sets the operating rate once, after the first frame, "
-         "and keeps the host's rate from the codec");
+    puts("PASS: media3_rate is on by default for MediaTek and MStar decoders, "
+         "sets the operating rate once, after the first frame, and keeps the "
+         "host's rate from the codec");
     return 0;
 }

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Compile the production media3_rate path from the final Android ffmpeg
-# series: the decoder's own operating rate after its first frame
-# (mediacodecdec.c) and the host's operating-rate call it overrides
-# (mediacodec.c). Pass an already patched ffmpeg tree for offline use;
-# otherwise fetch and patch the pinned source in a temporary directory.
+# series: which decoders turn it on by default and the decoder's own
+# operating rate after its first frame (mediacodecdec.c), and the host's
+# operating-rate call it overrides (mediacodec.c). Pass an already patched
+# ffmpeg tree for offline use; otherwise fetch and patch the pinned source
+# in a temporary directory.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,7 +26,9 @@ fi
 # something else nearby.
 E="$root/scripts/extract.py"
 python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec.c" \
-    "$workdir/mediacodec_rate.inc" --fn apply_media3_rate --return void
+    "$workdir/mediacodec_rate.inc" --fn media3_rate_resolve --return int
+python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec.c" \
+    "$workdir/mediacodec_rate.inc" --append --fn apply_media3_rate --return void
 python3 "$E" symbol "$source_dir/libavcodec/mediacodecdec.c" \
     "$workdir/mediacodec_rate.inc" --append --fn mediacodec_receive_frame_cb --return int
 python3 "$E" symbol "$source_dir/libavcodec/mediacodec.c" \

@@ -387,10 +387,12 @@ already-patched source directory as the first argument to run offline.
 
 Run the MediaCodec `media3_rate` regression with
 `bash scripts/test_mediacodec_rate.sh`. It applies the Android series to the
-pinned ffmpeg and exercises the production path: with the option on, the
-decoder sets the operating rate to the stream's frame rate, rounded, once,
-after its first frame, a refused rate or a missing frame rate ends the
-attempt without costing the frame, and the host's
+pinned ffmpeg and exercises the production path. The option defaults to auto:
+on for decoders named `c2.mtk.`, `OMX.MTK.` or `OMX.MS.`, off for the rest and
+for a decoder that could not be named, and an explicit value wins either way.
+With the option on, the decoder sets the operating rate to the stream's frame
+rate, rounded, once, after its first frame, a refused rate or a missing frame
+rate ends the attempt without costing the frame, and the host's
 `av_mediacodec_set_operating_rate` never reaches the codec; without it the
 host's rate does and frames set nothing. The keys the option leaves out of
 the configure format are logged by the decoder, not covered here. Pass an
