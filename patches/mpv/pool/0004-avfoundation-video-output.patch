@@ -277,6 +277,65 @@ Folded in, in series order:
     change. scripts/test_avf_osd_layer_geometry.sh compiles the helper and
     checks it against real Core Animation layers.
 
+* 0040-avfoundation-dolby-vision-profile5-software-rpu:
+
+    From: edde746 <86283021+edde746@users.noreply.github.com>
+    Date: Wed, 21 Oct 2026 02:28:47 +0200
+    Subject: [PATCH] vo_avfoundation: give software-decoded Dolby Vision
+     profile 5 frames their RPU
+
+    Dolby Vision profile 5 played magenta and green on the iPad 10th and
+    11th generation (plezy#2760). Those iPads have no Dolby Vision decoder:
+    VTIsHardwareDecodeSupported(dvh1) is false, a dvh1 session fails with
+    -12906, and AVPlayer cannot open the file. Profile 5 has no HDR10 base
+    layer to fall back to, so it is decoded in software, and
+    upload_software_frame() handed the display layer the raw full-range IPT
+    codes in a video-range buffer with nothing to reshape them.
+
+    The display pipeline does the reshaping itself when the frame carries
+    its RPU, as a dvh1 session's output does, and it does so on these iPads
+    as well. FFmpeg's HEVC decoder exports the RPU NAL payload as
+    AV_FRAME_DATA_DOVI_RPU_BUFFER in the layout VideoToolbox attaches
+    (dovi_tool reads the two as the same RPU; VideoToolbox only smooths the
+    level 4 anchor). For a profile 5 frame, recognised the way
+    ff_dovi_guess_profile_hevc() does, upload into a full-range 10-bit
+    buffer and attach that payload as DolbyVisionRPUData. Profile 8,
+    hardware frames and everything else are unchanged.
+
+    Measured on AWS Device Farm with a profile 5 frame built into a pixel
+    buffer and enqueued on an AVSampleBufferDisplayLayer, sRGB mean of a
+    sand patch (reference, libplacebo's reshaping: 145,95,33):
+
+      iPad (2025) A16, iPadOS 18.3.2, no DV decoder
+        today's software upload                      245,0,106  magenta
+        full-range codes + FFmpeg's RPU              198,128,53
+      iPad (2022) A14, iPadOS 27.0, no DV decoder
+        today's software upload                      199,0,84   magenta
+        full-range codes + FFmpeg's RPU              160,102,38
+      iPad Air 11 (2024) M2, iPadOS 26.1, DV decoder
+        full-range codes + FFmpeg's RPU              160,102,38
+        the layer decoding the file itself           160,102,38
+
+    The A16's brighter result is iPadOS 18's tone mapping: an iPhone 11 on
+    iOS 18.6.2, whose layer decodes the file itself, shows 198,128,52.
+    Switching the layer to preferredDynamicRange .standard (an HDR toggle)
+    or attaching VideoToolbox's copy of the RPU changed none of the values.
+
+    End to end, the built libmpv playing the clip with vo=avfoundation,
+    hwdec=videotoolbox and hwdec-software-fallback (Plezy's options), paused
+    on the same frame, same patch:
+
+      iPad (2025) A16, 18.3.2   software fallback        198,128,52
+      iPad (2022) A14, 27.0     software fallback        160,102,38
+      iPad Air 11 (2024), 26.1  videotoolbox, unchanged  160,102,38
+                                hwdec=no                 160,102,38
+      iPhone 14 Pro, 27.0       videotoolbox, unchanged  158,101,38
+                                hwdec=no                 158,101,38
+
+    scripts/test_avf_dovi_profile5_rpu.sh compiles the selector (the marked
+    "avf dovi profile5 rpu" region) and checks that only profile 5 frames
+    are picked.
+
 diff --git a/meson.build b/meson.build
 index f6f8e7f..55612b4 100644
 --- a/meson.build
@@ -339,10 +398,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..0d1e9ad
+index 0000000..c60b4e6
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4624 @@
+@@ -0,0 +1,4701 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -369,6 +428,7 @@ index 0000000..0d1e9ad
 +#endif
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/frame.h>
++#include <libavutil/dovi_meta.h>
 +#include <libavutil/hdr_dynamic_metadata.h>
 +#include <libavutil/hwcontext_videotoolbox.h>
 +#include <libavutil/pixfmt.h>
@@ -833,6 +893,10 @@ index 0000000..0d1e9ad
 +
 +    // One-shot log for refusing geometry rendering on Dolby Vision frames.
 +    bool dovi_geometry_skip_logged;
++
++    // One-shot log for the first software Dolby Vision profile 5 frame
++    // given its RPU.
++    bool dovi_software_rpu_logged;
 +
 +    // One-shot log for dropping a composite that changed the sample size.
 +    bool composite_size_mismatch_logged;
@@ -2055,6 +2119,65 @@ index 0000000..0d1e9ad
 +    }
 +}
 +
++// --- avf dovi profile5 rpu (host-testable; keep freestanding) ---
++// Dolby Vision profile 5 has no backward-compatible base layer: its picture is
++// full-range IPT-PQ-c2, which only the RPU's reshaping turns into an image. A
++// VideoToolbox dvh1 session hands that RPU to the display layer as the
++// DolbyVisionRPUData attachment, and the display pipeline reshapes the frame
++// with it -- also on devices that have no Dolby Vision decoder (the iPad 10th
++// and 11th generation) and therefore decode profile 5 in software
++// (plezy#2760). A software frame uploaded without the RPU shows the raw IPT
++// codes: a magenta and green picture.
++//
++// FFmpeg's HEVC decoder exports the RPU NAL payload as
++// AV_FRAME_DATA_DOVI_RPU_BUFFER, NAL header stripped and emulation prevention
++// bytes intact, which is the layout VideoToolbox attaches. Return it for a
++// profile 5 frame, told apart the way FFmpeg's ff_dovi_guess_profile_hevc()
++// does. Profile 8 keeps presenting its HDR10/HLG base layer as before.
++static const AVBufferRef *find_dolby_vision_profile5_rpu(const mp_image_t *mpi)
++{
++    if (mpi->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
++        return NULL;
++
++    const AVBufferRef *metadata = NULL;
++    const AVBufferRef *rpu = NULL;
++    for (int i = 0; i < mpi->num_ff_side_data; i++) {
++        const struct mp_ff_side_data *sd = &mpi->ff_side_data[i];
++        if (sd->type == AV_FRAME_DATA_DOVI_METADATA)
++            metadata = sd->buf;
++        else if (sd->type == AV_FRAME_DATA_DOVI_RPU_BUFFER)
++            rpu = sd->buf;
++    }
++    if (!metadata || metadata->size < sizeof(AVDOVIMetadata) || !rpu || !rpu->size)
++        return NULL;
++
++    const AVDOVIRpuDataHeader *header =
++        av_dovi_get_header((const AVDOVIMetadata *)metadata->data);
++    if (header->vdr_rpu_profile != 0 || !header->bl_video_full_range_flag)
++        return NULL;
++    return rpu;
++}
++// --- end avf dovi profile5 rpu ---
++
++static void attach_dolby_vision_rpu(struct vo *vo, CVPixelBufferRef pixbuf,
++                                    const AVBufferRef *rpu)
++{
++    struct priv *p = vo->priv;
++
++    CFDataRef data = CFDataCreate(NULL, rpu->data, rpu->size);
++    if (!data)
++        return;
++    CVBufferSetAttachment(pixbuf, CFSTR("DolbyVisionRPUData"), data,
++                          kCVAttachmentMode_ShouldPropagate);
++    CFRelease(data);
++
++    if (!p->dovi_software_rpu_logged) {
++        MP_INFO(vo, "Dolby Vision profile 5 software frames carry their RPU "
++                    "(%zu bytes) to the display pipeline\n", (size_t)rpu->size);
++        p->dovi_software_rpu_logged = true;
++    }
++}
++
 +// --- HDR10+ per-frame metadata ---
 +// HEVC carries HDR10+ (SMPTE ST 2094-40) as a per-frame T.35 user-data SEI.
 +// FFmpeg parses it into AV_FRAME_DATA_DYNAMIC_HDR_PLUS on every decoded frame,
@@ -2593,6 +2716,17 @@ index 0000000..0d1e9ad
 +        return NULL;
 +    }
 +
++    // Profile 5's codes are full range, which the video-range buffer every
++    // other 10-bit frame gets would clip. The pool is rebuilt on a format
++    // change, so only profile 5 frames, each given its own RPU below, ever
++    // use the full-range one.
++    const AVBufferRef *dovi_rpu = NULL;
++    if (cvFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) {
++        dovi_rpu = find_dolby_vision_profile5_rpu(mpi);
++        if (dovi_rpu)
++            cvFormat = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++    }
++
 +    int w = mpi->w;
 +    int h = mpi->h;
 +
@@ -2666,6 +2800,8 @@ index 0000000..0d1e9ad
 +
 +    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
 +    tag_pixel_buffer_color_metadata(pixbuf, &mpi->params);
++    if (dovi_rpu)
++        attach_dolby_vision_rpu(vo, pixbuf, dovi_rpu);
 +
 +    return pixbuf;
 +}

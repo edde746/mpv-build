@@ -354,6 +354,16 @@ are neither allocated nor copied, that HDR10+ SEI messages and profile 7
 layers are removed or converted as configured, that malformed SEI is left
 verbatim, and that the output buffer is reused.
 
+Run the AVFoundation Dolby Vision profile 5 regression with
+`bash scripts/test_avf_dovi_profile5_rpu.sh`. It extracts the selector from
+patch 0004 that decides which software-decoded frames vo_avfoundation uploads
+full range with their RPU attached, so the display layer reshapes profile 5 on
+devices without a Dolby Vision decoder (plezy#2760). It checks that only a
+profile 5 frame (RPU profile 0, full-range base layer) presented as Dolby Vision
+is picked, in any side-data order, and that profile 8, other RPU profile and
+range combinations, non-Dolby Vision frames and frames missing their metadata
+or RPU keep their old upload.
+
 Run the MediaCodec input regression with `bash scripts/test_mediacodec_input.sh`.
 It fetches the pinned ffmpeg revision, applies the Android series, and
 exercises the production input-buffer sizing and packet submission: an access
