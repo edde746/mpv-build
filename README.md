@@ -757,6 +757,30 @@ player.close()
 - `close()` waits for the native teardown; once it starts no listener call
   starts, and every unanswered hook is continued.
 
+Beside it, the playback helpers both apps' engines share (derived from Plezy,
+GPL-3.0; `NOTICE`), all in `com.edde746.mpv`:
+
+- `GpuVoPolicy`: pure policy for when a session leaves the video plane
+  (`vo=mediacodec`) for `gpu` or `gpu-next` (`targetFor` over the session's
+  `REASON_*` set) and how a file's decode is routed before its decoder opens:
+  Dolby Vision decoder options, P5 reshaping and the overlay's route
+  (`dvDecoderOptions`, `needsDvReshaping`, `dvRoute`), software decode for
+  profiles and codecs no hardware decoder serves (`needsSoftwareDecode`), HDR
+  to SDR (`needsToneMapping`, with the app's `auto`/`device`/`player` mode),
+  the cheap render tier, the decode-stall watch (`decodeStall`) and the
+  BigOcean AV1 rebuild (`needsParkedRebuild`). It reads no player or
+  platform state: the app passes mpv's properties and the device's answers.
+- `MediaCodecQuery`: hardware decoder lookup and classification (H.264 High
+  10, HEVC Main 10, AV1, BigOcean, the Dolby Vision decoders FFmpeg would
+  open, a decoder's highest frame rate at a size).
+- `GlCapabilities`: `textureNorm16`, probed once per process on a throwaway
+  EGL context.
+- `MpvPlaceholderSurface`: the Surface mpv holds while the app has no video
+  Surface, a consumer that latches and drops every frame on its own GL
+  thread.
+- `VideoRectPolicy`: the video Surface's size for fit, cover, zoom and
+  stretch on the plane, and the `vo-mediacodec-video-rect` value.
+
 `mpv-android` is a package artifact of the android group (`group.json`): its
 key covers the libmpv-android key, every file under `platforms/android/lib`
 that git tracks and `scripts/symbols.py`, so editing the glue moves the AAR's
@@ -844,7 +868,8 @@ C++ tests (`src/test/cpp`: session lifecycle, event order with the error
 end-file drain, UTF-8 conversion) against fakes, with the patched mpv and
 FFmpeg headers; `./gradlew testDebugUnitTest` (in `platforms/android/lib`;
 AGP 9 runs a library's unit tests against its debug build type only)
-runs the JVM tests of the listener delivery and hook rules; the device test
+runs the JVM tests of the listener delivery and hook rules and of the
+helpers (Robolectric for `MediaCodecQuery` below API 29); the device test
 (`src/androidTest`) creates a player, plays the media given as the
 instrumentation argument `mediaUrl`, attaches and replaces surfaces and
 destroys it:
