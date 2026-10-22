@@ -1,7 +1,17 @@
 The mpv-build Android library (platforms/android/lib) is part of mpv-build and,
 like it, is licensed under the GNU General Public License version 3 (see LICENSE
-at the root of this repository). Its JNI glue and Kotlin wrapper derive from the
-JNI glue of mpv-android as distributed by libmpv-android
+at the root of this repository).
+
+Its playback helpers derive from Plezy (https://github.com/edde746/plezy), which
+is under the GNU General Public License version 3 as well:
+src/main/kotlin/com/edde746/mpv/GlCapabilities.kt, GpuVoPolicy.kt,
+MediaCodecQuery.kt, MpvPlaceholderSurface.kt and VideoRectPolicy.kt, and their
+tests in src/test/kotlin/com/edde746/mpv (GpuVoPolicyTest.kt,
+MediaCodecQueryTest.kt and VideoRectPolicyTest.kt). Each of these files names
+its origin in a header comment.
+
+Its JNI glue and Kotlin wrapper derive from the JNI glue of mpv-android as
+distributed by libmpv-android
 (https://github.com/jarnedemeulemeester/libmpv-android), which is under the MIT
 license below: src/main/cpp/main.cpp, event.cpp, event.h, render.cpp,
 property.cpp, jni_utils.cpp, jni_utils.h, log.cpp, log.h, globals.h and

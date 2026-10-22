@@ -133,6 +133,8 @@ tasks.withType<Test>().configureEach {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // MediaCodecQueryTest: MediaCodecInfo on the API levels below 29, where isHardwareAccelerated() does not exist.
+    testImplementation("org.robolectric:robolectric:4.16.1")
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test:core:1.7.0")
