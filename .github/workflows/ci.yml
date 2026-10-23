@@ -16,7 +16,7 @@ jobs:
     name: Patch series
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -160,7 +160,7 @@ jobs:
     name: Android plan
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       natives: ${{ steps.stale.outputs.natives }}
     steps:

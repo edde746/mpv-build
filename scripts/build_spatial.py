@@ -148,11 +148,17 @@ def build(root, source, output, mpv, target, sdk, rust_target, bridge_only=False
     rustup = cargo_home / "bin/rustup"
     if not rustup.exists():
         rustup = Path(shutil.which("rustup") or "rustup")
+    # cargo runs the `rustc` it finds on PATH unless RUSTC names one, and the
+    # driver's default PATH (plus the CARGO_HOME/bin rustup prepends) reaches
+    # a rustc proxy only when rustup-init populated ~/.cargo/bin. Homebrew's
+    # rustup, which macos-26 images ship since 20261021, keeps its proxies in
+    # its keg, so name the pinned toolchain's own rustc.
+    rustc = subprocess.check_output([str(rustup), "which", "--toolchain", rust, "rustc"], text=True).strip()
     cargo_target = output / "cargo-target"
     manifest = source / "Rust/SpatialAudioCore/Cargo.toml"
-    environment.update(CARGO_TARGET_DIR=str(cargo_target), CARGO_PROFILE_RELEASE_LTO="fat")
+    environment.update(CARGO_TARGET_DIR=str(cargo_target), CARGO_PROFILE_RELEASE_LTO="fat", RUSTC=rustc)
     environment.pop("RUSTFLAGS", None)
-    sysroot = subprocess.check_output([str(rustup), "run", rust, "rustc", "--print", "sysroot"], text=True).strip()
+    sysroot = subprocess.check_output([rustc, "--print", "sysroot"], text=True).strip()
     environment["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join([
         f"--remap-path-prefix={source}=/spatial-audio-bridge",
         f"--remap-path-prefix={cargo_home}=/cargo",

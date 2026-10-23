@@ -184,10 +184,9 @@ compiler pinned by this checkout and the targets used by its spatial slices:
 ```bash
 rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
 test -n "$rust_version"
-rustup toolchain install "$rust_version" --profile minimal
-rustup target add --toolchain "$rust_version" \
-  aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
-  aarch64-apple-tvos aarch64-apple-tvos-sim
+rustup toolchain install "$rust_version" --profile minimal --no-self-update \
+  --component rustc,cargo,rust-std \
+  --target aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-tvos,aarch64-apple-tvos-sim
 ```
 
 These are the same toolchain and target prerequisites installed by Apple CI.

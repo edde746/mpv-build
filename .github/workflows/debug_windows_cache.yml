@@ -26,7 +26,8 @@ permissions:
 jobs:
   dump:
     name: Dump ${{ inputs.arch }} logs (${{ inputs.pattern }})
-    runs-on: ubuntu-latest
+    # The host the cached windows tree was built on (publish.yml build-windows).
+    runs-on: ubuntu-24.04
     steps:
       - name: Restore newest build state cache
         uses: actions/cache/restore@v4

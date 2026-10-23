@@ -32,7 +32,11 @@ jobs:
   natives:
     name: Build android ${{ matrix.abi }}
     if: inputs.natives
-    runs-on: ubuntu-latest
+    # Pinned, never ubuntu-latest: the NDK is pinned, but nasm, meson and the
+    # autotools come from the image's apt, and a rebuild of a published key
+    # has to reproduce its bytes. ubuntu-latest moved these legs to
+    # ubuntu-26.04 in October 2026; the tarballs published since were built there.
+    runs-on: ubuntu-26.04
     # One job per ABI: the driver builds one architecture per --arch invocation
     # (platforms/android/build.sh), the ABIs share nothing but sources, and the
     # dependency graph is expensive enough that four runners beat one.
@@ -90,7 +94,7 @@ jobs:
     # always(): natives is skipped when the tarballs are published already;
     # a failed tarball leg leaves nothing to pack.
     if: always() && !cancelled() && needs.natives.result != 'failure'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 

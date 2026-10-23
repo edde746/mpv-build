@@ -201,7 +201,7 @@ jobs:
     needs: tests
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       # The stale libraries of the apple group, comma-separated: the `libs=`
       # argument the apple build legs need.
@@ -294,9 +294,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rustup is named rather than assumed: macos-26 images have changed how
+      # they ship it (rustup-init's ~/.cargo/bin until 20261013, Homebrew's
+      # keg from 20261021), and an image may drop it.
       - name: Install dependencies
         run: |
-          brew install autoconf automake libtool ninja
+          brew install autoconf automake libtool ninja rustup
           python -m pip install meson==1.4.2
 
       # Only the stale libraries are compiled; the rest are restored from their
@@ -307,11 +310,16 @@ jobs:
         run: |
           rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
           test -n "$rust_version"
-          rustup toolchain install "$rust_version" --profile minimal
-          # Only the slices with spatial audio build Rust; see spatialTarget().
-          rustup target add --toolchain "$rust_version" \
-            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
-            aarch64-apple-tvos aarch64-apple-tvos-sim
+          # What build_spatial.py runs, named instead of left to a profile:
+          # rustc and cargo, and rust-std for every target spatialTarget()
+          # returns (only the slices with spatial audio build Rust).
+          rustup toolchain install "$rust_version" --profile minimal --no-self-update \
+            --component rustc,cargo,rust-std \
+            --target aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-tvos,aarch64-apple-tvos-sim
+          # build_spatial.py resolves the toolchain's rustc through rustup, so
+          # no proxy has to be on the driver's PATH.
+          rustup which --toolchain "$rust_version" rustc
+          rustup which --toolchain "$rust_version" cargo
 
       - name: Build GPL version (${{ matrix.name }})
         run: |
@@ -431,14 +439,17 @@ jobs:
     # The aarch64 leg runs on GitHub's native arm runner: toolchain/linux.txt
     # pins the container image by multi-arch index digest, so the same
     # container-build.sh invocation resolves the arm64 image natively -- no
-    # qemu, and the glibc floor is identical to the x86_64 leg's.
+    # qemu, and the glibc floor is identical to the x86_64 leg's. The hosts
+    # are pinned as well, so a rebuild that has to reproduce a published key
+    # runs where that key was built: ubuntu-latest moved the x86_64 leg to
+    # ubuntu-26.04 in October 2026, and it stays there.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
@@ -482,7 +493,14 @@ jobs:
     # GCC_ARCH probe runs the HOST compiler with -march=x86-64 and fails on
     # arm64 hosts, and aarch64-w64-mingw32 only needs the clang toolchain,
     # which build.sh hardcodes.
-    runs-on: ubuntu-latest
+    # Pinned to the host the cached toolchain was built on: the llvm
+    # bootstrap links the host clang against the host's libc++, so the cached
+    # clang needs ubuntu-24.04's libc++/libunwind (LLVM 18) at run time. On
+    # ubuntu-26.04 it dies with "libunwind.so.1: cannot open shared object
+    # file" and meson reports "Unknown compiler(s)". The cache key does not
+    # name the host, so moving this runner means a new cache epoch
+    # (windows-ep3) and a cold, hours-long toolchain bootstrap.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -607,7 +625,7 @@ jobs:
     if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -716,7 +734,7 @@ jobs:
     if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
