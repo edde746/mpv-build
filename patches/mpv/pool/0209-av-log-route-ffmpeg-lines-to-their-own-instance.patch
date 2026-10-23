@@ -1,0 +1,361 @@
+av_log: send FFmpeg's log lines to the instance whose thread logged them
+
+FFmpeg has one log callback per process. mpv installed it for the first
+instance only (log_mpv_instance): every FFmpeg line went to that instance,
+and once it was destroyed the callback went back to FFmpeg's default
+(stderr) until no instance was left. An embedder that creates its next
+player while the last one still terminates (Tortuga releases an engine on
+its own thread, and termination can take seconds) got a player that never
+saw an FFmpeg line, among them "http: HTTP error 404 Not Found" when it
+cannot open a file, which the embedder reads to tell an expired link from
+a missing one. On a Pixel 7 with two engines: the 404 line of the second
+engine's load arrived on the first engine's log, and after the first one
+terminated no instance logged it at all.
+
+Keep every initialized instance, oldest first, and route each line to the
+instance whose thread logged it: each mpv thread that calls into FFmpeg
+(core, opener, demuxer, decoder, VO and the core's thread pool jobs) names
+its instance first (mp_av_log_set_thread()). A line from any other thread
+(FFmpeg's own workers, a client's thread) goes to the oldest instance
+alive. The callback stays installed while any instance is, and the partial
+line state (buffer, prefix) is per instance. mpv master has the same code.
+
+diff --git a/common/av_log.c b/common/av_log.c
+index 6785e89..61f56a5 100644
+--- a/common/av_log.c
++++ b/common/av_log.c
+@@ -51,13 +51,27 @@
+ #include <libavdevice/avdevice.h>
+ #endif
+ 
++// FFmpeg has one log callback for the whole process, and a process may run
++// several mpv instances at once: an embedder starts its next player while the
++// last one still terminates, which can take seconds. Each instance gets the
++// lines logged on its own threads (mp_av_log_set_thread()), so a player that
++// cannot open a file sees the "HTTP error 404" FFmpeg logged for it; a line
++// from any other thread (FFmpeg's own workers, a client's thread) goes to the
++// oldest instance alive.
++struct av_log_instance {
++    struct mpv_global *global;
++    struct mp_log *root, *decaudio, *decvideo, *demuxer;
++    bool print_prefix;
++    bstr buffer;
++};
++
+ // Needed because the av_log callback does not provide a library-safe message
+ // callback.
+ static mp_static_mutex log_lock = MP_STATIC_MUTEX_INITIALIZER;
+-static struct mpv_global *log_mpv_instance;
+-static struct mp_log *log_root, *log_decaudio, *log_decvideo, *log_demuxer;
+-static bool log_print_prefix = true;
+-static bstr log_buffer;
++// Every initialized instance, oldest first.
++static struct av_log_instance **log_instances;
++static int num_log_instances;
++static thread_local struct mpv_global *log_thread_global;
+ 
+ static int av_log_level_to_mp_level(int av_level)
+ {
+@@ -74,17 +88,17 @@ static int av_log_level_to_mp_level(int av_level)
+     return MSGL_FATAL;
+ }
+ 
+-static struct mp_log *get_av_log(void *ptr)
++static struct mp_log *get_av_log(struct av_log_instance *inst, void *ptr)
+ {
+     if (!ptr)
+-        return log_root;
++        return inst->root;
+ 
+     AVClass *avc = *(AVClass **)ptr;
+     if (!avc) {
+-        mp_warn(log_root,
++        mp_warn(inst->root,
+                "av_log callback called with bad parameters (NULL AVClass).\n"
+                "This is a bug in one of FFmpeg libraries used.\n");
+-        return log_root;
++        return inst->root;
+     }
+ 
+     if (!strcmp(avc->class_name, "AVCodecContext")) {
+@@ -92,10 +106,10 @@ static struct mp_log *get_av_log(void *ptr)
+         if (s->codec) {
+             if (s->codec->type == AVMEDIA_TYPE_AUDIO) {
+                 if (av_codec_is_decoder(s->codec))
+-                    return log_decaudio;
++                    return inst->decaudio;
+             } else if (s->codec->type == AVMEDIA_TYPE_VIDEO) {
+                 if (av_codec_is_decoder(s->codec))
+-                    return log_decvideo;
++                    return inst->decvideo;
+             }
+         }
+     }
+@@ -103,10 +117,10 @@ static struct mp_log *get_av_log(void *ptr)
+     if (!strcmp(avc->class_name, "AVFormatContext")) {
+         AVFormatContext *s = ptr;
+         if (s->iformat)
+-            return log_demuxer;
++            return inst->demuxer;
+     }
+ 
+-    return log_root;
++    return inst->root;
+ }
+ 
+ static const char *avclass_item_name(void *obj, const AVClass *avc)
+@@ -114,6 +128,17 @@ static const char *avclass_item_name(void *obj, const AVClass *avc)
+     return (avc->item_name ? avc->item_name : av_default_item_name)(obj);
+ }
+ 
++// The instance a line logged on the calling thread goes to; NULL when none is
++// alive. Called with log_lock held.
++static struct av_log_instance *thread_log_instance(void)
++{
++    for (int n = 0; n < num_log_instances; n++) {
++        if (log_instances[n]->global == log_thread_global)
++            return log_instances[n];
++    }
++    return num_log_instances ? log_instances[0] : NULL;
++}
++
+ static void mp_msg_av_log_callback(void *ptr, int level, const char *fmt,
+                                    va_list vl)
+ {
+@@ -123,27 +148,28 @@ static void mp_msg_av_log_callback(void *ptr, int level, const char *fmt,
+     // Note: mp_log is thread-safe, but destruction of the log instances is not.
+     mp_mutex_lock(&log_lock);
+ 
+-    if (!log_mpv_instance) {
++    struct av_log_instance *inst = thread_log_instance();
++    if (!inst) {
+         mp_mutex_unlock(&log_lock);
+         // Fallback to stderr
+         vfprintf(stderr, fmt, vl);
+         return;
+     }
+ 
+-    struct mp_log *log = get_av_log(ptr);
++    struct mp_log *log = get_av_log(inst, ptr);
+ 
+     if (mp_msg_test(log, mp_level)) {
+-        log_buffer.len = 0;
+-        bstr_xappend_vasprintf(log_root, &log_buffer, fmt, vl);
+-        if (!log_buffer.len)
++        inst->buffer.len = 0;
++        bstr_xappend_vasprintf(inst, &inst->buffer, fmt, vl);
++        if (!inst->buffer.len)
+             goto done;
+         const char *prefix = avc ? avclass_item_name(ptr, avc) : NULL;
+-        if (log_print_prefix && prefix) {
+-            mp_msg(log, mp_level, "%s: %.*s", prefix, BSTR_P(log_buffer));
++        if (inst->print_prefix && prefix) {
++            mp_msg(log, mp_level, "%s: %.*s", prefix, BSTR_P(inst->buffer));
+         } else {
+-            mp_msg(log, mp_level, "%.*s", BSTR_P(log_buffer));
++            mp_msg(log, mp_level, "%.*s", BSTR_P(inst->buffer));
+         }
+-        log_print_prefix = log_buffer.start[log_buffer.len - 1] == '\n';
++        inst->print_prefix = inst->buffer.start[inst->buffer.len - 1] == '\n';
+     }
+ 
+ done:
+@@ -152,16 +178,18 @@ done:
+ 
+ void init_libav(struct mpv_global *global)
+ {
++    struct av_log_instance *inst = talloc_zero(NULL, struct av_log_instance);
++    inst->global = global;
++    inst->root = mp_log_new(inst, global->log, "ffmpeg");
++    inst->decaudio = mp_log_new(inst, inst->root, "audio");
++    inst->decvideo = mp_log_new(inst, inst->root, "video");
++    inst->demuxer = mp_log_new(inst, inst->root, "demuxer");
++    inst->print_prefix = true;
++
+     mp_mutex_lock(&log_lock);
+-    if (!log_mpv_instance) {
+-        log_mpv_instance = global;
+-        log_root = mp_log_new(NULL, global->log, "ffmpeg");
+-        log_decaudio = mp_log_new(log_root, log_root, "audio");
+-        log_decvideo = mp_log_new(log_root, log_root, "video");
+-        log_demuxer = mp_log_new(log_root, log_root, "demuxer");
+-        log_buffer = (bstr){0};
++    MP_TARRAY_APPEND(NULL, log_instances, num_log_instances, inst);
++    if (num_log_instances == 1)
+         av_log_set_callback(mp_msg_av_log_callback);
+-    }
+     mp_mutex_unlock(&log_lock);
+ 
+     avformat_network_init();
+@@ -174,14 +202,25 @@ void init_libav(struct mpv_global *global)
+ void uninit_libav(struct mpv_global *global)
+ {
+     mp_mutex_lock(&log_lock);
+-    if (log_mpv_instance == global) {
++    for (int n = 0; n < num_log_instances; n++) {
++        if (log_instances[n]->global == global) {
++            talloc_free(log_instances[n]);
++            MP_TARRAY_REMOVE_AT(log_instances, num_log_instances, n);
++            break;
++        }
++    }
++    if (!num_log_instances) {
+         av_log_set_callback(av_log_default_callback);
+-        log_mpv_instance = NULL;
+-        talloc_free(log_root);
++        TA_FREEP(&log_instances);
+     }
+     mp_mutex_unlock(&log_lock);
+ }
+ 
++void mp_av_log_set_thread(struct mpv_global *global)
++{
++    log_thread_global = global;
++}
++
+ #define V(x) AV_VERSION_MAJOR(x), \
+              AV_VERSION_MINOR(x), \
+              AV_VERSION_MICRO(x)
+diff --git a/common/av_log.h b/common/av_log.h
+index ae12838..95b1dfe 100644
+--- a/common/av_log.h
++++ b/common/av_log.h
+@@ -7,5 +7,8 @@ struct mpv_global;
+ struct mp_log;
+ void init_libav(struct mpv_global *global);
+ void uninit_libav(struct mpv_global *global);
++// FFmpeg's log lines from the calling thread go to this instance. Every mpv
++// thread that calls into FFmpeg sets it first.
++void mp_av_log_set_thread(struct mpv_global *global);
+ void check_library_versions(struct mp_log *log, int v);
+ #endif
+diff --git a/demux/demux.c b/demux/demux.c
+index dc36193..0fc3898 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -33,6 +33,7 @@
+ #include "options/m_option.h"
+ #include "mpv_talloc.h"
+ #include "common/av_common.h"
++#include "common/av_log.h"
+ #include "common/msg.h"
+ #include "common/global.h"
+ #include "common/recorder.h"
+@@ -2560,6 +2561,7 @@ static MP_THREAD_VOID demux_thread(void *pctx)
+ {
+     struct demux_internal *in = pctx;
+     mp_thread_set_name("demux");
++    mp_av_log_set_thread(in->global);
+     mp_mutex_lock(&in->lock);
+ 
+     stats_register_thread_cputime(in->stats, "thread");
+diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
+index 5e2e8d7..1e0c90c 100644
+--- a/filters/f_decoder_wrapper.c
++++ b/filters/f_decoder_wrapper.c
+@@ -36,6 +36,7 @@
+ #include "demux/packet.h"
+ #include "demux/packet_pool.h"
+ 
++#include "common/av_log.h"
+ #include "common/codecs.h"
+ #include "common/global.h"
+ #include "common/recorder.h"
+@@ -1127,6 +1128,7 @@ static MP_THREAD_VOID dec_thread(void *ptr)
+     case STREAM_AUDIO: t_name = "dec/audio"; break;
+     }
+     mp_thread_set_name(t_name);
++    mp_av_log_set_thread(p->decf->global);
+ 
+     while (!p->request_terminate_dec_thread) {
+         mp_filter_graph_run(p->dec_root_filter);
+diff --git a/player/client.c b/player/client.c
+index e23b98b..667e28f 100644
+--- a/player/client.c
++++ b/player/client.c
+@@ -24,6 +24,7 @@
+ 
+ #include "common/common.h"
+ #include "common/global.h"
++#include "common/av_log.h"
+ #include "common/msg.h"
+ #include "common/msg_control.h"
+ #include "input/input.h"
+@@ -595,6 +596,7 @@ static MP_THREAD_VOID core_thread(void *p)
+     while (!mpctx->initialized && mpctx->stop_play != PT_QUIT)
+         mp_idle(mpctx);
+ 
++    mp_av_log_set_thread(mpctx->global);
+     if (mpctx->initialized)
+         mp_play_files(mpctx);
+ 
+diff --git a/player/command.c b/player/command.c
+index 20e8829..be75261 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -35,6 +35,7 @@
+ #include "clipboard/clipboard.h"
+ #include "external_files.h"
+ #include "common/av_common.h"
++#include "common/av_log.h"
+ #include "common/codecs.h"
+ #include "common/msg.h"
+ #include "common/msg_control.h"
+@@ -5549,6 +5550,8 @@ static void run_command_on_worker_thread(void *p)
+     struct mp_cmd_ctx *ctx = p;
+     struct MPContext *mpctx = ctx->mpctx;
+ 
++    mp_av_log_set_thread(mpctx->global);
++
+     mp_core_lock(mpctx);
+ 
+     bool exec_async = ctx->cmd->def->exec_async;
+diff --git a/player/loadfile.c b/player/loadfile.c
+index f9b6531..ec39a68 100644
+--- a/player/loadfile.c
++++ b/player/loadfile.c
+@@ -33,6 +33,7 @@
+ #include "osdep/timer.h"
+ 
+ #include "client.h"
++#include "common/av_log.h"
+ #include "common/msg.h"
+ #include "common/msg_control.h"
+ #include "options/path.h"
+@@ -1125,6 +1126,7 @@ static MP_THREAD_VOID open_demux_thread(void *ctx)
+     struct MPContext *mpctx = ctx;
+ 
+     mp_thread_set_name("opener");
++    mp_av_log_set_thread(mpctx->global);
+ 
+     struct demuxer_params p = {
+         .force_format = mpctx->open_format,
+@@ -1508,6 +1510,8 @@ static void load_external_opts_thread(void *p)
+     struct MPContext *mpctx = a[0];
+     struct mp_waiter *waiter = a[1];
+ 
++    mp_av_log_set_thread(mpctx->global);
++
+     mp_core_lock(mpctx);
+ 
+     load_chapters(mpctx);
+diff --git a/video/out/vo.c b/video/out/vo.c
+index c9cde30..36db5a6 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -37,6 +37,7 @@
+ #include "dr_helper.h"
+ #include "input/input.h"
+ #include "options/m_config.h"
++#include "common/av_log.h"
+ #include "common/msg.h"
+ #include "common/global.h"
+ #include "common/stats.h"
+@@ -1121,6 +1122,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+     bool vo_paused = false;
+ 
+     mp_thread_set_name("vo");
++    mp_av_log_set_thread(vo->global);
+ 
+     if (vo->driver->get_image) {
+         in->dr_helper = dr_helper_create(in->dispatch, get_image_vo, vo);

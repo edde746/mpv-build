@@ -31,3 +31,6 @@
 # deinterlace=ivtc and the ivtc-active property (needs the fieldmatch and
 # decimate filters every group's FFmpeg enables).
 0207-f-auto-filters-inverse-telecine-deinterlace-mode.patch
+# FFmpeg's log lines reach the instance whose thread logged them, with
+# several instances alive at once.
+0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch

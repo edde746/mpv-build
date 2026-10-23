@@ -582,6 +582,16 @@ subtitle stream with no packet between the seek target and its old position is
 its next line. Streams with DTS and position-only streams are both covered.
 Pass an already-patched source directory to run offline.
 
+Run the FFmpeg log routing regression with `bash scripts/test_av_log_routing.sh`.
+It compiles the instance list, `init_libav()`, `uninit_libav()`,
+`mp_av_log_set_thread()` and the av_log callback (`common/av_log.c`, patch
+0209) and logs lines from threads of two instances alive at once: each line
+reaches the instance whose thread logged it, before and after the other one is
+destroyed; a line from a thread no instance owns reaches the oldest one alive;
+a partial line of one instance leaves the next line of the other its prefix;
+the callback stays installed while any instance is and is FFmpeg's default
+again after the last. Pass an already-patched source directory to run offline.
+
 Run the spatial audio output regression with `bash scripts/test_ao_spatial.sh`
 (macOS). It drives the driver with a real synchronizer and a fake sink:
 admission and the bytes waiting for a full sink, the clock's start, holds and

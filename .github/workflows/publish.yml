@@ -153,6 +153,9 @@ jobs:
       - name: Test the packets a refresh seek reads back
         run: bash ./scripts/test_demux_refresh.sh
 
+      - name: Test FFmpeg log lines reaching the instance that logged them
+        run: bash ./scripts/test_av_log_routing.sh
+
       - name: Test the codec profile the demuxers publish at load
         run: bash ./scripts/test_demux_codec_profile.sh
 
