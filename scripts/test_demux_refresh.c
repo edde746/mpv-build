@@ -15,7 +15,9 @@
 // dropped even when it lay past the old position. Video and audio read their
 // old last packet back, so nothing new was lost for them; a subtitle stream
 // usually has no packet between the seek target and its old position, so it
-// lost its next line for good (plezy#2717).
+// lost its next line for good (plezy#2717). A subtitle queue with nothing in
+// the joined range has no old position at all; with Matroska's missing DTS
+// its first line was dropped as NOPTS <= NOPTS (plezy#2810).
 #include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -292,6 +294,20 @@ int main(void)
     CHECK(queue_is(&r, (const int64_t[]){100, 200, 300, 400, 500, 600}, 6) && dropped == 2,
           "pos only, re-read tail: packets at or before the old position were not dropped "
           "exactly (%d dropped, expected 2)", dropped);
+    rig_free(&r);
+
+    // A seek joined ranges while the subtitle stream had nothing queued in
+    // either, as for a signs track with no line in the opening minute. The
+    // queue keeps the empty queue's correct_dts and has no old DTS or
+    // position; Matroska packets carry no DTS. Every packet is new.
+    rig_init(&r, STREAM_SUB);
+    refresh_after_join(&r);
+    feed(&r, MP_NOPTS_VALUE, 3550);
+    feed(&r, MP_NOPTS_VALUE, 3600);
+    CHECK(queue_is(&r, (const int64_t[]){3550, 3600}, 2) && dropped == 0,
+          "join, empty subtitle queue: the first line read after the join was not queued "
+          "(%d dropped); it never shows and never reaches the cache (plezy#2810)", dropped);
+    CHECK(!r.ds.refreshing, "join, empty subtitle queue: the stream is still refreshing");
     rig_free(&r);
 
     CHECK(warnings == 0, "a refresh with valid DTS or pos warned %d time(s)", warnings);

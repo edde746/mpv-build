@@ -20,27 +20,45 @@ could not show it.
 
 Drop only the packets at or before the old position. Packet DTS and pos are
 strictly increasing whenever the refresh uses them (correct_dts,
-correct_pos), so "at or before" matches the old packet exactly. mpv master
-has the same code.
+correct_pos), so "at or before" matches the old packet exactly.
+
+The line still went missing when the subtitle stream had nothing queued in
+the cached range at the join, a signs track with no line in the opening
+minute (edde746/plezy#2810). Such a queue has no old position: last_dts is
+NOPTS, last_pos is -1, and correct_dts is still the "true" an empty queue
+starts with. Matroska packets carry no DTS, so the DTS comparison read
+NOPTS <= NOPTS and dropped the next line. A queue with neither an old DTS nor
+an old position now keeps every packet and stops refreshing, and each
+comparison runs only against an old value that exists.
+
+mpv master has the same code.
 
 diff --git a/demux/demux.c b/demux/demux.c
-index d1accba..dc36193 100644
+index d1accba..cf492a0 100644
 --- a/demux/demux.c
 +++ b/demux/demux.c
-@@ -2027,17 +2027,21 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
+@@ -2027,17 +2027,27 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
  
      if (!drop && ds->refreshing) {
          // Resume reading once the old position was reached (i.e. we start
 -        // returning packets where we left off before the refresh).
 -        // If it's the same position, drop, but continue normally next time.
+-        if (queue->correct_dts) {
 +        // returning packets where we left off before the refresh). Drop the
 +        // packet at the old position, but keep the first one past it: a
 +        // sparse stream (subtitles) often has no packet between the seek
 +        // target and the old position, so its first packet is already new.
-         if (queue->correct_dts) {
++        // With neither an old DTS nor an old position (nothing queued in this
++        // range, nothing returned before the refresh) every packet is new.
++        // Such a queue still has the empty queue's correct_dts, and Matroska
++        // packets have no DTS: comparing DTS would drop as NOPTS <= NOPTS.
++        if (queue->last_dts == MP_NOPTS_VALUE && queue->last_pos < 0) {
++            ds->refreshing = false;
++        } else if (queue->correct_dts && queue->last_dts != MP_NOPTS_VALUE) {
              ds->refreshing = dp->dts < queue->last_dts;
+-        } else if (queue->correct_pos) {
 +            drop = dp->dts <= queue->last_dts;
-         } else if (queue->correct_pos) {
++        } else if (queue->correct_pos && queue->last_pos >= 0) {
              ds->refreshing = dp->pos < queue->last_pos;
 +            drop = dp->pos <= queue->last_pos;
          } else {

@@ -578,8 +578,10 @@ resume and a track switch set it up: a stream that was already selected drops
 exactly the packets at or before its old position, so video reading its old
 tail back queues nothing twice, and keeps the first packet past it, which for a
 subtitle stream with no packet between the seek target and its old position is
-its next line. Streams with DTS and position-only streams are both covered.
-Pass an already-patched source directory to run offline.
+its next line. A subtitle stream with nothing queued in the joined range has
+no old position and keeps every packet, even without DTS as Matroska muxes
+it. Streams with DTS and position-only streams are both covered. Pass an
+already-patched source directory to run offline.
 
 Run the FFmpeg log routing regression with `bash scripts/test_av_log_routing.sh`.
 It compiles the instance list, `init_libav()`, `uninit_libav()`,
