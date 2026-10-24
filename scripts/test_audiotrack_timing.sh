@@ -63,7 +63,8 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_thdPut --fn AudioTrack_thdStreamWord --fn AudioTrack_thdMatWord \
     --fn AudioTrack_thdGroup --fn AudioTrack_thdTake \
     --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
-    --fn iec_burst_bytes --fn AudioTrack_trackBurst --fn AudioTrack_noteLayout \
+    --fn iec_burst_bytes --fn ka_default_burst --fn AudioTrack_initKeepAlive \
+    --fn AudioTrack_trackBurst --fn AudioTrack_noteLayout \
     --fn AudioTrack_keepAliveAudio --fn AudioTrack_keepAliveStop \
     --fn AudioTrack_writeSilence --fn AudioTrack_keepAlive \
     --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
