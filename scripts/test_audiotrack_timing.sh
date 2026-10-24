@@ -48,7 +48,11 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
     --name THREAD_PRIORITY_AUDIO \
-    --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
+    --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES \
+    --name KA_AHEAD_NS --name KA_HEAD_STILL_NS --name KA_POLL_NS --name KA_STALL_LOG_NS \
+    --name KA_IDLE_NS
+# The silent frames and the IEC preamble the stream-silence path writes.
+python3 "$E" region "$src" "$workdir/audiotrack_write.inc" --append --start stream-silence-data
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_thdReset --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
@@ -59,9 +63,12 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_thdPut --fn AudioTrack_thdStreamWord --fn AudioTrack_thdMatWord \
     --fn AudioTrack_thdGroup --fn AudioTrack_thdTake \
     --fn AudioTrack_unwrapIEC61937 --fn dtshd_core_rate \
+    --fn iec_burst_bytes --fn AudioTrack_trackBurst --fn AudioTrack_noteLayout \
+    --fn AudioTrack_keepAliveAudio --fn AudioTrack_keepAliveStop \
+    --fn AudioTrack_writeSilence --fn AudioTrack_keepAlive \
     --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
-    --fn ao_thread --fn monitor_thread --fn stop --fn start
+    --fn AudioTrack_deferredPlay --fn AudioTrack_kaStep --fn ao_thread --fn monitor_thread --fn stop --fn start
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_audiotrack_timing.c" -lm

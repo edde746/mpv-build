@@ -58,7 +58,7 @@ struct jni {
     void (*SetFloatArrayRegion)(JNIEnv *, jobject, int, int, const void *);
     void (*SetByteArrayRegion)(JNIEnv *, jobject, int, int, const void *);
 };
-struct ao { void *priv; int samplerate, sstride, format; };
+struct ao { void *priv; int samplerate, sstride, format; bool stream_silence; };
 
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
@@ -341,7 +341,10 @@ static int AudioTrack_New(struct ao *ao)
 static int ao_read_data(struct ao *ao, void **data, int samples, int64_t end,
                         void *pts, bool pad, bool block)
 {
-    (void)end; (void)pts; (void)pad; (void)block;
+    (void)end; (void)pts; (void)pad;
+    // A non-blocking read that misses the core's lock returns 0, which a
+    // stream-silence track cannot tell from an empty queue.
+    assert(block == ao->stream_silence);
     mp_mutex_lock(&gate);
     assert(input_bytes <= samples * ao->sstride);
     memcpy(*data, input, input_bytes);
@@ -654,6 +657,86 @@ static void check_dead_object(void)
     assert(track_count == 2 && failures == 1 && atomic_load(&f.p.failed));
     teardown(&f);
     puts("PASS: stale ERROR_DEAD_OBJECT is ignored; live errors retain recovery budget");
+}
+
+// --audio-stream-silence makes the core start the AO before it has audio. A
+// bitstream track with stream silence is left paused by start() and started
+// by the worker once its first frame has been written: nothing reaches the
+// track before that frame, it starts primed rather than empty, and a
+// replacement made meanwhile is not started either. Once feeding, a step
+// that takes KA_STALL_LOG_NS or longer is logged by name.
+static void check_stream_silence_deferred_start(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    mp_mutex_lock(&f.p.lock);
+    f.ao.stream_silence = true;
+    f.p.ka_enabled = true;
+    f.p.ka_unit_51 = silence_ac3_51;
+    f.p.ka_unit_51_len = 16; // a short unit keeps the fake buffers in bounds
+    f.p.ka_unit_frames = 1536;
+    mp_mutex_unlock(&f.p.lock);
+
+    // The core starts the AO with nothing to play: the track stays paused
+    // and the worker polls for audio instead of writing silence.
+    mp_mutex_lock(&gate);
+    int target = idle + 1;
+    mp_mutex_unlock(&gate);
+    start(&f.ao);
+    wait_counter(&idle, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[0].state == AudioTrack.PLAYSTATE_PAUSED && entered == 0);
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f.p.play_deferred));
+
+    mp_mutex_lock(&f.p.lock);
+    assert(!AudioTrack_Recreate(&f.ao));
+    mp_mutex_unlock(&f.p.lock);
+    mp_mutex_lock(&gate);
+    assert(track_count == 2 && tracks[1].state == AudioTrack.PLAYSTATE_PAUSED);
+
+    // The first burst is written to the still-paused track, which starts
+    // once that write has completed.
+    target = entered + 1;
+    memcpy(input, burst, sizeof(burst));
+    input_bytes = sizeof(burst);
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[1].state == AudioTrack.PLAYSTATE_PAUSED);
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f.p.play_deferred));
+    // Let the write complete with the track left playing. The core has
+    // nothing more, so the worker goes straight on to a silent frame, and
+    // that write (held by the device in turn) is the signal the first one
+    // has completed.
+    mp_mutex_lock(&gate);
+    pause_after_write = false;
+    response = sizeof(payload);
+    permitted = entered;
+    target = entered + 1;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    assert(tracks[1].sink_size == sizeof(payload));
+    assert(!memcmp(tracks[1].sink, payload, sizeof(payload)));
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.play_deferred));
+    expect_delay(&f, sizeof(burst) / 2);
+    assert(!warnings && !failures);
+
+    // The fake clock advances 200 ms while the device holds the silent
+    // frame, and the worker names the slow step once the write returns.
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(200));
+    pause_after_write = true;
+    finish_write(&f, 16);
+    assert(warnings == 1);
+    assert(strstr(last_warning, "the silence write took 200 ms"));
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a stream-silence track starts primed with its first frame, and a slow feed step is named");
 }
 
 // One monitor sample, then the verdict it produced: the monitor logs after
@@ -1199,6 +1282,7 @@ int main(void)
     check_pcm_and_iec(AudioFormat.ENCODING_IEC61937, true, 3, 6);
     puts("PASS: PCM direct/byte/float and IEC partial counts survive reset without stale credit");
     check_dead_object();
+    check_stream_silence_deferred_start();
     check_watchdog_after_reset();
     check_underrun_reporting();
     check_pcm_stale_head_after_flush();
