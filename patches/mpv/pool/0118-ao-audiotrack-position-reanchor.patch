@@ -1,8 +1,8 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index b828b5c..c7d2d57 100644
+index 6505092..9190e37 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -73,11 +73,26 @@ struct priv {
+@@ -81,11 +81,26 @@ struct priv {
      bool timestamp_set;
      int timestamp_stable;
      uint32_t timestamp_last_fpos;
@@ -32,7 +32,7 @@ index b828b5c..c7d2d57 100644
  
      // Accounting/parser state belongs to this generation, under lock. Only
      // the worker touches the buffers; reset never clears or frees their data.
-@@ -505,11 +520,15 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
+@@ -515,11 +530,15 @@ static void AudioTrack_resetPlayheadSmoothing(struct priv *p)
  static void AudioTrack_resetClock(struct priv *p)
  {
      p->write_generation++;
@@ -49,13 +49,19 @@ index b828b5c..c7d2d57 100644
      p->raw_state = RAW_SYNC_PA;
      p->raw_payload_left = 0;
      p->raw_dts_header_len = 0;
-@@ -541,9 +560,11 @@ static int AudioTrack_Recreate(struct ao *ao)
+@@ -552,8 +571,6 @@ static int AudioTrack_Recreate(struct ao *ao)
      p->routed_device = 0;
      p->track_generation++;
      p->routing_lost = false;
 -    p->playhead_pos = 0;
 -    p->reset_pending = false;
-     AudioTrack_resetClock(p);
+     // The clock goes with the track it timed. A retry after a failed
+     // replacement (AudioTrack_recreateOrFail) has no track and finds the
+     // clock reset already; what a caller has put back since then stays.
+@@ -564,6 +581,10 @@ static int AudioTrack_Recreate(struct ao *ao)
+     // replacement, whose own first write opens a fresh window.
+     atomic_store(&p->write_progress_ns, mp_time_ns());
+     atomic_store(&p->write_outstanding, false);
 +    // A fresh track's counters start at zero, but a HAL that resumes them
 +    // mid-epoch is handled the same way as a flush: anchor on first read.
 +    p->head_reset_pending = true;
@@ -63,7 +69,7 @@ index b828b5c..c7d2d57 100644
      int ret = AudioTrack_New(ao);
      if (ret == 0 && atomic_load(&p->play_requested)) {
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
-@@ -611,6 +632,25 @@ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
+@@ -631,6 +652,25 @@ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
      return (uint32_t)est;
  }
  
@@ -89,7 +95,7 @@ index b828b5c..c7d2d57 100644
  static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
                                                   int64_t *sample_time)
  {
-@@ -625,9 +665,11 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -645,9 +685,11 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
  
      int stable_count = 20;
      int64_t wait = p->timestamp_stable < stable_count ? 50000000 : 3000000000;
@@ -101,7 +107,7 @@ index b828b5c..c7d2d57 100644
          (p->timestamp_fetched == 0 || now - p->timestamp_fetched >= wait)) {
          if (!p->timestamp_fetched)
              p->timestamp_stable = 0;
-@@ -640,8 +682,18 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -660,8 +702,18 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
              bool advancing = time2 != 0 && fpos != 0 &&
                               p->timestamp_fetched != 0 && fpos != p->timestamp_last_fpos;
              p->timestamp_fetched = now;
@@ -121,7 +127,7 @@ index b828b5c..c7d2d57 100644
                  p->timestamp_set = true;
                  if (p->timestamp_stable < stable_count)
                      p->timestamp_stable++;
-@@ -655,61 +707,69 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -675,61 +727,69 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
      /* AudioTrack's framePosition and playbackHeadPosition return a signed integer,
       * but documentation states it should be interpreted as a 32-bit unsigned integer.
       */
@@ -236,7 +242,7 @@ index b828b5c..c7d2d57 100644
  }
  
  // Pair the delay with the instant its selected playhead represents, in mpv time.
-@@ -725,14 +785,28 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+@@ -745,14 +805,28 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
      uint32_t playhead = AudioTrack_getPlaybackHeadPosition(ao, sample_time);
      if (passthrough)
          playhead = AudioTrack_smoothPlayhead(ao, playhead, sample_time);
@@ -268,7 +274,7 @@ index b828b5c..c7d2d57 100644
      }
      return MPCLAMP(delay, 0.0, 2.0);
  }
-@@ -1771,8 +1845,11 @@ static void stop(struct ao *ao)
+@@ -1821,8 +1895,11 @@ static void stop(struct ao *ao)
  
      // Interrupt first, then reset without waiting for a late write to return.
      mp_mutex_lock(&p->lock);

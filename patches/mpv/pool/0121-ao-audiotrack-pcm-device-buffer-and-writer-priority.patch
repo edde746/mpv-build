@@ -1,5 +1,5 @@
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index d57c17c..47d9155 100644
+index 2906b45..4aae050 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -21,10 +21,12 @@
@@ -26,9 +26,9 @@ index d57c17c..47d9155 100644
  // stopped consuming keeps the writer inside AudioTrack.write for good, and
  // with it the audio clock and the video waiting on it. Several seconds of
  // neither a completed write nor a moving playback head is far beyond any
-@@ -51,6 +53,10 @@ static int jni_static_use_count = 0;
- #define STALL_MAX_RECREATES 1
- #define STALL_POLL_NS MP_TIME_MS_TO_NS(250)
+@@ -59,6 +61,10 @@ static int jni_static_use_count = 0;
+ #define RECREATE_GRACE_NS MP_TIME_S_TO_NS(3)
+ #define RECREATE_RETRY_NS MP_TIME_MS_TO_NS(100)
  
 +// android.os.Process.THREAD_PRIORITY_AUDIO: the niceness of the platform's
 +// own audio client threads.
@@ -37,7 +37,7 @@ index d57c17c..47d9155 100644
  enum {
      RAW_SYNC_PA = 0,
      RAW_SYNC_PB,
-@@ -93,6 +99,7 @@ struct priv {
+@@ -101,6 +107,7 @@ struct priv {
      bool head_reset_pending;   // anchor the head counter on its next read
      bool ts_reset_pending;     // anchor the timestamp counter on its next fetch
      int64_t latency_warn_ns;   // rate limit for the delay tripwire
@@ -45,7 +45,7 @@ index d57c17c..47d9155 100644
  
      // Accounting/parser state belongs to this generation, under lock. Only
      // the worker touches the buffers; reset never clears or frees their data.
-@@ -430,6 +437,21 @@ static const struct {
+@@ -440,6 +447,21 @@ static const struct {
  };
  #undef ENTRY
  
@@ -67,7 +67,7 @@ index d57c17c..47d9155 100644
  static int AudioTrack_New(struct ao *ao)
  {
      struct priv *p = ao->priv;
-@@ -503,12 +525,18 @@ static int AudioTrack_New(struct ao *ao)
+@@ -513,12 +535,18 @@ static int AudioTrack_New(struct ao *ao)
          return -1;
      }
  
@@ -92,7 +92,7 @@ index d57c17c..47d9155 100644
          }
      }
  
-@@ -901,8 +929,17 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
+@@ -916,8 +944,17 @@ static double AudioTrack_getLatency(struct ao *ao, int64_t *sample_time)
          playhead = p->written_frames;
      uint32_t diff = p->written_frames - playhead;
      double delay = diff / (double)(ao->samplerate);
@@ -112,7 +112,7 @@ index d57c17c..47d9155 100644
      // Anchored counters make delay > 2 s unreachable through accounting; a
      // trip here means the HAL is lying in a way anchoring cannot absorb.
      // Report it instead of silently returning 0, which hid exactly this class
-@@ -1442,6 +1479,26 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -1478,6 +1515,26 @@ static MP_THREAD_VOID ao_thread(void *arg)
      struct priv *p = ao->priv;
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      mp_thread_set_name("ao/audiotrack");
@@ -138,8 +138,8 @@ index d57c17c..47d9155 100644
 +        MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
      mp_mutex_lock(&p->lock);
      while (!atomic_load(&p->thread_terminate)) {
-         if (atomic_exchange(&p->recreate_requested, false)) {
-@@ -1855,20 +1912,40 @@ static int init(struct ao *ao)
+         if (atomic_load(&p->recreate_requested)) {
+@@ -1900,20 +1957,40 @@ static int init(struct ao *ao)
          MP_VERBOSE(ao, "Setting raw bufferSize = %d (driver=%d, budget=%d, chunk=%d)\n",
                     p->size, buffer_size, budget, p->chunksize);
      } else {
