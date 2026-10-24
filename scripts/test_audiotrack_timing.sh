@@ -47,6 +47,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name THD_UNITS_PER_S --name THD_MAX_UNIT --name THD_GROUP_UNITS \
     --name DTSHD_BURST_HEADER \
     --name STALL_TIMEOUT_NS --name STALL_RECOVERED_NS --name STALL_MAX_RECREATES --name STALL_POLL_NS \
+    --name RECREATE_GRACE_NS --name RECREATE_RETRY_NS \
     --name THREAD_PRIORITY_AUDIO \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
