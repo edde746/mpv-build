@@ -21,3 +21,4 @@
 0133-ao-audiotrack-normalize-loudness-with-the-platform-effect.patch
 0136-vo-mediacodec-hold-back-a-vsync-sample-off-the-grid.patch
 0139-player-release-vo-mediacodec-frame-with-the-video-chain.patch
+0140-ao-audiotrack-stream-silence-on-passthrough.patch

@@ -28,6 +28,8 @@
 #define AF_FORMAT_S_DTS 99
 #define AF_FORMAT_S_DTSHD 98
 #define AF_FORMAT_S_TRUEHD 97
+#define AF_FORMAT_S_EAC3 96
+#define AF_FORMAT_S_AC3 95
 
 typedef pthread_t mp_thread;
 typedef pthread_mutex_t mp_mutex;
@@ -58,7 +60,7 @@ struct jni {
     void (*SetFloatArrayRegion)(JNIEnv *, jobject, int, int, const void *);
     void (*SetByteArrayRegion)(JNIEnv *, jobject, int, int, const void *);
 };
-struct ao { void *priv; int samplerate, sstride, format; };
+struct ao { void *priv; int samplerate, sstride, format; bool stream_silence; };
 
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
@@ -111,11 +113,14 @@ static void warn_log(const char *fmt, ...)
 #define MP_WARN(ao, ...) warn_log(__VA_ARGS__)
 #define MP_ERR(ao, ...) test_log(__VA_ARGS__)
 
+static int64_t last_wait_ns; // what the worker asked its latest wait for
+
 static void mp_cond_timedwait(mp_cond *c, mp_mutex *m, int64_t ns)
 {
     // The worker publishes its completed accounting before entering this wait.
     mp_mutex_lock(&gate);
     idle++;
+    last_wait_ns = ns;
     pthread_cond_broadcast(&changed);
     mp_mutex_unlock(&gate);
     struct timespec until;
@@ -321,6 +326,7 @@ static void AudioTrack_releaseNormalizer(struct ao *ao) { (void)ao; }
 static void ao_request_failure(struct ao *ao) { (void)ao; failures++; }
 static void ao_request_reload(struct ao *ao) { (void)ao; reloads++; }
 static const char *af_fmt_to_str(int format) { (void)format; return "spdif"; }
+static bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AC3; }
 static int ao_read_data(struct ao *, void **, int, int64_t, void *, bool, bool);
 #include "audiotrack_write.inc"
 
@@ -341,7 +347,10 @@ static int AudioTrack_New(struct ao *ao)
 static int ao_read_data(struct ao *ao, void **data, int samples, int64_t end,
                         void *pts, bool pad, bool block)
 {
-    (void)end; (void)pts; (void)pad; (void)block;
+    (void)end; (void)pts; (void)pad;
+    // A non-blocking read that misses the core's lock returns 0, which a
+    // stream-silence track cannot tell from an empty queue.
+    assert(block == ao->stream_silence);
     mp_mutex_lock(&gate);
     assert(input_bytes <= samples * ao->sstride);
     memcpy(*data, input, input_bytes);
@@ -654,6 +663,700 @@ static void check_dead_object(void)
     assert(track_count == 2 && failures == 1 && atomic_load(&f.p.failed));
     teardown(&f);
     puts("PASS: stale ERROR_DEAD_OBJECT is ignored; live errors retain recovery budget");
+}
+
+// --audio-stream-silence makes the core start the AO before it has audio. A
+// bitstream track with stream silence is left paused by start() and started
+// by the worker once its first frame has been written: nothing reaches the
+// track before that frame, it starts primed rather than empty, and a
+// replacement made meanwhile is not started either. Once feeding, a step
+// that takes KA_STALL_LOG_NS or longer is logged by name.
+static void check_stream_silence_deferred_start(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    mp_mutex_lock(&f.p.lock);
+    f.ao.stream_silence = true;
+    f.p.ka_enabled = true;
+    f.p.ka_unit_51 = silence_ac3_51;
+    f.p.ka_unit_51_len = 16; // a short unit keeps the fake buffers in bounds
+    f.p.ka_unit_frames = 1536;
+    mp_mutex_unlock(&f.p.lock);
+
+    // The core starts the AO with nothing to play: the track stays paused
+    // and the worker polls for audio instead of writing silence.
+    mp_mutex_lock(&gate);
+    int target = idle + 1;
+    mp_mutex_unlock(&gate);
+    start(&f.ao);
+    wait_counter(&idle, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[0].state == AudioTrack.PLAYSTATE_PAUSED && entered == 0);
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f.p.play_deferred));
+
+    mp_mutex_lock(&f.p.lock);
+    assert(!AudioTrack_Recreate(&f.ao));
+    mp_mutex_unlock(&f.p.lock);
+    mp_mutex_lock(&gate);
+    assert(track_count == 2 && tracks[1].state == AudioTrack.PLAYSTATE_PAUSED);
+
+    // The first burst is written to the still-paused track, which starts
+    // once that write has completed.
+    target = entered + 1;
+    memcpy(input, burst, sizeof(burst));
+    input_bytes = sizeof(burst);
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[1].state == AudioTrack.PLAYSTATE_PAUSED);
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f.p.play_deferred));
+    // Let the write complete with the track left playing. The core has
+    // nothing more, so the worker goes straight on to a silent frame, and
+    // that write (held by the device in turn) is the signal the first one
+    // has completed.
+    mp_mutex_lock(&gate);
+    pause_after_write = false;
+    response = sizeof(payload);
+    permitted = entered;
+    target = entered + 1;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    assert(tracks[1].sink_size == sizeof(payload));
+    assert(!memcmp(tracks[1].sink, payload, sizeof(payload)));
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.play_deferred));
+    expect_delay(&f, sizeof(burst) / 2);
+    assert(!warnings && !failures);
+
+    // The fake clock advances 200 ms while the device holds the silent
+    // frame, and the worker names the slow step once the write returns.
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(200));
+    pause_after_write = true;
+    finish_write(&f, 16);
+    assert(warnings == 1);
+    assert(strstr(last_warning, "the silence write took 200 ms"));
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a stream-silence track starts primed with its first frame, and a slow feed step is named");
+}
+
+// A stream-silence track as AudioTrack_initKeepAlive leaves it. The silent
+// frames are cut to a few bytes so that they fit the fake device, and the
+// device takes every write without pausing the track, as a playing HAL does.
+static void setup_stream_silence(struct fixture *f, bool raw, int format,
+                                 const uint8_t *unit_20, const uint8_t *unit_51,
+                                 int unit_frames)
+{
+    setup(f, raw, format, true);
+    pause_after_write = false;
+    mp_mutex_lock(&f->p.lock);
+    f->ao.stream_silence = true;
+    f->p.ka_enabled = true;
+    f->p.ka_unit_20 = unit_20;
+    f->p.ka_unit_20_len = 8;
+    f->p.ka_unit_51 = unit_51;
+    f->p.ka_unit_51_len = 16;
+    f->p.ka_unit_frames = unit_frames;
+    f->p.cfg_silence_limit = 60;
+    mp_mutex_unlock(&f->p.lock);
+}
+
+// The device takes the outstanding write whole, `result` units of it, and
+// the worker goes on to its next write, which the device holds in turn. The
+// core hands out `next` meanwhile, or nothing: then the worker feeds silence.
+// On return the sink holds the completed write alone.
+static void take_write(int result, const uint8_t *next, int next_len)
+{
+    mp_mutex_lock(&gate);
+    for (int n = 0; n < track_count; n++)
+        tracks[n].sink_size = 0;
+    if (next_len)
+        memcpy(input, next, next_len);
+    input_bytes = next_len;
+    response = result;
+    permitted = entered;
+    int target = entered + 1;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+}
+
+// As take_write, but the worker is expected to wait instead of writing: the
+// pacing wait is an idle wait, and two of them prove a whole poll ran after
+// the write completed.
+static void take_write_then_wait(int result)
+{
+    mp_mutex_lock(&gate);
+    for (int n = 0; n < track_count; n++)
+        tracks[n].sink_size = 0;
+    response = result;
+    permitted = entered;
+    int writes = entered, target = idle + 2;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    wait_counter(&idle, target);
+    mp_mutex_lock(&gate);
+    assert(entered == writes);
+    mp_mutex_unlock(&gate);
+}
+
+// The pacing wait the worker has just entered went half the way to the
+// queue (`queued` frames at 48 kHz) draining to KA_AHEAD_NS, and no less
+// than a poll: a wait of the whole way would bet on the smoothed head.
+static void expect_pacing_wait(uint32_t queued)
+{
+    const int64_t drained_in = queued * MP_TIME_S_TO_NS(1) / 48000 - KA_AHEAD_NS;
+    mp_mutex_lock(&gate);
+    const int64_t wait = last_wait_ns;
+    mp_mutex_unlock(&gate);
+    assert(wait >= KA_POLL_NS && wait <= MPMAX(drained_in / 2, KA_POLL_NS));
+}
+
+// One IEC 61937 burst around a raw codec frame, as libavformat's spdif muxer
+// emits it: little-endian preamble words with Pd in bits (AC-3, DTS) or in
+// bytes (E-AC-3), then the byte-swapped frame. `n` is even.
+static int raw_burst(uint8_t *out, int pc, const uint8_t *frame, int n)
+{
+    const uint16_t preamble[4] = {0xf872, 0x4e1f, pc,
+                                  pc == IEC61937_EAC3 ? n : n * 8};
+    int len = 0;
+    for (int i = 0; i < 4; i++) {
+        out[len++] = preamble[i] & 0xff;
+        out[len++] = preamble[i] >> 8;
+    }
+    for (int i = 0; i < n; i += 2) {
+        out[len++] = frame[i + 1];
+        out[len++] = frame[i];
+    }
+    return len;
+}
+
+// park_worker completes the silence write the device holds; make room for
+// it in the sink first.
+static void park_fed_worker(struct fixture *f)
+{
+    mp_mutex_lock(&gate);
+    for (int n = 0; n < track_count; n++)
+        tracks[n].sink_size = 0;
+    mp_mutex_unlock(&gate);
+    park_worker(f);
+}
+
+static void expect_sink(int track, const uint8_t *bytes, int len)
+{
+    mp_mutex_lock(&gate);
+    assert(tracks[track].sink_size == len);
+    assert(!memcmp(tracks[track].sink, bytes, len));
+    mp_mutex_unlock(&gate);
+}
+
+static void expect_sink_zeros(int track, int len)
+{
+    mp_mutex_lock(&gate);
+    assert(tracks[track].sink_size == len);
+    for (int i = 0; i < len; i++)
+        assert(!tracks[track].sink[i]);
+    mp_mutex_unlock(&gate);
+}
+
+// The raw codecs a track can stream silence for, with a 5.1 and a 2.0 frame
+// header of each: AC-3 carries acmod after the syncinfo, E-AC-3 in its fourth
+// header byte, DTS its amode across the seventh and eighth.
+static const struct layout {
+    const char *codec;
+    int format, pc, unit_frames;
+    const uint8_t *unit_20, *unit_51;
+    uint8_t frame_51[10], frame_20[10];
+} layouts[] = {
+    {"AC-3", 5, IEC61937_AC3, 1536, silence_ac3_20, silence_ac3_51,
+     {0x0b, 0x77, 0, 0, 0, 0x40, 0xe0, 0, 0, 0},
+     {0x0b, 0x77, 0, 0, 0, 0x40, 0x40, 0, 0, 0}},
+    {"E-AC-3", 6, IEC61937_EAC3, 1536, silence_eac3_20, silence_eac3_51,
+     {0x0b, 0x77, 0, 0, 0x0e, 0x80, 0, 0, 0, 0},
+     {0x0b, 0x77, 0, 0, 0x04, 0x80, 0, 0, 0, 0}},
+    {"DTS", 7, IEC61937_DTS1, 512, silence_dts_20, silence_dts_51,
+     {0x7f, 0xfe, 0x80, 0x01, 0, 0, 0, 0x02, 0x40, 0},
+     {0x7f, 0xfe, 0x80, 0x01, 0, 0, 0, 0x00, 0x80, 0}},
+};
+
+// A raw track's silence follows the layout of the frames it carries: 5.1
+// frames get the 5.1 silent frame, 2.0 frames the 2.0 one, read off each
+// frame's header. Audio coming back ends the feed; the next gap starts one.
+static void check_stream_silence_layout(const struct layout *l)
+{
+    const uint8_t *frame_51 = l->frame_51, *frame_20 = l->frame_20;
+    const uint8_t *unit_20 = l->unit_20, *unit_51 = l->unit_51;
+    const int unit_frames = l->unit_frames, pc = l->pc;
+    struct fixture f;
+    setup_stream_silence(&f, true, l->format, unit_20, unit_51, unit_frames);
+    uint8_t wire[32];
+    int len = raw_burst(wire, pc, frame_51, 10);
+
+    // The first frame starts the track; the core then has nothing, and the
+    // silence that follows is the 5.1 frame.
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0);
+    expect_sink(0, frame_51, 10);
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.ka_unit_stereo && f.p.ka_feeding && f.p.ka_feed_units == 1);
+    mp_mutex_unlock(&f.p.lock);
+    take_write(16, NULL, 0);
+    expect_sink(0, unit_51, 16);
+    expect_delay(&f, len / 2 + unit_frames);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.ka_feed_units == 2);
+    mp_mutex_unlock(&f.p.lock);
+
+    // A 2.0 frame arrives: it ends the feed and the next gap gets 2.0 silence.
+    len = raw_burst(wire, pc, frame_20, 10);
+    take_write(16, wire, len);
+    expect_sink(0, unit_51, 16);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.ka_unit_stereo && !f.p.ka_feeding);
+    mp_mutex_unlock(&f.p.lock);
+    take_write(10, NULL, 0);
+    expect_sink(0, frame_20, 10);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.ka_feeding && f.p.ka_feed_units == 1);
+    mp_mutex_unlock(&f.p.lock);
+    take_write(8, NULL, 0);
+    expect_sink(0, unit_20, 8);
+    assert(!warnings && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    printf("PASS: %s silence follows the frames' layout, and audio ends the feed\n",
+           l->codec);
+}
+
+// On the IEC 61937 carrier silence is zero words, written so that a burst a
+// seek cut short is completed first and whole bursts of zeros follow, each
+// in reads of the chunk; zeros between bursts leave the burst grid alone, so
+// the next real burst is read on it.
+static void check_stream_silence_burst_grid(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, false, AudioFormat.ENCODING_IEC61937, NULL, NULL,
+                         2048 / 2);
+    // A DTS type I burst: 2048 bytes on the wire, of which the core delivers
+    // one chunk and then 100 bytes before a seek cuts it.
+    uint8_t head[256], tail[100];
+    memset(head, 0x5a, sizeof(head));
+    memcpy(head, iec_preamble, sizeof(iec_preamble));
+    head[4] = IEC61937_DTS1;
+    head[5] = 0;
+    memset(tail, 0x5a, sizeof(tail));
+
+    begin_write(&f, head, sizeof(head));
+    take_write(128, tail, sizeof(tail));
+    expect_sink(0, head, sizeof(head));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_burst == 2048 && f.p.iec_pos == 256 && !f.p.iec_lost);
+    mp_mutex_unlock(&f.p.lock);
+    take_write(50, NULL, 0);
+    expect_sink(0, tail, sizeof(tail));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_pos == 356 && f.p.ka_feeding);
+    mp_mutex_unlock(&f.p.lock);
+
+    // 1692 bytes complete the burst: six chunks of zeros, then the 156 that
+    // remain, and the grid is back at a boundary.
+    for (int n = 1; n <= 6; n++) {
+        take_write(128, NULL, 0);
+        expect_sink_zeros(0, 256);
+        mp_mutex_lock(&f.p.lock);
+        assert(f.p.iec_pos == 356 + 256 * n);
+        mp_mutex_unlock(&f.p.lock);
+    }
+    take_write(78, NULL, 0);
+    expect_sink_zeros(0, 156);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_pos == 0 && !f.p.iec_lost);
+    mp_mutex_unlock(&f.p.lock);
+
+    // Between bursts, a whole chunk of zeros at a time, off the grid; the
+    // next real burst then opens on a boundary and is tracked as one.
+    take_write(128, head, sizeof(head));
+    expect_sink_zeros(0, 256);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_pos == 0 && !f.p.ka_feeding);
+    mp_mutex_unlock(&f.p.lock);
+    take_write(128, NULL, 0);
+    expect_sink(0, head, sizeof(head));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_pos == 256 && !f.p.iec_lost && f.p.ka_feeding);
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, (256 + 100 + 1692 + 256 + 256) / 2);
+    assert(!warnings && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: carrier silence completes a cut burst, then keeps whole bursts "
+         "on the grid");
+}
+
+// Pacing: silence goes in until KA_AHEAD_NS is queued ahead of the playback
+// head, then the worker waits. A head that has not moved for
+// KA_HEAD_STILL_NS is fed regardless, since a direct track that AudioFlinger
+// holds back starts only on a full buffer; once it moves, pacing resumes.
+static void check_stream_silence_pacing(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, true, 5, silence_ac3_20, silence_ac3_51, 1536);
+    uint8_t wire[32];
+    const int len = raw_burst(wire, IEC61937_AC3, layouts[0].frame_51, 10);
+    const uint32_t ahead = 48000 * 300 / 1000;
+
+    // The head sits at 0: ten 32 ms frames reach 300 ms, and the eleventh
+    // waits.
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0);
+    uint32_t written = len / 2;
+    for (int n = 1; n < 10; n++) {
+        take_write(16, NULL, 0);
+        written += 1536;
+        assert(written < ahead);
+    }
+    take_write_then_wait(16);
+    written += 1536;
+    assert(written >= ahead);
+    expect_pacing_wait(written);
+    expect_delay(&f, written);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.ka_feeding && f.p.ka_feed_units == 10);
+    mp_mutex_unlock(&f.p.lock);
+
+    // The clock passes KA_HEAD_STILL_NS with the head unmoved, in steps too
+    // small for the slow-step line: the feed resumes at 250 ms, not before.
+    for (int step = 1; step <= 5; step++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(50));
+        mp_mutex_lock(&gate);
+        int writes = entered, polls = idle + 2;
+        while (entered == writes && idle < polls)
+            pthread_cond_wait(&changed, &gate);
+        bool wrote = entered > writes;
+        mp_mutex_unlock(&gate);
+        assert(wrote == (step == 5));
+    }
+    take_write(16, NULL, 0); // and keeps going while it stands still
+    written += 1536;
+    expect_sink(0, silence_ac3_51, 16);
+    take_write(16, NULL, 0);
+    written += 1536;
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.ka_feed_units == 13); // the one the device holds included
+    mp_mutex_unlock(&f.p.lock);
+
+    // The head moves: 200 ms played leaves 184 ms queued; the frame the
+    // device holds and three more reach 300 ms, and pacing waits again.
+    mp_mutex_lock(&gate);
+    tracks[0].head = 9600;
+    mp_mutex_unlock(&gate);
+    for (int n = 0; n < 3; n++) {
+        take_write(16, NULL, 0);
+        written += 1536;
+        assert(written - 9600 < ahead);
+    }
+    take_write_then_wait(16);
+    written += 1536;
+    assert(written - 9600 >= ahead);
+    expect_pacing_wait(written - 9600);
+    expect_delay_played(&f, written, 9600);
+    assert(!warnings && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: silence is paced to 300 ms ahead of a moving head and fed to a "
+         "still one");
+}
+
+// Two idle polls with no write between them: the worker is waiting for the
+// core and nothing goes to the track.
+static void expect_idle(void)
+{
+    mp_mutex_lock(&gate);
+    int writes = entered, target = idle + 2;
+    while (idle < target)
+        pthread_cond_wait(&changed, &gate);
+    assert(entered == writes);
+    mp_mutex_unlock(&gate);
+}
+
+// A track stood down is paused and empty, armed for a deferred start, with
+// no write outstanding and the clock cleared; nothing has failed or been
+// charged to the recovery budget.
+static void expect_stood_down(struct fixture *f, int track)
+{
+    mp_mutex_lock(&f->p.lock);
+    assert(f->p.ka_stood_down && !atomic_load(&f->p.ka_feeding));
+    mp_mutex_unlock(&f->p.lock);
+    mp_mutex_lock(&gate);
+    assert(tracks[track].state == AudioTrack.PLAYSTATE_PAUSED);
+    assert(tracks[track].head == 0 && tracks[track].ts_fpos == 0); // flushed
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f->p.play_deferred));
+    assert(!atomic_load(&f->p.write_outstanding));
+    assert(!atomic_load(&f->p.recreate_requested));
+    assert(!atomic_load(&f->p.recovery_attempts) && !failures);
+    assert(track_count == track + 1);
+    expect_delay(f, 0);
+    expect_idle();
+}
+
+// The core has audio again for a track stood down: the first burst is
+// written to the paused track, which starts primed once it is in, and the
+// feed resumes behind it as it did at the first start. Returns with the
+// device holding the second silent frame.
+static void resume_stood_down(struct fixture *f, int track, const uint8_t *wire,
+                              int len)
+{
+    mp_mutex_lock(&gate);
+    int target = entered + 1;
+    memcpy(input, wire, len);
+    input_bytes = len;
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(tracks[track].state == AudioTrack.PLAYSTATE_PAUSED);
+    mp_mutex_unlock(&gate);
+    take_write(10, NULL, 0);
+    mp_mutex_lock(&gate);
+    assert(tracks[track].state == AudioTrack.PLAYSTATE_PLAYING);
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f->p.play_deferred));
+    mp_mutex_lock(&f->p.lock);
+    assert(!f->p.ka_stood_down && atomic_load(&f->p.ka_feeding));
+    assert(f->p.ka_feed_units == 1);
+    mp_mutex_unlock(&f->p.lock);
+    expect_delay(f, len / 2);
+    // The device takes that unit, a 5.1 frame after the burst's layout, and
+    // holds the next; park_fed_worker completes it whole.
+    take_write(16, NULL, 0);
+    expect_sink(track, silence_ac3_51, 16);
+}
+
+// The feed is bounded by cfg_silence_limit seconds of silence per pause.
+// When it is up the worker stands the track down: pauses and flushes it,
+// clears the clock, arms the deferred start and writes nothing more until
+// the core has audio, which then starts the track primed.
+static void check_stream_silence_limit(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, true, 5, silence_ac3_20, silence_ac3_51, 1536);
+    mp_mutex_lock(&f.p.lock);
+    f.p.cfg_silence_limit = 2;
+    mp_mutex_unlock(&f.p.lock);
+    uint8_t wire[32];
+    const int len = raw_burst(wire, IEC61937_AC3, layouts[0].frame_51, 10);
+
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0); // the burst is in; the feed begins at t=1 s
+    take_write(16, NULL, 0); // unit 1 is in; unit 2 is held by the device
+    mp_mutex_lock(&f.p.lock);
+    assert(atomic_load(&f.p.ka_feeding) && f.p.ka_feed_units == 2);
+    assert(f.p.ka_feed_started_ns == MP_TIME_S_TO_NS(1));
+    mp_mutex_unlock(&f.p.lock);
+
+    // The device holds unit 2 for the rest of the limit (which the worker
+    // names as a slow step) and plays some of the queue meanwhile; the
+    // pass after it stands the track down instead of feeding unit 3, and
+    // the flush takes the head back to 0.
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(2));
+    mp_mutex_lock(&gate);
+    int paused = pauses + 1;
+    tracks[0].head = 480;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, 16);
+    wait_counter(&pauses, paused);
+    assert(warnings == 1 && strstr(last_warning, "the silence write took 2000 ms"));
+    expect_stood_down(&f, 0);
+
+    resume_stood_down(&f, 0, wire, len);
+    assert(warnings == 1 && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: the silence limit stands the track down, and the next audio "
+         "starts it primed");
+}
+
+// The device stops taking the silence (the receiver was turned off during
+// the pause). The monitor's stall verdict stands the feed down instead of
+// recreating the track: it pauses the track to release the worker from the
+// write, charges nothing to the recovery budget, and the worker stands the
+// track down; the next audio starts it primed and nothing has failed.
+static void check_stream_silence_stall_stands_down(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, true, 5, silence_ac3_20, silence_ac3_51, 1536);
+    uint8_t wire[32];
+    const int len = raw_burst(wire, IEC61937_AC3, layouts[0].frame_51, 10);
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0); // feeding; the device holds unit 1 and never takes it
+
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+    mp_mutex_lock(&gate);
+    int sampled = head_queries + 2;
+    int interrupted = pauses + 1;
+    mp_mutex_unlock(&gate);
+    wait_counter(&head_queries, sampled);
+    atomic_fetch_add(&now_ns, STALL_TIMEOUT_NS + 1);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    wait_counter(&pauses, interrupted);
+    assert(atomic_load(&f.p.ka_stop_requested));
+    assert(!atomic_load(&f.p.recreate_requested));
+    assert(!atomic_load(&f.p.recovery_attempts));
+    assert(warnings == 1 && strstr(last_warning, "standing the feed down"));
+    assert(strstr(last_warning, "accepted no audio for 5000 ms"));
+    // Stop the monitor before observing the worker's idle/completion boundary.
+    atomic_store(&f.p.monitor_terminate, true);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    assert(!pthread_join(f.p.monitor, NULL));
+    f.p.monitor_created = false;
+
+    // The interrupted write returns with nothing taken (one warning for the
+    // short write, one for the slow step), and the worker stands down.
+    finish_write(&f, 0);
+    assert(warnings == 3 && strstr(last_warning, "the silence write took 5000 ms"));
+    expect_stood_down(&f, 0);
+
+    resume_stood_down(&f, 0, wire, len);
+    assert(warnings == 3 && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: a device that stops taking silence stands the feed down "
+         "instead of recreating the track");
+}
+
+// A silence write that fails - the track died with the output device, as
+// it does on HALs that invalidate the track when the receiver goes - stands
+// the feed down as a stall does: nothing is charged to the recovery budget
+// and nothing fails while the user is away. The next audio finds the dead
+// track and recovers it the usual way, on the budget the silence left whole.
+static void check_stream_silence_write_error_stands_down(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, true, 5, silence_ac3_20, silence_ac3_51, 1536);
+    uint8_t wire[32];
+    const int len = raw_burst(wire, IEC61937_AC3, layouts[0].frame_51, 10);
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0); // feeding; the device holds unit 1
+    mp_mutex_lock(&gate);
+    int paused = pauses + 1;
+    tracks[0].head = 480; // some of the queue played before the track died
+    mp_mutex_unlock(&gate);
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    wait_counter(&pauses, paused);
+    assert(!warnings);
+    expect_stood_down(&f, 0);
+
+    // The next audio goes to the dead track, and that write's error is
+    // recovered as any is: the track is replaced, one attempt charged.
+    mp_mutex_lock(&gate);
+    int target = entered + 1;
+    memcpy(input, wire, len);
+    input_bytes = len;
+    mp_mutex_unlock(&gate);
+    wait_counter(&entered, target);
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    assert(track_count == 2 && !failures && !atomic_load(&f.p.failed));
+    assert(atomic_load(&f.p.recovery_attempts) == 1);
+    assert(atomic_load(&f.p.play_deferred)); // the replacement starts with its audio
+    expect_delay(&f, 0);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: a silence write that fails stands the track down, and the next "
+         "audio recovers it on a whole budget");
+}
+
+// The monitor's stand-down is two steps, the ka_feeding check and the
+// pause, and the feed can end for real audio between them: the pause then
+// cuts a write of audio short, not of silence. The worker finds the feed
+// over, resumes the track rather than standing it down, nothing is
+// flushed, and the feed starts again behind the audio as usual.
+static void check_stream_silence_stand_down_meets_audio(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, true, 5, silence_ac3_20, silence_ac3_51, 1536);
+    uint8_t wire[32];
+    const int len = raw_burst(wire, IEC61937_AC3, layouts[0].frame_51, 10);
+    begin_write(&f, wire, len);
+    take_write(10, NULL, 0);   // feeding; the device holds unit 1
+    take_write(16, wire, len); // unit 1 in; the core has audio: the device holds the burst
+    mp_mutex_lock(&f.p.lock);
+    assert(!atomic_load(&f.p.ka_feeding) && f.p.ka_feed_units == 1);
+    mp_mutex_unlock(&f.p.lock);
+
+    // The monitor, having seen the feed on, requests the stand-down and
+    // pauses the track under the burst's write.
+    mp_mutex_lock(&gate);
+    tracks[0].head = 480;
+    tracks[0].state = AudioTrack.PLAYSTATE_PAUSED;
+    mp_mutex_unlock(&gate);
+    atomic_store(&f.p.ka_stop_requested, true);
+    take_write(10, NULL, 0); // the burst goes in; the worker resumes and feeds again
+    mp_mutex_lock(&gate);
+    assert(tracks[0].state == AudioTrack.PLAYSTATE_PLAYING);
+    assert(tracks[0].head == 480); // not flushed
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.ka_stop_requested));
+    assert(!atomic_load(&f.p.play_deferred));
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.ka_stood_down && atomic_load(&f.p.ka_feeding));
+    assert(f.p.ka_feed_units == 1); // the feed behind the burst, unit 1 held
+    mp_mutex_unlock(&f.p.lock);
+    assert(!warnings && !failures && !atomic_load(&f.p.recovery_attempts));
+    expect_delay_played(&f, len / 2 + 1536 + len / 2, 480);
+    take_write(16, NULL, 0); // the device takes that unit whole and holds the next
+    expect_sink(0, silence_ac3_51, 16);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: a stand-down that meets the audio coming back resumes the track "
+         "instead");
+}
+
+
+// the rate the frames are encoded at; the IEC 61937 carrier gets zero words
+// at any rate. Reads are sized to the format's largest burst where silence
+// is on, and left alone where it is not.
+static void check_stream_silence_init_rate(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    mp_mutex_lock(&f.p.lock);
+    f.ao.stream_silence = true;
+    f.ao.format = AF_FORMAT_S_AC3;
+    f.p.samplerate = 48000;
+    f.p.cfg_silence_limit = 60;
+    AudioTrack_initKeepAlive(&f.ao);
+    assert(f.p.ka_enabled && !f.p.ka_pad_silence);
+    assert(f.p.ka_unit_51 == silence_ac3_51 && f.p.ka_unit_20 == silence_ac3_20);
+    assert(f.p.ka_unit_frames == 1536 && f.p.chunksize == 1536 * 4);
+    assert(!warnings);
+
+    f.p.samplerate = 44100;
+    f.p.chunksize = sizeof(f.chunk);
+    AudioTrack_initKeepAlive(&f.ao);
+    assert(!f.p.ka_enabled && f.p.chunksize == (int)sizeof(f.chunk));
+    assert(warnings == 1 && strstr(last_warning, "48 kHz"));
+    assert(strstr(last_warning, "44100 Hz"));
+
+    f.p.raw_passthrough = false; // the carrier is rate-agnostic
+    AudioTrack_initKeepAlive(&f.ao);
+    assert(f.p.ka_enabled && f.p.ka_unit_frames == 1536 * 2);
+    assert(f.p.chunksize == 1536 * 4 && warnings == 1);
+
+    f.ao.stream_silence = false; // and nothing changes with the option off
+    f.p.chunksize = sizeof(f.chunk);
+    AudioTrack_initKeepAlive(&f.ao);
+    assert(!f.p.ka_enabled && !f.p.ka_pad_silence);
+    assert(f.p.chunksize == (int)sizeof(f.chunk) && warnings == 1);
+    f.p.raw_passthrough = true;
+    mp_mutex_unlock(&f.p.lock);
+    teardown(&f);
+    puts("PASS: raw silent frames are enabled at 48 kHz only; the carrier at any rate");
 }
 
 // One monitor sample, then the verdict it produced: the monitor logs after
@@ -1199,6 +1902,16 @@ int main(void)
     check_pcm_and_iec(AudioFormat.ENCODING_IEC61937, true, 3, 6);
     puts("PASS: PCM direct/byte/float and IEC partial counts survive reset without stale credit");
     check_dead_object();
+    check_stream_silence_deferred_start();
+    for (int n = 0; n < MP_ARRAY_SIZE(layouts); n++)
+        check_stream_silence_layout(&layouts[n]);
+    check_stream_silence_burst_grid();
+    check_stream_silence_pacing();
+    check_stream_silence_limit();
+    check_stream_silence_stall_stands_down();
+    check_stream_silence_write_error_stands_down();
+    check_stream_silence_stand_down_meets_audio();
+    check_stream_silence_init_rate();
     check_watchdog_after_reset();
     check_underrun_reporting();
     check_pcm_stale_head_after_flush();

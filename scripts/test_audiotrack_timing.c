@@ -23,7 +23,7 @@ static void sink_log(const char *fmt, ...) { (void)fmt; }
 
 typedef void *jobject, *jbyteArray, *jshortArray, *jfloatArray;
 typedef int jint, JNIEnv, mp_thread, mp_mutex, mp_cond;
-struct ao { void *priv; int samplerate, sstride; };
+struct ao { void *priv; int samplerate, sstride; bool stream_silence; };
 
 static int64_t now_ns, state_delay_ns, head_delay_ns, latency_delay_ns;
 // Deliberately different epochs: mixing Android nanoTime with mp_time_ns must
