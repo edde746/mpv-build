@@ -1,0 +1,79 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:00:00 +0200
+Subject: [PATCH] ao_avfoundation: say when AVPlayer never asked for the stream
+
+AVPlayer attaches an item on the main thread. A host that never services the
+main dispatch queue, such as a command-line libmpv client blocked in
+mpv_wait_event(), gets no resource-loader call at all: the item never plays,
+and the only log lines were "playback did not engage" and "native compressed
+playback did not start", which read like a decoder or route failure.
+
+The output now records whether the current item's resource loader was called
+and, when it was not, says so with both messages. Behavior is unchanged.
+
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index efb820e..f95525d 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -105,6 +105,7 @@ - (void)invalidate;
+     bool avp_rate_applied;       // rate 1 has been handed to AVPlayer
+     bool avp_start_seeked;       // seek-to-start workaround already tried
+     bool avp_eof;
++    bool avp_loader_asked;       // the current item's loader has been called
+     int64_t avp_start_deadline;  // mp_time_ns() deadline; -1 = healthy
+     int64_t avp_primed_pts;      // es_pts at the last observed priming progress
+     int avp_last_item_status;    // last logged AVPlayerItemStatus
+@@ -482,6 +483,18 @@ static void avp_serve_requests(struct ao *ao)
+     }
+ }
+ 
++// AVPlayer attaches an item on the main thread: a host that never services
++// the main dispatch queue gets no resource-loader call at all, and nothing
++// plays. The startup timeouts cannot tell that apart from a stalled decode.
++static void avp_report_unasked_loader(struct ao *ao, int msgl)
++{
++    struct priv *p = ao->priv;
++
++    if (!p->avp_loader_asked)
++        MP_MSG(ao, msgl, "AVPlayer has made no resource requests; this usually "
++               "means the host is not servicing the main dispatch queue\n");
++}
++
+ // Apply the desired transport state, with the startup workaround: prime the
+ // player, and when the playhead refuses to move, first seek to the stream
+ // start, then give up and fall back to PCM.
+@@ -531,6 +544,7 @@ static void avp_update_transport(struct ao *ao)
+         return;
+     if (!p->avp_start_seeked) {
+         MP_WARN(ao, "playback did not engage; seeking to the stream start\n");
++        avp_report_unasked_loader(ao, MSGL_WARN);
+         p->avp_start_seeked = true;
+         p->avp_start_deadline = now + AVP_START_GRACE_NS;
+         [p->item seekToTime:kCMTimeZero completionHandler:nil];
+@@ -538,6 +552,7 @@ static void avp_update_transport(struct ao *ao)
+         return;
+     }
+     MP_ERR(ao, "native compressed playback did not start; falling back to PCM\n");
++    avp_report_unasked_loader(ao, MSGL_ERR);
+     spdif_reload(ao);
+ }
+ 
+@@ -638,6 +653,7 @@ static void avp_create_item(struct ao *ao)
+     p->avp_rate_applied = false;
+     p->avp_start_seeked = false;
+     p->avp_primed_pts = 0;
++    p->avp_loader_asked = false;
+     p->avp_start_deadline = 0; // armed by avp_update_transport
+     p->avp_last_item_status = -1;
+     p->avp_last_tcs = -1;
+@@ -1069,6 +1085,10 @@ - (BOOL)resourceLoader:(AVAssetResourceLoader *)resourceLoader
+         if (!ao)
+             return NO;
+         struct priv *p = ao->priv;
++        // Only the current item's loader counts: a call queued by a loader
++        // torn down since must not vouch for its replacement.
++        if (p->asset && resourceLoader == p->asset.resourceLoader)
++            p->avp_loader_asked = true;
+         AVAssetResourceLoadingContentInformationRequest *info =
+             request.contentInformationRequest;
+         if (info) {
