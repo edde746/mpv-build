@@ -112,6 +112,10 @@ jobs:
               # series that were actually acquired and applied here.
               fetch(component, group, dest)
               checked += 1
+              if component == 'mpv' and group == 'apple':
+                # The player's half of the passthrough fallback: plain C, no
+                # Apple frameworks.
+                subprocess.run(['bash', 'scripts/test_audio_passthrough_fallback.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_audiotrack_truehd.sh', str(dest)], check=True)
@@ -206,6 +210,10 @@ jobs:
 
       - name: Test spatial audio bridge
         run: bash scripts/test_spatial_feed.sh
+
+      # A real AVPlayer in a process that never services the main queue.
+      - name: Test AVFoundation passthrough fallback
+        run: bash scripts/test_ao_avfoundation_fallback.sh
 
       # The Swift side exactly as libmpv's tvOS slice compiles it, against the
       # pinned SpatialAudioBridge; only the Rust core is left to publish.

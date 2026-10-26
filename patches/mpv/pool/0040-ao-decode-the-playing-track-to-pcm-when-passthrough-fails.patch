@@ -1,0 +1,349 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:00:00 +0200
+Subject: [PATCH] ao: decode the playing track to PCM when its passthrough
+ output fails
+
+ao_avfoundation's AVPlayer sink and ao_spatial fell back to PCM by latching
+the failing format and reloading the output: the reopen refused the format and
+the player decoded the track instead. ao_avfoundation's latch was
+process-wide, and only its own PCM initialization cleared it. On macOS PCM
+goes to coreaudio first and on tvOS to audiounit, so that never ran there: one
+failure turned AC-3/E-AC-3 passthrough off for every later file and every mpv
+instance in the process until it restarted. ao_spatial kept its latch per
+player and cleared it the same way, which held only because it is the first
+output tried.
+
+The fallback also lost the audio the failed output had taken. AVPlayer pulls
+up to twice the compressed lead before the output gives up, and the decoder
+resumed after it: with video, audio stayed silent for about 14 s; audio-only
+playback skipped that much; a file ending within that span stalled at its end
+with no audio output open.
+
+An output that cannot play its passthrough stream now reports
+AO_EVENT_PASSTHROUGH_FAILED through ao_request_pcm_fallback(). The player
+closes the output and, when that output fed the current passthrough chain,
+switches the track's decoder to PCM with the chain's existing spdif_failed
+state, then issues an exact refresh seek to the playback position. The next
+track or file, or a later output reload, tries passthrough again. An event
+from an output that outlived its chain (a gapless file change or a track
+switch keeps it open) only closes it. Both outputs drop their latches, and
+mpv_global loses ao_spatial's.
+
+Checked on a MacBook Pro (macOS 27) with AirPods and a libmpv client whose
+main thread never services the main queue, so AVPlayer never starts and every
+E-AC-3 2.0 file falls back after 4.4 s. With video, audio resumes at 4.08 s in
+sync (before: silent until 18 s); audio-only resumes at 0.07 s (before: 18.3
+s); a 10 s file ends (before: stuck at 9.9 s). After the main thread is
+serviced, the next file of the same player and a new player in the same
+process play passthrough (before: "passthrough disabled after an earlier
+player failure").
+
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 0fd3c87..4fc4490 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -388,6 +388,13 @@ void ao_request_reload(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_RELOAD);
+ }
+ 
++// Report that the AO cannot play its passthrough stream: the player core
++// destroys the AO and decodes the track to PCM. Fully thread-safe.
++void ao_request_pcm_fallback(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_PASSTHROUGH_FAILED);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index ce044fd..c3d4918 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -43,6 +43,9 @@ enum aocontrol {
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
++    // The AO cannot play the passthrough stream it was opened for; the player
++    // closes it and decodes the track to PCM instead.
++    AO_EVENT_PASSTHROUGH_FAILED = 4,
+ };
+ 
+ enum {
+@@ -105,6 +108,7 @@ struct mp_async_queue;
+ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
++void ao_request_pcm_fallback(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index 6e93a4e..efb820e 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -181,17 +181,8 @@ - (void)invalidate;
+ // legal E-AC-3 rate (6.144 Mb/s) is 768 KiB/s.
+ #define AVP_ES_LEAD_BYTES_PER_S (768 * 1024)
+ 
+-// A failed compressed AO must reject its immediate reload so mpv can decode
+-// to PCM. A later successful PCM initialization clears this process-local
+-// handoff, allowing another track or playback session to try native audio.
+-static _Atomic bool spdif_format_latch[2];
+ static char avfoundation_queue_key;
+ 
+-static int spdif_latch_index(int format)
+-{
+-    return format == AF_FORMAT_S_EAC3;
+-}
+-
+ static void feed_avp(struct ao *ao);
+ 
+ static int64_t CMTimeGetNanoseconds(CMTime time)
+@@ -242,8 +233,8 @@ static void avp_timer_arm(struct priv *p)
+         AVP_TICK_NS, AVP_TICK_NS / 2);
+ }
+ 
+-// Latch the failing format and force a reinit; init() will then reject the
+-// format and the player core falls back to PCM decoding.
++// Stop the player and ask the core to decode this track instead. The next
++// track or file opens a fresh output and tries native playback again.
+ static void spdif_reload(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -251,10 +242,9 @@ static void spdif_reload(struct ao *ao)
+     if (p->spdif_reload_requested)
+         return;
+     p->spdif_reload_requested = true;
+-    atomic_store(&spdif_format_latch[spdif_latch_index(ao->format)], true);
+     [p->player setRate:0];
+     avp_timer_idle(p);
+-    ao_request_reload(ao);
++    ao_request_pcm_fallback(ao);
+ }
+ 
+ // Playhead position on the elementary-stream timeline. AVPlayerItem's
+@@ -1135,11 +1125,6 @@ static int init(struct ao *ao)
+         return CONTROL_ERROR;
+     }
+ 
+-    if (!spdif) {
+-        atomic_store(&spdif_format_latch[0], false);
+-        atomic_store(&spdif_format_latch[1], false);
+-    }
+-
+ #if TARGET_OS_IPHONE
+     AVAudioSession *instance = AVAudioSession.sharedInstance;
+     [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+@@ -1201,11 +1186,6 @@ static int init(struct ao *ao)
+ #endif
+             goto error;
+         }
+-        if (atomic_load(&spdif_format_latch[spdif_latch_index(ao->format)])) {
+-            MP_FATAL(ao, "%s passthrough disabled after an earlier player failure\n",
+-                     af_fmt_to_str(ao->format));
+-            goto error;
+-        }
+         p->spdif = true;
+ 
+         if ((p->player = [[AVPlayer alloc] init]) == nil) {
+diff --git a/audio/out/ao_spatial.m b/audio/out/ao_spatial.m
+index e889485..3551e7e 100644
+--- a/audio/out/ao_spatial.m
++++ b/audio/out/ao_spatial.m
+@@ -23,10 +23,9 @@
+ // conversion holds playback instead of letting the renderer drop late audio.
+ //
+ // A stream the sink fails on falls back to PCM the way avfoundation's
+-// compressed sink does: the format is latched and the output reloaded, the
+-// reopen refuses it, and mpv decodes the track instead. A later PCM
+-// initialization clears the latch, so the next track or file tries again.
+-// The latch belongs to this mpv player and survives AO reconstruction.
++// compressed sink does: the output asks the player to decode the track
++// instead, and the next track or file opens a fresh output and tries the
++// renderer again.
+ 
+ #include <stdatomic.h>
+ #include <stdlib.h>
+@@ -35,7 +34,6 @@
+ #include "ao.h"
+ #include "audio/format.h"
+ #include "common/common.h"
+-#include "common/global.h"
+ #include "common/msg.h"
+ #include "internal.h"
+ #include "ao_spatial.h"
+@@ -74,11 +72,6 @@
+     bool reload_requested;
+ };
+ 
+-static int spatial_latch_index(int format)
+-{
+-    return format == AF_FORMAT_S_DTSHD;
+-}
+-
+ static int64_t ns_from_time(CMTime time)
+ {
+     return CMTimeConvertScale(time, 1000000000, kCMTimeRoundingMethod_Default).value;
+@@ -165,18 +158,9 @@ static int init(struct ao *ao)
+     } else if (ao->format == AF_FORMAT_S_DTSHD) {
+         codec = 2;
+     } else {
+-        if (!af_fmt_is_spdif(ao->format)) {
+-            atomic_store(&ao->global->spatial_format_latch[0], false);
+-            atomic_store(&ao->global->spatial_format_latch[1], false);
+-        }
+         MP_VERBOSE(ao, "only TrueHD and DTS-HD passthrough are handed to the renderer\n");
+         return -1;
+     }
+-    if (atomic_load(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)])) {
+-        MP_INFO(ao, "%s failed in the renderer; decoding it instead\n",
+-                af_fmt_to_str(ao->format));
+-        return -1;
+-    }
+ 
+     // ao->sstride is set only after init().
+     p->sstride = af_fmt_to_bytes(ao->format) * ao->channels.num;
+@@ -330,8 +314,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
+                 reason ? reason : "unknown error");
+         free(reason);
+         p->reload_requested = true;
+-        atomic_store(&ao->global->spatial_format_latch[spatial_latch_index(ao->format)], true);
+-        ao_request_reload(ao);
++        ao_request_pcm_fallback(ao);
+     }
+ 
+     int64_t now = ns_from_time([p->synchronizer currentTime]);
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 7b64ea3..cc51549 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -61,7 +61,8 @@ struct ao {
+     // Used during init: if init fails, redirect to this ao
+     char *redirect;
+ 
+-    // Internal events (use ao_request_reload(), ao_hotplug_event())
++    // Internal events (use ao_request_reload(), ao_request_pcm_fallback(),
++    // ao_hotplug_event())
+     atomic_uint events_;
+ 
+     // Float gain multiplicator
+diff --git a/common/global.h b/common/global.h
+index 7a029b0..c05b70e 100644
+--- a/common/global.h
++++ b/common/global.h
+@@ -1,8 +1,6 @@
+ #ifndef MPV_MPV_H
+ #define MPV_MPV_H
+ 
+-#include <stdatomic.h>
+-
+ // This should be accessed by glue code only, never normal code.
+ // The only purpose of this is to make mpv library-safe.
+ // Think hard before adding new members.
+@@ -13,9 +11,6 @@ struct mpv_global {
+     char *configdir;
+     struct stats_base *stats;
+     struct demux_packet_pool *packet_pool;
+-    // Per-player failure state must survive destruction/recreation of its AO.
+-    // Only ao_spatial reads/writes it (on the AO and player threads).
+-    atomic_bool spatial_format_latch[2];
+ };
+ 
+ #endif
+diff --git a/player/audio.c b/player/audio.c
+index c7e5650..e581066 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -355,6 +355,17 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+     mp_filter_wakeup(ao_c->ao_filter);
+ }
+ 
++// Switch the chain's track from passthrough to decoding. The caller resets
++// the output chain. Returns false if the decoder could not be reinitialized.
++static bool fall_back_to_pcm(struct MPContext *mpctx, struct ao_chain *ao_c)
++{
++    MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
++    ao_c->spdif_passthrough = false;
++    ao_c->spdif_failed = true;
++    mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
++    return mp_decoder_wrapper_reinit(ao_c->track->dec);
++}
++
+ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -467,11 +478,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     if (!mpctx->ao) {
+         // If spdif was used, try to fallback to PCM.
+         if (spdif_fallback && ao_c->track && ao_c->track->dec) {
+-            MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
+-            ao_c->spdif_passthrough = false;
+-            ao_c->spdif_failed = true;
+-            mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
+-            if (!mp_decoder_wrapper_reinit(ao_c->track->dec))
++            if (!fall_back_to_pcm(mpctx, ao_c))
+                 goto init_error;
+             reset_audio_state(mpctx);
+             mp_output_chain_reset_harder(ao_c->filter);
+@@ -871,12 +878,45 @@ void audio_start_ao(struct MPContext *mpctx)
+     mp_wakeup_core(mpctx);
+ }
+ 
++static void handle_ao_events(struct MPContext *mpctx)
++{
++    if (!mpctx->ao)
++        return;
++    int events = ao_query_and_reset_events(mpctx->ao,
++                    AO_EVENT_RELOAD | AO_EVENT_PASSTHROUGH_FAILED);
++    if (!events)
++        return;
++
++    // A failure belongs to this AO, which can outlive the chain it failed
++    // for: gapless file changes and track switches keep it open. Only the
++    // passthrough chain it is attached to falls back; any other chain gets a
++    // fresh AO and tries passthrough itself. Decide before the reload
++    // detaches the AO. A chain still allowed passthrough has not failed
++    // before, so the reload's own spdif retry leaves it alone.
++    struct ao_chain *ao_c = mpctx->ao_chain;
++    bool fall_back = (events & AO_EVENT_PASSTHROUGH_FAILED) && ao_c &&
++                     ao_c->ao == mpctx->ao && ao_c->spdif_passthrough &&
++                     ao_c->track && ao_c->track->dec;
++
++    reload_audio_output(mpctx);
++    if (!fall_back)
++        return;
++
++    if (!fall_back_to_pcm(mpctx, ao_c)) {
++        MP_ERR(mpctx, "Error reinitializing audio.\n");
++        error_on_track(mpctx, ao_c->track);
++        return;
++    }
++    // The failed AO took audio it never played; the decoder would resume past
++    // it. Decode again from where playback is.
++    issue_refresh_seek(mpctx, MPSEEK_EXACT);
++}
++
+ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
+-    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
+-        reload_audio_output(mpctx);
++    handle_ao_events(mpctx);
+ 
+     update_throttle(mpctx);
+ 
+diff --git a/player/main.c b/player/main.c
+index 51acf4d..37eb6b1 100644
+--- a/player/main.c
++++ b/player/main.c
+@@ -285,8 +285,6 @@ struct MPContext *mp_create(void)
+     mp_mutex_init(&mpctx->abort_lock);
+ 
+     mpctx->global = talloc_zero(mpctx, struct mpv_global);
+-    for (int i = 0; i < 2; i++)
+-        atomic_init(&mpctx->global->spatial_format_latch[i], false);
+ 
+     demux_packet_pool_init(mpctx->global);
+     stats_global_init(mpctx->global);

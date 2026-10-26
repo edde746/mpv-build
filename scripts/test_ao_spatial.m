@@ -14,15 +14,15 @@
 #include "audio/out/ao_spatial.m"
 
 // The parts of mpv the driver calls.
-static int reloads;
+static int reloads, fallbacks;
 void mp_msg(struct mp_log *log, int lev, const char *format, ...) {}
 void ao_request_reload(struct ao *ao) { reloads++; }
+void ao_request_pcm_fallback(struct ao *ao) { fallbacks++; }
 bool af_fmt_is_spdif(int format) { return format >= AF_FORMAT_S_AAC && format < AF_FORMAT_COUNT; }
 const char *af_fmt_to_str(int format) { return "spdif"; }
 int af_fmt_to_bytes(int format) { return 2; }
 
 struct fake_sink {
-    struct mpv_global player;
     bool refuse;
     int codec;
     size_t buffer_limit;
@@ -107,8 +107,6 @@ static int failures;
 static struct fake_sink *new_sink(void)
 {
     struct fake_sink *s = calloc(1, sizeof(*s));
-    for (int i = 0; i < 2; i++)
-        atomic_init(&s->player.spatial_format_latch[i], false);
     s->received = [[NSMutableData alloc] init];
     s->space = SIZE_MAX;
     return s;
@@ -121,8 +119,6 @@ static struct ao *new_ao(struct fake_sink *s, int format)
     struct ao *ao = calloc(1, sizeof(*ao));
     struct priv *p = calloc(1, sizeof(*p));
     opening_sink = s;
-    static struct mpv_global no_sink_player;
-    ao->global = s ? &s->player : &no_sink_player;
     ao->priv = p;
     ao->format = format;
     ao->samplerate = 192000;
@@ -333,7 +329,7 @@ int main(void)
         int64_t idle = now_of(ao);
         CHECK(idle - idle_start > 300 * MS && idle < s->covered,
               "after playing out what was held, short of its end (%lld ms)", (long long)((idle - idle_start) / MS));
-        CHECK(reloads == 0 && !p->reload_requested, "silence never falls back to PCM");
+        CHECK(fallbacks == 0 && reloads == 0 && !p->reload_requested, "silence never falls back to PCM");
         s->covered = idle + 600 * MS;
         state_of(ao);
         CHECK(rate_of(ao) == 1, "audio after the silence resumes the clock");
@@ -352,7 +348,7 @@ int main(void)
               "the untaken burst is the new timeline's first audio");
         CHECK(rate_of(ao) == 0 && p->written == BURST_SAMPLES, "the clock waits for the new timeline (%lld)",
               (long long)p->written);
-        CHECK(fabs(st.delay - 0.02) < 0.005 && reloads == 0, "only that burst is queued (%f)", st.delay);
+        CHECK(fabs(st.delay - 0.02) < 0.005 && fallbacks == 0, "only that burst is queued (%f)", st.delay);
 
         // End of stream reaches the sink after the last waiting byte.
         s->space = 0;
@@ -404,7 +400,8 @@ int main(void)
         p->written = INT64_C(192000) * 14 * 3600 + 19200;
         CHECK(fabs(state_of(ao).delay - 0.1) < 0.001, "14 h carrier accounting remains representable");
 
-        // A sink failure asks mpv to reopen the output, once, and stops the clock.
+        // A sink failure asks mpv, once, to decode the track instead, and
+        // stops the clock.
         start(ao);
         s->ready = true;
         s->covered = now_of(ao) + 2000 * MS;
@@ -413,43 +410,27 @@ int main(void)
         s->failure = MP_SPATIAL_FAILED;
         state_of(ao);
         state_of(ao);
-        CHECK(reloads == 1 && s->failure_reads == 1, "a failure is logged and requests one reload (%d)", reloads);
+        CHECK(fallbacks == 1 && reloads == 0 && s->failure_reads == 1,
+              "a failure is logged and requests one PCM fallback (%d), not a plain reload (%d)",
+              fallbacks, reloads);
         CHECK(rate_of(ao) == 0, "and stops the clock");
 
         uninit(ao);
         CHECK(s->closes == 2, "uninit closes the sink (%d)", s->closes);
 
-        // A second player neither inherits the failure nor clears it when
-        // it probes PCM. The first player's new AO must still refuse TrueHD.
-        struct fake_sink *independent = new_sink();
-        struct ao *independent_ao = new_ao(independent, AF_FORMAT_S_TRUEHD);
-        CHECK(init(independent_ao) == 0, "another player can still open TrueHD");
-        CHECK(init(new_ao(independent, AF_FORMAT_FLOAT)) < 0,
-              "another player's PCM probe leaves the first latch alone");
-        uninit(independent_ao);
-
-        // The reopen refuses the failed format without asking the sink, so
-        // mpv falls back to decoding it.
+        // The fallback belongs to the failed track, which mpv now decodes: the
+        // next track or file opens a fresh output, which offers the same
+        // format to the sink again.
         s->codec = 0;
-        struct ao *reopened = new_ao(s, AF_FORMAT_S_TRUEHD);
-        CHECK(init(reopened) < 0, "the reopen after a failure refuses TrueHD");
-        CHECK(s->codec == 0, "and does not offer it to the sink");
+        struct ao *retried = new_ao(s, AF_FORMAT_S_TRUEHD);
+        CHECK(init(retried) == 0 && s->codec == 1, "the next TrueHD output asks the sink again");
+        uninit(retried);
         struct ao *other = new_ao(s, AF_FORMAT_S_DTSHD);
-        CHECK(init(other) == 0, "DTS-HD is not latched by a TrueHD failure");
+        CHECK(init(other) == 0 && s->codec == 2, "so does the next DTS-HD output");
         uninit(other);
         struct ao *ac3 = new_ao(s, AF_FORMAT_S_AC3);
         CHECK(init(ac3) < 0, "AC-3 goes to the next output");
-        s->codec = 0;
-        CHECK(init(new_ao(s, AF_FORMAT_S_TRUEHD)) < 0, "another passthrough format leaves the latch");
-        CHECK(s->codec == 0, "and the sink still is not asked");
-
-        // Once the decoded track opens a PCM output, the next track tries the
-        // sink again.
-        CHECK(init(new_ao(s, AF_FORMAT_FLOAT)) < 0, "PCM goes to the next output");
-        struct ao *retried = new_ao(s, AF_FORMAT_S_TRUEHD);
-        CHECK(init(retried) == 0 && s->codec == 1,
-              "a PCM initialization clears the latch");
-        uninit(retried);
+        CHECK(fallbacks == 1 && reloads == 0, "opening outputs after a failure requests nothing");
     }
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;

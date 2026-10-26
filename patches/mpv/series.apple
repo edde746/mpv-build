@@ -21,3 +21,5 @@
 0033-avfoundation-compressed-software-volume.patch
 0036-avfoundation-restart-only-a-running-pcm-sink.patch
 0039-ao-spatial-render-truehd-atmos-and-dts-x.patch
+0040-ao-decode-the-playing-track-to-pcm-when-passthrough-fails.patch
+0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch

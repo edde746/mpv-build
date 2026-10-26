@@ -66,6 +66,7 @@ static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static atomic_llong now_ns;
 static int entered, permitted, idle, head_queries, pauses, plays, failures, warnings, reloads;
+static int new_failures; // AudioTrack_New fails this many times: the device is away
 static int underrun_queries;
 static char last_warning[256];
 static int response, input_bytes;
@@ -157,9 +158,17 @@ static void warn_log(const char *fmt, ...)
     mp_mutex_unlock(&gate);
     va_end(args);
 }
+static int errors; // lines logged at the error level
+static void err_log(const char *fmt, ...)
+{
+    (void)fmt;
+    mp_mutex_lock(&gate);
+    errors++;
+    mp_mutex_unlock(&gate);
+}
 #define MP_VERBOSE(ao, ...) test_log(__VA_ARGS__)
 #define MP_WARN(ao, ...) warn_log(__VA_ARGS__)
-#define MP_ERR(ao, ...) test_log(__VA_ARGS__)
+#define MP_ERR(ao, ...) err_log(__VA_ARGS__)
 
 static int64_t last_wait_ns; // what the worker asked its latest wait for
 
@@ -397,6 +406,12 @@ static int AudioTrack_New(struct ao *ao)
         fn();
     }
     mp_mutex_lock(&gate);
+    if (new_failures) {
+        // AudioFlinger has no output for the format while HDMI re-plugs.
+        new_failures--;
+        mp_mutex_unlock(&gate);
+        return -1;
+    }
     assert(track_count < (int)MP_ARRAY_SIZE(tracks));
     jobject track = &tracks[track_count++];
     *track = (struct object){.track = true, .refs = 1,
@@ -438,6 +453,8 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
 {
     memset(f, 0, sizeof(*f));
     entered = permitted = idle = head_queries = pauses = plays = failures = warnings = reloads = 0;
+    errors = 0;
+    new_failures = 0;
     response = input_bytes = track_count = underrun_queries = step_lines = 0;
     last_write_count = 0;
     atomic_store(&hook_lock, NULL);
@@ -636,6 +653,477 @@ static int dtshd_burst(uint8_t *out, int sfreq)
     for (int i = 0; i < 6; i++)
         out[n++] = 0;
     return n;
+}
+
+// The worker is waiting for its next retry of a failed replacement: no
+// track, nothing failed, the retry armed. `wakeups` idle waits later it is
+// still waiting (the fake clock has not reached the retry time).
+static void expect_retry_pending(struct fixture *f, int wakeups)
+{
+    for (int n = 0; n < wakeups; n++) {
+        mp_mutex_lock(&gate);
+        int target = idle + 1;
+        mp_mutex_unlock(&gate);
+        mp_mutex_lock(&f->p.lock);
+        mp_cond_signal(&f->p.wakeup);
+        mp_mutex_unlock(&f->p.lock);
+        wait_counter(&idle, target);
+    }
+    mp_mutex_lock(&f->p.lock);
+    assert(!f->p.audiotrack);
+    assert(f->p.recreate_deadline_ns == MP_TIME_S_TO_NS(1) + RECREATE_GRACE_NS);
+    mp_mutex_unlock(&f->p.lock);
+    assert(atomic_load(&f->p.recreate_requested));
+    assert(!atomic_load(&f->p.failed) && !failures);
+}
+
+// The fake clock moves `ns` on and the worker is woken to look at it.
+static void advance_and_wake(struct fixture *f, int64_t ns)
+{
+    atomic_fetch_add(&now_ns, ns);
+    mp_mutex_lock(&f->p.lock);
+    mp_cond_signal(&f->p.wakeup);
+    mp_mutex_unlock(&f->p.lock);
+}
+
+// A replacement that cannot be created - the HDMI audio device is gone for
+// ~100 ms around a display mode switch - is retried from the top of the
+// worker loop every RECREATE_RETRY_NS, with no track meanwhile and nothing
+// failed, and succeeds once the device is back. The recovery budget is
+// charged once, for the episode.
+static void check_recreate_retries_while_device_away(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    begin_write(&f, burst, sizeof(burst));
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    mp_mutex_unlock(&gate);
+    atomic_store(&f.p.play_requested, false); // the replacement is not started
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    assert(track_count == 1 && atomic_load(&f.p.recovery_attempts) == 1);
+    assert(warnings == 2 && strstr(last_warning, "retrying for 3000 ms"));
+    expect_retry_pending(&f, 1);
+
+    // Half the interval on: still waiting. The rest of it: the device is
+    // back, the track is recreated, and the worker idles on it (paused).
+    advance_and_wake(&f, RECREATE_RETRY_NS / 2);
+    expect_retry_pending(&f, 2);
+    mp_mutex_lock(&gate);
+    int target = idle + 1;
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS / 2);
+    wait_counter(&idle, target);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.audiotrack == &tracks[1] && !f.p.recreate_deadline_ns);
+    mp_mutex_unlock(&f.p.lock);
+    assert(track_count == 2 && !atomic_load(&f.p.recreate_requested));
+    assert(warnings == 3 && strstr(last_warning, "recreated once the output device was back"));
+    assert(!atomic_load(&f.p.failed) && !failures);
+    assert(atomic_load(&f.p.recovery_attempts) == 1);
+    expect_delay(&f, 0);
+    teardown(&f);
+    puts("PASS: a failed track replacement is retried after 100 ms and succeeds "
+         "once the device is back");
+}
+
+// The device does not come back within RECREATE_GRACE_NS: the retry that
+// finds the grace over gives up, and the AO fails as before.
+static void check_recreate_gives_up_after_grace(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    begin_write(&f, burst, sizeof(burst));
+    mp_mutex_lock(&gate);
+    new_failures = 1000;
+    mp_mutex_unlock(&gate);
+    atomic_store(&f.p.play_requested, false);
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    expect_retry_pending(&f, 1);
+
+    mp_mutex_lock(&gate);
+    int target = idle + 1;
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_GRACE_NS);
+    wait_counter(&idle, target);
+    assert(atomic_load(&f.p.failed) && failures == 1);
+    assert(track_count == 1 && !atomic_load(&f.p.recreate_requested));
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.audiotrack && !f.p.recreate_deadline_ns);
+    mp_mutex_unlock(&f.p.lock);
+    assert(new_failures == 998); // the first attempt and the one retry
+    teardown(&f);
+    puts("PASS: a replacement still failing after the grace period fails the AO");
+}
+
+// The replacement's stall clock is its own. The write the device held on the
+// old track and the retries the replacement took are not counted against
+// the new track: its first write opens a fresh window, and the monitor
+// passes a verdict on it STALL_TIMEOUT_NS after that write, not after the
+// old one.
+static void check_recreate_retry_restarts_stall_clock(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    begin_write(&f, burst, sizeof(burst)); // outstanding since t=1 s
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    expect_retry_pending(&f, 1);
+    assert(!atomic_load(&f.p.write_outstanding)); // nothing to hold during the retries
+
+    // The device is back: the replacement is created playing (the core
+    // still wants playback) and the device holds its first write.
+    mp_mutex_lock(&gate);
+    int target = entered + 1;
+    memcpy(input, burst, sizeof(burst));
+    input_bytes = sizeof(burst);
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(track_count == 2 && tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    mp_mutex_unlock(&gate);
+    assert(atomic_load(&f.p.write_outstanding));
+    assert(atomic_load(&f.p.write_progress_ns) == MP_TIME_S_TO_NS(1) + RECREATE_RETRY_NS);
+
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+    mp_mutex_lock(&gate);
+    int sampled = head_queries + 2;
+    int interrupted = pauses;
+    mp_mutex_unlock(&gate);
+    wait_counter(&head_queries, sampled);
+    // STALL_TIMEOUT_NS and more since the old track's write, less since the
+    // replacement's: no verdict.
+    atomic_fetch_add(&now_ns, STALL_TIMEOUT_NS - RECREATE_RETRY_NS / 2);
+    mp_mutex_lock(&gate);
+    sampled = head_queries + 2;
+    mp_mutex_unlock(&gate);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    wait_counter(&head_queries, sampled);
+    mp_mutex_lock(&gate);
+    assert(pauses == interrupted);
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.recreate_requested) && !atomic_load(&f.p.failed));
+    assert(atomic_load(&f.p.recovery_attempts) == 1 && !failures);
+    // STALL_TIMEOUT_NS since the replacement's write: the verdict, on a
+    // budget cleared as STALL_RECOVERED_NS of health would clear it.
+    atomic_store(&f.p.recovery_attempts, 0);
+    atomic_fetch_add(&now_ns, RECREATE_RETRY_NS);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    wait_counter(&pauses, interrupted + 1);
+    assert(atomic_load(&f.p.recreate_requested));
+    assert(atomic_load(&f.p.recovery_attempts) == 1);
+    assert(strstr(last_warning, "accepted no audio for 5050 ms")); // since the new write
+    atomic_store(&f.p.monitor_terminate, true);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    assert(!pthread_join(f.p.monitor, NULL));
+    f.p.monitor_created = false;
+    atomic_store(&f.p.play_requested, false);
+    finish_write(&f, sizeof(payload));
+    assert(track_count == 3 && !failures);
+    expect_delay(&f, 0);
+    teardown(&f);
+    puts("PASS: a replacement made after retries gets a stall window of its own");
+}
+
+// The DTS-HD core-rate reopen (AudioTrack_adoptDtsHdRate) runs inside the
+// write with the first packet saved. When its replacement fails, the write
+// returns without waiting, the packet stays pending, the retry recreates
+// the track without clearing it again, and the packet is the first thing
+// written to the new track.
+static void check_raw_dtshd_reopen_retry(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    f.ao.format = AF_FORMAT_S_DTSHD;
+    f.ao.samplerate = 192000;
+    f.p.samplerate = 48000;
+    f.p.raw_rate_mult = 4;
+    uint8_t stream[64];
+    const int len = dtshd_burst(stream, 14);
+    const uint8_t packet[10] = {0x7f, 0xfe, 0x80, 0x01, 0x3f, 0xc0, 0x40, 0x00, 14 << 2, 0xab};
+
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    int target = idle + 1;
+    memcpy(input, stream, len);
+    input_bytes = len;
+    mp_mutex_unlock(&gate);
+    start(&f.ao);
+    wait_counter(&idle, target);
+    expect_retry_pending(&f, 1);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.raw_pending == (int)sizeof(packet)); // the saved packet
+    assert(f.p.samplerate == 96000 && f.p.raw_rate_mult == 2 && f.p.raw_rate_verified);
+    mp_mutex_unlock(&f.p.lock);
+    assert(track_count == 1 && !atomic_load(&f.p.recovery_attempts));
+    assert(warnings == 1 && strstr(last_warning, "retrying for 3000 ms"));
+
+    mp_mutex_lock(&gate);
+    target = entered + 1;
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS);
+    wait_counter(&entered, target);
+    assert(track_count == 2 && warnings == 2);
+    assert(strstr(last_warning, "recreated once the output device was back"));
+    finish_write(&f, sizeof(packet));
+    assert(tracks[1].sink_size == (int)sizeof(packet));
+    assert(!memcmp(tracks[1].sink, packet, sizeof(packet)));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.written_frames == (uint32_t)(len / f.ao.sstride));
+    assert(!f.p.raw_pending);
+    mp_mutex_unlock(&f.p.lock);
+    assert(!failures);
+    teardown(&f);
+    puts("PASS: a DTS-HD reopen whose replacement fails keeps the packet for the retried track");
+}
+
+// The core seeks and resumes while the replacement is pending. stop() finds
+// no track and says so below the error level, and still resets the clock:
+// the packet saved for the replacement goes with it, as the core has dropped
+// its side of the seek. start() finds no track and leaves the start to the
+// retry, which makes the replacement playing. The replacement's first write
+// is the audio after the seek, not the packet from before it.
+static void check_recreate_stop_start_during_retry(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    f.ao.format = AF_FORMAT_S_DTSHD;
+    f.ao.samplerate = 192000;
+    f.p.samplerate = 48000;
+    f.p.raw_rate_mult = 4;
+    uint8_t stream[64];
+    const int len = dtshd_burst(stream, 14);
+    const uint8_t packet[10] = {0x7f, 0xfe, 0x80, 0x01, 0x3f, 0xc0, 0x40, 0x00, 14 << 2, 0xab};
+
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    int target = idle + 1;
+    memcpy(input, stream, len);
+    input_bytes = len;
+    mp_mutex_unlock(&gate);
+    start(&f.ao);
+    wait_counter(&idle, target);
+    expect_retry_pending(&f, 1);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.raw_pending == (int)sizeof(packet)); // the saved packet
+    mp_mutex_unlock(&f.p.lock);
+
+    stop(&f.ao);  // the seek
+    start(&f.ao); // and the resume
+    assert(!errors && warnings == 1);
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.audiotrack && !f.p.raw_pending);
+    mp_mutex_unlock(&f.p.lock);
+    assert(atomic_load(&f.p.recreate_requested));
+    assert(atomic_load(&f.p.play_requested));
+    expect_retry_pending(&f, 1);
+
+    // The device is back: the replacement is made playing, and the first
+    // write to it is the burst the core has after the seek.
+    mp_mutex_lock(&gate);
+    target = entered + 1;
+    memcpy(input, stream, len);
+    input_bytes = len;
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(track_count == 2 && tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.recreate_requested));
+    finish_write(&f, sizeof(packet));
+    assert(tracks[1].sink_size == (int)sizeof(packet));
+    assert(!memcmp(tracks[1].sink, packet, sizeof(packet)));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.written_frames == (uint32_t)(len / f.ao.sstride));
+    assert(!f.p.raw_pending);
+    mp_mutex_unlock(&f.p.lock);
+    assert(!errors && !failures);
+    teardown(&f);
+    puts("PASS: a seek and a resume while the replacement is pending drop the "
+         "saved packet and leave the start to the retry");
+}
+
+// The worker's write in progress completes (the device takes it whole), and
+// the hook waits for the worker's next write before it returns.
+static int completed_len; // what that write asked the track to take
+static void complete_write_then_wait_for_the_next(void)
+{
+    mp_mutex_lock(&gate);
+    response = completed_len;
+    permitted = entered;
+    int target = entered + 1;
+    pthread_cond_broadcast(&changed);
+    while (entered < target)
+        pthread_cond_wait(&changed, &gate);
+    mp_mutex_unlock(&gate);
+}
+
+// The monitor's recreate request and its pause are one step under
+// track_lock. Stored before the lock, the request could be answered in the
+// gap: the device takes the write it held, the worker sees the request,
+// replaces the track and plays the replacement, and the monitor's pause then
+// lands on that replacement, which stays paused with nothing outstanding and
+// so no verdict to come, and with --audio-stream-silence no stop()/start()
+// from the core either. The hook has the device take the write at the moment
+// the monitor reaches for track_lock, and returns once the worker is in its
+// next write: on this code the worker finds no request yet and writes an
+// empty read to the old track; stored first, it would make the replacement
+// before the pause.
+static void check_recreate_request_meets_completed_write(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    pause_after_write = false; // the track plays on once the device takes the write
+    static const uint8_t audio[6] = {1, 2, 3, 4, 5, 6};
+    completed_len = sizeof(audio);
+    begin_write(&f, audio, sizeof(audio)); // the device holds it; the head stays at 0
+
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+    mp_mutex_lock(&gate);
+    int sampled = head_queries + 2;
+    int interrupted = pauses + 1;
+    hook_worker = f.p.thread;
+    hook_fn = complete_write_then_wait_for_the_next;
+    hook_after_warning = &f.p.track_lock;
+    mp_mutex_unlock(&gate);
+    wait_counter(&head_queries, sampled);
+    atomic_fetch_add(&now_ns, STALL_TIMEOUT_NS + 1);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    wait_counter(&pauses, interrupted);
+    assert(!atomic_load(&hook_lock) && !hook_after_warning);
+    assert(warnings == 1 && strstr(last_warning, "recreating the AudioTrack (attempt 1/1)"));
+    assert(atomic_load(&f.p.recreate_requested));
+    // Stop the monitor before observing the worker.
+    atomic_store(&f.p.monitor_terminate, true);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    assert(!pthread_join(f.p.monitor, NULL));
+    f.p.monitor_created = false;
+
+    // The pause released the worker's write (nothing taken). The worker
+    // answers the request now: the old track goes, the replacement is made
+    // playing, and the worker's next write goes to it.
+    mp_mutex_lock(&gate);
+    int writes = entered, polls = idle;
+    response = 0;
+    permitted = entered;
+    pthread_cond_broadcast(&changed);
+    while (entered == writes && idle == polls)
+        pthread_cond_wait(&changed, &gate);
+    assert(track_count == 2 && tracks[0].released);
+    assert(tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    assert(entered > writes); // writing to the replacement, not idling on a paused one
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.recreate_requested));
+    assert(atomic_load(&f.p.recovery_attempts) == 1 && !failures);
+    assert(warnings == 1 && !errors);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a recreate request that meets the completed write replaces the "
+         "track after the pause, and the replacement plays");
+}
+
+// The core's stop() and start() while a retried attempt is being made: the
+// request stands through the attempt, so both find the replacement pending
+// (verbose) rather than the track missing (an error). The attempt runs on the
+// worker with p->lock and track_lock held, so stop() waits for track_lock;
+// the hook in the fake AudioTrack_New has the core call it then, and the
+// worker's release of track_lock lets it through up to p->lock before the
+// worker goes on to re-arm the request: were the request cleared before the
+// attempt, stop() would find neither a track nor a request in that window.
+static struct fixture *attempt_f;
+static pthread_t attempt_caller;
+static void *stop_and_start(void *arg)
+{
+    struct ao *ao = arg;
+    stop(ao);  // the seek
+    start(ao); // and the resume
+    return NULL;
+}
+static void seek_during_the_attempt(void)
+{
+    mp_mutex_lock(&gate);
+    int target = watched_waits + 1;
+    mp_mutex_unlock(&gate);
+    watched_excluded = pthread_self();
+    atomic_store(&watched_lock, &attempt_f->p.track_lock);
+    assert(!pthread_create(&attempt_caller, NULL, stop_and_start, &attempt_f->ao));
+    wait_counter(&watched_waits, target); // stop() waits for track_lock
+    atomic_store(&watched_lock, NULL);
+}
+static void let_the_seek_through(void)
+{
+    mp_mutex_lock(&gate);
+    int target = watched_waits + 1;
+    mp_mutex_unlock(&gate);
+    atomic_store(&watched_lock, &attempt_f->p.lock);
+    wait_counter(&watched_waits, target); // stop() is through track_lock, at p->lock
+    atomic_store(&watched_lock, NULL);
+}
+
+static void check_recreate_stop_start_during_attempt(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    begin_write(&f, burst, sizeof(burst));
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    mp_mutex_unlock(&gate);
+    finish_write(&f, AudioManager.ERROR_DEAD_OBJECT);
+    assert(track_count == 1 && atomic_load(&f.p.recovery_attempts) == 1);
+    assert(warnings == 2 && strstr(last_warning, "retrying for 3000 ms"));
+    expect_retry_pending(&f, 1);
+
+    // The retry: the device is still away, and the core seeks and resumes
+    // while the attempt is being made.
+    mp_mutex_lock(&gate);
+    new_failures = 1;
+    attempt_f = &f;
+    hook_worker = f.p.thread;
+    new_hook_fn = seek_during_the_attempt;
+    unlock_hook_fn = let_the_seek_through;
+    atomic_store(&unlock_hook_lock, &f.p.track_lock);
+    int target = idle + 1;
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS);
+    wait_counter(&idle, target);
+    assert(!pthread_join(attempt_caller, NULL));
+    assert(!new_hook_fn && !atomic_load(&unlock_hook_lock));
+    assert(!errors && warnings == 2);
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.audiotrack && !f.p.raw_pending);
+    assert(f.p.recreate_deadline_ns == MP_TIME_S_TO_NS(1) + RECREATE_GRACE_NS);
+    mp_mutex_unlock(&f.p.lock);
+    assert(atomic_load(&f.p.recreate_requested));
+    assert(atomic_load(&f.p.play_requested));
+
+    // The device is back: the replacement is made playing, and the first
+    // write to it is the burst the core has after the seek.
+    mp_mutex_lock(&gate);
+    target = entered + 1;
+    memcpy(input, burst, sizeof(burst));
+    input_bytes = sizeof(burst);
+    mp_mutex_unlock(&gate);
+    advance_and_wake(&f, RECREATE_RETRY_NS);
+    wait_counter(&entered, target);
+    mp_mutex_lock(&gate);
+    assert(track_count == 2 && tracks[1].state == AudioTrack.PLAYSTATE_PLAYING);
+    mp_mutex_unlock(&gate);
+    assert(!atomic_load(&f.p.recreate_requested));
+    assert(warnings == 3 && strstr(last_warning, "recreated once the output device was back"));
+    finish_write(&f, sizeof(payload));
+    assert(tracks[1].sink_size == (int)sizeof(payload));
+    assert(!memcmp(tracks[1].sink, payload, sizeof(payload)));
+    expect_delay(&f, sizeof(burst) / 2);
+    assert(!errors && !failures);
+    teardown(&f);
+    puts("PASS: a seek and a resume during a retried attempt find the replacement "
+         "pending, and the retry still makes it");
 }
 
 static void check_raw_dtshd(int sfreq, int expected_rate, int expected_tracks)
@@ -2415,6 +2903,13 @@ int main(void)
     check_pcm_and_iec(AudioFormat.ENCODING_IEC61937, true, 3, 6);
     puts("PASS: PCM direct/byte/float and IEC partial counts survive reset without stale credit");
     check_dead_object();
+    check_recreate_retries_while_device_away();
+    check_recreate_gives_up_after_grace();
+    check_recreate_retry_restarts_stall_clock();
+    check_raw_dtshd_reopen_retry();
+    check_recreate_stop_start_during_retry();
+    check_recreate_request_meets_completed_write();
+    check_recreate_stop_start_during_attempt();
     check_stream_silence_deferred_start();
     for (int n = 0; n < MP_ARRAY_SIZE(layouts); n++)
         check_stream_silence_layout(&layouts[n]);

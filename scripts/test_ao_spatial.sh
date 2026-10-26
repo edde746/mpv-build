@@ -3,7 +3,7 @@
 # (patches/mpv/pool/0039-ao-spatial-render-truehd-atmos-and-dts-x.patch):
 # test_ao_spatial.m includes the patched audio/out/ao_spatial.m and drives it
 # against a real AVSampleBufferRenderSynchronizer and a fake sink,
-# including the latch that makes a failed stream fall back to PCM. macOS only.
+# including the PCM fallback a failed stream requests (patch 0040). macOS only.
 # Pass an already-patched mpv tree for offline use; otherwise fetch and patch
 # the pinned source.
 set -euo pipefail
