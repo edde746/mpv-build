@@ -2255,6 +2255,56 @@ static void check_stream_silence_queue_cap(void)
          "still one");
 }
 
+// On the carrier the hold's floor is half the stream's own burst, which the
+// tracker reads from its first preamble, not half the format's largest that
+// init reads by: near the mark a DTS type I stream (2048 bytes a burst) at
+// 44.1 kHz waits half of its burst, where init's 8192 bytes were four.
+static void check_stream_silence_queue_cap_carrier(void)
+{
+    struct fixture f;
+    setup_stream_silence(&f, false, AudioFormat.ENCODING_IEC61937, NULL, NULL,
+                         8192 / 2);
+    f.ao.samplerate = 44100;
+    uint8_t head[256];
+    memset(head, 0x5a, sizeof(head));
+    memcpy(head, iec_preamble, sizeof(iec_preamble));
+    head[4] = IEC61937_DTS1;
+    head[5] = 0;
+    const uint32_t cap = 44100 * 500 / 1000;
+    begin_write(&f, head, sizeof(head));
+
+    // The first chunk goes in with the queue well over the mark: the worker
+    // holds instead of feeding silence.
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = cap + 4410;
+    mp_mutex_unlock(&f.p.lock);
+    mp_mutex_lock(&gate);
+    response = sizeof(head) / 2;
+    permitted = entered;
+    int writes = entered, target = idle + 2;
+    pthread_cond_broadcast(&changed);
+    mp_mutex_unlock(&gate);
+    wait_counter(&idle, target);
+    mp_mutex_lock(&gate);
+    assert(entered == writes);
+    mp_mutex_unlock(&gate);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.iec_burst == 2048 && !atomic_load(&f.p.ka_feeding));
+
+    // Just over the mark (10 ms): half the stream's burst, 1024 frames.
+    f.p.written_frames = cap + 441;
+    mp_mutex_unlock(&f.p.lock);
+    expect_idle();
+    mp_mutex_lock(&gate);
+    assert(entered == writes);
+    assert(last_wait_ns == (int64_t)MP_TIME_S_TO_NS(1024 / 44100.0) / 2);
+    mp_mutex_unlock(&gate);
+    assert(!warnings && !failures);
+    park_fed_worker(&f);
+    teardown(&f);
+    puts("PASS: on the carrier the hold waits half the stream's own burst");
+}
+
 // A track that gets no silence (its format has none) polls for the core's
 // audio every KA_POLL_NS while it plays, as the worker does without the
 // option. A track stood down backs off from KA_POLL_NS to KA_IDLE_NS.
@@ -2923,6 +2973,7 @@ int main(void)
     check_stream_silence_resume_answer_waits_for_the_pause();
     check_stream_silence_pcm_padding();
     check_stream_silence_queue_cap();
+    check_stream_silence_queue_cap_carrier();
     check_stream_silence_polls();
     check_stream_silence_init_rate();
     check_watchdog_after_reset();

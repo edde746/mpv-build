@@ -40,7 +40,7 @@ index 7eb7c97..f5858bb 100644
      SDL 2.0+ audio output driver. Should work on any platform supported by SDL
      2.0, but may require the ``SDL_AUDIODRIVER`` environment variable to be set
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index 20f9c1a..a2ff1a1 100644
+index 560d1ee..4ac514f 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
 @@ -26,6 +26,7 @@
@@ -51,7 +51,7 @@ index 20f9c1a..a2ff1a1 100644
  #include <sys/resource.h>
  
  #include "ao.h"
-@@ -57,6 +58,95 @@ static int jni_static_use_count = 0;
+@@ -65,6 +66,95 @@ static int jni_static_use_count = 0;
  // own audio client threads.
  #define THREAD_PRIORITY_AUDIO (-16)
  
@@ -147,7 +147,7 @@ index 20f9c1a..a2ff1a1 100644
  enum {
      RAW_SYNC_PA = 0,
      RAW_SYNC_PB,
-@@ -122,6 +212,33 @@ struct priv {
+@@ -130,6 +220,33 @@ struct priv {
      bool raw_depth_logged;// first burst's Pd has sized the track in bursts
      bool raw_rate_verified;// DTS-HD: the core header confirmed the track rate
  
@@ -181,7 +181,7 @@ index 20f9c1a..a2ff1a1 100644
      // Raw TrueHD (AudioTrack_thdMatWord): the MAT frame is peeled off each
      // burst and its access units are rebuilt in rawbuf, complete units first.
      int thd_mat_pos;      // byte offset in the current MAT frame
-@@ -182,6 +299,7 @@ struct priv {
+@@ -190,6 +307,7 @@ struct priv {
      bool cfg_route_reload;
      int cfg_session_id;
      bool cfg_normalize;
@@ -189,7 +189,7 @@ index 20f9c1a..a2ff1a1 100644
  
      // --audiotrack-normalize: the platform loudness effect on the PCM track's
      // audio session (AudioTrack_attachNormalizer), released with the track.
-@@ -203,6 +321,8 @@ struct priv {
+@@ -211,6 +329,8 @@ struct priv {
      // playback-head movement and decides. Lock-free even if a JNI clock or
      // lifecycle query (not just a write) stalls the worker.
      atomic_bool play_requested;
@@ -198,7 +198,7 @@ index 20f9c1a..a2ff1a1 100644
      atomic_bool write_outstanding;
      atomic_llong write_progress_ns;
      atomic_bool recreate_requested;
-@@ -977,6 +1097,12 @@ static void AudioTrack_resetClock(struct priv *p)
+@@ -1027,6 +1147,12 @@ static void AudioTrack_resetClock(struct priv *p)
      p->raw_pending = 0;
      p->raw_input_len = 0;
      AudioTrack_thdReset(p);
@@ -211,7 +211,7 @@ index 20f9c1a..a2ff1a1 100644
      AudioTrack_resetPlayheadSmoothing(p);
      p->step_anchored = false;
      // The worker sets write_outstanding before the JNI call a stop/reset can
-@@ -1010,7 +1136,9 @@ static int AudioTrack_Recreate(struct ao *ao)
+@@ -1070,7 +1196,9 @@ static int AudioTrack_Recreate(struct ao *ao)
      p->head_reset_pending = true;
      p->ts_reset_pending = true;
      int ret = AudioTrack_New(ao);
@@ -222,7 +222,7 @@ index 20f9c1a..a2ff1a1 100644
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.play);
          MP_JNI_EXCEPTION_LOG(ao);
      }
-@@ -1959,6 +2087,999 @@ static void AudioTrack_adoptDtsHdRate(struct ao *ao)
+@@ -2019,6 +2147,999 @@ static void AudioTrack_adoptDtsHdRate(struct ao *ao)
      p->raw_have_byte = have_byte;
  }
  
@@ -1222,7 +1222,7 @@ index 20f9c1a..a2ff1a1 100644
  // Enter and return with p->lock held. Preparation and completion mutate the
  // parser/accounting; only the blocking JNI write runs outside that lock.
  static int AudioTrack_write(struct ao *ao, int len)
-@@ -2000,6 +3121,11 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -2060,6 +3181,11 @@ static int AudioTrack_write(struct ao *ao, int len)
      } else if (p->raw_passthrough) {
          if (!p->raw_pending) {
              p->raw_pending = AudioTrack_unwrapIEC61937(ao, p->rawbuf, buf, len);
@@ -1234,7 +1234,7 @@ index 20f9c1a..a2ff1a1 100644
              if (!p->raw_pending)
                  return len; // only header/padding: consumed, nothing to write
              p->raw_input_len = len;
-@@ -2076,6 +3202,8 @@ static int AudioTrack_write(struct ao *ao, int len)
+@@ -2136,6 +3262,8 @@ static int AudioTrack_write(struct ao *ao, int len)
              AudioTrack_thdTake(p, p->thd_group_bytes, p->thd_group_units);
          return p->raw_input_len;
      }
@@ -1243,7 +1243,7 @@ index 20f9c1a..a2ff1a1 100644
      return ret * sample_size;
  }
  
-@@ -2197,6 +3325,33 @@ static void AudioTrack_recreateOrFail(struct ao *ao)
+@@ -2282,6 +3410,33 @@ static void AudioTrack_recreateOrFail(struct ao *ao)
      ao_request_failure(ao);
  }
  
@@ -1277,18 +1277,18 @@ index 20f9c1a..a2ff1a1 100644
  static MP_THREAD_VOID ao_thread(void *arg)
  {
      struct ao *ao = arg;
-@@ -2213,7 +3368,9 @@ static MP_THREAD_VOID ao_thread(void *arg)
-     // refusal leaves it where it was.
-     //
-     // Not for a raw track. Its budget is bytes, so at a low bitrate it holds
--    // more audio than the core queues in front of it, and the writer
-+    // more audio than the core queues in front of it (with
-+    // --audio-stream-silence the worker stops reading at KA_QUEUE_NS while
-+    // the head moves, still more than the core's queue), and the writer
-     // fills it in one burst whenever the HAL starts taking data (Fire TV's
-     // Dolby track holds the first writes until the sink locks, then drains
-     // them at once). A writer that outranks the core empties the queue
-@@ -2235,34 +3392,167 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -2305,7 +3460,9 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     // inside that burst and trips the short-read wire; at the priority it
+     // inherits from the core, which opens the AO, it yields to the refill.
+     // The depth is the raw track's own slack, so the priority buys nothing
+-    // there.
++    // there. With --audio-stream-silence the reads stop at KA_QUEUE_NS,
++    // under the core's queue, but only while the head moves: a head that
++    // stands still, as through that burst, still gets the whole budget.
+     if (!p->raw_passthrough &&
+         setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
+         MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
+@@ -2330,34 +3487,172 @@ static MP_THREAD_VOID ao_thread(void *arg)
              mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(300));
              continue;
          }
@@ -1387,12 +1387,17 @@ index 20f9c1a..a2ff1a1 100644
 +                // near the mark the way is a burst at most, and halving it
 +                // down to KA_POLL_NS would have the worker query the track
 +                // several times per burst, where a blocking write woke it
-+                // once per burst.
++                // once per burst. On the carrier the burst is the stream's
++                // own once the tracker has read one: init's unit is the
++                // format's largest, four bursts of a 512-sample DTS stream.
++                // A raw track's unit is its codec frame already.
 +                const int64_t drained_in = (int64_t)(delay * 1e9) - KA_QUEUE_NS;
-+                const int64_t unit_ns =
-+                    MP_TIME_S_TO_NS(p->ka_unit_frames / (double)ao->samplerate);
++                const int burst_frames = !p->raw_passthrough && p->iec_burst
++                                         ? p->iec_burst / ao->sstride : p->ka_unit_frames;
++                const int64_t burst_ns =
++                    MP_TIME_S_TO_NS(burst_frames / (double)ao->samplerate);
 +                mp_cond_timedwait(&p->wakeup, &p->lock,
-+                                  MPMAX(drained_in / 2, MPMAX(unit_ns / 2, KA_POLL_NS)));
++                                  MPMAX(drained_in / 2, MPMAX(burst_ns / 2, KA_POLL_NS)));
 +                continue;
              }
 +            // Padded reads come back whole: ao_read_data returns what it
@@ -1470,7 +1475,7 @@ index 20f9c1a..a2ff1a1 100644
              if (generation != p->write_generation) {
                  atomic_store(&p->write_outstanding, false);
                  continue;
-@@ -2273,6 +3563,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
+@@ -2368,6 +3663,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
              }
              if (ret >= 0) {
                  p->written_frames += ret / ao->sstride;
@@ -1481,7 +1486,7 @@ index 20f9c1a..a2ff1a1 100644
              } else if (ret == AudioManager.ERROR_DEAD_OBJECT) {
                  if (AudioTrack_beginRecovery(ao, "AudioTrack.write failed with ERROR_DEAD_OBJECT"))
                      AudioTrack_recreateOrFail(ao);
-@@ -2382,6 +3676,31 @@ static MP_THREAD_VOID monitor_thread(void *arg)
+@@ -2477,6 +3776,31 @@ static MP_THREAD_VOID monitor_thread(void *arg)
          char why[96];
          snprintf(why, sizeof(why), "AudioTrack accepted no audio for %d ms",
                   (int)(stalled_ns / 1000000));
@@ -1513,7 +1518,7 @@ index 20f9c1a..a2ff1a1 100644
          if (p->raw_passthrough && ao->format == AF_FORMAT_S_TRUEHD) {
              // #1804's failure: the route took the raw TrueHD track and does
              // not play it. A new track would stall the same way; decode.
-@@ -2658,7 +3977,8 @@ static int init(struct ao *ao)
+@@ -2761,7 +4085,8 @@ static int init(struct ao *ao)
      if (p->raw_passthrough) {
          // getMinBufferSize answers in bitstream bytes for raw encodings. The
          // budget is depth, not granularity: each write stays one doubled
@@ -1523,7 +1528,7 @@ index 20f9c1a..a2ff1a1 100644
          const int budget = raw_buffer_budget(ao->format);
          p->chunksize = MP_ALIGN_UP(buffer_size * 2, bps);
          if (ao->format == AF_FORMAT_S_TRUEHD) {
-@@ -2689,9 +4009,10 @@ static int init(struct ao *ao)
+@@ -2792,9 +4117,10 @@ static int init(struct ao *ao)
          // the queue in one burst when it wakes. A SHIELD measured 12000 to
          // 24000 of 24000 frames.
          //
@@ -1537,7 +1542,7 @@ index 20f9c1a..a2ff1a1 100644
          // trip-wire. AudioTrack rejects a PCM buffer that is not a whole
          // number of frames.
          const int frame = bps * ao->channels.num;
-@@ -2703,6 +4024,7 @@ static int init(struct ao *ao)
+@@ -2806,6 +4132,7 @@ static int init(struct ao *ao)
                     p->size, buffer_size, half_second, p->chunksize);
      }
      mp_assert(p->size % bps == 0);
@@ -1545,7 +1550,7 @@ index 20f9c1a..a2ff1a1 100644
      ao->device_buffer = AudioTrack_queueFloor(ao, p->size / bps);
  
      p->chunk = talloc_size(ao, p->chunksize);
-@@ -2777,6 +4099,7 @@ static void stop(struct ao *ao)
+@@ -2880,6 +4207,7 @@ static void stop(struct ao *ao)
  {
      struct priv *p = ao->priv;
      atomic_store(&p->play_requested, false);
@@ -1553,7 +1558,7 @@ index 20f9c1a..a2ff1a1 100644
  
      JNIEnv *env = MP_JNI_GET_ENV(ao);
      mp_mutex_lock(&p->track_lock);
-@@ -2814,8 +4137,17 @@ static void start(struct ao *ao)
+@@ -2927,8 +4255,17 @@ static void start(struct ao *ao)
          MP_ERR(ao, "AudioTrack does not exist to start!\n");
          return;
      }
@@ -1573,7 +1578,7 @@ index 20f9c1a..a2ff1a1 100644
      mp_mutex_unlock(&p->track_lock);
  
      mp_cond_signal(&p->wakeup);
-@@ -2835,12 +4167,18 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -2948,12 +4285,18 @@ const struct ao_driver audio_out_audiotrack = {
          .cfg_pcm_float = 1,
          .cfg_raw_passthrough = 1,
          .cfg_route_reload = 1,
