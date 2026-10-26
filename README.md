@@ -713,8 +713,18 @@ across stop/reset/recreation, stale write completions without clock credit,
 DTS-HD bursts unwrapping to bare packets with the raw track reopened at
 the core rate, and the passthrough clock's rate-limited `playhead step`
 diagnostic with its observe-only `getTimestamp` probe, and a stalled raw
-TrueHD track demoting TrueHD to decoding instead of being recreated. Pass an
-already-patched source directory as the first argument to run offline.
+TrueHD track demoting TrueHD to decoding instead of being recreated.
+The stream-silence cases drive the production worker and monitor with the
+option on: the deferred, primed start; the silent frame following the layout
+of raw AC-3, E-AC-3 and DTS frames; zero words on the carrier's burst grid;
+the pacing of the silence and the cap on queued audio, with the hold's wait
+floored at half a burst; the feed's time limit; the stand-down when the
+device stops taking the silence or the track dies under it; the monitor's
+request meeting the feed ending for audio on either side, and the resumption
+that answers it waiting for the pause; a PCM track's padding counting as
+feeding; the polls of a track without silence and the backoff of one stood
+down; and what init enables for each format and rate.
+Pass an already-patched source directory as the first argument to run offline.
 
 Run the raw TrueHD regression with `bash scripts/test_audiotrack_truehd.sh`.
 It encodes TrueHD with the host ffmpeg, packs it into IEC 61937 MAT bursts
