@@ -1,18 +1,5 @@
-Subject: [PATCH] avcodec/mediacodec: report rendered frames through a drainable ring
-
-Register AMediaCodec_setOnFrameRenderedCallback (NDK, Android 13) on a
-surface-backed video decoder and keep its reports in a lock-free
-single-producer ring owned by the decoder context, which outlives
-avcodec_close while output buffers are referenced. The consumer drains
-through any buffer of that codec (av_mediacodec_drain_rendered), reads the
-presentation time a buffer was queued with (av_mediacodec_buffer_get_pts)
-and learns why feedback is off (av_mediacodec_rendered_source): the Java
-wrapper has no listener class to hand the platform, older NDKs lack the
-entry point, or the codec refused it. The callback is unregistered before
-the codec is deleted so no late delivery reaches a freed context.
-
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index 33bde81..dc31246 100644
+index 2701f35ef0..792d453b3f 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
 @@ -29,6 +29,7 @@
@@ -23,8 +10,8 @@ index 33bde81..dc31246 100644
  
  #include "libavcodec/avcodec.h"
  #include "libavutil/mem.h"
-@@ -117,6 +118,39 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
-     return 0;
+@@ -119,6 +120,39 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+     return AVERROR(ENOENT);
  }
  
 +int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
@@ -63,7 +50,7 @@ index 33bde81..dc31246 100644
  #else
  
  #include <stdlib.h>
-@@ -145,4 +179,20 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+@@ -147,4 +181,20 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
      return AVERROR(ENOSYS);
  }
  
@@ -85,10 +72,10 @@ index 33bde81..dc31246 100644
 +
  #endif
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 4e9b56a..77c44fc 100644
+index 5382302a4c..466ec23704 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -100,4 +100,42 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
+@@ -102,4 +102,42 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render);
   */
  int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time);
  
@@ -132,10 +119,10 @@ index 4e9b56a..77c44fc 100644
 +
  #endif /* AVCODEC_MEDIACODEC_H */
 diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
-index 005fa0c..cb100ea 100644
+index 0b9be798f4..56b26e0366 100644
 --- a/libavcodec/mediacodec_wrapper.c
 +++ b/libavcodec/mediacodec_wrapper.c
-@@ -1884,6 +1884,9 @@ typedef struct FFAMediaCodecNdk {
+@@ -1984,6 +1984,9 @@ typedef struct FFAMediaCodecNdk {
      FFAMediaCodecOnAsyncNotifyCallback async_cb;
      void *async_userdata;
  
@@ -145,7 +132,7 @@ index 005fa0c..cb100ea 100644
      // Available since API level 28.
      media_status_t (*getName)(AMediaCodec*, char** out_name);
      void (*releaseName)(AMediaCodec*, char* name);
-@@ -1893,6 +1896,12 @@ typedef struct FFAMediaCodecNdk {
+@@ -1993,6 +1996,12 @@ typedef struct FFAMediaCodecNdk {
      media_status_t (*signalEndOfInputStream)(AMediaCodec *);
      media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
              struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
@@ -158,7 +145,7 @@ index 005fa0c..cb100ea 100644
  } FFAMediaCodecNdk;
  
  static const FFAMediaFormat media_format_ndk;
-@@ -2131,6 +2140,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+@@ -2231,6 +2240,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
      GET_SYMBOL(setInputSurface)
      GET_SYMBOL(signalEndOfInputStream)
      GET_SYMBOL(setAsyncNotifyCallback)
@@ -166,7 +153,7 @@ index 005fa0c..cb100ea 100644
  
  #undef GET_SYMBOL
  
-@@ -2179,6 +2189,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
+@@ -2279,6 +2289,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
  
      av_assert0(codec->api.class == &amediacodec_ndk_class);
  
@@ -178,7 +165,7 @@ index 005fa0c..cb100ea 100644
      if (codec->impl && (AMediaCodec_delete(codec->impl) != AMEDIA_OK))
          ret = AVERROR_EXTERNAL;
      if (codec->window)
-@@ -2494,6 +2509,40 @@ static int mediacodec_ndk_setAsyncNotifyCallback(FFAMediaCodec *ctx,
+@@ -2594,6 +2609,40 @@ static int mediacodec_ndk_setAsyncNotifyCallback(FFAMediaCodec *ctx,
      return 0;
  }
  
@@ -219,7 +206,7 @@ index 005fa0c..cb100ea 100644
  static const FFAMediaFormat media_format_ndk = {
      .class = &amediaformat_ndk_class,
  
-@@ -2556,6 +2605,7 @@ static const FFAMediaCodec media_codec_ndk = {
+@@ -2656,6 +2705,7 @@ static const FFAMediaCodec media_codec_ndk = {
      .cleanOutputBuffers = mediacodec_ndk_cleanOutputBuffers,
      .signalEndOfInputStream = mediacodec_ndk_signalEndOfInputStream,
      .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
@@ -228,7 +215,7 @@ index 005fa0c..cb100ea 100644
  
  FFAMediaFormat *ff_AMediaFormat_new(int ndk)
 diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
-index 191e1a5..224b5a2 100644
+index 191e1a5422..224b5a2418 100644
 --- a/libavcodec/mediacodec_wrapper.h
 +++ b/libavcodec/mediacodec_wrapper.h
 @@ -195,6 +195,11 @@ typedef struct FFAMediaCodecOnAsyncNotifyCallback {
@@ -274,10 +261,10 @@ index 191e1a5..224b5a2 100644
  
  enum FFAMediaFormatColorRange {
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index 4365a50..c1021f1 100644
+index 914633ff58..7b082b764f 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -831,6 +831,59 @@ static int mediacodec_dec_get_audio_codec(AVCodecContext *avctx, MediaCodecDecCo
+@@ -849,6 +849,59 @@ static int mediacodec_dec_get_audio_codec(AVCodecContext *avctx, MediaCodecDecCo
      return 0;
  }
  
@@ -337,7 +324,7 @@ index 4365a50..c1021f1 100644
  int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
                             const char *mime, FFAMediaFormat *format)
  {
-@@ -841,6 +894,9 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -859,6 +912,9 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
      atomic_init(&s->refcount, 1);
      atomic_init(&s->hw_buffer_count, 0);
      atomic_init(&s->serial, 1);
@@ -347,7 +334,7 @@ index 4365a50..c1021f1 100644
      s->current_input_buffer = -1;
  
      if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
-@@ -864,6 +920,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -882,6 +938,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
          goto fail;
      }
  
@@ -357,7 +344,7 @@ index 4365a50..c1021f1 100644
      if (status < 0) {
          char *desc = ff_AMediaFormat_toString(format);
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 50123ef..512601f 100644
+index d7e7dd3cbd..5b3307e14a 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -32,8 +32,15 @@
@@ -376,7 +363,7 @@ index 50123ef..512601f 100644
  typedef struct MediaCodecDecContext {
  
      AVCodecContext *avctx;
-@@ -72,6 +79,12 @@ typedef struct MediaCodecDecContext {
+@@ -77,6 +84,12 @@ typedef struct MediaCodecDecContext {
  
      bool use_ndk_codec;
      int profile_override; // CodecProfileLevel constant, 0 = derive from avctx

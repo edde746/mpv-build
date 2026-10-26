@@ -1,20 +1,20 @@
 diff --git a/configure b/configure
-index 539747c..f40b86e 100755
+index eec1c1c441..dea09a31d7 100755
 --- a/configure
 +++ b/configure
-@@ -3399,6 +3399,7 @@ av1_amf_encoder_deps="amf"
- av1_amf_decoder_deps="amf"
- av1_cuvid_decoder_deps="cuvid CUVIDAV1PICPARAMS"
+@@ -3586,6 +3586,7 @@ av1_cuvid_decoder_deps="cuvid CUVIDAV1PICPARAMS"
+ av1_d3d12va_encoder_deps="d3d12va d3d12va_av1_headers"
+ av1_d3d12va_encoder_select="cbs_av1 d3d12va_encode"
  av1_mediacodec_decoder_deps="mediacodec"
 +av1_mediacodec_decoder_select="cbs_av1"
  av1_mediacodec_encoder_deps="mediacodec"
  av1_mediacodec_encoder_select="extract_extradata_bsf"
  av1_mf_encoder_deps="mediafoundation"
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index c6d8108..e048f23 100644
+index 0130207438..4390b8c748 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -137,7 +137,7 @@ OBJS-$(CONFIG_LPC)                     += lpc.o
+@@ -141,7 +141,7 @@ OBJS-$(CONFIG_LPC)                     += lpc.o
  OBJS-$(CONFIG_LSP)                     += lsp.o
  OBJS-$(CONFIG_LZF)                     += lzf.o
  OBJS-$(CONFIG_ME_CMP)                  += me_cmp.o
@@ -23,7 +23,7 @@ index c6d8108..e048f23 100644
  OBJS-$(CONFIG_MPEG_ER)                 += mpeg_er.o
  OBJS-$(CONFIG_MPEGAUDIO)               += mpegaudio.o mpegaudiodec_common.o \
                                            mpegaudiodata.o
-@@ -1324,7 +1324,7 @@ SKIPHEADERS-$(CONFIG_LIBAOM)           += libaom.h
+@@ -1369,7 +1369,7 @@ SKIPHEADERS-$(CONFIG_LIBAOM)           += libaom.h
  SKIPHEADERS-$(CONFIG_LIBJXL)           += libjxl.h
  SKIPHEADERS-$(CONFIG_LIBVPX)           += libvpx.h
  SKIPHEADERS-$(CONFIG_LIBWEBP_ENCODER)  += libwebpenc_common.h
@@ -33,10 +33,10 @@ index c6d8108..e048f23 100644
  SKIPHEADERS-$(CONFIG_NVDEC)            += nvdec.h
  SKIPHEADERS-$(CONFIG_NVENC)            += nvenc.h
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index e5873dd..1ed0ee6 100644
+index 3121d9a541..ad2735094f 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
-@@ -198,6 +198,38 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -200,6 +200,38 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
      return 0;
  }
  
@@ -75,7 +75,7 @@ index e5873dd..1ed0ee6 100644
  int av_mediacodec_hwdevice_set_surface(AVBufferRef *device_ref, void *surface)
  {
      AVHWDeviceContext *device = device_ref ? (AVHWDeviceContext *)device_ref->data : NULL;
-@@ -273,6 +305,17 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -275,6 +307,17 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
      return AVERROR(ENOSYS);
  }
  
@@ -94,10 +94,10 @@ index e5873dd..1ed0ee6 100644
  {
      return AVERROR(ENOSYS);
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 14e3e6f..4c67672 100644
+index e45d8b6ea4..7ded55a981 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -157,6 +157,32 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
+@@ -159,6 +159,32 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
  int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
                                        void (*wakeup)(void *opaque), void *opaque);
  
@@ -132,7 +132,7 @@ index 14e3e6f..4c67672 100644
   * at `surface` (an android.view.Surface jobject) without recreating it, and
 diff --git a/libavcodec/mediacodec_shed.c b/libavcodec/mediacodec_shed.c
 new file mode 100644
-index 0000000..9e6f7e6
+index 0000000000..9e6f7e6928
 --- /dev/null
 +++ b/libavcodec/mediacodec_shed.c
 @@ -0,0 +1,491 @@
@@ -629,7 +629,7 @@ index 0000000..9e6f7e6
 +}
 diff --git a/libavcodec/mediacodec_shed.h b/libavcodec/mediacodec_shed.h
 new file mode 100644
-index 0000000..a68c5e0
+index 0000000000..a68c5e06ca
 --- /dev/null
 +++ b/libavcodec/mediacodec_shed.h
 @@ -0,0 +1,89 @@
@@ -723,10 +723,10 @@ index 0000000..a68c5e0
 +
 +#endif /* AVCODEC_MEDIACODEC_SHED_H */
 diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
-index fa54396..035a8e2 100644
+index f8c939860c..95a837df4b 100644
 --- a/libavcodec/mediacodec_wrapper.c
 +++ b/libavcodec/mediacodec_wrapper.c
-@@ -1919,6 +1919,7 @@ typedef struct FFAMediaCodecNdk {
+@@ -2019,6 +2019,7 @@ typedef struct FFAMediaCodecNdk {
      media_status_t (*signalEndOfInputStream)(AMediaCodec *);
      media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
              struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
@@ -734,7 +734,7 @@ index fa54396..035a8e2 100644
  
      // Available since API level 33. Declared locally: the NDK typedef is
      // guarded by __ANDROID_API__, and the symbol is resolved at run time.
-@@ -2165,6 +2166,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
+@@ -2265,6 +2266,7 @@ static inline FFAMediaCodec *ndk_codec_create(int method, const char *arg) {
      GET_SYMBOL(signalEndOfInputStream)
      GET_SYMBOL(setAsyncNotifyCallback)
      GET_SYMBOL(setOnFrameRenderedCallback)
@@ -742,7 +742,7 @@ index fa54396..035a8e2 100644
  
  #undef GET_SYMBOL
  
-@@ -2612,6 +2614,28 @@ static int mediacodec_ndk_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *
+@@ -2712,6 +2714,28 @@ static int mediacodec_ndk_setOutputSurface(FFAMediaCodec *ctx, FFANativeWindow *
      return 0;
  }
  
@@ -771,7 +771,7 @@ index fa54396..035a8e2 100644
  static const FFAMediaFormat media_format_ndk = {
      .class = &amediaformat_ndk_class,
  
-@@ -2676,6 +2700,7 @@ static const FFAMediaCodec media_codec_ndk = {
+@@ -2776,6 +2800,7 @@ static const FFAMediaCodec media_codec_ndk = {
      .setAsyncNotifyCallback = mediacodec_ndk_setAsyncNotifyCallback,
      .setOnFrameRenderedCallback = mediacodec_ndk_setOnFrameRenderedCallback,
      .setOutputSurface = mediacodec_ndk_setOutputSurface,
@@ -780,7 +780,7 @@ index fa54396..035a8e2 100644
  
  FFAMediaFormat *ff_AMediaFormat_new(int ndk)
 diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
-index 911069e..1cdf601 100644
+index 911069e61a..1cdf60173e 100644
 --- a/libavcodec/mediacodec_wrapper.h
 +++ b/libavcodec/mediacodec_wrapper.h
 @@ -255,6 +255,11 @@ struct FFAMediaCodec {
@@ -812,10 +812,10 @@ index 911069e..1cdf601 100644
  
  enum FFAMediaFormatColorRange {
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index c7a7c42..96a7f76 100644
+index 7b273f3cc7..b06eb14d40 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -45,6 +45,7 @@
+@@ -46,6 +46,7 @@
  #include "hwconfig.h"
  #include "internal.h"
  #include "jni.h"
@@ -823,7 +823,7 @@ index c7a7c42..96a7f76 100644
  #include "mediacodec_wrapper.h"
  #include "mediacodecdec_common.h"
  
-@@ -60,8 +61,9 @@ typedef struct MediaCodecH264DecContext {
+@@ -61,8 +62,12 @@ typedef struct MediaCodecContext {
      int amlogic_mpeg2_api23_workaround;
  
      int use_ndk_codec;
@@ -831,22 +831,13 @@ index c7a7c42..96a7f76 100644
 +    // Ref. MediaFormat KEY_OPERATING_RATE, KEY_FRAME_RATE
      int operating_rate;
 +    float frame_rate;
++    // Pre-decode frame shedding state; see mediacodec_shed.h.
++    MediaCodecShedContext shed;
++    int shed_inited;
      int dolby_vision;
      int dv_p7_mode;
      int dv_filter; // DV_FILTER_*
-@@ -73,6 +75,11 @@ typedef struct MediaCodecH264DecContext {
-     AVBufferRef *dv_out;
-     uint8_t *dv_sei_scratch;
-     unsigned dv_sei_scratch_size;
-+    // Pre-decode frame shedding for avctx->skip_frame >= AVDISCARD_NONREF,
-+    // see mediacodec_shed.h. Hardware decodes everything it is handed, so
-+    // the only way to honour a discard request is to hand it less.
-+    MediaCodecShedContext shed;
-+    int shed_inited;
- } MediaCodecH264DecContext;
- 
- // convert: rewrite UNSPEC62 to profile 8.1 and drop UNSPEC63; strip: drop both
-@@ -95,6 +102,10 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+@@ -95,6 +100,10 @@ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
      av_packet_unref(&s->buffered_pkt);
      av_buffer_unref(&s->dv_out);
      av_freep(&s->dv_sei_scratch);
@@ -857,17 +848,17 @@ index c7a7c42..96a7f76 100644
  
      return 0;
  }
-@@ -271,6 +282,9 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -271,6 +280,9 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
  
          avctx->profile = sps->ptl.general_ptl.profile_idc;
          avctx->level   = sps->ptl.general_ptl.level_idc;
 +        // The highest temporal sub-layer, for the shedding classifier.
-+        ((MediaCodecH264DecContext *)avctx->priv_data)->shed.hevc_max_sub_layers_minus1 =
++        ((MediaCodecContext *)avctx->priv_data)->shed.hevc_max_sub_layers_minus1 =
 +            sps->max_sub_layers - 1;
  
          if ((ret = h2645_ps_to_nalu(vps->data, vps->data_size, &vps_data, &vps_data_size)) < 0 ||
              (ret = h2645_ps_to_nalu(sps->data, sps->data_size, &sps_data, &sps_data_size)) < 0 ||
-@@ -804,6 +818,15 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -805,6 +817,15 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      if (s->use_ndk_codec < 0)
          s->use_ndk_codec = !av_jni_get_java_vm(avctx);
  
@@ -883,7 +874,7 @@ index c7a7c42..96a7f76 100644
      format = ff_AMediaFormat_new(s->use_ndk_codec);
      if (!format) {
          av_log(avctx, AV_LOG_ERROR, "Failed to create media format\n");
-@@ -937,6 +960,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -938,6 +959,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      }
      if (s->operating_rate > 0)
          ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
@@ -893,7 +884,7 @@ index c7a7c42..96a7f76 100644
  
      s->ctx = av_mallocz(sizeof(*s->ctx));
      if (!s->ctx) {
-@@ -1078,6 +1104,33 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1079,6 +1103,33 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
              }
          }
  #endif
@@ -927,8 +918,8 @@ index c7a7c42..96a7f76 100644
          if (ret == AVERROR_EOF) {
              AVPacket null_pkt = { 0 };
              ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
-@@ -1099,6 +1152,8 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
-     MediaCodecH264DecContext *s = avctx->priv_data;
+@@ -1100,6 +1151,8 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
+     MediaCodecContext *s = avctx->priv_data;
  
      av_packet_unref(&s->buffered_pkt);
 +    if (s->shed_inited)
@@ -936,7 +927,7 @@ index c7a7c42..96a7f76 100644
  
      ff_mediacodec_dec_flush(avctx, s->ctx);
  }
-@@ -1147,6 +1202,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -1137,6 +1190,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                     OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
      { "operating_rate", "The desired operating rate that the codec will need to operate at, zero for unspecified",
              OFFSET(operating_rate), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, VD },
@@ -946,10 +937,10 @@ index c7a7c42..96a7f76 100644
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
      { "dv_p7_mode", "Dolby Vision profile 7 handling",
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index 25fc2b8..549021e 100644
+index a6d44fa7de..fd9677fbba 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -778,6 +778,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -791,6 +791,8 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      atomic_fetch_add(&s->serial, 1);
      atomic_init(&s->hw_buffer_count, 0);
      s->current_input_buffer = -1;
@@ -958,7 +949,7 @@ index 25fc2b8..549021e 100644
  
      status = ff_AMediaCodec_flush(codec);
      if (status < 0) {
-@@ -1156,6 +1158,20 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1181,6 +1183,20 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
                  " flags=%" PRIu32 "\n", index, info.offset, info.size,
                  info.presentationTimeUs, info.flags);
  
@@ -979,7 +970,7 @@ index 25fc2b8..549021e 100644
          if (info.flags & ff_AMediaCodec_getBufferFlagEndOfStream(codec)) {
              s->eos = 1;
          }
-@@ -1289,3 +1303,30 @@ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx, MediaCodecDecContext *s
+@@ -1328,3 +1344,30 @@ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx, MediaCodecDecContext *s
  {
      return s->flushing;
  }
@@ -1011,7 +1002,7 @@ index 25fc2b8..549021e 100644
 +    *pending = s->pending_drops;
 +}
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index fec4fe9..2b92d6f 100644
+index cf62996e16..4f7921985a 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -41,6 +41,10 @@
@@ -1025,7 +1016,7 @@ index fec4fe9..2b92d6f 100644
  typedef struct MediaCodecDecContext {
  
      AVCodecContext *avctx;
-@@ -92,6 +96,13 @@ typedef struct MediaCodecDecContext {
+@@ -97,6 +101,13 @@ typedef struct MediaCodecDecContext {
      AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
      atomic_uint rendered_head;        // consumer
      atomic_uint rendered_tail;        // producer
@@ -1039,7 +1030,7 @@ index fec4fe9..2b92d6f 100644
  } MediaCodecDecContext;
  
  int ff_mediacodec_dec_init(AVCodecContext *avctx,
-@@ -118,6 +129,12 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
+@@ -123,6 +134,12 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
  int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
                                    MediaCodecDecContext *s);
  

@@ -1,36 +1,8 @@
-Subject: [PATCH] avcodec/mediacodec: present decode-order container timestamps in presentation order
-
-An MP4 that stores B-frame H.264 or HEVC without composition offsets (no
-ctts box: a raw stream remuxed with generated timestamps, as in the RARBG
-x265 releases) gives every access unit its decode-order time. MediaCodec
-echoes each frame's queued timestamp back with the frame, so in presentation
-order the timestamps run backwards on every reordered frame. A libavcodec
-decoder recovers because its frames also carry the packet DTS and mpv falls
-back to it; MediaCodec frames carry none, so mpv dropped most frames as late:
-on a Pixel 7 such a film rendered at 9 fps and drifted 38 s from its audio in
-two minutes, while software decoding played it cleanly.
-
-Watch for exactly that stream: queued timestamps strictly increasing in
-decode order while the output steps backwards. Once seen, hand each frame the
-queued timestamps in increasing order, which is what VLC does for these files
-(androidx/media#3347 has the same failure on Media3). Frames that will never be
-output are taken out of that timeline so the frames after them keep their
-times: HEVC RASL pictures that follow the CRA decoding started from are known
-not to be output when they are queued (and counted back in if a decoder
-outputs them anyway), and any other frame is written off once more frames that
-precede it in decode order are missing than the stream's reorder bound allows.
-A stream that ever queues a timestamp at or below its predecessor orders its
-own timestamps, or is discontinuous, and is left alone for the session, as is
-one without timestamps. Only H.264, HEVC, MPEG-2 and MPEG-4 video are watched.
-
-The recovered time replaces frame->pts only. buffer->pts, which the
-rendered-frame feedback matches against the codec's reports, keeps the codec's
-own timestamp.
 diff --git a/libavcodec/Makefile b/libavcodec/Makefile
-index e048f23..8e8fb5f 100644
+index 4390b8c748..481ebf2bd4 100644
 --- a/libavcodec/Makefile
 +++ b/libavcodec/Makefile
-@@ -137,7 +137,7 @@ OBJS-$(CONFIG_LPC)                     += lpc.o
+@@ -141,7 +141,7 @@ OBJS-$(CONFIG_LPC)                     += lpc.o
  OBJS-$(CONFIG_LSP)                     += lsp.o
  OBJS-$(CONFIG_LZF)                     += lzf.o
  OBJS-$(CONFIG_ME_CMP)                  += me_cmp.o
@@ -39,7 +11,7 @@ index e048f23..8e8fb5f 100644
  OBJS-$(CONFIG_MPEG_ER)                 += mpeg_er.o
  OBJS-$(CONFIG_MPEGAUDIO)               += mpegaudio.o mpegaudiodec_common.o \
                                            mpegaudiodata.o
-@@ -1324,7 +1324,7 @@ SKIPHEADERS-$(CONFIG_LIBAOM)           += libaom.h
+@@ -1369,7 +1369,7 @@ SKIPHEADERS-$(CONFIG_LIBAOM)           += libaom.h
  SKIPHEADERS-$(CONFIG_LIBJXL)           += libjxl.h
  SKIPHEADERS-$(CONFIG_LIBVPX)           += libvpx.h
  SKIPHEADERS-$(CONFIG_LIBWEBP_ENCODER)  += libwebpenc_common.h
@@ -50,7 +22,7 @@ index e048f23..8e8fb5f 100644
  SKIPHEADERS-$(CONFIG_NVENC)            += nvenc.h
 diff --git a/libavcodec/mediacodec_reorder.c b/libavcodec/mediacodec_reorder.c
 new file mode 100644
-index 0000000..7b513e0
+index 0000000000..7b513e094a
 --- /dev/null
 +++ b/libavcodec/mediacodec_reorder.c
 @@ -0,0 +1,278 @@
@@ -334,7 +306,7 @@ index 0000000..7b513e0
 +}
 diff --git a/libavcodec/mediacodec_reorder.h b/libavcodec/mediacodec_reorder.h
 new file mode 100644
-index 0000000..16825cb
+index 0000000000..16825cb0b3
 --- /dev/null
 +++ b/libavcodec/mediacodec_reorder.h
 @@ -0,0 +1,124 @@
@@ -463,37 +435,36 @@ index 0000000..16825cb
 +
 +#endif /* AVCODEC_MEDIACODEC_REORDER_H */
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index e0a602c..707a0f5 100644
+index ecca6f14fd..ea2c29c450 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -82,6 +82,9 @@ typedef struct MediaCodecH264DecContext {
-     // the only way to honour a discard request is to hand it less.
+@@ -70,6 +70,8 @@ typedef struct MediaCodecContext {
+     // Pre-decode frame shedding state; see mediacodec_shed.h.
      MediaCodecShedContext shed;
      int shed_inited;
-+    // The SPS reorder bound, for presentation-order recovery
-+    // (mediacodec_reorder.h); 0 when the extradata carries no SPS.
++    // SPS reorder bound used by presentation-order recovery.
 +    int reorder_depth;
- } MediaCodecH264DecContext;
- 
- // convert: rewrite UNSPEC62 to profile 8.1 and drop UNSPEC63; strip: drop both
-@@ -203,6 +206,7 @@ static int h264_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+     int dolby_vision;
+     int dv_p7_mode;
+     int dv_filter; // DV_FILTER_*
+@@ -201,6 +203,7 @@ static int h264_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
  
          avctx->profile = ff_h264_get_profile(sps);
          avctx->level = sps->level_idc;
-+        ((MediaCodecH264DecContext *)avctx->priv_data)->reorder_depth = sps->num_reorder_frames;
++        ((MediaCodecContext *)avctx->priv_data)->reorder_depth = sps->num_reorder_frames;
  
          if ((ret = h2645_ps_to_nalu(sps->data, sps->data_size, &data, &data_size)) < 0) {
              goto done;
-@@ -287,6 +291,8 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+@@ -285,6 +288,8 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
          // The highest temporal sub-layer, for the shedding classifier.
-         ((MediaCodecH264DecContext *)avctx->priv_data)->shed.hevc_max_sub_layers_minus1 =
+         ((MediaCodecContext *)avctx->priv_data)->shed.hevc_max_sub_layers_minus1 =
              sps->max_sub_layers - 1;
-+        ((MediaCodecH264DecContext *)avctx->priv_data)->reorder_depth =
++        ((MediaCodecContext *)avctx->priv_data)->reorder_depth =
 +            sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics;
  
          if ((ret = h2645_ps_to_nalu(vps->data, vps->data_size, &vps_data, &vps_data_size)) < 0 ||
              (ret = h2645_ps_to_nalu(sps->data, sps->data_size, &sps_data, &sps_data_size)) < 0 ||
-@@ -986,6 +992,15 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -985,6 +990,15 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      s->ctx->profile_override = profile_override;
      s->ctx->codec_name = codec_name;
      codec_name = NULL;
@@ -510,10 +481,10 @@ index e0a602c..707a0f5 100644
      if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
          s->ctx = NULL;
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index d597294..f130825 100644
+index d325892c9b..406263f511 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -114,6 +114,56 @@ static int64_t mediacodec_dec_untag_pts(const MediaCodecDecContext *s, int64_t t
+@@ -120,6 +120,56 @@ static int64_t mediacodec_dec_untag_pts(const MediaCodecDecContext *s, int64_t t
                       << MEDIACODEC_GENERATION_SHIFT);
  }
  
@@ -570,7 +541,7 @@ index d597294..f130825 100644
  enum {
      ENCODING_PCM_16BIT        = 0x00000002,
      ENCODING_PCM_8BIT         = 0x00000003,
-@@ -369,13 +419,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
+@@ -377,13 +427,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
      frame->format = avctx->pix_fmt;
      frame->sample_aspect_ratio = avctx->sample_aspect_ratio;
  
@@ -585,7 +556,7 @@ index d597294..f130825 100644
      frame->pkt_dts = AV_NOPTS_VALUE;
      frame->color_range = avctx->color_range;
      frame->color_primaries = avctx->color_primaries;
-@@ -474,13 +518,7 @@ static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
+@@ -482,13 +526,7 @@ static int mediacodec_wrap_sw_audio_buffer(AVCodecContext *avctx,
       * on the last avpacket received which is not in sync with the frame:
       *   * N avpackets can be pushed before 1 frame is actually returned
       *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
@@ -600,7 +571,7 @@ index d597294..f130825 100644
      frame->pkt_dts = AV_NOPTS_VALUE;
      frame->flags |= AV_FRAME_FLAG_KEY;
  
-@@ -528,13 +566,7 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
+@@ -536,13 +574,7 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
       * on the last avpacket received which is not in sync with the frame:
       *   * N avpackets can be pushed before 1 frame is actually returned
       *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
@@ -615,7 +586,7 @@ index d597294..f130825 100644
      frame->pkt_dts = AV_NOPTS_VALUE;
  
      av_log(avctx, AV_LOG_TRACE,
-@@ -1083,6 +1115,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -1149,6 +1181,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      s->input_since_flush = 0;
      // Every shed frame the codec had yet to pass is moot after a flush.
      s->pending_drops = 0;
@@ -623,7 +594,7 @@ index d597294..f130825 100644
  
      status = ff_AMediaCodec_flush(codec);
      if (status < 0) {
-@@ -1338,7 +1371,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1410,7 +1443,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
      FFAMediaCodec *codec = s->codec;
      int status;
      int64_t input_dequeue_timeout_us = wait ? INPUT_DEQUEUE_TIMEOUT_US : 0;
@@ -632,7 +603,7 @@ index d597294..f130825 100644
  
      if (s->flushing) {
          av_log(avctx, AV_LOG_ERROR, "Decoder is flushing and cannot accept new buffer "
-@@ -1412,6 +1445,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1484,6 +1517,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
          if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
              pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
          }
@@ -640,7 +611,7 @@ index d597294..f130825 100644
          pts = mediacodec_dec_tag_pts(s, pts);
  
          if (need_draining) {
-@@ -1441,6 +1475,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1513,6 +1547,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
              av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
              return AVERROR_EXTERNAL;
          }
@@ -649,7 +620,7 @@ index d597294..f130825 100644
  
          av_log(avctx, AV_LOG_TRACE,
                 "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
-@@ -1640,6 +1676,13 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+@@ -1734,6 +1770,13 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
          }
      }
  
@@ -664,7 +635,7 @@ index d597294..f130825 100644
  
      return 0;
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index ab520fb..d083ab4 100644
+index c23245ee0c..38eb94587e 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -35,6 +35,7 @@
@@ -675,7 +646,7 @@ index ab520fb..d083ab4 100644
  #include "mediacodec_wrapper.h"
  
  // Rendered-frame feedback ring. One producer (the codec's callback thread),
-@@ -128,6 +129,10 @@ typedef struct MediaCodecDecContext {
+@@ -146,6 +147,10 @@ typedef struct MediaCodecDecContext {
      int64_t input_drops;
      int64_t pending_drop_pts[FF_MEDIACODEC_PENDING_DROPS];
      int pending_drops;

@@ -23,7 +23,16 @@
         "linux",
         "windows"
       ],
-      "overrides": {}
+      "overrides": {
+        "android": {
+          "kind": "git",
+          "version": "fel-git-99b4c12",
+          "url": "https://github.com/mpv-player/mpv",
+          "ref": "99b4c12cccb4d8d3f72b41944cb6c640e2156650",
+          "commit": "99b4c12cccb4d8d3f72b41944cb6c640e2156650",
+          "provenance": "Exact mpv upstream commit containing merged PR #17932 (Dolby Vision P7 enhancement-layer demux, pairing, filter and gpu-next path): https://github.com/mpv-player/mpv/commit/99b4c12cccb4d8d3f72b41944cb6c640e2156650. Android FEL experiment pin; not a stable release pin."
+        }
+      }
     },
     "ffmpeg": {
       "kind": "git",
@@ -38,7 +47,16 @@
         "linux",
         "windows"
       ],
-      "overrides": {}
+      "overrides": {
+        "android": {
+          "kind": "git",
+          "version": "fel-git-246d0da2",
+          "url": "https://github.com/FFmpeg/FFmpeg",
+          "ref": "246d0da2c1b1f1924c9ba3b585a1ff3582d0e3f1",
+          "commit": "246d0da2c1b1f1924c9ba3b585a1ff3582d0e3f1",
+          "provenance": "Exact FFmpeg upstream master commit needed by the rebased Dolby Vision MediaCodec patch stack: https://github.com/FFmpeg/FFmpeg/commit/246d0da2c1b1f1924c9ba3b585a1ff3582d0e3f1. Android FEL experiment pin; not a stable release pin."
+        }
+      }
     },
     "libass": {
       "kind": "git",
@@ -355,12 +373,11 @@
       "overrides": {
         "android": {
           "kind": "git",
-          "version": "7.360.1",
-          "url": "https://code.videolan.org/videolan/libplacebo.git",
-          "mirror": "https://github.com/haasn/libplacebo.git",
-          "ref": "v7.360.1",
-          "commit": "cee9b076f2c63104ccfd497fa79c39a867293ec4",
-          "provenance": "Official VideoLAN GitLab annotated tag object 719cc95244a1f1d648dd72459822e026e6530f22 (v7.360.1, PGP-signed by llyyr) dereferences to this root commit; upstream's own author repository (haasn/libplacebo, not a fork) reports the same tag object and commit. Its gitlinks are identical to v7.360.0's, which the android driver already cloned recursively. Ships the OpenGL sync-object leak fix (upstream c93aa134) the android series used to carry."
+          "version": "fel-git-275f7dea",
+          "url": "https://github.com/haasn/libplacebo.git",
+          "ref": "275f7dea27924cdd34ab2e6c20e448b6bc4fab65",
+          "commit": "275f7dea27924cdd34ab2e6c20e448b6bc4fab65",
+          "provenance": "Exact upstream-author libplacebo commit with the P7 FEL renderer, frame API and NLQ residual shader: https://github.com/haasn/libplacebo/commit/275f7dea27924cdd34ab2e6c20e448b6bc4fab65. Android FEL experiment pin; not a stable release pin."
         },
         "linux": {
           "kind": "git",

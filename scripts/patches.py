@@ -5,6 +5,8 @@ Layout, relative to the repository root (the current working directory):
 
     patches/<component>/pool/<name>.patch   the patch bytes, platform-neutral
     patches/<component>/series.common       applied on every platform, first
+    patches/<component>/series.common.<platform>
+                                            replaces series.common on a platform
     patches/<component>/series.<platform>   applied after series.common
 
 A series file lists one pool filename per line; `#` comments and blank lines
@@ -16,7 +18,8 @@ windows.
 Commands:
 
     patches.py resolve <component> <platform>
-        Print the resolved series (series.common then series.<platform>) as
+        Print the resolved series (the platform common override when present,
+        otherwise series.common, followed by series.<platform>) as
         pool-relative filenames, one per line.
 
     patches.py check
@@ -105,7 +108,10 @@ def read_series(path):
 def series_files(component, platform):
     """The series files that make up one resolved series, in order."""
     root = PATCHES_DIR / component
-    return [root / "series.common", root / f"series.{platform}"]
+    common = root / f"series.common.{platform}"
+    if not common.is_file():
+        common = root / "series.common"
+    return [common, root / f"series.{platform}"]
 
 
 def resolve(component, platform):
@@ -515,14 +521,19 @@ def cmd_check():
                     continue
                 pool_files.add(entry.name)
 
-        known_series = {"series.common"} | {f"series.{p}" for p in PLATFORMS}
+        known_series = (
+            {"series.common"}
+            | {f"series.common.{p}" for p in PLATFORMS}
+            | {f"series.{p}" for p in PLATFORMS}
+        )
         for entry in sorted(component_dir.iterdir()):
             if entry.name.startswith(".") or entry == pool_dir:
                 continue
             if entry.name not in known_series:
                 problems.append(
                     f"{component}: unexpected file {entry.name!r}; expected pool/ and "
-                    f"series.common or series.<{('|'.join(PLATFORMS))}>"
+                    f"series.common, series.common.<{('|'.join(PLATFORMS))}>, or "
+                    f"series.<{('|'.join(PLATFORMS))}>"
                 )
 
         referenced = set()
