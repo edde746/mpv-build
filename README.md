@@ -713,8 +713,15 @@ across stop/reset/recreation, stale write completions without clock credit,
 DTS-HD bursts unwrapping to bare packets with the raw track reopened at
 the core rate, and the passthrough clock's rate-limited `playhead step`
 diagnostic with its observe-only `getTimestamp` probe, and a stalled raw
-TrueHD track demoting TrueHD to decoding instead of being recreated. Pass an
-already-patched source directory as the first argument to run offline.
+TrueHD track demoting TrueHD to decoding instead of being recreated.
+The recreate retry is covered too: a replacement that cannot be made is
+retried every 100 ms until the device is back or the 3 s grace is up, the
+replacement gets a stall window of its own, the DTS-HD reopen's packet
+survives the retry, a seek and a resume inside the retry window and during an
+attempt find the replacement pending, and the monitor's request that meets
+the completion of the write it interrupted still has the replacement made
+after the pause.
+Pass an already-patched source directory as the first argument to run offline.
 
 Run the raw TrueHD regression with `bash scripts/test_audiotrack_truehd.sh`.
 It encodes TrueHD with the host ffmpeg, packs it into IEC 61937 MAT bursts

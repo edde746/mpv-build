@@ -25,10 +25,10 @@ Same Fire TV and file with the option on: 1 late frame in 1554, the
 first after the seek, which normalization off shows as well.
 
 diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
-index 7a3ccf6..20f9c1a 100644
+index 073b9cf..560d1ee 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -181,6 +181,11 @@ struct priv {
+@@ -189,6 +189,11 @@ struct priv {
      bool cfg_raw_passthrough;
      bool cfg_route_reload;
      int cfg_session_id;
@@ -40,7 +40,7 @@ index 7a3ccf6..20f9c1a 100644
  
      atomic_bool thread_terminate;
      bool thread_created;
-@@ -250,6 +255,7 @@ static struct JNIAudioTrack {
+@@ -260,6 +265,7 @@ static struct JNIAudioTrack {
      jmethodID getRoutedDevice;
      jmethodID getUnderrunCount;
      jmethodID getNativeOutputSampleRate;
@@ -48,7 +48,7 @@ index 7a3ccf6..20f9c1a 100644
      jint STATE_INITIALIZED;
      jint PLAYSTATE_STOPPED;
      jint PLAYSTATE_PAUSED;
-@@ -286,6 +292,7 @@ static const struct MPJniField AudioTrack_mapping[] = {
+@@ -296,6 +302,7 @@ static const struct MPJniField AudioTrack_mapping[] = {
      {"getNativeOutputSampleRate", "(I)I", MP_JNI_STATIC_METHOD, OFFSET(getNativeOutputSampleRate), 1},
      {"getRoutedDevice", "()Landroid/media/AudioDeviceInfo;", MP_JNI_METHOD, OFFSET(getRoutedDevice), 0},
      {"getUnderrunCount", "()I", MP_JNI_METHOD, OFFSET(getUnderrunCount), 0},
@@ -56,7 +56,7 @@ index 7a3ccf6..20f9c1a 100644
      {"WRITE_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_BLOCKING), 0},
      {"WRITE_NON_BLOCKING", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(WRITE_NON_BLOCKING), 0},
      {"STATE_INITIALIZED", "I", MP_JNI_STATIC_FIELD_AS_INT, OFFSET(STATE_INITIALIZED), 1},
-@@ -442,10 +449,129 @@ static const struct MPJniField AudioDeviceInfo_mapping[] = {
+@@ -452,10 +459,129 @@ static const struct MPJniField AudioDeviceInfo_mapping[] = {
  };
  #undef OFFSET
  
@@ -187,7 +187,7 @@ index 7a3ccf6..20f9c1a 100644
  } jclass_list[] = {
      ENTRY(ByteBuffer),
      ENTRY(AudioTrack),
-@@ -456,7 +582,16 @@ static const struct {
+@@ -466,7 +592,16 @@ static const struct {
      ENTRY(AudioManager),
      ENTRY(AudioTimestamp),
      ENTRY(AudioDeviceInfo),
@@ -203,8 +203,8 @@ index 7a3ccf6..20f9c1a 100644
 +#undef OPTIONAL_ENTRY
  #undef ENTRY
  
- // ao.c takes device_buffer as the floor of the queue the core keeps in front
-@@ -485,6 +620,218 @@ static int AudioTrack_queueFloor(struct ao *ao, int frames)
+ // A JNI call of a retried replacement (AudioTrack_recreateOrFail) threw:
+@@ -517,6 +652,218 @@ static int AudioTrack_queueFloor(struct ao *ao, int frames)
      return frames * 2;
  }
  
@@ -423,7 +423,7 @@ index 7a3ccf6..20f9c1a 100644
  static int AudioTrack_New(struct ao *ao)
  {
      struct priv *p = ao->priv;
-@@ -578,6 +925,7 @@ static int AudioTrack_New(struct ao *ao)
+@@ -628,6 +975,7 @@ static int AudioTrack_New(struct ao *ao)
      if (!p->audiotrack)
          return -1;
  
@@ -431,15 +431,15 @@ index 7a3ccf6..20f9c1a 100644
      return 0;
  }
  
-@@ -647,6 +995,7 @@ static int AudioTrack_Recreate(struct ao *ao)
-     JNIEnv *env = MP_JNI_GET_ENV(ao);
+@@ -698,6 +1046,7 @@ static int AudioTrack_Recreate(struct ao *ao)
  
      mp_mutex_lock(&p->track_lock);
+     const bool had_track = !!p->audiotrack;
 +    AudioTrack_releaseNormalizer(ao);
      if (p->audiotrack) {
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
          MP_JNI_EXCEPTION_LOG(ao);
-@@ -1751,7 +2100,8 @@ static int init_jni(struct ao *ao)
+@@ -1811,7 +2160,8 @@ static int init_jni(struct ao *ao)
      if (jni_static_use_count == 0) {
          for (int i = 0; i < MP_ARRAY_SIZE(jclass_list); i++) {
              if (mp_jni_init_jfields(env, jclass_list[i].fields,
@@ -449,7 +449,7 @@ index 7a3ccf6..20f9c1a 100644
                  goto error;
              }
          }
-@@ -2098,6 +2448,7 @@ static void uninit(struct ao *ao)
+@@ -2201,6 +2551,7 @@ static void uninit(struct ao *ao)
      if (p->monitor_created)
          mp_thread_join(p->monitor);
  
@@ -457,7 +457,7 @@ index 7a3ccf6..20f9c1a 100644
      if (p->audiotrack) {
          MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
          MP_JNI_EXCEPTION_LOG(ao);
-@@ -2490,6 +2841,8 @@ const struct ao_driver audio_out_audiotrack = {
+@@ -2603,6 +2954,8 @@ const struct ao_driver audio_out_audiotrack = {
          {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
          {"route-reload", OPT_BOOL(cfg_route_reload)},
          {"session-id", OPT_INT(cfg_session_id)},
