@@ -65,7 +65,7 @@ struct ao { void *priv; int samplerate, sstride, format; bool stream_silence; };
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static atomic_llong now_ns;
-static int entered, permitted, idle, head_queries, pauses, plays, failures, warnings, reloads;
+static int entered, permitted, idle, head_queries, pauses, plays, flushes, failures, warnings, reloads;
 static int new_failures; // AudioTrack_New fails this many times: the device is away
 static int underrun_queries;
 static char last_warning[256];
@@ -276,14 +276,15 @@ static jint jni_int(JNIEnv *env, jobject track, int method, ...)
     va_start(args, method);
     jobject buffer = va_arg(args, jobject);
     int count = va_arg(args, int);
+    int array_offset = 0;
     if (method != AudioTrack.writeBufferV21) {
-        assert(count == 0); // array offset
+        array_offset = count;
         count = va_arg(args, int);
     }
     va_end(args);
     int unit = method == AudioTrack.writeShortV23 ? 2 :
                method == AudioTrack.writeFloat ? (int)sizeof(float) : 1;
-    int offset = method == AudioTrack.writeBufferV21 ? buffer->position : 0;
+    int offset = method == AudioTrack.writeBufferV21 ? buffer->position : array_offset * unit;
     assert(count * unit <= 256 && buffer->refs > 0);
     last_write_count = count * unit;
     uint8_t snapshot[256];
@@ -335,6 +336,7 @@ static void jni_void(JNIEnv *env, jobject track, int method)
         plays++;
     } else {
         assert(method == AudioTrack.flush);
+        flushes++;
         // A healthy HAL zeroes its counters on flush; a broken one keeps them.
         if (track->head_resets) {
             track->head = 0;
@@ -452,7 +454,7 @@ struct fixture {
 static void setup(struct fixture *f, bool raw, int format, bool direct)
 {
     memset(f, 0, sizeof(*f));
-    entered = permitted = idle = head_queries = pauses = plays = failures = warnings = reloads = 0;
+    entered = permitted = idle = head_queries = pauses = plays = flushes = failures = warnings = reloads = 0;
     errors = 0;
     new_failures = 0;
     response = input_bytes = track_count = underrun_queries = step_lines = 0;
@@ -2939,6 +2941,230 @@ static void check_recreate_anchors_fresh_track(void)
     puts("PASS: recreate re-anchors without tripping reset detection");
 }
 
+// Plezy #2665: the core pauses the AO through set_pause, no longer through
+// stop(). Resume the track and wait for the worker's next JNI write.
+static void resume_into_write(struct fixture *f)
+{
+    mp_mutex_lock(&gate);
+    int target = entered + 1;
+    mp_mutex_unlock(&gate);
+    set_pause(&f->ao, false);
+    wait_counter(&entered, target);
+}
+
+// The track is paused, never flushed, and nothing it held is lost. The pause
+// cuts the blocked write short after the device took 4 bytes of the chunk;
+// the resume writes the other 12 from where the track stopped, before the
+// core's next audio is read, on every write path: the ByteBuffer, byte and
+// float arrays, and the carrier's shorts.
+static void check_pause_keeps_the_rest(int format, bool direct, int unit)
+{
+    struct fixture f;
+    setup(&f, false, format, direct);
+    uint8_t data[16], next[16];
+    for (int n = 0; n < 16; n++) {
+        data[n] = n + 1;
+        next[n] = n + 101;
+    }
+    begin_write(&f, data, sizeof(data));
+    mp_mutex_lock(&f.p.lock);
+    const uint64_t generation = f.p.write_generation;
+    mp_mutex_unlock(&f.p.lock);
+    set_pause(&f.ao, true);
+    assert(pauses == 1 && !flushes && !atomic_load(&f.p.play_requested));
+    finish_write(&f, 4 / unit);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.write_generation == generation); // nothing was reset
+    assert(f.p.pcm_written == 4 && f.p.pcm_pending == 12);
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, 2); // what the track took is credited and still queued
+
+    mp_mutex_lock(&gate);
+    memcpy(input, next, sizeof(next)); // the core's next audio, waiting
+    input_bytes = sizeof(next);
+    mp_mutex_unlock(&gate);
+    resume_into_write(&f);
+    assert(last_write_count == 12);
+    finish_write(&f, 12 / unit);
+    mp_mutex_lock(&gate);
+    assert(input_bytes == sizeof(next)); // not read while the rest was due
+    assert(tracks[0].sink_size == 16 && !memcmp(tracks[0].sink, data, 16));
+    mp_mutex_unlock(&gate);
+    expect_delay(&f, 8);
+
+    begin_write(&f, next, sizeof(next));
+    assert(last_write_count == 16);
+    finish_write(&f, 16 / unit);
+    assert(tracks[0].sink_size == 32 && !memcmp(tracks[0].sink + 16, next, 16));
+    expect_delay(&f, 16);
+    assert(pauses == 1 && !flushes);
+    teardown(&f);
+}
+
+// A seek while paused still reaches stop(): the track is flushed, and the
+// rest of the cut chunk goes with it, as the core's queue did.
+static void check_pause_then_seek_discards_the_rest(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const uint8_t next[16] = {9, 10, 11, 12, 13, 14, 15, 16};
+    begin_write(&f, data, sizeof(data));
+    set_pause(&f.ao, true);
+    finish_write(&f, 4);
+    stop(&f.ao);
+    assert(flushes == 1);
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.pcm_written && !f.p.pcm_pending);
+    mp_mutex_unlock(&f.p.lock);
+    expect_delay(&f, 0);
+
+    begin_write(&f, next, sizeof(next)); // the resume after a seek is a start()
+    assert(last_write_count == 16);
+    finish_write(&f, 16);
+    assert(tracks[0].sink_size == 20 && !memcmp(tracks[0].sink + 4, next, 16));
+    expect_delay(&f, 8);
+    teardown(&f);
+    puts("PASS: a seek while paused flushes the track and drops the rest of the cut chunk");
+}
+
+// A raw track keeps the rest of a cut write in raw_pending, and its credit
+// still waits for the whole chunk.
+static void check_pause_keeps_the_raw_rest(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    begin_write(&f, burst, sizeof(burst));
+    set_pause(&f.ao, true);
+    finish_write(&f, 2);
+    expect_delay(&f, 0);
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.raw_pending == 4);
+    mp_mutex_unlock(&f.p.lock);
+
+    resume_into_write(&f);
+    assert(last_write_count == 4);
+    finish_write(&f, 4);
+    expect_delay(&f, sizeof(burst) / 2);
+    assert(tracks[0].sink_size == sizeof(payload));
+    assert(!memcmp(tracks[0].sink, payload, sizeof(payload)));
+    assert(pauses == 1 && !flushes);
+    teardown(&f);
+    puts("PASS: a pause keeps a raw track's unwritten rest and its deferred credit");
+}
+
+// A timestamp taken before the pause is not extrapolated across it: the
+// pause requalifies it as a start does, so the first delay after the resume
+// is the head's. Nothing was flushed, so the epoch anchors stand.
+static void check_pause_requalifies_the_timestamp(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 16);
+    mp_mutex_lock(&gate);
+    response = 0; // a parked zero-write must not credit stale frames
+    tracks[0].timestamp_ok = true;
+    mp_mutex_unlock(&gate);
+    for (int n = 0; n < 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        mp_mutex_lock(&gate);
+        tracks[0].head += 1;
+        tracks[0].ts_fpos += 1;
+        tracks[0].ts_nanos = atomic_load(&now_ns);
+        tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(&f, 8, n + 1);
+    }
+    assert(f.p.timestamp_set);
+
+    set_pause(&f.ao, true);
+    mp_mutex_lock(&f.p.lock);
+    assert(!f.p.timestamp_set && !f.p.timestamp_fetched && !f.p.timestamp_stable);
+    assert(!f.p.head_reset_pending && !f.p.ts_reset_pending);
+    mp_mutex_unlock(&f.p.lock);
+    assert(pauses == 1 && !flushes);
+
+    // 5 ms paused: within the stale-timestamp slack, so the old timestamp
+    // would read 240 frames past the frozen head and zero the delay.
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(5));
+    set_pause(&f.ao, false);
+    expect_delay_played(&f, 8, 3);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a pause requalifies the timestamp instead of extrapolating it across the pause");
+}
+
+// The passthrough clock is the smoothed head. A pause stands the head still
+// while the clock runs on; carried across it, the smoothing window would read
+// the pause as a jump and report the buffer drained. The pause restarts the
+// window, so the first estimate after the resume is the head.
+static void check_pause_restarts_the_passthrough_smoother(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = 10000;
+    mp_mutex_unlock(&f.p.lock);
+    for (int n = 1; n <= 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 1920 * n;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(&f, 10000, 1920 * n);
+    }
+
+    set_pause(&f.ao, true);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
+    set_pause(&f.ao, false);
+    expect_delay_played(&f, 10000, 5760);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a pause restarts the passthrough smoother instead of reading as a jump");
+}
+
+// A pause that outlasts the stall timeout is no stall: the monitor stands by
+// while the core has the track paused, and the resume restarts the stall
+// window, so the write the pause cut short before the device took any of it
+// is not taken for a dead track once the track plays again.
+static void check_pause_outlasts_the_stall_timeout(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    set_pause(&f.ao, true);
+    finish_write(&f, 0);
+    assert(!atomic_load(&f.p.play_requested) && atomic_load(&f.p.write_outstanding));
+    mp_mutex_lock(&f.p.lock);
+    assert(f.p.pcm_pending == 16 && !f.p.pcm_written);
+    mp_mutex_unlock(&f.p.lock);
+
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+    atomic_fetch_add(&now_ns, 2 * STALL_TIMEOUT_NS);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    resume_into_write(&f);
+    assert(last_write_count == 16);
+    sample_monitor(&f);
+    sample_monitor(&f);
+    assert(pauses == 1 && !atomic_load(&f.p.recreate_requested));
+    assert(!atomic_load(&f.p.recovery_attempts) && !failures && !warnings);
+
+    // Stop the monitor before observing the worker's idle/completion boundary.
+    atomic_store(&f.p.monitor_terminate, true);
+    mp_cond_signal(&f.p.monitor_wakeup);
+    assert(!pthread_join(f.p.monitor, NULL));
+    f.p.monitor_created = false;
+    finish_write(&f, 16);
+    assert(tracks[0].sink_size == 16 && !memcmp(tracks[0].sink, data, 16));
+    expect_delay(&f, 8);
+    atomic_store(&f.p.play_requested, false);
+    teardown(&f);
+    puts("PASS: a pause longer than the stall timeout trips no recovery after the resume");
+}
+
 int main(void)
 {
     alarm(15); // fail a regression that holds the reset lock, rather than hang CI
@@ -2987,6 +3213,16 @@ int main(void)
     check_iec_delayed_reset_smoothing();
     check_iec_playhead_step_line();
     check_recreate_anchors_fresh_track();
+    check_pause_keeps_the_rest(1, true, 1);
+    check_pause_keeps_the_rest(1, false, 1);
+    check_pause_keeps_the_rest(AudioFormat.ENCODING_PCM_FLOAT, false, sizeof(float));
+    check_pause_keeps_the_rest(AudioFormat.ENCODING_IEC61937, false, 2);
+    puts("PASS: a pause keeps the track's buffer and writes the rest of a cut chunk before the next read");
+    check_pause_then_seek_discards_the_rest();
+    check_pause_keeps_the_raw_rest();
+    check_pause_requalifies_the_timestamp();
+    check_pause_restarts_the_passthrough_smoother();
+    check_pause_outlasts_the_stall_timeout();
     check_truehd_stall_demotes(); // last: the demotion is process-wide
     return 0;
 }

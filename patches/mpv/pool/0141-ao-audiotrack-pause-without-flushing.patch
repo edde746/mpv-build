@@ -1,0 +1,286 @@
+Subject: [PATCH] ao_audiotrack: pause the track instead of flushing it
+
+The driver had no set_pause, so the core paused it through reset: stop()
+paused and flushed the track, and the audio the track held - at least
+500 ms on a PCM track, more on a raw one - was lost. That audio had
+already left the core's queue, so playback resumed that far ahead and the
+video dropped frames to catch up (Plezy #2665: a Fire TV Stick 4K Max
+lost 290-420 ms of audio on every pause).
+
+set_pause pauses the track and keeps its buffer and position counters, so
+written_frames - head stays the delay across the pause, and buffer.c
+keeps the core's side (hw_paused). A blocking write the pause interrupts
+keeps its rest: a raw track already did in raw_pending; PCM and the IEC
+61937 carrier now keep pcm_written/pcm_pending and write the rest before
+the next read. The pause clears play_requested, so the stall monitor
+stands by; requalifies the PCM timestamp, which would otherwise be
+extrapolated across the pause; and restarts the passthrough smoother,
+which would read the head standing still as a jump. The resume is
+start(). A seek while paused still reaches stop(), which flushes and
+drops the rest. With --audio-stream-silence the core never pauses the AO.
+
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index 4ac514f..ba1d623 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -203,6 +203,12 @@ struct priv {
+     // the worker touches the buffers; reset never clears or frees their data.
+     uint64_t write_generation;
+ 
++    // PCM and the IEC 61937 carrier: the rest of a chunk whose write
++    // AudioTrack.pause() cut short (set_pause), written before the worker
++    // reads again. A raw track keeps its rest in raw_pending.
++    int pcm_written;      // bytes of the chunk the track has taken
++    int pcm_pending;      // bytes after them still to write
++
+     // Raw passthrough: IEC 61937 bursts from ad_spdif unwrapped into a track
+     // opened with the codec's own encoding (ENCODING_AC3/E_AC3/DTS/DTS_HD).
+     bool raw_passthrough;
+@@ -1140,6 +1146,8 @@ static void AudioTrack_resetClock(struct priv *p)
+     p->timestamp_stable = 0;
+     p->timestamp_last_fpos = 0;
+     p->timestamp_retry_ns = 0;
++    p->pcm_written = 0;
++    p->pcm_pending = 0;
+     p->raw_state = RAW_SYNC_PA;
+     p->raw_payload_left = 0;
+     p->raw_dts_header_len = 0;
+@@ -3140,6 +3148,13 @@ static int AudioTrack_keepAlive(struct ao *ao, double delay)
+     return AudioTrack_writeSilence(ao);
+ }
+ 
++// The rest of a write the track has not taken yet, raw or not. The worker
++// writes it before it reads anything new, since the read would overwrite it.
++static bool write_pending(struct priv *p)
++{
++    return p->raw_pending || p->pcm_pending;
++}
++
+ // Enter and return with p->lock held. Preparation and completion mutate the
+ // parser/accounting; only the blocking JNI write runs outside that lock.
+ static int AudioTrack_write(struct ao *ao, int len)
+@@ -3152,6 +3167,12 @@ static int AudioTrack_write(struct ao *ao, int len)
+     jobject buffer;
+     jmethodID method;
+     int count = len, sample_size = 1;
++    // The rest of a PCM or carrier chunk a pause cut short goes on from where
++    // the track stopped taking it: the arrays still hold the chunk, and the
++    // ByteBuffer's position is on the rest.
++    const int offset = p->pcm_pending ? p->pcm_written : 0;
++    if (p->pcm_pending)
++        count = len = p->pcm_pending;
+ 
+     if (p->raw_passthrough && ao->format == AF_FORMAT_S_TRUEHD) {
+         if (!p->raw_pending) {
+@@ -3206,26 +3227,34 @@ static int AudioTrack_write(struct ao *ao, int len)
+     } else if (p->format == AudioFormat.ENCODING_IEC61937) {
+         sample_size = 2;
+         count = len / sample_size;
+-        (*env)->SetShortArrayRegion(env, p->shortarray, 0, count, buf);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        if (!offset) {
++            (*env)->SetShortArrayRegion(env, p->shortarray, 0, count, buf);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        }
+         buffer = p->shortarray;
+         method = AudioTrack.writeShortV23;
+     } else if (AudioTrack.writeBufferV21) {
+-        jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
+-        MP_JNI_LOCAL_FREEP(&bbuf);
++        if (!offset) {
++            jobject bbuf = MP_JNI_CALL_OBJECT(p->bbuf, ByteBuffer.clear);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++            MP_JNI_LOCAL_FREEP(&bbuf);
++        }
+         buffer = p->bbuf;
+         method = AudioTrack.writeBufferV21;
+     } else if (p->format == AudioFormat.ENCODING_PCM_FLOAT) {
+         sample_size = sizeof(float);
+         count = len / sample_size;
+-        (*env)->SetFloatArrayRegion(env, p->floatarray, 0, count, buf);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        if (!offset) {
++            (*env)->SetFloatArrayRegion(env, p->floatarray, 0, count, buf);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        }
+         buffer = p->floatarray;
+         method = AudioTrack.writeFloat;
+     } else {
+-        (*env)->SetByteArrayRegion(env, p->bytearray, 0, count, buf);
+-        if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        if (!offset) {
++            (*env)->SetByteArrayRegion(env, p->bytearray, 0, count, buf);
++            if (MP_JNI_EXCEPTION_LOG(ao) < 0) return -1;
++        }
+         buffer = p->bytearray;
+         method = AudioTrack.write;
+     }
+@@ -3242,9 +3271,10 @@ static int AudioTrack_write(struct ao *ao, int len)
+     if (method == AudioTrack.writeBufferV21) {
+         ret = MP_JNI_CALL_INT(track, method, buffer, count, AudioTrack.WRITE_BLOCKING);
+     } else if (method == AudioTrack.write) {
+-        ret = MP_JNI_CALL_INT(track, method, buffer, 0, count);
++        ret = MP_JNI_CALL_INT(track, method, buffer, offset, count);
+     } else {
+-        ret = MP_JNI_CALL_INT(track, method, buffer, 0, count, AudioTrack.WRITE_BLOCKING);
++        ret = MP_JNI_CALL_INT(track, method, buffer, offset / sample_size, count,
++                              AudioTrack.WRITE_BLOCKING);
+     }
+     if (MP_JNI_EXCEPTION_LOG(ao) < 0)
+         ret = -1;
+@@ -3252,8 +3282,11 @@ static int AudioTrack_write(struct ao *ao, int len)
+     mp_mutex_lock(&p->lock);
+     if (generation != p->write_generation)
+         return 0; // caller also discards stale errors/progress/frame credit
+-    if (ret < 0)
++    if (ret < 0) {
++        // An error ends the chunk, as it always has: the worker reads on.
++        p->pcm_written = p->pcm_pending = 0;
+         return ret;
++    }
+     if (p->raw_passthrough) {
+         p->raw_pending -= ret;
+         if (p->raw_pending)
+@@ -3262,9 +3295,16 @@ static int AudioTrack_write(struct ao *ao, int len)
+             AudioTrack_thdTake(p, p->thd_group_bytes, p->thd_group_units);
+         return p->raw_input_len;
+     }
++    const int taken = ret * sample_size;
+     if (p->ka_enabled && p->format == AudioFormat.ENCODING_IEC61937)
+-        AudioTrack_trackBurst(ao, buf, ret * sample_size);
+-    return ret * sample_size;
++        AudioTrack_trackBurst(ao, (uint8_t *)buf + offset, taken);
++    // A blocking write comes back short only when AudioTrack.pause()
++    // interrupted it (set_pause, or the monitor); stop() discards the rest
++    // with the generation. The rest goes out on the worker's next pass, ahead
++    // of any read, so a pause loses nothing of the chunk.
++    p->pcm_pending = len - taken;
++    p->pcm_written = p->pcm_pending ? offset + taken : 0;
++    return taken;
+ }
+ 
+ static void uninit_jni(struct ao *ao)
+@@ -3498,12 +3538,10 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             } else {
+                 // The verdict landed as the feed ended for real audio
+                 // (AudioTrack_keepAliveAudio), and the pause cut a write of
+-                // audio short instead. A raw track keeps the rest of that
+-                // write in raw_pending; a PCM track's next read overwrites
+-                // the chunk, so the rest of its write is dropped - once,
+-                // after a 5 s stall, with written_frames right, since only
+-                // what went in was credited. Resume the track, unless
+-                // something else has it paused meanwhile.
++                // audio short instead. The rest of that write stays pending
++                // (raw_pending, pcm_pending) and goes out once the track
++                // plays. Resume the track, unless something else has it
++                // paused meanwhile.
+                 mp_mutex_lock(&p->track_lock);
+                 if (p->audiotrack && atomic_load(&p->play_requested) &&
+                     !atomic_load(&p->play_deferred) && !p->ka_stood_down)
+@@ -3551,7 +3589,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             // some of it has played (below), so that no more than that
+             // plays out at a seek or a pause. A head that stands still gets
+             // the track filled instead, as with the silence.
+-            const bool hold = p->ka_enabled && !p->raw_pending &&
++            const bool hold = p->ka_enabled && !write_pending(p) &&
+                               !atomic_load(&p->play_deferred) &&
+                               mp_time_ns() - p->ka_head_moved_ns < KA_HEAD_STILL_NS &&
+                               delay * 1e9 >= KA_QUEUE_NS;
+@@ -3561,7 +3599,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             // padded one (PCM) or put silence into playing audio
+             // (passthrough). The core never calls a pull driver with that
+             // lock held, so the wait is a copy's worth.
+-            int samples = hold || p->raw_pending ? 0 :
++            int samples = hold || write_pending(p) ? 0 :
+                 ao_read_data(ao, &p->chunk, read_samples, ts, NULL, p->ka_pad_silence, ao->stream_silence);
+             if (hold) {
+                 // Half the way to the mark, as the silence is paced
+@@ -3585,8 +3623,8 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             // Padded reads come back whole: ao_read_data returns what it
+             // copied, and the rest of the chunk is the silence it wrote. One
+             // that copied nothing is the core's silence (AudioTrack_keepAlivePad).
+-            const bool padded = p->ka_pad_silence && !p->raw_pending && !samples;
+-            if (p->ka_pad_silence && !p->raw_pending)
++            const bool padded = p->ka_pad_silence && !write_pending(p) && !samples;
++            if (p->ka_pad_silence && !write_pending(p))
+                 samples = read_samples;
+             // A slow step here is the query, or the wait for the core's lock.
+             if (p->ka_enabled)
+@@ -3594,7 +3632,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+             int len = samples * ao->sstride;
+             uint64_t generation = p->write_generation;
+             int ret;
+-            if (ao->stream_silence && !len && !p->raw_pending) {
++            if (ao->stream_silence && !len && !write_pending(p)) {
+                 if (!p->ka_enabled) {
+                     // No silence for this track: wait for the core a poll at
+                     // a time, as the worker does without the option, so that
+@@ -3641,7 +3679,7 @@ static MP_THREAD_VOID ao_thread(void *arg)
+                 // the window opens on the first attempt and stays open across
+                 // zero/short returns, so a track that never takes bytes is
+                 // caught whether it blocks or spins.
+-                if ((len > 0 || p->raw_pending) &&
++                if ((len > 0 || write_pending(p)) &&
+                     !atomic_load(&p->write_outstanding))
+                 {
+                     atomic_store(&p->write_progress_ns, mp_time_ns());
+@@ -4271,6 +4309,50 @@ static void start(struct ao *ao)
+     mp_cond_signal(&p->wakeup);
+ }
+ 
++// The core's pause. Without this hook the core paused the AO through reset,
++// that is stop(), whose flush() dropped what the track held: a PCM track
++// holds at least 500 ms, all of it already gone from the core's queue, so
++// playback resumed up to that far ahead and the video dropped frames to
++// catch up (Plezy #2665). Paused instead, the track keeps its buffer and its
++// position counters, written_frames - head stays the delay across the pause,
++// and the core keeps its own queue time across it (buffer.c, hw_paused). A
++// write the pause interrupts keeps its rest pending (AudioTrack_write). A
++// seek while paused still reaches stop(), which flushes, and the resume after
++// it is a start(). With --audio-stream-silence the core never pauses the AO.
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++    if (!paused) {
++        start(ao);
++        return true;
++    }
++    // Nothing is due from the track: the monitor stands by, and a
++    // replacement made meanwhile is made paused (AudioTrack_Recreate).
++    atomic_store(&p->play_requested, false);
++
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    mp_mutex_lock(&p->track_lock);
++    if (p->audiotrack) {
++        MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.pause);
++        MP_JNI_EXCEPTION_LOG(ao);
++    }
++    mp_mutex_unlock(&p->track_lock);
++
++    // The clock was sampled while the track played. A timestamp from before
++    // the pause would be extrapolated across it, and the passthrough smoother
++    // would read the head standing still as a jump: requalify the timestamp
++    // from fresh fetches, as at a start, and restart the smoothing from the
++    // head after the resume. Nothing was flushed, so the epoch anchors stand.
++    mp_mutex_lock(&p->lock);
++    p->timestamp_fetched = 0;
++    p->timestamp_set = false;
++    p->timestamp_stable = 0;
++    AudioTrack_resetPlayheadSmoothing(p);
++    p->step_anchored = false;
++    mp_mutex_unlock(&p->lock);
++    return true;
++}
++
+ #define OPT_BASE_STRUCT struct priv
+ 
+ const struct ao_driver audio_out_audiotrack = {
+@@ -4280,6 +4362,7 @@ const struct ao_driver audio_out_audiotrack = {
+     .uninit    = uninit,
+     .reset     = stop,
+     .start     = start,
++    .set_pause = set_pause,
+     .priv_size = sizeof(struct priv),
+     .priv_defaults = &(const OPT_BASE_STRUCT) {
+         .cfg_pcm_float = 1,

@@ -31,7 +31,7 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_clock.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_smoothPlayhead \
     --fn head_rate --fn head_jump_is_wrap \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
-    --fn AudioTrack_getLatency
+    --fn AudioTrack_getLatency --fn write_pending
 python3 "$E" range "$src" "$workdir/audiotrack_read.inc" \
     --first "            int read_samples =" --last "ao_read_data(" --last-inclusive
 printf '(void)samples;\n' >> "$workdir/audiotrack_read.inc"
@@ -69,9 +69,10 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_trackBurst --fn AudioTrack_noteLayout \
     --fn AudioTrack_keepAliveAudio --fn AudioTrack_keepAliveStop --fn AudioTrack_keepAlivePad --fn AudioTrack_waitForAudio \
     --fn AudioTrack_writeSilence --fn AudioTrack_keepAlive \
-    --fn AudioTrack_adoptDtsHdRate --fn AudioTrack_write \
+    --fn AudioTrack_adoptDtsHdRate --fn write_pending --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
-    --fn AudioTrack_deferredPlay --fn AudioTrack_kaStep --fn ao_thread --fn monitor_thread --fn stop --fn start
+    --fn AudioTrack_deferredPlay --fn AudioTrack_kaStep --fn ao_thread --fn monitor_thread --fn stop --fn start \
+    --fn set_pause
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_audiotrack_timing.c" -lm

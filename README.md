@@ -770,6 +770,12 @@ dies under it; the monitor's request meeting the feed ending for audio on
 either side, and the resumption that answers it waiting for the pause; a PCM
 track's padding counting as feeding; the polls of a track without silence and
 the backoff of one stood down; and what init enables for each format and rate.
+The pause cases drive set_pause: the track is paused, not flushed, and the
+rest of a write the pause cut short goes out on resume before the next read,
+on the ByteBuffer, byte, float and carrier paths and in a raw track's
+raw_pending; a seek while paused flushes that rest; the timestamp is
+requalified and the passthrough smoother restarted rather than carried across
+the pause; and a pause longer than the stall timeout trips no recovery.
 Pass an already-patched source directory as the first argument to run offline.
 
 Run the raw TrueHD regression with `bash scripts/test_audiotrack_truehd.sh`.
