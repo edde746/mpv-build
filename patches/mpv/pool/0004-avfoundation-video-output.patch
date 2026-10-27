@@ -398,10 +398,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..d5b5515
+index 0000000..323c44c
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4791 @@
+@@ -0,0 +1,4822 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -757,6 +757,8 @@ index 0000000..d5b5515
 +    double next_pts;
 +    CMTimebaseRef timebase;
 +    int64_t next_present_host_ns;
++    // Latest host stamp given to a video frame; see avf_host_present_ns().
++    int64_t last_host_present_ns;
 +    int64_t next_media_pts_ns;
 +    bool next_media_pts_valid;
 +    double next_timebase_rate;
@@ -1196,6 +1198,29 @@ index 0000000..d5b5515
 +    CMTimebaseSetTime(p->timebase, cm_time_from_ns(now));
 +    CMTimebaseSetRate(p->timebase, 1.0);
 +}
++
++// --- avf host present stamp (host-testable; keep freestanding) ---
++// Host stamps never go back. A seek's flush drops the samples the layer
++// still holds, but not always the ones CoreMedia already took for display;
++// those keep their pre-seek stamps, up to queue-lead-ms ahead. The first
++// frame after a seek is due at once, so it could show before them and the
++// old position would flash back after the new one (plezy#2823). A target at
++// or before the last stamp is moved just after it, so no old frame can come
++// after a new one. A last stamp further ahead than window_ns (queue lead
++// plus slack) is not a queued frame and is ignored, so this never holds the
++// picture back by more than the queue lead.
++static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
++                                   int64_t window_ns)
++{
++    if (last_ns >= target_ns && last_ns - target_ns <= window_ns)
++        return last_ns + 1;
++    return target_ns;
++}
++// --- end avf host present stamp ---
++
++// Slack over queue-lead-ms for avf_host_present_ns()'s window: how far ahead
++// of a new frame's target an already queued frame can be stamped.
++#define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
 +
 +static void update_media_timebase_for_frame(struct vo *vo)
 +{
@@ -4874,6 +4899,12 @@ index 0000000..d5b5515
 +
 +    p->next_pts = pts;
 +    p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
++    if (p->presentation_host) {
++        p->next_present_host_ns = avf_host_present_ns(
++            p->last_host_present_ns, p->next_present_host_ns,
++            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms) + AVF_HOST_PRESENT_SLACK_NS);
++        p->last_host_present_ns = p->next_present_host_ns;
++    }
 +    p->next_media_pts_valid = media_pts_is_valid(pts);
 +    p->next_media_pts_ns = p->next_media_pts_valid
 +        ? media_pts_to_ns(pts)
