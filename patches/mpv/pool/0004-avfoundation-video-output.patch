@@ -398,10 +398,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..c60b4e6
+index 0000000..c7fb227
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4701 @@
+@@ -0,0 +1,4772 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -773,6 +773,10 @@ index 0000000..c60b4e6
 +    CVPixelBufferPoolRef osdPool;
 +    int osd_pool_w, osd_pool_h;
 +    bool osd_needs_enqueue;
++    // The OSD layer has been handed a subtitle, so clearing it takes a
++    // transparent sample (clear_osd_layer). One that never had one stays
++    // empty and costs WindowServer nothing to composite.
++    bool osd_layer_dirty;
 +
 +    // Subtitles render ahead on the shared pipeline's thread (osd_ahead.h)
 +    // and flip_page presents the results. When that thread cannot start,
@@ -936,6 +940,7 @@ index 0000000..c60b4e6
 +
 +static void dispatch_main_sync_safe(dispatch_block_t block);
 +static void clear_subtitle_cache(struct priv *p);
++static void clear_osd_layer(struct vo *vo);
 +static void ahead_invalidate(struct priv *p, double pts);
 +static void release_ci_compositor(struct priv *p);
 +static const struct m_sub_options avfoundation_conf;
@@ -1280,27 +1285,19 @@ index 0000000..c60b4e6
 +    p->timebase_anchor_valid = false;
 +}
 +
-+static void sample_buffer_renderer_flush(AVSampleBufferDisplayLayer *displayLayer,
-+                                         bool remove_image)
++// Drop queued samples, keeping the displayed image: clear_osd_layer explains
++// why nothing here removes it.
++static void sample_buffer_renderer_flush(AVSampleBufferDisplayLayer *displayLayer)
 +{
 +    if (!displayLayer)
 +        return;
 +
 +    if (@available(iOS 17.0, tvOS 17.0, macOS 14.0, *)) {
-+        AVSampleBufferVideoRenderer *renderer = displayLayer.sampleBufferRenderer;
-+        if (remove_image) {
-+            [renderer flushWithRemovalOfDisplayedImage:YES completionHandler:NULL];
-+        } else {
-+            [renderer flush];
-+        }
++        [displayLayer.sampleBufferRenderer flush];
 +        return;
 +    }
 +
-+    if (remove_image) {
-+        [displayLayer flushAndRemoveImage];
-+    } else {
-+        [displayLayer flush];
-+    }
++    [displayLayer flush];
 +}
 +
 +static void sample_buffer_renderer_enqueue(AVSampleBufferDisplayLayer *displayLayer,
@@ -1357,8 +1354,8 @@ index 0000000..c60b4e6
 +            timebase_rate = CMTimebaseGetRate(p->timebase);
 +        }
 +
-+        sample_buffer_renderer_flush(displayLayer, false);
-+        sample_buffer_renderer_flush(osdLayer, false);
++        sample_buffer_renderer_flush(displayLayer);
++        sample_buffer_renderer_flush(osdLayer);
 +    });
 +
 +    MP_WARN(vo, "Recovered AVFoundation display layer after %s "
@@ -1645,7 +1642,17 @@ index 0000000..c60b4e6
 +    [osdDisplayLayer release];
 +}
 +
-+// Drop the timed OSD layer; the composite path owns the OSD from then on.
++// How long a retired layer stays hidden before it leaves the layer tree.
++// Leaving the tree drops the layer's video receiver and image queue, and on
++// macOS 27 tearing those down while WindowServer still composites the layer
++// can wedge the display: it stops presenting, the WindowServer watchdog
++// fires and the Mac panics (plezy#2823). Hidden first, the layer is out of
++// the frames WindowServer presents by then; 200 ms is several refreshes even
++// at 24 Hz.
++#define AVF_LAYER_RETIRE_DELAY_NS MP_TIME_MS_TO_NS(200)
++
++// Drop the timed OSD layer, on uninit or when the composite path takes the
++// OSD over: hidden now, out of the tree once that has reached the screen.
 +static void release_osd_layer(struct vo *vo)
 +{
 +    struct priv *p = vo->priv;
@@ -1655,12 +1662,18 @@ index 0000000..c60b4e6
 +
 +    AVSampleBufferDisplayLayer *osdLayer = p->osdLayer;
 +    p->osdLayer = nil;
-+    if (osdLayer) {
-+        dispatch_main_sync_safe(^{
++    p->osd_layer_dirty = false;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        osdLayer.hidden = YES;
++        [CATransaction commit];
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, AVF_LAYER_RETIRE_DELAY_NS),
++                       dispatch_get_main_queue(), ^{
 +            [osdLayer removeFromSuperlayer];
++            [osdLayer release];
 +        });
-+        [osdLayer release];
-+    }
++    });
 +}
 +
 +// Keep the OSD layer over the display layer's untransformed geometry.
@@ -1752,8 +1765,7 @@ index 0000000..c60b4e6
 +    clear_subtitle_cache(p);
 +    if (composite_changed && !should_composite_into_video(p))
 +        release_ci_compositor(p);
-+    if (p->osdLayer)
-+        sample_buffer_renderer_flush(p->osdLayer, true);
++    clear_osd_layer(vo);
 +    sync_osd_layer_frame(vo);
 +}
 +
@@ -1772,8 +1784,7 @@ index 0000000..c60b4e6
 +    MP_VERBOSE(vo, "Host layer resized; resyncing OSD geometry\n");
 +
 +    clear_subtitle_cache(p);
-+    if (p->osdLayer)
-+        sample_buffer_renderer_flush(p->osdLayer, true);
++    clear_osd_layer(vo);
 +    sync_osd_layer_frame(vo);
 +    // Repaint promptly even while paused so a rotation doesn't leave the
 +    // old-geometry subtitle on screen until the next natural frame.
@@ -1802,14 +1813,15 @@ index 0000000..c60b4e6
 +// copy, and before releasing it drains the private serial queue the block runs
 +// on: a timed-out wait may stop the request while an invocation that began
 +// just before is still running.
-+static void wait_for_renderer_ready(struct priv *p, int64_t until)
++static void wait_for_renderer_ready(struct priv *p, AVSampleBufferDisplayLayer *layer,
++                                    int64_t until)
 +{
 +    int64_t timeout = MPMIN(until - mp_time_ns(), MP_TIME_MS_TO_NS(20));
 +    if (timeout <= 0)
 +        return;
 +
 +    id<AVQueuedSampleBufferRendering> renderer =
-+        active_sample_buffer_renderer(p->displayLayer);
++        active_sample_buffer_renderer(layer);
 +    if (!renderer || !p->ready_queue) {
 +        mp_sleep_ns(MPMIN(timeout, MP_TIME_MS_TO_NS(1)));
 +        return;
@@ -1878,7 +1890,7 @@ index 0000000..c60b4e6
 +            record_deadline_drop(vo);
 +            return false;
 +        }
-+        wait_for_renderer_ready(p, give_up);
++        wait_for_renderer_ready(p, p->displayLayer, give_up);
 +    }
 +
 +    p->not_ready_drop_count = 0;
@@ -3378,6 +3390,46 @@ index 0000000..c60b4e6
 +    return pixbuf;
 +}
 +
++// Wrap pixbuf (not consumed) in a sample buffer. An immediate sample is shown
++// as soon as it arrives instead of at pts on the layer's timebase.
++static CMSampleBufferRef create_image_sample_buffer(struct vo *vo,
++                                                    CVPixelBufferRef pixbuf,
++                                                    int64_t pts_ns,
++                                                    bool immediate)
++{
++    CMSampleTimingInfo info = {
++        .presentationTimeStamp = cm_time_from_ns(pts_ns),
++        .duration = kCMTimeInvalid,
++        .decodeTimeStamp = kCMTimeInvalid
++    };
++
++    CMFormatDescriptionRef format = NULL;
++    CMSampleBufferRef buf = NULL;
++    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
++    if (err == noErr && format)
++        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, pixbuf, format, &info, &buf);
++
++    if (format)
++        CFRelease(format);
++
++    if (err != noErr || !buf) {
++        MP_ERR(vo, "Failed to create image sample buffer: %d\n", (int)err);
++        return NULL;
++    }
++
++    if (immediate) {
++        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, true);
++        if (attachments && CFArrayGetCount(attachments) > 0) {
++            CFMutableDictionaryRef dict =
++                (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
++            CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately,
++                                 kCFBooleanTrue);
++        }
++    }
++
++    return buf;
++}
++
 +static CMSampleBufferRef create_osd_sample_buffer(struct vo *vo,
 +                                                  int64_t media_pts_ns,
 +                                                  bool *needed)
@@ -3402,27 +3454,8 @@ index 0000000..c60b4e6
 +    if (!pixbuf)
 +        return NULL;
 +
-+    CMSampleTimingInfo info = {
-+        .presentationTimeStamp = cm_time_from_ns(media_pts_ns),
-+        .duration = kCMTimeInvalid,
-+        .decodeTimeStamp = kCMTimeInvalid
-+    };
-+
-+    CMFormatDescriptionRef format = NULL;
-+    CMSampleBufferRef buf = NULL;
-+    OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
-+    if (err == noErr && format)
-+        err = CMSampleBufferCreateReadyWithImageBuffer(NULL, pixbuf, format, &info, &buf);
-+
-+    if (format)
-+        CFRelease(format);
++    CMSampleBufferRef buf = create_image_sample_buffer(vo, pixbuf, media_pts_ns, false);
 +    CVPixelBufferRelease(pixbuf);
-+
-+    if (err != noErr || !buf) {
-+        MP_ERR(vo, "Failed to create OSD sample buffer: %d\n", (int)err);
-+        return NULL;
-+    }
-+
 +    return buf;
 +}
 +
@@ -3447,6 +3480,46 @@ index 0000000..c60b4e6
 +    [osdLayer release];
 +
 +    return true;
++}
++
++// Where the layers' shared timebase is now, for samples shown at once.
++static int64_t layer_time_ns(struct priv *p)
++{
++    return p->timebase ? cm_time_to_ns(CMTimebaseGetTime(p->timebase)) : 0;
++}
++
++// Make the OSD layer show nothing, dropping what is queued for it, without
++// removing its image. Removing the displayed image (flush with removal)
++// hands the layer's video receiver an empty configuration on every seek,
++// and on macOS 27 tearing receivers down on a visible layer can wedge the
++// display (AVF_LAYER_RETIRE_DELAY_NS). A transparent sample looks the same.
++static void clear_osd_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (!p->osdLayer)
++        return;
++    sample_buffer_renderer_flush(p->osdLayer);
++    if (!p->osd_layer_dirty)
++        return;
++
++    // Shown at once, so the subtitle leaves with the seek rather than with
++    // the first frame after it. The next frame carries a timed clear too, in
++    // case another flush drops this one before it is shown.
++    p->osd_needs_enqueue = true;
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return;
++    CMSampleBufferRef buf = create_image_sample_buffer(vo, pixbuf, layer_time_ns(p), true);
++    CVPixelBufferRelease(pixbuf);
++    if (!buf)
++        return;
++    // A flush leaves the layer refusing samples for a moment (under a
++    // millisecond on macOS 27); wait that out rather than drop the clear.
++    if (!sample_buffer_renderer_is_ready(p->osdLayer))
++        wait_for_renderer_ready(p, p->osdLayer, mp_time_ns() + MP_TIME_MS_TO_NS(4));
++    enqueue_osd_sample(vo, buf);
++    CFRelease(buf);
 +}
 +
 +// Callback for osd_draw - renders subtitle bitmaps
@@ -4682,6 +4755,7 @@ index 0000000..c60b4e6
 +
 +        int64_t osd_pts_ns = sample_presentation_pts_ns(p);
 +        osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
++        bool osd_buf_has_subtitle = osd_buf && p->has_subtitle && p->cachedSubtitleBuffer;
 +
 +        int64_t t = mp_time_ns();
 +        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
@@ -4699,6 +4773,8 @@ index 0000000..c60b4e6
 +                p->perf.enqueue_ns += mp_time_ns() - t;
 +                if (osd_enqueued) {
 +                    p->osd_needs_enqueue = false;
++                    if (osd_buf_has_subtitle)
++                        p->osd_layer_dirty = true;
 +                    // Margin between the OSD/video enqueue pair and the
 +                    // frame's intended presentation time (same clock).
 +                    int64_t lead = p->next_present_host_ns - mp_time_ns();
@@ -4836,16 +4912,7 @@ index 0000000..c60b4e6
 +    struct priv *p = vo->priv;
 +
 +    clear_subtitle_cache(p);
-+
-+    if (p->osdLayer) {
-+        AVSampleBufferDisplayLayer *osdLayer = [p->osdLayer retain];
-+        if (!osdLayer)
-+            return;
-+        dispatch_async(dispatch_get_main_queue(), ^{
-+            sample_buffer_renderer_flush(osdLayer, true);
-+            [osdLayer release];
-+        });
-+    }
++    clear_osd_layer(vo);
 +}
 +
 +static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -4905,8 +4972,11 @@ index 0000000..c60b4e6
 +
 +    mp_image_unrefp(&p->next_image);
 +    mp_image_unrefp(&p->ahead_shown_image);
-+    sample_buffer_renderer_flush(p->displayLayer, true);
-+    sample_buffer_renderer_flush(p->osdLayer, true);
++    // Drop what is queued but keep the displayed images; clear_osd_layer
++    // explains why. The host hides the display layer before it leaves the
++    // tree, and release_osd_layer below does the same for the OSD layer.
++    sample_buffer_renderer_flush(p->displayLayer);
++    sample_buffer_renderer_flush(p->osdLayer);
 +
 +    if (p->timebase) {
 +        AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
@@ -5004,11 +5074,11 @@ index 0000000..c60b4e6
 +        // frame: removing it blanks the layer to black until the first
 +        // post-seek frame survives demux+decode, a visible flash on every
 +        // skip. Reference VOs (gpu/gpu-next) hold the last frame through
-+        // seeks; the OSD layer still drops so stale subtitles don't linger
-+        // over the held frame.
++        // seeks; the OSD layer is still cleared so stale subtitles don't
++        // linger over the held frame.
 +        p->ahead_last_pts = MP_NOPTS_VALUE;
 +        osd_cadence_reset(&p->ahead_cadence);
-+        clear_subtitle_state(vo);
++        clear_subtitle_cache(p);
 +        p->not_ready_drop_count = 0;
 +        p->last_not_ready_drop_ns = 0;
 +        p->last_display_recovery_ns = 0;
@@ -5018,8 +5088,7 @@ index 0000000..c60b4e6
 +        bool was_paused = p->playback_paused;
 +        reset_media_timing(p);
 +        p->playback_paused = was_paused;
-+        sample_buffer_renderer_flush(p->displayLayer, false);
-+        sample_buffer_renderer_flush(p->osdLayer, true);
++        sample_buffer_renderer_flush(p->displayLayer);
 +        if (p->presentation_host && p->timebase) {
 +            // Fresh host-time samples arrive with future timestamps; the
 +            // free-running timebase needs no correction, only a re-seed in
@@ -5030,6 +5099,8 @@ index 0000000..c60b4e6
 +            CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
 +            CMTimebaseSetRate(p->timebase, 0.0);
 +        }
++        // After the re-seed, so the clear is stamped on the new timeline.
++        clear_osd_layer(vo);
 +        return VO_TRUE;
 +    case VOCTRL_PAUSE:
 +        if (!p->presentation_host)
