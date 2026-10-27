@@ -398,10 +398,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..c7fb227
+index 0000000..d5b5515
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4772 @@
+@@ -0,0 +1,4791 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -1174,6 +1174,27 @@ index 0000000..c7fb227
 +    p->servo_integral = 0.0;
 +    p->last_servo_eval_ns = 0;
 +    p->rate_est = (struct avf_rate_est){0};
++}
++
++// How far a host-mode timebase may sit from mp_time_ns() before a reset puts
++// it back. Both run on mach_absolute_time, so an untouched timebase stays
++// within microseconds; only CoreMedia clamping or stopping it crosses this.
++#define AVF_HOST_TIMEBASE_TOLERANCE_NS MP_TIME_MS_TO_NS(5)
++
++// Host mode keeps timebase time equal to mp_time_ns(). Re-seed it only when
++// it has left that clock: every SetTime retimes the layers' image queues,
++// and on macOS 27 a retime behind frames the display has already taken
++// stops the whole screen until the timebase reaches them (plezy#2823).
++static void reseed_host_timebase_if_drifted(struct priv *p)
++{
++    int64_t now = mp_time_ns();
++    int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
++    if (CMTimebaseGetRate(p->timebase) == 1.0 &&
++        llabs(timebase_ns - now) <= AVF_HOST_TIMEBASE_TOLERANCE_NS)
++        return;
++
++    CMTimebaseSetTime(p->timebase, cm_time_from_ns(now));
++    CMTimebaseSetRate(p->timebase, 1.0);
 +}
 +
 +static void update_media_timebase_for_frame(struct vo *vo)
@@ -5091,10 +5112,8 @@ index 0000000..c7fb227
 +        sample_buffer_renderer_flush(p->displayLayer);
 +        if (p->presentation_host && p->timebase) {
 +            // Fresh host-time samples arrive with future timestamps; the
-+            // free-running timebase needs no correction, only a re-seed in
-+            // case CoreMedia clamped it while torn between videos.
-+            CMTimebaseSetTime(p->timebase, cm_time_from_ns(mp_time_ns()));
-+            CMTimebaseSetRate(p->timebase, 1.0);
++            // free-running timebase needs no correction.
++            reseed_host_timebase_if_drifted(p);
 +        } else if (p->timebase) {
 +            CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
 +            CMTimebaseSetRate(p->timebase, 0.0);
