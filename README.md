@@ -363,15 +363,18 @@ is picked, in any side-data order, and that profile 8, other RPU profile and
 range combinations, non-Dolby Vision frames and frames missing their metadata
 or RPU keep their old upload.
 
-Run the AVFoundation host-mode stamp regression with
-`bash scripts/test_avf_host_present.sh`. It extracts the rule from patch 0004
-that stamps each video frame for a display layer on the host clock. After a
-seek, CoreMedia can still hold frames stamped up to the queue lead ahead, so
+Run the AVFoundation host-mode clock regressions with
+`bash scripts/test_avf_host_present.sh`. It extracts two rules from patch 0004
+for display layers on the host clock. The first stamps each video frame: after
+a seek, CoreMedia can still hold frames stamped up to the queue lead ahead, so
 the first post-seek frames must be stamped after them or the old position
 flashes back after the new one (plezy#2823). It checks that steady playback
 keeps every frame's own target, that post-seek stamps come after the last
 pre-seek one and stay strictly increasing, and that no frame is held back more
-than the queue lead plus slack.
+than the queue lead plus slack. The second decides whether a reset re-seeds
+the timebase, a clock write that retimes the layers: only a stopped timebase
+or one outside the span of the clock reads around it by more than the
+tolerance counts, so a thread descheduled between the reads never does.
 
 Run the MediaCodec input regression with `bash scripts/test_mediacodec_input.sh`.
 It fetches the pinned ffmpeg revision, applies the Android series, and

@@ -398,10 +398,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..323c44c
+index 0000000..93e801e
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,4822 @@
+@@ -0,0 +1,4842 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -1183,20 +1183,40 @@ index 0000000..323c44c
 +// within microseconds; only CoreMedia clamping or stopping it crosses this.
 +#define AVF_HOST_TIMEBASE_TOLERANCE_NS MP_TIME_MS_TO_NS(5)
 +
++// --- avf host timebase drift (host-testable; keep freestanding) ---
++// Whether a host-mode timebase has left mp_time_ns(). before_ns and after_ns
++// are mp_time_ns() read either side of the timebase read: a timebase still on
++// the clock read somewhere in that span, so only a time outside it, by more
++// than tolerance_ns, is drift. A thread descheduled between the reads only
++// widens the span; it can never make an untouched timebase look drifted.
++static bool avf_host_timebase_drifted(int64_t before_ns, int64_t timebase_ns,
++                                      int64_t after_ns, double rate,
++                                      int64_t tolerance_ns)
++{
++    return rate != 1.0 || timebase_ns < before_ns - tolerance_ns ||
++           timebase_ns > after_ns + tolerance_ns;
++}
++// --- end avf host timebase drift ---
++
 +// Host mode keeps timebase time equal to mp_time_ns(). Re-seed it only when
-+// it has left that clock: every SetTime retimes the layers' image queues,
-+// and on macOS 27 a retime behind frames the display has already taken
-+// stops the whole screen until the timebase reaches them (plezy#2823).
++// it has left that clock: every timebase write retimes the layers' image
++// queues, and on macOS 27 a retime behind frames the display has already
++// taken stops the whole screen until the timebase reaches them (plezy#2823).
++// The re-seed anchors mp_time_ns() to the timebase's own source clock in one
++// call, so it lands on the current time rather than one read earlier.
 +static void reseed_host_timebase_if_drifted(struct priv *p)
 +{
-+    int64_t now = mp_time_ns();
++    int64_t before_ns = mp_time_ns();
 +    int64_t timebase_ns = cm_time_to_ns(CMTimebaseGetTime(p->timebase));
-+    if (CMTimebaseGetRate(p->timebase) == 1.0 &&
-+        llabs(timebase_ns - now) <= AVF_HOST_TIMEBASE_TOLERANCE_NS)
++    double rate = CMTimebaseGetRate(p->timebase);
++    int64_t after_ns = mp_time_ns();
++    if (!avf_host_timebase_drifted(before_ns, timebase_ns, after_ns, rate,
++                                   AVF_HOST_TIMEBASE_TOLERANCE_NS))
 +        return;
 +
-+    CMTimebaseSetTime(p->timebase, cm_time_from_ns(now));
-+    CMTimebaseSetRate(p->timebase, 1.0);
++    int64_t now = mp_time_ns();
++    CMTimebaseSetRateAndAnchorTime(p->timebase, 1.0, cm_time_from_ns(now),
++                                   source_time_for_mp_time(p, now));
 +}
 +
 +// --- avf host present stamp (host-testable; keep freestanding) ---

@@ -1,14 +1,18 @@
-// Behavioral regressions for vo_avfoundation's host-mode presentation stamp
-// rule (avf_host_present_ns), compiled verbatim from the final Apple series by
-// test_avf_host_present.sh: a seek must not let a frame queued before it be
-// shown after one decoded after it (plezy#2823), and the rule must never hold
-// the picture back past the queue lead.
+// Behavioral regressions for vo_avfoundation's host-mode clock rules,
+// compiled verbatim from the final Apple series by test_avf_host_present.sh:
+// - avf_host_present_ns: a seek must not let a frame queued before it be
+//   shown after one decoded after it (plezy#2823), and the rule must never
+//   hold the picture back past the queue lead.
+// - avf_host_timebase_drifted: a reset re-seeds the timebase, a clock write
+//   that retimes the display layers, only when it has really left
+//   mp_time_ns(); a thread descheduled between the clock reads must not count.
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "avf_host_present.inc"
+#include "avf_host_timebase_drift.inc"
 
 #define MS INT64_C(1000000)
 
@@ -77,10 +81,31 @@ int main(void)
     }
     check(bounded, "a frame is never stamped more than the window past its target");
 
+    // The timebase drift check. Reads are mp_time_ns() before and after the
+    // timebase read; tolerance as in vo_avfoundation.
+    const int64_t tol = 5 * MS;
+    check(!avf_host_timebase_drifted(now, now, now, 1.0, tol),
+          "an untouched timebase is not drifted");
+    check(!avf_host_timebase_drifted(now, now + 20 * MS, now + 20 * MS, 1.0, tol),
+          "a thread descheduled before the timebase read is not drift");
+    check(!avf_host_timebase_drifted(now, now, now + 20 * MS, 1.0, tol),
+          "a thread descheduled after the timebase read is not drift");
+    check(!avf_host_timebase_drifted(now, now - 4 * MS, now, 1.0, tol) &&
+          !avf_host_timebase_drifted(now, now + 4 * MS, now, 1.0, tol),
+          "an offset within the tolerance is not drift");
+    check(avf_host_timebase_drifted(now, now - 20 * MS, now, 1.0, tol),
+          "a timebase behind the clock is drifted");
+    check(avf_host_timebase_drifted(now, now + 20 * MS, now + 1 * MS, 1.0, tol),
+          "a timebase ahead of the clock is drifted");
+    check(avf_host_timebase_drifted(now, now - 900 * MS, now + 20 * MS, 1.0, tol),
+          "a timebase clamped far back is drifted even across a long read");
+    check(avf_host_timebase_drifted(now, now, now, 0.0, tol),
+          "a stopped timebase is drifted");
+
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return EXIT_FAILURE;
     }
-    printf("avf host present stamp: all checks passed\n");
+    printf("avf host clock rules: all checks passed\n");
     return EXIT_SUCCESS;
 }

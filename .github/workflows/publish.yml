@@ -87,7 +87,7 @@ jobs:
       - name: Test AVFoundation Dolby Vision profile 5 RPU selection
         run: ./scripts/test_avf_dovi_profile5_rpu.sh
 
-      - name: Test AVFoundation host-mode presentation stamps
+      - name: Test AVFoundation host-mode clock rules
         run: ./scripts/test_avf_host_present.sh
 
       - name: Test MediaCodec timing cadence
