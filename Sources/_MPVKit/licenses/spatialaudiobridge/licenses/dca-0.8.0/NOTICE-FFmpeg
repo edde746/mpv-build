@@ -1,0 +1,20 @@
+The dca crate declares Apache-2.0, but describes itself as a native Rust port of FFmpeg's DTS
+decoder. Its core, XLL, EXSS, synthesis and header parsing code name the FFmpeg files below as
+their sources, and its tables are generated from FFmpeg's dcadata.c and dcahuff.c. Those files are
+licensed under the GNU Lesser General Public License, version 2.1 or (at your option) any later
+version (LGPL-2.1). Combined with the crate's Apache-2.0 code, the crate can be used under version 3
+or later of that license (LGPL-3.0), whose text incorporates the GNU General Public License,
+version 3 (GPL-3.0).
+
+FFmpeg libavcodec sources, at tag n8.0:
+
+- dca_xll.c, dca_core.c, dcadsp.c, dcadct.c, dca_exss.c: Copyright (C) 2016 foo86
+- dcaadpcm.h: Copyright (C) 2017 Daniil Cherednik
+- synth_filter.c: Copyright (c) 2008 Michael Niedermayer; Copyright (C) 2016 foo86
+- dca.c: Copyright (C) 2004 Gildas Bazin; Copyright (C) 2004 Benjamin Zores;
+  Copyright (C) 2006 Benjamin Larsson; Copyright (C) 2007 Konstantin Shishkov
+- dcadata.c: Copyright (C) 2004 Gildas Bazin; Copyright (c) 2006 Benjamin Larsson
+- dcahuff.c: Copyright (C) 2004 Gildas Bazin; Copyright (C) 2007 Konstantin Shishkov
+
+FFmpeg's source code is available at https://ffmpeg.org/ and the dca crate's at
+https://github.com/harletty/harletty-bridge/tree/a717bae441b116485f0254603dc20a6ede65d8c6/dca.

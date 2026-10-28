@@ -6,7 +6,8 @@
       "For an archive or prebuilt, verify upstream release evidence first, hash the complete reviewed file, and update URL and SHA-256 together.",
       "For Git, verify the upstream release-producing tag record, record the full dereferenced root commit, and review its dependency lock or gitlinks before updating.",
       "Run python3 scripts/patches.py check after changing any patch pool or series file, and bash scripts/test_patches.sh after changing scripts/patches.py.",
-      "Never derive an expected checksum from bytes inside the production build or verification command."
+      "Never derive an expected checksum from bytes inside the production build or verification command.",
+      "A prebuilt's upstream names the source revision its archive was built from, with the vendored subtrees its build fetches into that tree; re-derive it from the build repository at the new release whenever the prebuilt moves. After changing it or the pin of any apple component, run python3 scripts/licenses.py apple and commit Sources/_MPVKit/licenses; CI fails while they differ."
     ]
   },
   "components": {
@@ -206,6 +207,13 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libunibreak-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/adah1972/libunibreak",
+        "ref": "libunibreak_6_1",
+        "commit": "304585d8e2d63187507368d612c3d5fff1486368",
+        "version": "6.1",
+        "provenance": "mpvkit/libass-build 0.17.4 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; a lightweight tag, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple",
         "android"
@@ -225,6 +233,14 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfreetype-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/freetype/freetype",
+        "mirror": "https://gitlab.freedesktop.org/freetype/freetype.git",
+        "ref": "VER-2-12-1",
+        "commit": "e8ebfe988b5f57bfb9a3ecb13c70d9791bce9ecf",
+        "version": "2.12.1",
+        "provenance": "mpvkit/libass-build 0.17.4 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref from FreeType's GitHub mirror; the annotated tag 4cc0dd694aacb6f452608ac290e20332938d17ec dereferences to this commit there and on the freedesktop GitLab, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -234,6 +250,13 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libfribidi-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/fribidi/fribidi",
+        "ref": "v1.0.12",
+        "commit": "6428d8469e536bcbb6e12c7b79ba6659371c435a",
+        "version": "1.0.12",
+        "provenance": "mpvkit/libass-build 0.17.4 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; the annotated tag 7b381a6d68fc9d6e01bdaace427d05f92c7809c7 dereferences to this commit, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -243,6 +266,13 @@
       "version": "0.17.4",
       "url": "https://github.com/mpvkit/libass-build/releases/download/0.17.4/libharfbuzz-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/harfbuzz/harfbuzz",
+        "ref": "8.1.1",
+        "commit": "1d665c2b521512cdd56964138fc601debd1f1177",
+        "version": "8.1.1",
+        "provenance": "mpvkit/libass-build 0.17.4 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; the annotated tag 6dee7ce2ffd3ec9eff0fbb9e3182edc831fe0895 dereferences to this commit, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -252,6 +282,19 @@
       "version": "1.4.0",
       "url": "https://github.com/mpvkit/libbluray-build/releases/download/1.4.0/libbluray-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://code.videolan.org/videolan/libbluray.git",
+        "ref": "1.4.0",
+        "commit": "9f07fbb2077be7a40b062bcf2463a9941c2a3b13",
+        "version": "1.4.0",
+        "vendored": {
+          "contrib/libudfread": {
+            "url": "https://code.videolan.org/videolan/libudfread.git",
+            "commit": "c3cd5cbb097924557ea4d9da1ff76a74620c51a8"
+          }
+        },
+        "provenance": "mpvkit/libbluray-build 1.4.0 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref recursively and builds with -Dembed_udfread=true; the annotated tag 0852c0eac309d435f4334baf168620fece742359 dereferences to this commit, whose contrib/libudfread gitlink is libudfread 1.2.0 (annotated tag 4469d721d7a192cccaff817b187eafc6c27238c6), resolved 2026-10-28 with git ls-remote and git ls-tree."
+      },
       "platforms": [
         "apple"
       ]
@@ -261,6 +304,13 @@
       "version": "3.3.5",
       "url": "https://github.com/mpvkit/openssl-build/releases/download/3.3.5/openssl-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/openssl/openssl",
+        "ref": "openssl-3.3.5",
+        "commit": "f10934c46fef092d04788f01fd0a4eafe3ef715f",
+        "version": "3.3.5",
+        "provenance": "mpvkit/openssl-build 3.3.5 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; the annotated tag c45e822dbf80cffdee8ac7aaac1797bd8867328d dereferences to this commit, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple",
         "windows",
@@ -291,6 +341,12 @@
       "url": "https://github.com/mpvkit/libuavs3d-build/releases/download/1.2.1-fix/libuavs3d-all.zip",
       "sha256": "8644c7a8182679dbe762b522356606220bb6d2196a5ec65511eda42ef48b3e7a",
       "provenance": "Upstream mpvkit/libuavs3d-build 1.2.1-fix release; the complete archive checksum was independently verified.",
+      "upstream": {
+        "url": "https://github.com/uavs3/uavs3d",
+        "commit": "0e20d2c291853f196c68922a264bcd8471d75b68",
+        "version": "1.2.1",
+        "provenance": "Inferred. mpvkit/libuavs3d-build 1.2.1-fix (Sources/BuildScripts/XCFrameworkBuild/main.swift) sets pullLatestVersion and so clones the master tip of its build day, 2026-07-25 (its tag commit's date); this commit has been master's tip since 2025-12-13 and still was on 2026-10-28 (git ls-remote). The archive does not name it: the VERSION_SHA1 compiled into libuavs3d.a, 51f936c182afae3d58da9aa4871ad8a439db4494, is a libuavs3d-build commit, the repository version.sh found around the build directory."
+      },
       "platforms": [
         "apple"
       ]
@@ -300,6 +356,13 @@
       "version": "3.3.2",
       "url": "https://github.com/mpvkit/libdovi-build/releases/download/3.3.2/libdovi-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/quietvoid/dovi_tool",
+        "ref": "libdovi-3.3.2",
+        "commit": "4fd2b2235c9f93582dd4a00e65ee34a07800afd7",
+        "version": "3.3.2",
+        "provenance": "mpvkit/libdovi-build 3.3.2 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref and builds dolby_vision with its capi feature; a lightweight tag, resolved 2026-10-28 with git ls-remote. Its crates are the ones dolby_vision/Cargo.lock pins."
+      },
       "platforms": [
         "apple",
         "android"
@@ -320,6 +383,35 @@
       "version": "1.4.1",
       "url": "https://github.com/mpvkit/moltenvk-build/releases/download/1.4.1/MoltenVK-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/KhronosGroup/MoltenVK",
+        "ref": "v1.4.1",
+        "commit": "db445ff2042d9ce348c439ad8451112f354b8d2a",
+        "version": "1.4.1",
+        "vendored": {
+          "External/SPIRV-Cross": {
+            "url": "https://github.com/KhronosGroup/SPIRV-Cross.git",
+            "commit": "adec7acbf41a988713cdb85f93f26c8ca5ea863e"
+          },
+          "External/SPIRV-Tools": {
+            "url": "https://github.com/KhronosGroup/SPIRV-Tools.git",
+            "commit": "262bdab48146c937467f826699a40da0fdfc0f1a"
+          },
+          "External/SPIRV-Tools/external/spirv-headers": {
+            "url": "https://github.com/KhronosGroup/SPIRV-Headers.git",
+            "commit": "b824a462d4256d720bebb40e78b9eb8f78bbb305"
+          },
+          "External/Vulkan-Headers": {
+            "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+            "commit": "6aefb8eb95c8e170d0805fd0f2d02832ec1e099a"
+          },
+          "External/cereal": {
+            "url": "https://github.com/USCiLab/cereal.git",
+            "commit": "a56bad8bbb770ee266e930c95d37fff2a5be7fea"
+          }
+        },
+        "provenance": "mpvkit/moltenvk-build 1.4.1 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref, a lightweight tag resolved 2026-10-28 with git ls-remote, and runs its fetchDependencies, which checks out the vendored trees at the commits in ExternalRevisions/<name>_repo_revision. libMoltenVK.a links SPIRV-Cross and SPIRV-Tools (its symbols are in the archive); Vulkan-Tools and Volk, which fetchDependencies also fetches, serve only the Cube demo."
+      },
       "platforms": [
         "apple"
       ]
@@ -329,6 +421,27 @@
       "version": "2025.5.0",
       "url": "https://github.com/mpvkit/libshaderc-build/releases/download/2025.5.0/libshaderc-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/google/shaderc",
+        "ref": "v2025.5",
+        "commit": "c4b0af6c3664cd8b33ffddf452514e02a173b4d6",
+        "version": "2025.5",
+        "vendored": {
+          "third_party/glslang": {
+            "url": "https://github.com/KhronosGroup/glslang.git",
+            "commit": "7a47e2531cb334982b2a2dd8513dca0a3de4373d"
+          },
+          "third_party/spirv-headers": {
+            "url": "https://github.com/KhronosGroup/SPIRV-Headers.git",
+            "commit": "b824a462d4256d720bebb40e78b9eb8f78bbb305"
+          },
+          "third_party/spirv-tools": {
+            "url": "https://github.com/KhronosGroup/SPIRV-Tools.git",
+            "commit": "262bdab48146c937467f826699a40da0fdfc0f1a"
+          }
+        },
+        "provenance": "mpvkit/libshaderc-build 2025.5.0 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref and runs utils/git-sync-deps, which checks out the vendored trees at the commits DEPS pins; the annotated tag bca2fa0bf0242340440d54f8d8e05c5dd2fafcea dereferences to this commit, resolved 2026-10-28 with git ls-remote. DEPS' abseil, effcee, googletest and re2 serve shaderc's tests, which the build skips (-DSHADERC_SKIP_TESTS=ON)."
+      },
       "platforms": [
         "apple"
       ]
@@ -338,6 +451,13 @@
       "version": "2.17.0",
       "url": "https://github.com/mpvkit/lcms2-build/releases/download/2.17.0/lcms2-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/mm2/Little-CMS",
+        "ref": "lcms2.17",
+        "commit": "5176347635785e53ee5cee92328f76fda766ecc6",
+        "version": "2.17",
+        "provenance": "mpvkit/lcms2-build 2.17.0 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; a lightweight tag, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -347,6 +467,28 @@
       "version": "7.351.0-2512",
       "url": "https://github.com/mpvkit/libplacebo-build/releases/download/7.351.0-2512/libplacebo-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/haasn/libplacebo",
+        "mirror": "https://code.videolan.org/videolan/libplacebo.git",
+        "ref": "v7.351.0",
+        "commit": "3188549fba13bbdf3a5a98de2a38c2e71f04e21e",
+        "version": "7.351.0",
+        "vendored": {
+          "3rdparty/Vulkan-Headers": {
+            "url": "https://github.com/KhronosGroup/Vulkan-Headers",
+            "commit": "cacef3039d277c448c89336290ec3937270b0996"
+          },
+          "3rdparty/fast_float": {
+            "url": "https://github.com/fastfloat/fast_float.git",
+            "commit": "1bf70101536d37fa9954cc4f03fd0903d045a9f3"
+          },
+          "3rdparty/glad": {
+            "url": "https://github.com/Dav1dde/glad",
+            "commit": "73db193f853e2ee079bf3ca8a64aa2eaf6459043"
+          }
+        },
+        "provenance": "mpvkit/libplacebo-build 7.351.0-2512 (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref recursively; the annotated tag 98c1416e95b21cd767b84ac9ee430ccadf263ff6 dereferences to this commit on haasn/libplacebo and on code.videolan.org, resolved 2026-10-28 with git ls-remote. The vendored trees are its gitlinks (git ls-tree); its jinja and markupsafe gitlinks only run at build time."
+      },
       "platforms": [
         "apple",
         "linux",
@@ -378,6 +520,14 @@
       "version": "1.5.3-neon",
       "url": "https://github.com/edde746/libdav1d-build/releases/download/1.5.3-neon/libdav1d-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/videolan/dav1d",
+        "mirror": "https://code.videolan.org/videolan/dav1d.git",
+        "ref": "1.5.3",
+        "commit": "b546257f770768b2c88258c533da38b91a06f737",
+        "version": "1.5.3",
+        "provenance": "edde746/libdav1d-build 1.5.3-neon (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref and applies no patches; the annotated tag 0664c109d1b85503bc32bf89920f951cacf5702e dereferences to this commit on GitHub and on code.videolan.org, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -387,6 +537,13 @@
       "version": "0.0.8-xcode",
       "url": "https://github.com/mpvkit/libuchardet-build/releases/download/0.0.8-xcode/libuchardet-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://gitlab.freedesktop.org/uchardet/uchardet",
+        "ref": "v0.0.8",
+        "commit": "ae6302a016088ad07177f86d417b20010053632b",
+        "version": "0.0.8",
+        "provenance": "mpvkit/libuchardet-build 0.0.8-xcode (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones this ref; the annotated tag 3ac6d310b4592afd5e1f0da578216495d96ce735 dereferences to this commit, resolved 2026-10-28 with git ls-remote."
+      },
       "platforms": [
         "apple"
       ]
@@ -396,6 +553,12 @@
       "version": "2.1.0-xcode",
       "url": "https://github.com/mpvkit/libluajit-build/releases/download/2.1.0-xcode/libluajit-all.zip",
       "provenance": "TODO(provenance): the apple driver has never hash-pinned this -all.zip (only the per-framework xcframework zips carry published checksums); hash the complete audited archive and add sha256 before the next version bump.",
+      "upstream": {
+        "url": "https://github.com/LuaJIT/LuaJIT.git",
+        "commit": "eba91fceb67a0a0163a9222869bf254c988c48c4",
+        "version": "2.1.1762795099",
+        "provenance": "mpvkit/libluajit-build 2.1.0-xcode (Sources/BuildScripts/XCFrameworkBuild/main.swift) clones the tip of branch v2.1, which has moved since. The archive's luajit.h reads LuaJIT 2.1.1762795099, and a LuaJIT version's last part is the committer time of its commit: 1762795099 (2025-11-10T17:18:19Z) is this commit's, fetched 2026-10-28."
+      },
       "platforms": [
         "apple"
       ]

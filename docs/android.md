@@ -52,7 +52,10 @@ seven FFmpeg libraries and `libc++_shared.so`, plus `classes.jar` and consumer
 R8 rules that keep every member the JNI code reaches. At run time it needs only
 the Kotlin standard library. minSdk is 25. The glue derives in part from
 libmpv-android (MIT) and the playback helpers from Plezy (GPL-3.0);
-`platforms/android/lib/NOTICE` carries both notices.
+`platforms/android/lib/NOTICE` carries both notices. `assets/licenses/` holds
+the licence texts of everything linked in
+([Licence texts](../README.md#licence-texts)); the tarballs carry the same
+tree as `licenses/`.
 
 ### API
 

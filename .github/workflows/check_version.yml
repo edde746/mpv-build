@@ -287,8 +287,8 @@ jobs:
           print(changed_path.read_text(), end='')
 
           # As with the upstream job, only the version fields move here: the
-          # url, ref, commit and provenance fields must be re-derived and
-          # audited per versions.json's refreshContract before the pins are
+          # url, ref, commit, provenance and upstream fields must be re-derived
+          # and audited per versions.json's refreshContract before the pins are
           # usable. No sort_keys, for the same reason as the upstream job: a
           # sorted dump reformats the whole file.
           path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
@@ -312,6 +312,7 @@ jobs:
             Updated `versions.json` components: `${{ steps.bump.outputs.changed_components }}`.
 
             Per `versions.json`'s `refreshContract`, audit the release before merging: the
-            `url`, `ref`, `commit` and `provenance` fields must be re-derived from the new
-            tag and verified, and a full CI run must prove the patch series still applies.
+            `url`, `ref`, `commit`, `provenance` and `upstream` fields must be re-derived from
+            the new tag and verified, `python3 scripts/licenses.py apple` must regenerate
+            `Sources/_MPVKit/licenses`, and a full CI run must prove the patch series still applies.
           commit-message: "chore: bump ${{ steps.bump.outputs.changed_components }} to ${{ steps.latest.outputs.tag }}"

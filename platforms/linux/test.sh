@@ -173,6 +173,7 @@ init_repository "$dav1d_repository"
 printf 'stub dav1d\n' >"$dav1d_repository/meson.build"
 git -C "$dav1d_repository" add meson.build
 licence "$dav1d_repository" COPYING
+licence "$dav1d_repository" doc/PATENTS
 git -C "$dav1d_repository" commit --quiet -m dav1d
 git -C "$dav1d_repository" -c tag.gpgsign=false tag release
 dav1d_commit="$(git -C "$dav1d_repository" rev-parse HEAD)"

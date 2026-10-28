@@ -45,6 +45,96 @@ index 0000000..1111111 100644
 +new
 """
 
+# `ninja -t inputs mpv` lines for a few packages of the pinned winbuild's
+# x86_64 graph, as ninja 1.11.1 (ubuntu-24.04, where CI builds) and 1.13.2
+# print them: 1.11 names each package's phony nodes and leaves out mpv-done,
+# 1.13 names CMakeFiles/<pkg>-complete instead. Both name the step stamps.
+NINJA_1_11_INPUTS = """\
+packages/curl
+packages/curl-download
+packages/curl-prefix/src/curl-stamp/curl-done
+packages/curl-prefix/src/curl-stamp/curl-download
+packages/curl-prefix/src/curl-stamp/curl-gitinfo.txt
+packages/libass
+packages/libass-download
+packages/libass-prefix/src/libass-stamp/libass-done
+packages/libass-prefix/src/libass-stamp/libass-download
+packages/libass-prefix/src/libass-stamp/libass-gitinfo.txt
+packages/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-gitinfo.txt
+packages/opus-dnn
+packages/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-done
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-urlinfo.txt
+packages/svtav1
+packages/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-done
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-gitinfo.txt
+packages/x265
+packages/x265-8+10bit
+packages/x265-8+10bit-download
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-custominfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-done
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-download
+packages/x265-download
+packages/x265-prefix/src/x265-stamp/x265-done
+packages/x265-prefix/src/x265-stamp/x265-download
+packages/x265-prefix/src/x265-stamp/x265-gitinfo.txt
+"""
+NINJA_1_13_INPUTS = """\
+packages/CMakeFiles/curl-complete
+packages/CMakeFiles/libass-complete
+packages/CMakeFiles/mpv-complete
+packages/CMakeFiles/opus-dnn-complete
+packages/CMakeFiles/svtav1-complete
+packages/CMakeFiles/x265-8+10bit-complete
+packages/CMakeFiles/x265-complete
+packages/curl-prefix/src/curl-stamp/curl-done
+packages/curl-prefix/src/curl-stamp/curl-download
+packages/curl-prefix/src/curl-stamp/curl-gitinfo.txt
+packages/libass-prefix/src/libass-stamp/libass-done
+packages/libass-prefix/src/libass-stamp/libass-download
+packages/libass-prefix/src/libass-stamp/libass-gitinfo.txt
+packages/mpv-prefix/src/mpv-stamp/mpv-done
+packages/mpv-prefix/src/mpv-stamp/mpv-download
+packages/mpv-prefix/src/mpv-stamp/mpv-gitinfo.txt
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-done
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-download
+packages/opus-dnn-prefix/src/opus-dnn-stamp/opus-dnn-urlinfo.txt
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-done
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-download
+packages/svtav1-prefix/src/svtav1-stamp/svtav1-gitinfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-custominfo.txt
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-done
+packages/x265-8+10bit-prefix/src/x265-8+10bit-stamp/x265-8+10bit-download
+packages/x265-prefix/src/x265-stamp/x265-done
+packages/x265-prefix/src/x265-stamp/x265-download
+packages/x265-prefix/src/x265-stamp/x265-gitinfo.txt
+"""
+# What both say libmpv-2.dll links: curl dropped, opus-dnn folded into opus
+# and x265's 8+10-bit build into x265.
+NINJA_LINKED = ["libass", "mpv", "opus", "svtav1", "x265"]
+
+
+def plant_package(build, subdir, package, info, source):
+    """A configured package in a synthetic winbuild build tree: the info file
+    ExternalProject writes beside the stamps, in its real shape, and a source
+    tree holding one file."""
+    stamp = build / subdir / f"{package}-prefix" / "src" / f"{package}-stamp"
+    stamp.mkdir(parents=True)
+    (stamp / f"{package}-{info}info.txt").write_text(
+        "# This is a generated file and its contents are an internal implementation detail.\n"
+        "# The download step will be re-executed if anything in this file changes.\n"
+        "# No other meaning or use of this file is supported.\n\n"
+        f"method={info}\nsource_dir={source}\nwork_dir={source.parent}\n",
+        encoding="utf-8",
+    )
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "COPYING").write_text("licence\n", encoding="utf-8")
+
 
 def first_word(line):
     return line.strip().split(" ", 1)[0] if line.strip() else ""
@@ -412,6 +502,72 @@ class PinPackagesTest(unittest.TestCase):
         versions = {"components": {"mpv": {"version": "v1", "url": "u", "ref": "v1"}}}
         with self.assertRaises(SystemExit):
             pin_packages.resolved_pins(versions, "mpv")
+
+    def test_linked_packages_from_either_ninja(self):
+        for name, inputs in (("1.11", NINJA_1_11_INPUTS), ("1.13", NINJA_1_13_INPUTS)):
+            with self.subTest(ninja=name):
+                self.assertEqual(pin_packages.linked_packages(inputs.splitlines()), NINJA_LINKED)
+        # Every x265 bit-depth build folds into x265, and a not-linked package
+        # is dropped wherever the graph names it.
+        lines = [f"packages/{p}-prefix/src/{p}-stamp/{p}-done"
+                 for p in ("mpv", "x265-10bit", "x265-10bit-lib", "vulkan", "subrandr", "nghttp3")]
+        self.assertEqual(pin_packages.linked_packages(lines), ["mpv", "x265"])
+
+    def test_linked_packages_fails_without_mpv(self):
+        # A query that names no mpv step read the wrong target or a graph
+        # whose layout moved; an empty or partial list must not ship.
+        lines = [line for line in NINJA_1_13_INPUTS.splitlines() if "mpv" not in line]
+        with self.assertRaises(SystemExit):
+            pin_packages.linked_packages(lines)
+        with self.assertRaises(SystemExit):
+            pin_packages.linked_packages([])
+
+    def test_licence_folders_are_the_keyed_component_names(self):
+        # check --group windows requires a folder per group.json component
+        # (but the build system's own, which ships no text), so the folders of
+        # the pinned packages have to be those names.
+        group = json.loads((HERE / "group.json").read_text(encoding="utf-8"))
+        keyed = set(group["artifacts"]["libmpv-windows"]["components"]) - {pin_packages.WINBUILD_COMPONENT}
+        stems = list(pin_packages.COMPONENTS) + [Path(r).stem for r in pin_packages.EXTRA_COMPONENTS.values()]
+        self.assertLessEqual(keyed, {pin_packages.licence_folder(stem) for stem in stems})
+        self.assertEqual(pin_packages.licence_folder("svtav1"), "svt-av1")
+        self.assertEqual(pin_packages.licence_folder("nvcodec-headers"), "nv-codec-headers")
+        self.assertEqual(pin_packages.licence_folder("freetype2"), "freetype2")
+
+    def test_licence_sources_are_the_recorded_source_dirs(self):
+        build = self.tmp / "x86_64"
+        src = self.tmp / "src"
+        for package in ("libass", "mpv", "svtav1", "x265"):
+            plant_package(build, "packages", package, "git", src / package)
+        opus = build / "packages" / "opus-prefix" / "src" / "opus"
+        plant_package(build, "packages", "opus", "url", opus)
+        for package in pin_packages.TOOLCHAIN_RUNTIME:
+            plant_package(build, "toolchain", package, "git", src / package)
+        self.assertEqual(
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines()),
+            [("libass", src / "libass"), ("llvm", src / "llvm"), ("mingw-w64", src / "mingw-w64"),
+             ("mpv", src / "mpv"), ("opus", opus), ("svt-av1", src / "svtav1"), ("x265", src / "x265")],
+        )
+        # ExternalProject creates every SOURCE_DIR at configure time, so an
+        # empty one is a source that was never fetched or has gone.
+        (opus / "COPYING").unlink()
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines())
+        shutil.rmtree(opus)
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, NINJA_1_11_INPUTS.splitlines())
+
+    def test_licence_sources_need_the_package_configured(self):
+        build = self.tmp / "x86_64"
+        plant_package(build, "packages", "mpv", "git", self.tmp / "src" / "mpv")
+        with self.assertRaises(SystemExit):
+            pin_packages.licence_sources(build, ["packages/mpv-prefix/src/mpv-stamp/mpv-done",
+                                                 "packages/libass-prefix/src/libass-stamp/libass-done"])
+
+    def test_info_source_dir(self):
+        text = "method=url\nsource_dir=/w/x86_64/packages/lzo-prefix/src/lzo\nwork_dir=/w/x86_64\n"
+        self.assertEqual(pin_packages.info_source_dir(text), "/w/x86_64/packages/lzo-prefix/src/lzo")
+        self.assertIsNone(pin_packages.info_source_dir("method=git\nwork_dir=/w/src\n"))
 
 
 if __name__ == "__main__":

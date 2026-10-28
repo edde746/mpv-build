@@ -2,8 +2,9 @@
 """Licence texts of the components linked into each published artifact.
 
 Usage:
-  licenses.py collect <licenses dir> [--group <group>] <component>=<source dir>...
-  licenses.py check <licenses dir> [--group <group>] [<component>...]
+  licenses.py collect [--group <group>] <licenses dir> <component>=<source dir>...
+  licenses.py check [--group <group>] <licenses dir> [<component>...]
+  licenses.py apple [--check]
 
 Every artifact carries `licenses/<component>/`: the licence texts of each
 component linked into it, copied unchanged from the source tree the build
@@ -34,11 +35,25 @@ instead of shipping a binary without its text. Files are written with mode
 `check` fails unless <licenses dir> holds exactly one folder per expected
 component, each with at least one non-empty file: the components of the
 group's multi-component artifact in platforms/<group>/group.json (the ones its
-key hashes, which is the set the artifact links), plus any named. Packaging
-runs it on the staged artifact.
+key hashes, which is the set the artifact links, but NOT_SHIPPED), plus any
+named. Packaging runs it on the staged artifact.
 
-This file decides bytes of every artifact, so every group's driver lists it
-and its key moves with it.
+`apple` collects the Apple package's texts into Sources/_MPVKit/licenses/, the
+resources of its _MPVKit target, which SwiftPM copies into every app that
+links MPVKit (MPVKit__MPVKit.bundle/licenses/<component>/). The Apple build
+compiles only mpv, FFmpeg, libass and SpatialAudioBridge; the rest are
+prebuilt XCFrameworks that carry no licence text. So `apple` fetches each
+versions.json component whose platforms include apple at the commit it was
+built from: a git pin's own, a prebuilt's `upstream` one with its `vendored`
+subtrees at their paths (from `mirror` when `url` fails). It adds rust-std
+from the Rust toolchain toolchain/apple.txt pins, collects them all and checks
+that exactly those folders are there. `apple --check` collects into a
+temporary directory instead and fails, naming each file, unless
+Sources/_MPVKit/licenses/ holds exactly those bytes.
+
+This file decides bytes of every group.json group's artifact, so each of
+their drivers lists it and their keys move with it. The Apple texts are not an
+artifact: they are committed, and CI runs `apple --check` on them.
 """
 
 from __future__ import annotations
@@ -50,6 +65,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -109,10 +126,89 @@ RULES = {
     # The Rust standard library every Rust static library carries, with the notices of the crates it is built
     # from. The source is the pinned toolchain's share/doc/rust.
     "rust-std": Rule(root=False, files=("COPYRIGHT-library.html",)),
+    # Apple components (`apple`). Their prebuilts are read from the upstream source trees versions.json names.
+    # FreeType 2.12.1: freetype's texts, from before the autofitter took in HarfBuzz code.
+    "libfreetype": Rule(
+        files=("docs/FTL.TXT", "docs/GPLv2.TXT", "src/bdf/README", "src/pcf/README"),
+        excerpts=(
+            ("src/base/fthash.c", "Copyright 2000", MIT_END),
+            ("src/gzip/zlib.h", "Copyright (C) 1995-", "madler@alumni.caltech.edu"),
+        ),
+    ),
+    # HarfBuzz 8.1.1, as harfbuzz.
+    "libharfbuzz": Rule(files=("src/ms-use/COPYING",)),
+    # The libudfread it embeds (-Dembed_udfread=true).
+    "libbluray": Rule(trees=("contrib/libudfread",)),
+    # MoltenVK links SPIRV-Cross and SPIRV-Tools and compiles in cereal and the SPIR-V and Vulkan headers, all of
+    # which its fetchDependencies puts under External/.
+    "vulkan": Rule(
+        trees=("External/SPIRV-Cross", "External/SPIRV-Tools", "External/SPIRV-Tools/external/spirv-headers",
+               "External/cereal", "External/Vulkan-Headers"),
+    ),
+    # shaderc 2025.5, as shaderc.
+    "libshaderc": Rule(trees=("third_party/glslang", "third_party/spirv-tools", "third_party/spirv-headers")),
+    # The AOM patent licence that comes with dav1d's BSD licence (the apple prebuilt is libdav1d).
+    "dav1d": Rule(files=("doc/PATENTS",)),
+    "libdav1d": Rule(files=("doc/PATENTS",)),
+    # The notices of its Rust core's crates and Rust standard library, which it ships for apps to show.
+    "spatialaudiobridge": Rule(files=("Sources/SpatialAudioBridge/Resources/ThirdPartyNotices.txt",)),
 }
 
 # Rules a group's sources need instead (`collect --group`).
-GROUP_RULES: dict[str, dict[str, Rule]] = {}
+GROUP_RULES: dict[str, dict[str, Rule]] = {
+    # mpv-winbuild-cmake packages (pinned ones under their versions.json names). Each is a source tree of its own,
+    # so the libraries other groups' sources vendor (glslang, SPIRV-Tools, SPIRV-Headers, fast_float, glad,
+    # Vulkan-Headers, xxHash, libudfread) are folders of their own here.
+    "windows": {
+        "shaderc": Rule(),
+        "libplacebo": Rule(),
+        "libbluray": Rule(),
+        "freetype2": RULES["freetype"],
+        # The IJG licence of the libjpeg code is in README.ijg.
+        "libjpeg": Rule(files=("README.ijg",)),
+        # Headers only, no licence file: the C interface ffmpeg's AviSynth demuxer compiles against is GPLv2+
+        # with an exception for programs that use it, stated in avisynth_c.h's leading comment.
+        "avisynth-headers": Rule(
+            excerpts=(("avs_core/include/avisynth_c.h", "Avisynth C Interface Version", "graphical user interfaces."),),
+        ),
+        # The encoder's FAST corner detector, and x86inc.asm under the x86 assembly.
+        "aom": Rule(files=("third_party/fastfeat/LICENSE", "third_party/x86inc/LICENSE")),
+        "libvpx": Rule(files=("third_party/x86inc/LICENSE",)),
+        # The FAST corner detector, and safestringlib where the CRT lacks the bounds-checked string functions.
+        "svt-av1": Rule(files=("third_party/fastfeat/LICENSE", "third_party/safestringlib/LICENSE")),
+        # {fmt} and the Guidelines Support Library.
+        "openal-soft": Rule(files=("fmt-*/LICENSE", "gsl/LICENSE")),
+        # HIDAPI (SDL_HIDAPI is on by default) and the YUV to RGB converters.
+        "libsdl2": Rule(files=("src/hidapi/LICENSE*.txt", "src/video/yuv2rgb/LICENSE")),
+        # The mpt base library its sources are built on.
+        "libopenmpt": Rule(files=("src/mpt/LICENSE.*",)),
+        # The HDR10+ metadata library and its json11 parser (ENABLE_HDR10_PLUS, x86_64).
+        "x265": Rule(files=("source/dynamicHDR10/LICENSE.txt", "source/dynamicHDR10/json11/LICENSE.txt")),
+        # PFFFT (WITH_PFFFT is on by default) and Ooura's FFT, each licensed in its leading comment.
+        "libsoxr": Rule(
+            excerpts=(
+                ("src/pffft.c", "Julien Pommier", "SOFTWARE."),
+                ("src/fft4g.c", "Copyright Takuya OOURA", "modify this code."),
+            ),
+        ),
+        # The Speex resampler, licensed in its leading comment.
+        "libmysofa": Rule(
+            excerpts=(("src/resampler/speex_resampler.c", "Copyright (C) 2007-2008 Jean-Marc Valin", "SUCH DAMAGE."),),
+        ),
+        # The runtime clang links into the DLL statically: compiler-rt's builtins, libunwind, libc++ and libc++abi.
+        "llvm": Rule(trees=("compiler-rt", "libcxx", "libcxxabi", "libunwind")),
+        # The CRT's start-up code and libraries (COPYING.MinGW-w64-runtime/, DISCLAIMER.PD for its public-domain
+        # parts) and winpthreads.
+        "mingw-w64": Rule(files=("DISCLAIMER", "DISCLAIMER.PD"), trees=("mingw-w64-libraries/winpthreads",)),
+    },
+}
+
+# Components a group's key lists that put no code under a licence of their own into the artifact.
+NOT_SHIPPED = {
+    # The Windows build system. It publishes no licence; its code in libmpv-2.dll is patches to packages whose
+    # texts ship.
+    "mpv-winbuild-cmake",
+}
 
 
 def fail(message: str) -> None:
@@ -245,7 +341,7 @@ def group_components(group: str) -> list[str]:
     linked = [spec["components"] for spec in artifacts.values() if "components" in spec]
     if len(linked) != 1:
         fail(f"{path}: expected one artifact with components, found {len(linked)}")
-    return linked[0]
+    return [name for name in linked[0] if name not in NOT_SHIPPED]
 
 
 def check(out: Path, expected: set[str]) -> None:
@@ -259,6 +355,92 @@ def check(out: Path, expected: set[str]) -> None:
         fail(f"{out}:\n  " + "\n  ".join(problems))
 
 
+# The Apple package's licence texts, resources of its _MPVKit target: SwiftPM copies them into every app that links
+# the package.
+APPLE_TEXTS = Path("Sources/_MPVKit/licenses")
+
+
+def fetch(url: str, mirror: str | None, commit: str, tree: Path) -> None:
+    """`commit`'s tree, fetched alone from `url`, or from `mirror` once `url` has failed, checked out at `tree`."""
+    git = ["git", "-C", str(tree)]
+    for source in [url] + ([mirror] if mirror else []):
+        for attempt in range(1, 4):
+            shutil.rmtree(tree, ignore_errors=True)
+            if (subprocess.run(["git", "init", "--quiet", str(tree)]).returncode == 0
+                    and subprocess.run(git + ["fetch", "--quiet", "--depth", "1", source, commit]).returncode == 0
+                    and subprocess.run(git + ["checkout", "--quiet", "--detach", "FETCH_HEAD"]).returncode == 0):
+                head = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True)
+                if head.stdout.strip() != commit:
+                    fail(f"{source} served {head.stdout.strip()} for {commit}")
+                return
+            if attempt < 3:
+                time.sleep(attempt)
+        print(f"licenses.py: could not fetch {commit} from {source}", file=sys.stderr)
+    fail(f"no source served {commit} of {url}")
+
+
+def apple_sources(root: Path, work: Path) -> dict[str, Path]:
+    """component → source tree for every component the Apple package links, fetched into `work`, and rust-std.
+
+    A git pin's tree is its commit. A prebuilt's is the commit its archive was built from (`upstream`), with the
+    `vendored` subtrees the upstream build fetches into it at their paths. rust-std is share/doc/rust of the Rust
+    toolchain toolchain/apple.txt pins, whose standard library the package's Rust static code carries.
+    """
+    components = json.loads((root / "versions.json").read_text(encoding="utf-8"))["components"]
+    sources = {}
+    for name, pin in components.items():
+        if "apple" not in pin.get("platforms", []):
+            continue
+        pin = {**pin, **pin.get("overrides", {}).get("apple", {})}
+        origin = pin if pin["kind"] == "git" else pin.get("upstream")
+        if origin is None:
+            fail(f"versions.json: {name} is a {pin['kind']} pin with no upstream source revision")
+        tree = work / name
+        fetch(origin["url"], origin.get("mirror"), origin["commit"], tree)
+        for path, vendored in sorted(origin.get("vendored", {}).items()):
+            fetch(vendored["url"], vendored.get("mirror"), vendored["commit"], tree / path)
+        sources[name] = tree
+    toolchain = dict(line.split("=", 1) for line in (root / "toolchain/apple.txt").read_text().splitlines()
+                     if line and not line.startswith("#"))
+    sysroot = subprocess.run(["rustup", "run", toolchain["rust"], "rustc", "--print", "sysroot"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+    sources["rust-std"] = Path(sysroot) / "share/doc/rust"
+    # libdovi's crates are resolved by that toolchain's cargo.
+    os.environ["PATH"] = f"{Path(sysroot) / 'bin'}{os.pathsep}{os.environ['PATH']}"
+    return sources
+
+
+def tree_files(tree: Path) -> dict[str, bytes]:
+    if not tree.is_dir():
+        return {}
+    return {path.relative_to(tree).as_posix(): path.read_bytes() for path in sorted(tree.rglob("*")) if path.is_file()}
+
+
+def apple(verify: bool) -> None:
+    """Collect the Apple components' texts into APPLE_TEXTS, or with `verify` fail unless it holds exactly them."""
+    root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory(prefix="licenses-apple-") as work:
+        out = Path(work) / "licenses"
+        sources = apple_sources(root, Path(work) / "sources")
+        for component, source in sources.items():
+            print(f"{component}: {collect(component, source, out, 'apple')} licence file(s)")
+        check(out, set(sources))
+        if not verify:
+            shutil.rmtree(root / APPLE_TEXTS, ignore_errors=True)
+            shutil.copytree(out, root / APPLE_TEXTS)
+            print(f"wrote {APPLE_TEXTS}")
+            return
+        generated, committed = tree_files(out), tree_files(root / APPLE_TEXTS)
+        problems = [f"missing {name}" for name in sorted(generated.keys() - committed.keys())]
+        problems += [f"not generated: {name}" for name in sorted(committed.keys() - generated.keys())]
+        problems += [f"differs: {name}" for name in sorted(generated.keys() & committed.keys())
+                     if generated[name] != committed[name]]
+        if problems:
+            fail(f"{APPLE_TEXTS} is not what `licenses.py apple` collects from the pinned sources:\n  "
+                 + "\n  ".join(problems))
+        print(f"{APPLE_TEXTS}: the texts of the pinned sources")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -270,6 +452,8 @@ def main(argv: list[str]) -> int:
     check_parser.add_argument("out", type=Path)
     check_parser.add_argument("--group")
     check_parser.add_argument("components", nargs="*")
+    apple_parser = subparsers.add_parser("apple", help=f"collect the Apple package's texts into {APPLE_TEXTS}")
+    apple_parser.add_argument("--check", action="store_true", help=f"fail unless {APPLE_TEXTS} holds exactly them")
     args = parser.parse_args(argv)
 
     if args.command == "collect":
@@ -279,6 +463,9 @@ def main(argv: list[str]) -> int:
                 fail(f"expected <component>=<source dir>, got {pair!r}")
             count = collect(component, Path(source), args.out, args.group)
             print(f"{component}: {count} licence file(s)")
+        return 0
+    if args.command == "apple":
+        apple(args.check)
         return 0
     expected = set(args.components)
     if args.group:
