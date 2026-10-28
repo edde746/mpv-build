@@ -5,7 +5,8 @@
     "platforms/windows/build.sh",
     "platforms/windows/package.sh",
     "platforms/windows/pin_packages.py",
-    "scripts/symbols.py"
+    "scripts/symbols.py",
+    "scripts/licenses.py"
   ],
   "artifacts": {
     "libmpv-windows": {

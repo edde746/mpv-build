@@ -6,7 +6,8 @@ set -euo pipefail
 # Builds the bundled libmpv.so for the linux platform group: dav1d, ffmpeg,
 # shaderc and libplacebo static into an install prefix (with nv-codec-headers'
 # header-only ffnvcodec feeding ffmpeg), our patched libass static on top,
-# then mpv as a shared libmpv linked against all of them.
+# then mpv as a shared libmpv linked against all of them, and copies each
+# one's licence texts into <prefix>/licenses/<component>/.
 # Every pin comes from the repo-root versions.json with `overrides.linux`
 # folded in; a missing pin is fatal, never defaulted.
 #
@@ -449,6 +450,20 @@ main() {
   ninja -C build -j"$jobs"
   ninja -C build install
   finish_step mpv
+
+  # ─── Licence texts ─────────────────────────────────────────────────────────
+  # Every source above is linked into libmpv.so (nv-codec-headers' loader is
+  # compiled in from its headers), so their licence texts go into the prefix
+  # for package.sh to ship; a component without one fails here.
+  python3 "$REPO_ROOT/scripts/licenses.py" collect "$prefix/licenses" \
+    "dav1d=$srcdir/dav1d-v${DAV1D_VERSION}" \
+    "nv-codec-headers=$srcdir/nv-codec-headers-${NV_CODEC_HEADERS_VERSION}" \
+    "ffmpeg=$srcdir/ffmpeg-${FFMPEG_VERSION}" \
+    "shaderc=$srcdir/shaderc-v${SHADERC_VERSION}" \
+    "libplacebo=$srcdir/libplacebo-v${LIBPLACEBO_VERSION}" \
+    "libass=$srcdir/libass-${LIBASS_VERSION}" \
+    "mpv=$srcdir/mpv-${MPV_VERSION}"
+  finish_step "licence texts"
   echo "==> libmpv build complete. Output in $prefix"
 }
 

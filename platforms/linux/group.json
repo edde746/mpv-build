@@ -5,7 +5,8 @@
     "platforms/linux/build.sh",
     "platforms/linux/package.sh",
     "platforms/linux/container-build.sh",
-    "scripts/symbols.py"
+    "scripts/symbols.py",
+    "scripts/licenses.py"
   ],
   "artifacts": {
     "libmpv-linux": {

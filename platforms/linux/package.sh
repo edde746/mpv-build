@@ -8,7 +8,8 @@ set -euo pipefail
 #     libmpv-linux-<key>-<x86_64|aarch64>.tar.zst
 #     libmpv-linux-<x86_64|aarch64>-symbols.zip
 #
-# The tarball serves two roles at once, so it carries two kinds of content:
+# The tarball serves two roles at once, so it carries two kinds of content,
+# plus the licence texts of both:
 #
 #   runtime bundle source -- exactly the set plezy's CI copied out of
 #     libmpv-prefix into the Flutter bundle: the versioned libmpv.so* chain
@@ -28,6 +29,11 @@ set -euo pipefail
 #     the multiarch lib/<triplet>/pkgconfig layout meson uses for mpv.pc, and
 #     it cannot fix the literal prefix paths shaderc's cmake bakes into
 #     Cflags outside ${prefix}.
+#
+#   licenses/<component>/ -- the licence texts of every component linked into
+#     libmpv.so and libshaderc_shared.so (build.sh collects them from the
+#     sources it compiled); packaging fails when one of group.json's
+#     components has none.
 #
 # The symbols zip is what plezy uploads to its crash tracker so libmpv and
 # FFmpeg frames get names and lines: an `objcopy --only-keep-debug` copy of
@@ -129,6 +135,11 @@ if [ "$found_pkgconfig" -eq 0 ]; then
   echo "no pkgconfig directory under $PREFIX; the artifact could not be compiled against" >&2
   exit 1
 fi
+
+# One folder per component group.json lists, each holding a text, or no
+# tarball: the libraries above link all of them.
+python3 "$REPO_ROOT/scripts/licenses.py" check "$PREFIX/licenses" --group linux
+cp -a "$PREFIX/licenses" "$stage/licenses"
 
 mkdir -p "$OUT_DIR"
 

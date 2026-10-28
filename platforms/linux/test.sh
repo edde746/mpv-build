@@ -120,6 +120,15 @@ for tool in make cmake meson ninja; do
   make_stub "$stub_bin" "$tool"
 done
 
+# Each stub source carries a licence text where its real source keeps one
+# (scripts/licenses.py's rules: the root, vendored trees, header comments).
+licence() {
+  local repository="$1" path="$2"
+  mkdir -p "$(dirname -- "$repository/$path")"
+  printf 'Copyright stub\nTHE USE OR OTHER DEALINGS IN THE SOFTWARE.\n' >"$repository/$path"
+  git -C "$repository" add "$path"
+}
+
 # ffmpeg runs ./configure out of its own checkout, so the recording configure
 # stub is committed into its stub repository.
 ffmpeg_repository="$temporary/ffmpeg-source"
@@ -127,6 +136,7 @@ init_repository "$ffmpeg_repository"
 cp -- "$stub_extra/configure" "$ffmpeg_repository/configure"
 git -C "$ffmpeg_repository" add configure
 git -C "$ffmpeg_repository" update-index --chmod=+x configure
+licence "$ffmpeg_repository" COPYING.LGPLv2.1
 git -C "$ffmpeg_repository" commit --quiet -m ffmpeg
 git -C "$ffmpeg_repository" -c tag.gpgsign=false tag release
 ffmpeg_commit="$(git -C "$ffmpeg_repository" rev-parse HEAD)"
@@ -135,6 +145,7 @@ mpv_repository="$temporary/mpv-source"
 init_repository "$mpv_repository"
 printf 'stub mpv\n' >"$mpv_repository/meson.build"
 git -C "$mpv_repository" add meson.build
+licence "$mpv_repository" Copyright
 git -C "$mpv_repository" commit --quiet -m mpv
 git -C "$mpv_repository" -c tag.gpgsign=false tag release
 mpv_commit="$(git -C "$mpv_repository" rev-parse HEAD)"
@@ -149,6 +160,10 @@ chmod +x "$shaderc_repository/utils/git-sync-deps"
 git -C "$shaderc_repository" add utils/git-sync-deps
 # Windows checkouts do not track the mode bit, and the build plan executes it.
 git -C "$shaderc_repository" update-index --chmod=+x utils/git-sync-deps
+licence "$shaderc_repository" LICENSE
+for tree in glslang spirv-tools spirv-headers; do
+  licence "$shaderc_repository" "third_party/$tree/LICENSE"
+done
 git -C "$shaderc_repository" commit --quiet -m shaderc
 git -C "$shaderc_repository" -c tag.gpgsign=false tag release
 shaderc_commit="$(git -C "$shaderc_repository" rev-parse HEAD)"
@@ -157,6 +172,7 @@ dav1d_repository="$temporary/dav1d-source"
 init_repository "$dav1d_repository"
 printf 'stub dav1d\n' >"$dav1d_repository/meson.build"
 git -C "$dav1d_repository" add meson.build
+licence "$dav1d_repository" COPYING
 git -C "$dav1d_repository" commit --quiet -m dav1d
 git -C "$dav1d_repository" -c tag.gpgsign=false tag release
 dav1d_commit="$(git -C "$dav1d_repository" rev-parse HEAD)"
@@ -165,6 +181,9 @@ libplacebo_repository="$temporary/libplacebo-source"
 init_repository "$libplacebo_repository"
 printf 'stub libplacebo\n' >"$libplacebo_repository/meson.build"
 git -C "$libplacebo_repository" add meson.build
+licence "$libplacebo_repository" LICENSE
+licence "$libplacebo_repository" 3rdparty/fast_float/LICENSE-MIT
+licence "$libplacebo_repository" 3rdparty/glad/LICENSE
 git -C "$libplacebo_repository" commit --quiet -m libplacebo
 git -C "$libplacebo_repository" -c tag.gpgsign=false tag release
 libplacebo_commit="$(git -C "$libplacebo_repository" rev-parse HEAD)"
@@ -175,6 +194,7 @@ nv_codec_headers_repository="$temporary/nv-codec-headers-source"
 init_repository "$nv_codec_headers_repository"
 printf 'stub nv-codec-headers\n' >"$nv_codec_headers_repository/Makefile"
 git -C "$nv_codec_headers_repository" add Makefile
+licence "$nv_codec_headers_repository" include/ffnvcodec/nvEncodeAPI.h
 git -C "$nv_codec_headers_repository" commit --quiet -m nv-codec-headers
 git -C "$nv_codec_headers_repository" -c tag.gpgsign=false tag release
 nv_codec_headers_commit="$(git -C "$nv_codec_headers_repository" rev-parse HEAD)"
@@ -192,6 +212,7 @@ SH
 chmod +x "$libass_repository/autogen.sh"
 git -C "$libass_repository" add autogen.sh
 git -C "$libass_repository" update-index --chmod=+x autogen.sh
+licence "$libass_repository" COPYING
 git -C "$libass_repository" commit --quiet -m libass
 git -C "$libass_repository" -c tag.gpgsign=false tag release
 libass_commit="$(git -C "$libass_repository" rev-parse HEAD)"
@@ -411,6 +432,16 @@ assert_argument "$libass_configure" "--enable-static" "libass's configure"
 assert_argument "$libass_configure" "--disable-shared" "libass's configure"
 assert_argument "$libass_configure" "--with-pic" "libass's configure"
 assert_argument "$libass_configure" "--enable-fontconfig" "libass's configure"
+
+# The tarball ships a licence text for every component its key lists, which
+# package.sh refuses to package without; the build collects them from the
+# trees it compiled, vendored ones included, at the paths they have there.
+python3 "$REPO_ROOT/scripts/licenses.py" check "$temporary/prefix/licenses" --group linux >/dev/null ||
+  fail "the build plan did not collect a licence text for every linked component"
+[ -f "$temporary/prefix/licenses/shaderc/third_party/glslang/LICENSE" ] ||
+  fail "the build plan did not collect the licence of shaderc's vendored glslang"
+[ -f "$temporary/prefix/licenses/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h.txt" ] ||
+  fail "the build plan did not cut nv-codec-headers' licence out of its header"
 
 # SRCDIR fixes the source path the libraries record, so a rebuild reproduces
 # the published bytes. The build must use exactly that directory and remove

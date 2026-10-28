@@ -15,7 +15,8 @@
     "platforms/android/scripts/libdovi.sh",
     "platforms/android/scripts/lua.sh",
     "platforms/android/scripts/meson.sh",
-    "platforms/android/scripts/openssl.sh"
+    "platforms/android/scripts/openssl.sh",
+    "scripts/licenses.py"
   ],
   "artifacts": {
     "libmpv-android": {
@@ -38,7 +39,7 @@
     },
     "mpv-android": {
       "inputs": ["libmpv-android"],
-      "sources": ["platforms/android/lib", "scripts/symbols.py"],
+      "sources": ["platforms/android/lib", "scripts/symbols.py", "LICENSE"],
       "assetPattern": "mpv-android-{key}.aar",
       "symbolsPattern": "mpv-android-{key}-{variant}-symbols.zip"
     }
