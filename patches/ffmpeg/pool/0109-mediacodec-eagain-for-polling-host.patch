@@ -1,5 +1,5 @@
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index dc31246..7c55d1e 100644
+index 792d453b3f..8eae6775a3 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
 @@ -34,6 +34,8 @@
@@ -11,7 +11,7 @@ index dc31246..7c55d1e 100644
  #include "ffjni.h"
  #include "mediacodecdec_common.h"
  
-@@ -151,6 +153,19 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
+@@ -153,6 +155,19 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
      return buffer->ctx->rendered_source;
  }
  
@@ -31,7 +31,7 @@ index dc31246..7c55d1e 100644
  #else
  
  #include <stdlib.h>
-@@ -195,4 +210,10 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
+@@ -197,4 +212,10 @@ const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer)
      return "off:platform";
  }
  
@@ -43,10 +43,10 @@ index dc31246..7c55d1e 100644
 +
  #endif
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 77c44fc..a4abbb1 100644
+index 466ec23704..7085010fbd 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -138,4 +138,23 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+@@ -140,4 +140,23 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
   */
  const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
  
@@ -71,10 +71,10 @@ index 77c44fc..a4abbb1 100644
 +
  #endif /* AVCODEC_MEDIACODEC_H */
 diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
-index cb100ea..479eecf 100644
+index 56b26e0366..e3bcc02fe2 100644
 --- a/libavcodec/mediacodec_wrapper.c
 +++ b/libavcodec/mediacodec_wrapper.c
-@@ -2194,6 +2194,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
+@@ -2294,6 +2294,11 @@ static int mediacodec_ndk_delete(FFAMediaCodec* ctx)
      // into a freed context.
      if (codec->impl && codec->rendered_cb && codec->setOnFrameRenderedCallback)
          codec->setOnFrameRenderedCallback(codec->impl, NULL, NULL);
@@ -87,10 +87,10 @@ index cb100ea..479eecf 100644
          ret = AVERROR_EXTERNAL;
      if (codec->window)
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 21ed553..c7a7c42 100644
+index 3b3b34fa1f..7b273f3cc7 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -1010,17 +1010,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1011,17 +1011,21 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
      while (1) {
          if (s->ctx->current_input_buffer < 0 && !s->ctx->draining) {
              /* poll for input space */
@@ -116,13 +116,13 @@ index 21ed553..c7a7c42 100644
                      continue;
                  return ret;
              }
-@@ -1112,6 +1116,17 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
+@@ -1113,6 +1117,17 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
      NULL
  };
  
 +MediaCodecDecContext *ff_mediacodec_dec_from_avctx(AVCodecContext *avctx)
 +{
-+    MediaCodecH264DecContext *s;
++    MediaCodecContext *s;
 +
 +    if (!avctx || !avctx->codec || av_codec_is_encoder(avctx->codec) ||
 +        !avctx->codec->wrapper_name || strcmp(avctx->codec->wrapper_name, "mediacodec"))
@@ -131,11 +131,11 @@ index 21ed553..c7a7c42 100644
 +    return s ? s->ctx : NULL;
 +}
 +
- #define OFFSET(x) offsetof(MediaCodecH264DecContext, x)
+ #define OFFSET(x) offsetof(MediaCodecContext, x)
  #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
  static const AVOption ff_mediacodec_vdec_options[] = {
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index c1021f1..1aa08f7 100644
+index 7b082b764f..800dd9e836 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -22,7 +22,6 @@
@@ -146,7 +146,7 @@ index c1021f1..1aa08f7 100644
  #include "libavutil/avassert.h"
  #include "libavutil/common.h"
  #include "libavutil/hwcontext_mediacodec.h"
-@@ -718,6 +717,25 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
+@@ -731,6 +730,25 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
          av_assert0(0);
  }
  
@@ -172,7 +172,7 @@ index c1021f1..1aa08f7 100644
  static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContext *s)
  {
      FFAMediaCodec *codec = s->codec;
-@@ -983,8 +1001,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1001,8 +1019,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
      while (offset < pkt->size || (need_draining && !s->draining)) {
          ssize_t index = s->current_input_buffer;
          if (index < 0) {
@@ -183,7 +183,7 @@ index c1021f1..1aa08f7 100644
                  av_log(avctx, AV_LOG_TRACE, "No input buffer available, try again later\n");
                  break;
              }
-@@ -1001,7 +1019,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1019,7 +1037,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
              av_log(avctx, AV_LOG_ERROR, "Failed to get input buffer\n");
              return AVERROR_EXTERNAL;
          }
@@ -191,7 +191,7 @@ index c1021f1..1aa08f7 100644
          /*
           * One input buffer is one access unit (ACodec flags every buffer
           * ENDOFFRAME); splitting a packet across buffers hands the decoder
-@@ -1033,7 +1050,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1051,7 +1068,6 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
          if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
              pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
          }
@@ -199,7 +199,7 @@ index c1021f1..1aa08f7 100644
          if (need_draining) {
              uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
  
-@@ -1087,7 +1103,14 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1105,7 +1121,14 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          return AVERROR_EOF;
      }
  
@@ -215,7 +215,7 @@ index c1021f1..1aa08f7 100644
          /* If the codec is flushing or need to be flushed, block for a fair
           * amount of time to ensure we got a frame */
          output_dequeue_timeout_us = OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US;
-@@ -1167,7 +1190,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1199,7 +1222,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
      } else if (ff_AMediaCodec_infoOutputBuffersChanged(codec, index)) {
          ff_AMediaCodec_cleanOutputBuffers(codec);
      } else if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
@@ -225,10 +225,10 @@ index c1021f1..1aa08f7 100644
                                          "while draining remaining frames, output will probably lack frames\n",
                                          output_dequeue_timeout_us / 1000);
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 512601f..69c7905 100644
+index 5b3307e14a..16577df14a 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
-@@ -79,6 +79,9 @@ typedef struct MediaCodecDecContext {
+@@ -84,6 +84,9 @@ typedef struct MediaCodecDecContext {
  
      bool use_ndk_codec;
      int profile_override; // CodecProfileLevel constant, 0 = derive from avctx
@@ -238,7 +238,7 @@ index 512601f..69c7905 100644
  
      // Frame-rendered feedback; see av_mediacodec_drain_rendered.
      const char *rendered_source;      // "ndk" or an "off:" reason, never NULL
-@@ -111,6 +114,14 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
+@@ -116,6 +119,14 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx,
  int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx,
                                    MediaCodecDecContext *s);
  
@@ -253,7 +253,7 @@ index 512601f..69c7905 100644
  typedef struct MediaCodecBuffer {
  
      MediaCodecDecContext *ctx;
-@@ -121,4 +132,8 @@ typedef struct MediaCodecBuffer {
+@@ -126,4 +137,8 @@ typedef struct MediaCodecBuffer {
  
  } MediaCodecBuffer;
  

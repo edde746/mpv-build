@@ -56,7 +56,12 @@ def make_tree(tmp):
     """A widget component whose series order is deliberately not sorted."""
     pool = Path(tmp) / "patches" / "widget" / "pool"
     pool.mkdir(parents=True)
-    for name in ("0001-common.patch", "0002-zeta.patch", "0003-alpha.patch"):
+    for name in (
+        "0001-common.patch",
+        "0002-zeta.patch",
+        "0003-alpha.patch",
+        "0004-android.patch",
+    ):
         (pool / name).write_text(f"fixture bytes of {name}\n", encoding="utf-8")
     component = pool.parent
     (component / "series.common").write_text(
@@ -69,10 +74,16 @@ def make_tree(tmp):
         "0003-alpha.patch\n",
         encoding="utf-8",
     )
+    (component / "series.common.android").write_text(
+        "# Android resolves against its own pinned source tree\n"
+        "0004-android.patch\n",
+        encoding="utf-8",
+    )
     return component
 
 
-# 1. resolve: series.common first, then series.<platform>, in file order.
+# 1. resolve: platform common override (or series.common), then
+# series.<platform>, in file order.
 with tempfile.TemporaryDirectory() as tmp:
     make_tree(tmp)
     result = run(tmp, "resolve", "widget", "apple")
@@ -82,8 +93,13 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     result = run(tmp, "resolve", "widget", "android")
     check(
+        result.stdout.split() == ["0004-android.patch"],
+        "a platform common override replaces series.common when present",
+    )
+    result = run(tmp, "resolve", "widget", "linux")
+    check(
         result.stdout.split() == ["0001-common.patch"],
-        "a platform without a series file resolves to series.common alone",
+        "a platform without a common override resolves series.common",
     )
     result = run(tmp, "resolve", "nonexistent", "apple")
     check(result.stdout == "", "a component without a patches directory resolves empty")
@@ -408,8 +424,8 @@ print("fetch-pinned's archive strip accepts the source tree and refuses the rest
 # 5. This repository's own tree is valid, and every group is declared where
 # versions.json says it is.
 run(root, "check")
-# Every real component resolves for every platform to exactly series.common
-# followed by series.<platform>, in order, comments and blank lines dropped.
+# Every real component resolves for every platform to its effective common
+# series followed by series.<platform>, in order, comments and blank lines dropped.
 # Running `resolve` at the default expect=0 only proves it did not crash:
 # cmd_resolve rejects an unknown platform and nothing else -- a missing series
 # file reads as empty -- so an empty or truncated resolution used to pass here.
@@ -417,7 +433,13 @@ for component in sorted(p.name for p in (root / "patches").iterdir() if p.is_dir
     component_dir = root / "patches" / component
     for platform in ("apple", "android", "linux", "windows"):
         expected = []
-        for series_name in ("series.common", f"series.{platform}"):
+        override = component_dir / f"series.common.{platform}"
+        common = (
+            f"series.common.{platform}"
+            if override.is_file()
+            else "series.common"
+        )
+        for series_name in (common, f"series.{platform}"):
             series_file = component_dir / series_name
             if not series_file.is_file():
                 continue
@@ -430,7 +452,7 @@ for component in sorted(p.name for p in (root / "patches").iterdir() if p.is_dir
         resolved = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         check(
             resolved == expected,
-            f"resolve {component} {platform} must return series.common then "
+            f"resolve {component} {platform} must return the effective common series then "
             f"series.{platform}; got {resolved}, expected {expected}",
         )
 

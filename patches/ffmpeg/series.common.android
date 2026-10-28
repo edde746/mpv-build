@@ -1,0 +1,18 @@
+# Android's experimental FFmpeg source override. This replaces the stable
+# series.common list for Android before series.android; Apple, Linux and Windows
+# keep the n8.0.1 list. The resolver keeps this patch order authoritative.
+#
+# The libdovi profile 7 to 8.1 conversion helper the MediaCodec and the
+# VideoToolbox paths both call. It only builds where one of them is enabled,
+# so elsewhere it costs one configure entry. First, so its Makefile lines land
+# on the pristine file before any later patch reads them.
+0021-dolby-vision-convert-profile7-rpu-to-p81-android.patch
+0022-pgssub-clear-palette-clut-on-epoch-flush.patch
+0029-tcp-resolve-each-address-family-separately.patch
+# The HEVC decoder's Dolby Vision log noise, and its software-only tables,
+# which no hwaccel reads (d3d11va, nvdec, vaapi and vulkan included).
+0010-hevc-downlevel-duplicate-dovi-rpu-log-android.patch
+0030-hevc-skip-software-tables-under-hwaccel.patch
+# OpenSSL is the TLS backend on apple, android and windows. Linux configures
+# GnuTLS, so tls_openssl.c is not compiled there and this changes nothing.
+0035-tls-openssl-read-ahead-android.patch
