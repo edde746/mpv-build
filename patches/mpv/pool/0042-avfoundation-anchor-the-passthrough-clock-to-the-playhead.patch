@@ -1,0 +1,137 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 12:00:00 +0100
+Subject: [PATCH] ao_avfoundation: anchor the passthrough clock to the playhead
+ on every tick
+
+With AC-3/E-AC-3 passthrough through the AVPlayer sink, every start, seek
+and audio track change played the picture ahead of the sound for about 8 s,
+then froze it for 0.2-0.3 s (plezy#2736). The sink set mpv's audio clock
+only when it read from mpv, and the core extrapolated it in host time
+between reads. The startup lead (twice --ao-avfoundation-compressed-lead)
+is fed while AVPlayer prerolls with its playhead at 0, and nothing is read
+again until the playhead has consumed one lead. The last read before that
+saw the playhead at 0, so the clock ran ahead by AVPlayer's preroll latency
+(~0.25 s on Apple TV 4K) for a whole lead, and the first read after it
+stepped the clock back by the same amount while video held a frame.
+
+The sink now re-anchors the clock to the observed playhead on every 50 ms
+tick through ao_set_end_time_ns(), a new pull-AO call that sets
+buffer_state.end_time_ns without reading. While the playhead is parked the
+clock stands still and video waits for the audio to start; afterwards it
+tracks the playhead with no step. A short read no longer leaves an end time
+that covers the unread part of its request. Feed pacing, the leads and the
+startup supervision are unchanged.
+
+diff --git a/audio/out/ao_avfoundation.m b/audio/out/ao_avfoundation.m
+index f95525d..f583a8b 100644
+--- a/audio/out/ao_avfoundation.m
++++ b/audio/out/ao_avfoundation.m
+@@ -327,6 +327,37 @@ static void avp_append_es(struct ao *ao, const uint8_t *payload, int payload_len
+         CMTimeMake(SPDIF_FRAMES_PER_BURST, p->spdif_rate));
+ }
+ 
++// Stream time of the IEC 61937 samples pulled from mpv, minus AU periods that
++// never reached the ES. The IEC 61937 stream is isochronous, so samples pulled
++// measure written stream time exactly. es_pts is unusable as the clock's end
++// point: it is credited a whole burst period the moment a payload lands,
++// which sawtooths the clock by up to 32 ms, and video retires every wrap as a
++// visible skip/hold pair (plezy#1776).
++static int64_t avp_written_ns(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    return CMTimeGetNanoseconds(CMTimeMake(p->pulled_samples, ao->samplerate)) -
++           p->es_dropped_ns;
++}
++
++// Anchor mpv's audio clock to the observed playhead. The clock is the output
++// time of the last sample pulled (buffer_state.end_time_ns), and audio-slaved
++// video follows it frame by frame. ao_read_data() only sets it on a read, and
++// between reads the core extrapolates it in host time. The startup lead is fed
++// while AVPlayer prerolls with its playhead at 0, and nothing is read again
++// until the playhead has consumed a full lead: the clock ran ahead by the
++// preroll latency for that long (~8 s), then stepped back and held a frame for
++// 0.2-0.3 s (plezy#2736). Anchored on every tick instead, the clock stands
++// still while the playhead is parked, so video waits for the audio to start,
++// and a stall or a resume reads the same way. This also replaces the end time
++// a short read leaves behind, which covers the unread part of its request.
++static void avp_anchor_clock(struct ao *ao)
++{
++    ao_set_end_time_ns(ao, mp_time_ns() + avp_written_ns(ao) -
++                           avp_current_time_ns(ao));
++}
++
+ // One read/unwrap pass: pull IEC 61937 data from mpv and append every
+ // complete burst's payload to the elementary stream. Returns false when out
+ // of data, at EOF, or reloading.
+@@ -346,15 +377,9 @@ static bool avp_pull(struct ao *ao)
+     int64_t cur_time_av = avp_current_time_ns(ao);
+     int64_t cur_time_mp = mp_time_ns();
+     int64_t time_delta = CMTimeGetNanoseconds(CMTimeMake(request_sample_count, samplerate));
+-    // The end time handed to ao_read_data becomes mpv's audio clock verbatim
+-    // (buffer_state.end_time_ns), and audio-slaved video follows it frame by
+-    // frame. The IEC 61937 stream is isochronous, so samples pulled measure
+-    // written stream time exactly (minus AU periods that never reached the
+-    // ES). es_pts is unusable here: it is credited a whole burst period the
+-    // moment a payload lands, which sawtooths the clock by up to 32 ms, and
+-    // video retires every wrap as a visible skip/hold pair (plezy#1776).
+-    int64_t written_ns = CMTimeGetNanoseconds(
+-        CMTimeMake(p->pulled_samples, samplerate)) - p->es_dropped_ns;
++    // Anchors the clock for this read; avp_anchor_clock() corrects it once
++    // the pull loop is done.
++    int64_t written_ns = avp_written_ns(ao);
+     void *data[] = {p->stash + p->stash_len};
+     int real_sample_count = ao_read_data(ao, data, request_sample_count,
+         written_ns - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
+@@ -623,6 +648,7 @@ static void feed_avp(struct ao *ao)
+     }
+     if (p->spdif_reload_requested)
+         return;
++    avp_anchor_clock(ao);
+     avp_serve_requests(ao);
+     avp_update_transport(ao);
+ }
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index a7e38f9..7c6f7d8 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -227,6 +227,21 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
+     return pos;
+ }
+ 
++// Set the output time of the last sample handed out by ao_read_data(), without
++// reading more. out_time_ns has the same meaning as in ao_read_data().
++void ao_set_end_time_ns(struct ao *ao, int64_t out_time_ns)
++{
++    struct buffer_state *p = ao->buffer_state;
++    mp_assert(!ao->driver->write);
++
++    mp_mutex_lock(&p->lock);
++    // ao_reset() and ao_set_paused() clear streaming under the lock before
++    // they reach the driver, so a call racing either leaves nothing behind.
++    if (p->streaming)
++        p->end_time_ns = out_time_ns;
++    mp_mutex_unlock(&p->lock);
++}
++
+ // Same as ao_read_data(), but convert data according to *fmt.
+ // fmt->src_fmt and fmt->channels must be the same as the AO parameters.
+ int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index cc51549..f95373f 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -210,6 +210,13 @@ struct ao_driver {
+ 
+ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof, bool pad_silence, bool blocking);
+ 
++// Pull AOs only: set the output time of the last sample handed out by
++// ao_read_data() without reading more, for drivers that observe their device's
++// playhead. Between reads the core extrapolates that time in host time, which
++// is wrong whenever the device clock does not run at rate 1 (a transport still
++// prerolling, a stall, a resume). Ignored unless the AO is streaming.
++void ao_set_end_time_ns(struct ao *ao, int64_t out_time_ns);
++
+ bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
+                          struct mp_chmap *map);
+ bool ao_chmap_sel_adjust2(struct ao *ao, const struct mp_chmap_sel *s,

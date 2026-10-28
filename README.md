@@ -745,16 +745,26 @@ PCM after about 4.4 s. Both messages then add that AVPlayer made no resource
 requests (patch 0041). Run the main loop on the main thread (`NSApplication`,
 `RunLoop.main.run()` or `dispatchMain()`) and drive libmpv from another thread.
 
+The AVPlayer sink anchors mpv's audio clock to AVPlayer's observed playhead on
+every 50 ms feed tick (patch 0042), not only when it reads from mpv. It reads
+nothing for one `--ao-avfoundation-compressed-lead` after its startup fill, so
+before 0042 the clock kept the anchor of a read taken while AVPlayer was still
+prerolling: after every start, seek and audio track change the picture ran
+ahead of the sound by the preroll latency for about 8 s, then held a frame for
+0.2-0.3 s (plezy#2736). Video now waits on its first frame until AVPlayer
+plays, and follows the playhead from there.
+
 Run the AVFoundation fallback regression with
 `bash scripts/test_ao_avfoundation_fallback.sh` (macOS). It includes the
 patched driver and drives a real AVPlayer from a process whose main thread
 never services the main queue, on a clock the test moves: the stream primes,
-the first deadline warns and seeks to the start, the second requests one PCM
+a tick that reads nothing still anchors the clock to the parked playhead, the
+first deadline warns and seeks to the start, the second requests one PCM
 fallback and no output reload, both with the no-resource-requests line; later
-ticks, pause, reset and start request nothing more; uninit is quiet; fresh
-E-AC-3 and AC-3 outputs then open and prime, and a failure after a loader call
-omits that line. CI runs it on pull requests. Pass an already-patched source
-directory to run offline.
+ticks, pause, reset and start request nothing more and anchor nothing; uninit
+is quiet; fresh E-AC-3 and AC-3 outputs then open and prime, and a failure
+after a loader call omits that line. CI runs it on pull requests. Pass an
+already-patched source directory to run offline.
 
 Run the AudioTrack deadline regression with
 `bash scripts/test_audiotrack_timing.sh`. It fetches the pinned mpv revision,
