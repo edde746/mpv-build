@@ -436,7 +436,7 @@ assert_argument "$libass_configure" "--enable-fontconfig" "libass's configure"
 # The tarball ships a licence text for every component its key lists, which
 # package.sh refuses to package without; the build collects them from the
 # trees it compiled, vendored ones included, at the paths they have there.
-python3 "$REPO_ROOT/scripts/licenses.py" check "$temporary/prefix/licenses" --group linux >/dev/null ||
+python3 "$REPO_ROOT/scripts/licenses.py" check --group linux "$temporary/prefix/licenses" >/dev/null ||
   fail "the build plan did not collect a licence text for every linked component"
 [ -f "$temporary/prefix/licenses/shaderc/third_party/glslang/LICENSE" ] ||
   fail "the build plan did not collect the licence of shaderc's vendored glslang"

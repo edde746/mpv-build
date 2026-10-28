@@ -96,7 +96,7 @@ for arch in "${archs[@]}"; do
 		cp -R "prefix/$prefix_name/include/$dir" "$staging/include/"
 	done
 	python3 "$root/scripts/licenses.py" collect "$staging/licenses" "${sources[@]}" "libc++=$toolchain"
-	python3 "$root/scripts/licenses.py" check "$staging/licenses" --group android libc++ rust-std
+	python3 "$root/scripts/licenses.py" check --group android "$staging/licenses" libc++ rust-std
 	asset="libmpv-android-$prefix_name.tar.gz"
 	# Reproducible bytes: the release skips re-uploading an existing
 	# content-addressed name, so a rebuild of the same key MUST produce the

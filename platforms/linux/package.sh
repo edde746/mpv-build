@@ -138,7 +138,7 @@ fi
 
 # One folder per component group.json lists, each holding a text, or no
 # tarball: the libraries above link all of them.
-python3 "$REPO_ROOT/scripts/licenses.py" check "$PREFIX/licenses" --group linux
+python3 "$REPO_ROOT/scripts/licenses.py" check --group linux "$PREFIX/licenses"
 cp -a "$PREFIX/licenses" "$stage/licenses"
 
 mkdir -p "$OUT_DIR"
