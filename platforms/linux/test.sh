@@ -184,6 +184,7 @@ git -C "$libplacebo_repository" add meson.build
 licence "$libplacebo_repository" LICENSE
 licence "$libplacebo_repository" 3rdparty/fast_float/LICENSE-MIT
 licence "$libplacebo_repository" 3rdparty/glad/LICENSE
+licence "$libplacebo_repository" 3rdparty/Vulkan-Headers/LICENSE.md
 git -C "$libplacebo_repository" commit --quiet -m libplacebo
 git -C "$libplacebo_repository" -c tag.gpgsign=false tag release
 libplacebo_commit="$(git -C "$libplacebo_repository" rev-parse HEAD)"
