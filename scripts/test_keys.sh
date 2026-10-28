@@ -1296,6 +1296,13 @@ for group, artifact, pattern, listed_in in (
     check("scripts/symbols.py" in files, f"{group}: scripts/symbols.py is in {artifact}'s {listed_in}")
 print("real group.json: the symbols patterns match the consumer's")
 
+# 21. scripts/licenses.py decides which licence texts every group.json
+#     artifact carries, so each of those groups' driver lists it.
+for path in sorted((root / "platforms").glob("*/group.json")):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    check("scripts/licenses.py" in data["driver"], f"{path.parent.name}: scripts/licenses.py is in its driver")
+print("real group.json: the licence collector keys every group")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)
