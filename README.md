@@ -84,7 +84,9 @@ change (a new Xcode, a miscompile), bump `generation` in that group's
 `toolchain/<group>.txt`. `check_version.yml` opens weekly pull requests that
 move the mpv and FFmpeg pins (and the badges above) and the prebuilt
 dependencies to new upstream tags. `release.yml` tags a commit whose
-`Package.swift` passes `verify`; it builds nothing.
+`Package.swift` passes `verify`; it builds nothing. Each pin's `provenance` in
+`versions.json` says why it is pinned; Windows' `fontconfig` pin is temporary
+and goes once winbuild rebases its fontconfig patches.
 
 ## Building locally
 

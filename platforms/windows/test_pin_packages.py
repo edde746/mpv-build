@@ -350,6 +350,26 @@ class PinPackagesTest(unittest.TestCase):
         self.assertTrue(pin_packages.upstream_patch_step(pinned, "openssl"))
         self.assertEqual(pin_packages.rewrite(pinned, "openssl", pins, True), pinned)
 
+    def test_fontconfig_main_tip_becomes_the_pinned_commit(self):
+        # winbuild builds fontconfig's main tip and git-ams its own patches;
+        # upstream dff5c35 broke them. The rewrite pins the commit they apply
+        # to, replaces upstream's GIT_TAG main and keeps the patches as git apply.
+        text = (TESTDATA / "fontconfig.cmake").read_text(encoding="utf-8")
+        self.assertIn("    GIT_TAG main\n", text)
+        self.assertIn("git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/fontconfig-*.patch", text)
+        pins = self.pins["fontconfig"]
+        pinned = pin_packages.rewrite(text, "fontconfig", pins, True)
+        self.assertIn(
+            "    PATCH_COMMAND ${EXEC} "
+            f'"git reset --hard {pins["commit"]} -q '
+            '&& git apply ${CMAKE_CURRENT_SOURCE_DIR}/fontconfig-*.patch"\n',
+            pinned,
+        )
+        self.assertIn(f"    GIT_TAG {pins['commit']}\n", pinned)
+        self.assertNotIn("GIT_TAG main", pinned)
+        self.assertEqual(keyword_sequence(pinned, {"GIT_TAG"}), ["GIT_TAG"])
+        self.assertEqual(pin_packages.rewrite(pinned, "fontconfig", pins, True), pinned)
+
     def test_unrecognized_upstream_patch_step_fails(self):
         # A winbuild bump that reshapes an extra's patch step must be audited,
         # not silently dropped by the strip.

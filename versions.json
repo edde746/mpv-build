@@ -129,6 +129,18 @@
       ],
       "overrides": {}
     },
+    "fontconfig": {
+      "kind": "git",
+      "version": "main-2026-10-30",
+      "url": "https://gitlab.freedesktop.org/fontconfig/fontconfig",
+      "ref": "main",
+      "commit": "be20036a56b47a8fea5012fc2896beed6481f3ec",
+      "provenance": "Font configuration for libass in the windows build. winbuild builds the main tip and applies its own fontconfig-0001/0002 patches with git am; upstream dff5c35 (\"Add portal indexer APIs\", 2026-10-30) changed src/fcdir.c and the patches no longer apply, so every cold windows build failed at fontconfig's patch step. be20036a (\"Fix deprecation warning for XML_GetCurrentLineNumber\", 2026-10-30) is the newest main commit both patches apply to (git apply --check over the 12 newest main commits, resolved 2026-10-31 from a clone of the repository). Drop this pin once winbuild rebases its fontconfig patches onto a newer main.",
+      "platforms": [
+        "windows"
+      ],
+      "overrides": {}
+    },
     "dav1d": {
       "kind": "git",
       "version": "1.5.4",
