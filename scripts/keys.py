@@ -8,17 +8,33 @@ consumer and gets binaries built from exactly its sources.
 The mechanism is a content key per library: the first 12 hex characters of a
 sha256 over that library's pinned sources, its patch series, the build flags,
 the platform group's canonical platform set, the group's build driver, and the
-group's toolchain generation. Assets carry the key in their name, which makes
-them immutable -- a name that already exists on the group's rolling prerelease
-is the same bytes by construction, so it is never re-uploaded and never
-clobbered.
+group's toolchain generation. Assets carry the key in their name, so a name
+stands for one build's bytes: an asset is never replaced, and never deleted
+while a manifest in this repository's history points at it.
 
 Everything is scoped to a platform group (`--platform-group`, default apple):
 each group has its own self-built libraries, canonical platform tuple, build
-driver, toolchain file `toolchain/<group>.txt`, rolling release
-`binaries-<group>`, and section under `platforms.<group>` in the repo-root
-`artifacts.json` manifest. Only the apple group is active today; the code paths
-are group-generic so android/linux/windows drivers plug into the same table.
+driver, toolchain file `toolchain/<group>.txt`, and section under
+`platforms.<group>` in the repo-root `artifacts.json` manifest.
+
+Releases -- every publish run uploads the assets it built to a release of its
+own, `binaries-<first 12 hex of the commit built>`: a prerelease holding
+nothing else (open-release creates it; release-notes lists its assets once
+the run's manifest has landed). A library whose key did not move keeps the
+assets an older run built, in that run's release, so the manifest names each
+asset's location: wherever an asset name is recorded, an `assetBase` beside
+it is the download base it is served from,
+
+    <assetBase>/<asset>
+
+and an asset recorded without one (everything published before per-run
+releases) is served from its section's `assetBase`, the group's old rolling
+release `binaries-<group>`, which takes no new assets. The record verbs stamp
+`--release`'s base on every asset they record, and `verify` accepts a
+per-asset assetBase only when it names a per-run release. A run that never
+lands its manifest (failed, cancelled or superseded) leaves a release no
+manifest points at; the next run's prune-releases deletes every per-run
+release that no version of artifacts.json or Package.swift on any ref names.
 
 Key-input text (schema 2) -- the exact bytes each key is derived from, one
 line per field, `\\n`-terminated, in this order:
@@ -51,12 +67,24 @@ Two artifact kinds per library:
   <library>-all-<key>-<platform>.zip  the thin install tree, restored by a
                                       later build instead of recompiling
 
+record-frameworks records an apple library as
+
+    platforms.apple.libraries.<library> = {
+      "key": <key>,
+      "prebuilt": {<platform>: {"asset": <name>, "assetBase": <base>}},
+      "frameworks": {<Framework>: {"asset": <name>, "checksum": <sha256>,
+                                   "assetBase": <base>}}
+    }
+
+(an entry recorded before per-run releases spells a prebuilt as the bare
+asset name and carries no assetBase anywhere).
+
 Group.json-defined groups -- the android/linux/windows drivers define their
 group in `platforms/<group>/group.json` instead of the in-code table (apple
 stays in code):
 
     {
-      "assetBase": ".../releases/download/binaries-<group>",
+      "assetBase": ".../releases/download/binaries-<group>",  # legacy base
       "toolchain": "toolchain/<group>.txt",
       "driver": ["platforms/<group>/build.sh", ...],
       "artifacts": {
@@ -98,7 +126,8 @@ authoritative. record-platform renames the unkeyed `<artifact>-<variant><ext>`
     platforms.<group>.libraries.<artifact> = {
       "key": <key>,
       "prebuilt": {<variant>: {"asset": <name>, "checksum": <sha256 of the
-                               asset file, verified by downstream consumers>}}
+                               asset file, verified by downstream consumers>,
+                               "assetBase": <base>}}
     }
 
 in artifacts.json; unlike apple there is no merge step, so record-platform is
@@ -135,7 +164,8 @@ record-packages renames the unkeyed `<artifact><ext>` (the pattern's text
 after {key}) and records
 
     platforms.<group>.libraries.<artifact> = {
-      "key": <key>, "asset": <name>, "checksum": <sha256 of the asset file>
+      "key": <key>, "asset": <name>, "checksum": <sha256 of the asset file>,
+      "assetBase": <base>
     }
 
 `stale`, `verify` and `publish-assets` treat it like any other library.
@@ -152,7 +182,7 @@ included; it is not key input, like assetPattern. The record verbs rename the
 unkeyed `<artifact><pattern after {key}>` with the variant substituted (or
 accept the keyed name) and add
 
-      "symbols": {<variant>: {"asset": <name>, "checksum": <sha256>}}
+      "symbols": {<variant>: {"asset": <name>, "checksum": <sha256>, "assetBase": <base>}}
 
 to the entry; an asset whose symbols zip is missing fails the record. `stale`
 and `verify` demand every variant's symbols, so an entry recorded before its
@@ -192,6 +222,16 @@ VERSIONS_PATH = Path("versions.json")
 PATCHES_ROOT = Path("patches")
 
 CHECKSUM_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# Where this repository's GitHub releases serve their assets: every group's
+# legacy `binaries-<group>` base and every per-run release live under it.
+REPOSITORY_URL = "https://github.com/edde746/mpv-build"
+DOWNLOAD_BASE = f"{REPOSITORY_URL}/releases/download"
+# A publish run's own release: `binaries-` and the first 12 hex characters of
+# the commit it built. The legacy group releases never match.
+RUN_RELEASE_RE = re.compile(r"\Abinaries-[0-9a-f]{12}\Z")
+# A per-run release named anywhere in a manifest or a rendered Package.swift.
+RELEASE_REFERENCE_RE = re.compile(r"/releases/download/(binaries-[0-9a-f]{12})(?![0-9a-f])")
 
 # The artifact-name -> versions.json component rule, including its alias table,
 # lives in scripts/patches.py: `check` needs it to compare the Swift driver's
@@ -242,7 +282,9 @@ class Group:
     # The platforms one publish covers. Part of the key: artifacts for a
     # different platform set are different artifacts.
     platforms: tuple[str, ...]
-    # Where the group's rolling prerelease serves its assets.
+    # The group's legacy rolling prerelease `binaries-<group>`: its section's
+    # assetBase, which serves every asset recorded without an assetBase of its
+    # own (all of them published before per-run releases). Nothing new goes there.
     asset_base: str
     # The build driver sources whose bytes key every library in the group.
     driver_sources: tuple[Path, ...]
@@ -269,7 +311,7 @@ GROUPS = {
     "apple": Group(
         self_built=("libass", "FFmpeg", "libmpv"),
         platforms=("ios", "isimulator", "maccatalyst", "macos", "tvos", "tvsimulator"),
-        asset_base="https://github.com/edde746/mpv-build/releases/download/binaries-apple",
+        asset_base=f"{DOWNLOAD_BASE}/binaries-apple",
         driver_sources=(
             Path("Sources/BuildScripts/Package.swift"),
             Path("Sources/BuildScripts/XCFrameworkBuild/base.swift"),
@@ -675,6 +717,57 @@ def save_manifest(root: Path, manifest: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def run_release_base(release: str | None) -> str:
+    """The download base of a publish run's own release; refuses any other name."""
+    if not RUN_RELEASE_RE.match(release or ""):
+        raise SystemExit(
+            f"{release!r} is not a publish run's release (binaries-<first 12 hex of the "
+            "commit built>); the legacy binaries-<group> releases take no new assets"
+        )
+    return f"{DOWNLOAD_BASE}/{release}"
+
+
+def release_of_base(base: str) -> str:
+    """The release tag a download base serves; refuses a base outside this repository."""
+    tag = base.removeprefix(DOWNLOAD_BASE + "/")
+    if tag == base or not tag or "/" in tag:
+        raise SystemExit(f"{base!r} is not a release download base of {REPOSITORY_URL}")
+    return tag
+
+
+def asset_location(section: dict, recorded) -> str:
+    """The download base one recorded asset is served from.
+
+    `recorded` is whatever names the asset: its {asset, ...} record (a package
+    entry is its own) or, for an apple prebuilt recorded before per-run
+    releases, the bare name. Its own assetBase wins; an asset without one is
+    served from its section's, the group's legacy release.
+    """
+    if isinstance(recorded, dict) and recorded.get("assetBase"):
+        return recorded["assetBase"]
+    return section["assetBase"]
+
+
+def _location_problems(label: str, recorded) -> list[str]:
+    """Why an asset's own assetBase, when it has one, is not a per-run release.
+
+    Only the record verbs write the field, always naming their run's release;
+    anything else would point an asset at a legacy group release, which takes
+    no new assets, or outside this repository.
+    """
+    if not isinstance(recorded, dict) or "assetBase" not in recorded:
+        return []
+    base = recorded["assetBase"]
+    prefix = DOWNLOAD_BASE + "/"
+    if (
+        not isinstance(base, str)
+        or not base.startswith(prefix)
+        or not RUN_RELEASE_RE.match(base[len(prefix):])
+    ):
+        return [f"{label}: assetBase {base!r} is not a per-run release of {REPOSITORY_URL}"]
+    return []
+
+
 def entry_problems(entry: dict | None, key: str, library: str, group: Group) -> list[str]:
     """Why this library's manifest entry cannot be trusted for `key`."""
     if not entry:
@@ -689,11 +782,15 @@ def entry_problems(entry: dict | None, key: str, library: str, group: Group) -> 
 
     prebuilt = entry.get("prebuilt") or {}
     for platform in group.platforms:
-        asset = prebuilt.get(platform)
+        recorded = prebuilt.get(platform)
+        # Recorded before per-run releases: the bare asset name.
+        asset = recorded.get("asset") if isinstance(recorded, dict) else recorded
         if not asset:
             problems.append(f"no prebuilt asset for {platform}")
-        elif asset != prebuilt_asset(library, key, platform):
+            continue
+        if asset != prebuilt_asset(library, key, platform):
             problems.append(f"prebuilt {platform} asset {asset!r} does not match the key")
+        problems += _location_problems(f"prebuilt {platform}", recorded)
 
     frameworks = entry.get("frameworks") or {}
     if not frameworks:
@@ -705,6 +802,7 @@ def entry_problems(entry: dict | None, key: str, library: str, group: Group) -> 
             problems.append(f"{name}: asset {asset!r} does not match the key")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"{name}: checksum {checksum!r} is not a sha256")
+        problems += _location_problems(name, framework)
     return problems
 
 
@@ -721,6 +819,7 @@ def _artifact_entry_problems(entry: dict, key: str, spec: Artifact) -> list[str]
         checksum = entry.get("checksum", "")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"checksum {checksum!r} is not a sha256")
+        problems += _location_problems("asset", entry)
         return problems + _symbols_problems(entry, key, spec)
 
     prebuilt = entry.get("prebuilt") or {}
@@ -735,6 +834,7 @@ def _artifact_entry_problems(entry: dict, key: str, spec: Artifact) -> list[str]
         checksum = recorded.get("checksum", "")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"{variant}: checksum {checksum!r} is not a sha256")
+        problems += _location_problems(f"prebuilt {variant}", recorded)
     return problems + _symbols_problems(entry, key, spec)
 
 
@@ -757,6 +857,7 @@ def _symbols_problems(entry: dict, key: str, spec: Artifact) -> list[str]:
         checksum = recorded.get("checksum", "")
         if not CHECKSUM_RE.match(checksum):
             problems.append(f"symbols {variant}: checksum {checksum!r} is not a sha256")
+        problems += _location_problems(f"symbols {variant}", recorded)
     return problems
 
 
@@ -809,7 +910,7 @@ def frameworks_in_prebuilt(zip_path: Path) -> list[str]:
 
 
 def _record_symbols(
-    release: Path, artifact_id: str, spec: Artifact, key: str, variants: tuple[str, ...]
+    release: Path, artifact_id: str, spec: Artifact, key: str, variants: tuple[str, ...], base: str
 ) -> dict[str, dict[str, str]]:
     """Name the symbols zips of `variants` by content; their manifest entries.
 
@@ -833,7 +934,11 @@ def _record_symbols(
             raise SystemExit(
                 f"{artifact_id}: {variant} was built without its symbols zip {target.name}"
             )
-        entries[variant] = {"asset": target.name, "checksum": _sha256_file(target)}
+        entries[variant] = {
+            "asset": target.name,
+            "checksum": _sha256_file(target),
+            "assetBase": base,
+        }
     return entries
 
 
@@ -844,8 +949,10 @@ def _record_variant(args, root: Path, group: Group) -> int:
     is also the verb that writes the manifest: the publish job collects every
     variant into one release dir and runs this once per variant. An entry
     whose key moved is restarted from scratch, symbols included, so a stale
-    variant can never hide under a fresh key.
+    variant can never hide under a fresh key. Every asset recorded here is
+    served from `--release`, the run's own release.
     """
+    base = run_release_base(args.release)
     release = root / args.release_dir
     keys = all_keys(root, group)
     manifest = load_manifest(root)
@@ -878,10 +985,11 @@ def _record_variant(args, root: Path, group: Group) -> int:
         entry["prebuilt"][args.platform] = {
             "asset": asset,
             "checksum": _sha256_file(target),
+            "assetBase": base,
         }
         if spec.symbols_pattern:
             entry.setdefault("symbols", {}).update(
-                _record_symbols(release, artifact_id, spec, key, (args.platform,))
+                _record_symbols(release, artifact_id, spec, key, (args.platform,), base)
             )
         section["libraries"][artifact_id] = entry
         recorded += 1
@@ -926,8 +1034,10 @@ def cmd_record_packages(args, root: Path, group: Group) -> int:
     """Name every package artifact's asset (and symbols zips) by content and record it.
 
     The build leaves the unkeyed `<artifact><ext>` (or the keyed name) in the
-    release dir; a package this run did not build keeps its recorded entry.
+    release dir; a package this run did not build keeps its recorded entry,
+    and one it built is served from `--release`, the run's own release.
     """
+    base = run_release_base(args.release)
     packages = [
         artifact_id for artifact_id, spec in (group.artifacts or {}).items() if spec.is_package
     ]
@@ -952,10 +1062,15 @@ def cmd_record_packages(args, root: Path, group: Group) -> int:
         if not target.is_file():
             print(f"{artifact_id}: not built in this run, keeping the recorded entry")
             continue
-        entry = {"key": key, "asset": target.name, "checksum": _sha256_file(target)}
+        entry = {
+            "key": key,
+            "asset": target.name,
+            "checksum": _sha256_file(target),
+            "assetBase": base,
+        }
         if spec.symbols_pattern:
             entry["symbols"] = _record_symbols(
-                release, artifact_id, spec, key, spec.symbols_variants
+                release, artifact_id, spec, key, spec.symbols_variants, base
             )
         section["libraries"][artifact_id] = entry
         recorded += 1
@@ -973,6 +1088,7 @@ def cmd_record_frameworks(args, root: Path, group: Group) -> int:
             f"the {group.name} group has no frameworks; record-platform per "
             "variant and record-packages are its record verbs"
         )
+    base = run_release_base(args.release)
     release = root / args.release_dir
     keys = all_keys(root, group)
     manifest = load_manifest(root)
@@ -984,11 +1100,12 @@ def cmd_record_frameworks(args, root: Path, group: Group) -> int:
         for platform in group.platforms:
             asset = prebuilt_asset(library, key, platform)
             if (release / asset).is_file():
-                prebuilt[platform] = asset
+                prebuilt[platform] = {"asset": asset, "assetBase": base}
 
         if not prebuilt:
             # Not compiled in this run: it was restored from its published
-            # artifacts, so its existing entry is still the right one.
+            # artifacts, so its existing entry, and the older release it
+            # names, is still the right one.
             print(f"{library}: not rebuilt, keeping the recorded entry")
             continue
 
@@ -999,7 +1116,7 @@ def cmd_record_frameworks(args, root: Path, group: Group) -> int:
                 f"{', '.join(missing)}; refusing to record a partial entry"
             )
 
-        reference = release / prebuilt[group.platforms[0]]
+        reference = release / prebuilt[group.platforms[0]]["asset"]
         frameworks = {}
         for name in frameworks_in_prebuilt(reference):
             built = release / f"{name}.xcframework.zip"
@@ -1013,6 +1130,7 @@ def cmd_record_frameworks(args, root: Path, group: Group) -> int:
             frameworks[name] = {
                 "asset": addressed.name,
                 "checksum": swiftpm_checksum(addressed),
+                "assetBase": base,
             }
 
         if not frameworks:
@@ -1054,13 +1172,12 @@ def framework_expectations(root: Path, group: Group) -> list[tuple[str, str, str
 
     The one authority for what `render` writes and what `verify` demands: both
     walk this list, so they cannot disagree about a layout the manifest
-    describes.
+    describes. Each framework's URL is its own location (asset_location).
     """
     if group.package is None:
         return []
     manifest = load_manifest(root)
     section = group_section(manifest, group)
-    asset_base = section["assetBase"]
 
     expected = []
     for library in group.self_built:
@@ -1068,9 +1185,8 @@ def framework_expectations(root: Path, group: Group) -> list[tuple[str, str, str
         if not entry:
             continue
         for name, framework in sorted((entry.get("frameworks") or {}).items()):
-            expected.append(
-                (name, f"{asset_base}/{framework['asset']}", framework["checksum"])
-            )
+            base = asset_location(section, framework)
+            expected.append((name, f"{base}/{framework['asset']}", framework["checksum"]))
     return expected
 
 
@@ -1148,47 +1264,43 @@ def cmd_stale(args, root: Path, group: Group) -> int:
     return 0
 
 
-def _wanted_assets(section: dict) -> list[tuple[str, str]]:
-    """(library, asset) for every asset the manifest pins, deduplicated in order.
+def _wanted_assets(section: dict) -> list[tuple[str, str, str]]:
+    """(library, asset, base) for every asset the manifest pins, deduplicated in order.
 
-    Three entry shapes reach here: the apple group records `prebuilt` as a
-    platform -> asset-name map, a group.json group records a variant ->
-    {asset, checksum} map, and a package records its one `asset`. Either of
-    the last two may add a variant -> {asset, checksum} `symbols` map.
+    `base` is where the asset is served from (asset_location). Three entry
+    shapes reach here: the apple group records `prebuilt` as a platform ->
+    {asset, assetBase} map (a bare asset name before per-run releases), a
+    group.json group records a variant -> {asset, checksum, assetBase} map,
+    and a package records its one `asset` in the entry itself. Either of the
+    last two may add a variant -> {asset, checksum, assetBase} `symbols` map.
     """
     wanted = []
     seen = set()
     for library, entry in sorted(section["libraries"].items()):
-        assets = [entry["asset"]] if entry.get("asset") else []
-        for value in sorted((entry.get("prebuilt") or {}).items()):
-            recorded = value[1]
-            assets.append(recorded["asset"] if isinstance(recorded, dict) else recorded)
-        assets += [
-            framework["asset"]
-            for _, framework in sorted((entry.get("frameworks") or {}).items())
-        ]
-        assets += [
-            symbols["asset"] for _, symbols in sorted((entry.get("symbols") or {}).items())
-        ]
-        for asset in assets:
+        records = [entry] if entry.get("asset") else []
+        records += [recorded for _, recorded in sorted((entry.get("prebuilt") or {}).items())]
+        records += [framework for _, framework in sorted((entry.get("frameworks") or {}).items())]
+        records += [symbols for _, symbols in sorted((entry.get("symbols") or {}).items())]
+        for recorded in records:
+            asset = recorded["asset"] if isinstance(recorded, dict) else recorded
             if asset not in seen:
                 seen.add(asset)
-                wanted.append((library, asset))
+                wanted.append((library, asset, asset_location(section, recorded)))
     return wanted
 
 
-def _published_digests(root: Path, group: Group) -> dict[str, str]:
-    """Asset name -> remote sha256 for the group's rolling prerelease."""
-    release = f"binaries-{group.name}"
-    listing = root / "dist" / "published-assets.txt"
+def _published_digests(root: Path, release: str) -> dict[str, str]:
+    """Asset name -> remote sha256 for one release of this repository."""
+    listing = root / "dist" / f"published-{release}.txt"
     listing.parent.mkdir(parents=True, exist_ok=True)
     with listing.open("w", encoding="utf-8") as handle:
-        subprocess.run(
+        result = subprocess.run(
             ["gh", "release", "view", release, "--json", "assets",
              "--jq", '.assets[] | "\\(.name) \\(.digest // "")"'],
             stdout=handle,
-            check=True,
         )
+    if result.returncode != 0:
+        raise SystemExit(f"cannot list the assets of release {release}")
     digests = {}
     for line in listing.read_text(encoding="utf-8").splitlines():
         name, _, digest = line.strip().partition(" ")
@@ -1198,55 +1310,56 @@ def _published_digests(root: Path, group: Group) -> dict[str, str]:
 
 
 def cmd_publish_assets(args, root: Path, group: Group) -> int:
-    """Upload every manifest asset this run built that is not published yet.
+    """Upload every manifest asset this run built to the run's own release.
 
     One implementation for every group, so the verify-on-skip rule below
-    cannot drift between them.
+    cannot drift between them. An asset located in `--release` (which
+    open-release created) is uploaded there unless an earlier attempt of the
+    same run already did; any other asset is served from the older release
+    its entry names and must already be there. Nothing is ever uploaded to
+    any release but the run's own.
     """
-    release = f"binaries-{group.name}"
-    notes = (
-        f"Content-addressed {group.name} build artifacts for the commits on main. "
-        "Asset names encode the sources they were built from, so every asset is "
-        "immutable and is never replaced. The committed manifest pins these URLs; "
-        "deleting an asset breaks every commit and tag that references it."
-    )
-    if subprocess.run(["gh", "release", "view", release], capture_output=True).returncode != 0:
-        subprocess.run(
-            ["gh", "release", "create", release,
-             "--prerelease", "--title", f"Rolling binaries ({group.name})", "--notes", notes],
-            check=True,
+    run_base = run_release_base(args.release)
+    if subprocess.run(["gh", "release", "view", args.release], capture_output=True).returncode != 0:
+        raise SystemExit(
+            f"release {args.release} does not exist; open-release creates it before any upload"
         )
 
-    digests = _published_digests(root, group)
     section = group_section(load_manifest(root), group)
     release_dir = root / args.release_dir
+    digests: dict[str, dict[str, str]] = {}
 
     uploads = []
     missing = []
-    for library, asset in _wanted_assets(section):
+    for library, asset, base in _wanted_assets(section):
+        release = release_of_base(base)
+        if release not in digests:
+            digests[release] = _published_digests(root, release)
         path = release_dir / asset
-        if asset in digests:
-            # Verify-on-skip: an existing content-addressed name must hold
-            # exactly the bytes this run rebuilt, or the checksum recorded in
-            # artifacts.json drifts from what consumers download (this happened
-            # when the archives were not byte-reproducible).
-            remote = digests[asset]
+        if asset in digests[release]:
+            # Verify-on-skip, against the release the manifest names for the
+            # asset: a name that is already published must hold exactly the
+            # bytes this run has for it, or the checksum recorded in
+            # artifacts.json drifts from what consumers download.
+            remote = digests[release][asset]
             if path.is_file() and remote:
                 local = _sha256_file(path)
                 if local != remote:
                     raise SystemExit(
-                        f"{asset}: rebuilt bytes {local} != published digest {remote}; "
-                        "a content-addressed asset must never change bytes -- the "
-                        "archive packaging has lost reproducibility"
+                        f"{asset}: rebuilt bytes {local} != digest {remote} published in "
+                        f"{release}; a content-addressed asset must never change bytes -- "
+                        "the archive packaging has lost reproducibility"
                     )
-                print(f"published {asset} (bytes verified)")
+                print(f"published {asset} in {release} (bytes verified)")
             else:
-                print(f"published {asset}")
+                print(f"published {asset} in {release}")
             continue
-        if path.is_file():
+        if base != run_base:
+            missing.append(f"{library}: {asset} (recorded in {release}, which does not hold it)")
+        elif path.is_file():
             uploads.append(path)
         else:
-            missing.append(f"{library}: {asset}")
+            missing.append(f"{library}: {asset} (not built by this run)")
 
     # A manifest asset that is neither published nor built would leave a dead
     # URL in the rendered package manifest, so refuse to commit that manifest.
@@ -1260,11 +1373,144 @@ def cmd_publish_assets(args, root: Path, group: Group) -> int:
         print("every manifest asset is already published")
         return 0
     for path in uploads:
-        print(f"upload    {path.name}")
-    # No --clobber: an existing name is the same bytes by construction.
+        print(f"upload    {path.name} -> {args.release}")
+    # No --clobber: an existing name was verified above, never replaced.
     subprocess.run(
-        ["gh", "release", "upload", release, *(str(path) for path in uploads)], check=True
+        ["gh", "release", "upload", args.release, *(str(path) for path in uploads)], check=True
     )
+    return 0
+
+
+# ---- per-run releases -----------------------------------------------------
+
+
+def _check_run_commit(release: str, commit: str) -> None:
+    run_release_base(release)
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or release != f"binaries-{commit[:12]}":
+        raise SystemExit(f"{release} is not the release of commit {commit!r}")
+
+
+def _release_notes(commit: str, assets: list[str] | None) -> str:
+    lines = [
+        f"Binaries the publish workflow built from {REPOSITORY_URL}/commit/{commit}.",
+        "",
+        "This prerelease holds only the assets that run built. A library whose sources "
+        "did not change keeps the assets an older run built, in that run's release: "
+        "artifacts.json on the binaries commit that follows this one on main records "
+        "where each asset is served from. Asset names are content-addressed, nothing "
+        "here is ever replaced, and the release is never deleted once a manifest in the "
+        "repository's history points at it.",
+        "",
+    ]
+    if assets is None:
+        lines.append("Assets: being uploaded; the run lists them here once its manifest lands.")
+    else:
+        lines.append("Assets:")
+        lines += [f"- `{name}`" for name in sorted(assets)] or ["- none"]
+    return "\n".join(lines) + "\n"
+
+
+def referenced_releases(root: Path) -> set[str]:
+    """Every per-run release a manifest of this repository points at.
+
+    Reads artifacts.json and Package.swift at every commit reachable from any
+    ref (branches, remote-tracking branches, tags) plus the working tree, so a
+    release that any commit names -- and so any consumer pinning a commit --
+    is found. A shallow clone cannot see that history and is refused.
+    """
+
+    def git(*arguments: str, stdin: str | None = None) -> str:
+        return subprocess.run(
+            ["git", *arguments], cwd=root, input=stdin, capture_output=True, text=True, check=True
+        ).stdout
+
+    if git("rev-parse", "--is-shallow-repository").strip() != "false":
+        raise SystemExit(
+            "a shallow clone cannot see every manifest in history; fetch it in full "
+            "(actions/checkout fetch-depth: 0)"
+        )
+    paths = (str(MANIFEST_PATH), "Package.swift")
+    specs = "".join(
+        f"{commit}:{path}\n" for commit in git("rev-list", "--all").split() for path in paths
+    )
+    blobs = set()
+    for line in git("cat-file", "--batch-check=%(objectname) %(objecttype)", stdin=specs).splitlines():
+        name, _, kind = line.partition(" ")
+        if kind == "blob":
+            blobs.add(name)
+    text = git("cat-file", "--batch", stdin="".join(f"{blob}\n" for blob in sorted(blobs))) if blobs else ""
+    for path in paths:
+        if (root / path).is_file():
+            text += (root / path).read_text(encoding="utf-8")
+    return set(RELEASE_REFERENCE_RE.findall(text))
+
+
+def cmd_prune_releases(args, root: Path, group: Group | None) -> int:
+    """Delete every per-run release no manifest in this repository points at.
+
+    Such a release belongs to a run that never landed its manifest (failed,
+    cancelled or superseded), so nothing can download from it. Only
+    prereleases named `binaries-<12 hex>` are candidates: the legacy group
+    releases and any other release are never touched.
+    """
+    referenced = referenced_releases(root)
+    listing = subprocess.run(
+        ["gh", "release", "list", "--limit", "100000", "--json", "tagName,isPrerelease",
+         "--jq", '.[] | "\\(.tagName) \\(.isPrerelease)"'],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    kept = 0
+    deleted = 0
+    for line in listing.splitlines():
+        tag, _, prerelease = line.strip().partition(" ")
+        if not RUN_RELEASE_RE.match(tag):
+            continue
+        if tag in referenced or prerelease != "true":
+            kept += 1
+            continue
+        print(f"delete    {tag} (no manifest points at it)")
+        subprocess.run(["gh", "release", "delete", tag, "--yes", "--cleanup-tag"], check=True)
+        deleted += 1
+    print(f"per-run releases: {kept} kept, {deleted} deleted")
+    return 0
+
+
+def cmd_open_release(args, root: Path, group: Group | None) -> int:
+    """Create the run's own release, a prerelease of the commit it builds.
+
+    Run after prune-releases, which deletes an earlier attempt's release of
+    the same commit unless a manifest points at it. A release that is still
+    there is therefore published: its commit already has its binaries, and
+    nothing may be added to them.
+    """
+    _check_run_commit(args.release, args.commit)
+    if subprocess.run(["gh", "release", "view", args.release], capture_output=True).returncode == 0:
+        raise SystemExit(
+            f"{args.release} exists already; prune-releases leaves only releases a manifest "
+            "points at, so this commit's binaries are published and nothing may be added"
+        )
+    subprocess.run(
+        ["gh", "release", "create", args.release, "--prerelease", "--target", args.commit,
+         "--title", f"Binaries for {args.commit[:12]}",
+         "--notes", _release_notes(args.commit, None)],
+        check=True,
+    )
+    print(f"opened {args.release}")
+    return 0
+
+
+def cmd_release_notes(args, root: Path, group: Group | None) -> int:
+    """List the source commit and every asset of the run's release in its notes."""
+    _check_run_commit(args.release, args.commit)
+    names = subprocess.run(
+        ["gh", "release", "view", args.release, "--json", "assets", "--jq", ".assets[].name"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    subprocess.run(
+        ["gh", "release", "edit", args.release, "--notes", _release_notes(args.commit, names)],
+        check=True,
+    )
+    print(f"{args.release}: notes list {len(names)} asset(s)")
     return 0
 
 
@@ -1360,12 +1606,15 @@ def main(argv: list[str]) -> int:
     )
     variants.set_defaults(func=cmd_variants)
 
+    run_release_help = "the run's own release, binaries-<first 12 hex of the commit built>"
+
     publish_assets = subparsers.add_parser(
         "publish-assets",
         parents=[common],
-        help="upload the manifest's assets that this run built and nothing published yet",
+        help="upload the manifest's assets that this run built to the run's own release",
     )
     publish_assets.add_argument("--release-dir", default="dist/release")
+    publish_assets.add_argument("--release", required=True, help=run_release_help)
     publish_assets.set_defaults(func=cmd_publish_assets)
 
     record_platform = subparsers.add_parser(
@@ -1375,6 +1624,9 @@ def main(argv: list[str]) -> int:
     )
     record_platform.add_argument("--platform", required=True)
     record_platform.add_argument("--release-dir", default="dist/release")
+    # Only a group.json group records here (apple's legs only rename), so
+    # only those need it; _record_variant refuses to run without it.
+    record_platform.add_argument("--release", help=run_release_help + " (group.json groups)")
     record_platform.set_defaults(func=cmd_record_platform)
 
     record_packages = subparsers.add_parser(
@@ -1383,6 +1635,7 @@ def main(argv: list[str]) -> int:
         help="name the group's package artifacts (e.g. the mpv-android AAR) by content",
     )
     record_packages.add_argument("--release-dir", default="dist/release")
+    record_packages.add_argument("--release", required=True, help=run_release_help)
     record_packages.set_defaults(func=cmd_record_packages)
 
     record_frameworks = subparsers.add_parser(
@@ -1391,7 +1644,24 @@ def main(argv: list[str]) -> int:
         help="name the merged xcframeworks by content and write the manifest",
     )
     record_frameworks.add_argument("--release-dir", default="dist/release")
+    record_frameworks.add_argument("--release", required=True, help=run_release_help)
     record_frameworks.set_defaults(func=cmd_record_frameworks)
+
+    # The release verbs are group-agnostic: one release per run serves every group.
+    prune_releases = subparsers.add_parser(
+        "prune-releases",
+        help="delete every per-run release no manifest in history points at",
+    )
+    prune_releases.set_defaults(func=cmd_prune_releases)
+
+    for name, func, text in (
+        ("open-release", cmd_open_release, "create the run's own prerelease"),
+        ("release-notes", cmd_release_notes, "list the run's commit and assets in its release notes"),
+    ):
+        verb = subparsers.add_parser(name, help=text)
+        verb.add_argument("--release", required=True, help=run_release_help)
+        verb.add_argument("--commit", required=True, help="the full sha of the commit built")
+        verb.set_defaults(func=func)
 
     render = subparsers.add_parser(
         "render", parents=[common], help="point Package.swift at the manifest's assets"

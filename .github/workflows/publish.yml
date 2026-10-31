@@ -2,13 +2,28 @@ name: Publish binaries
 
 # Every push to main publishes the binaries that commit needs, so any commit on
 # main is pinnable. Asset names are content-addressed (they carry a key derived
-# from the sources that produced them), which makes them immutable: an asset
-# that already exists on a rolling prerelease is byte-identical to the one this
-# run would upload, so it is skipped instead of clobbered.
+# from the sources that produced them), so a name stands for one build's bytes.
+#
+# Each run uploads what it built to a release of its own, tagged
+# `binaries-<first 12 hex of the commit built>`: a prerelease, so never
+# Latest, that the `release` job opens and the manifest job's notes list with
+# the source commit. A library whose key did not move keeps its assets in the
+# release of the run that built them (or in the legacy `binaries-<group>`
+# release they went to before per-run releases; those take nothing new), so
+# artifacts.json records each asset's own location: an `assetBase` beside its
+# name, the group section's `assetBase` when it has none (scripts/keys.py
+# documents the schema).
+#
+# A run that never commits its manifest (failed, cancelled, or superseded by a
+# newer push) leaves a release no manifest points at. The next run's `release`
+# job deletes every such release (`keys.py prune-releases`, which reads every
+# artifacts.json and Package.swift in the repository's history) before it
+# opens its own. An orphan never outlives the next publish, and a rebuild can
+# never collide with one: every run uploads into a fresh release.
 #
 # Binaries are sharded per platform group. Each group builds independently,
-# uploads to its own `binaries-<group>` rolling prerelease and contributes only
-# its own `platforms.<group>` section of artifacts.json; one final job splices
+# uploads to the run's release and contributes only its own
+# `platforms.<group>` section of artifacts.json; one final job splices
 # the sections together and commits the manifest. The plan job's group list
 # comes from `scripts/keys.py groups` (which discovers platforms/*/group.json),
 # and the recording step is one matrix job shared by every group.json group --
@@ -20,15 +35,17 @@ name: Publish binaries
 # which ci.yml runs for pull requests too.
 #
 # Only main publishes: a dispatch on any other branch builds, records and
-# verifies everything stale, then uploads no asset and pushes no manifest.
+# verifies everything stale (against the release main would have opened), then
+# opens no release, uploads no asset and pushes no manifest.
 on:
   push:
     branches:
       - main
   workflow_dispatch:
 
-# Two pushes must never interleave asset uploads or commits to main, and a
-# cancelled run could leave the manifest committed without its assets.
+# Two pushes must never interleave asset uploads or commits to main, a
+# cancelled run could leave the manifest committed without its assets, and
+# prune-releases must never see another run's release before its manifest lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -219,11 +236,18 @@ jobs:
       # guess. Empty when every group is already published, which is what skips
       # the build, publish and manifest jobs.
       stale_groups: ${{ steps.stale.outputs.stale_groups }}
+      # This run's own release, `binaries-<first 12 hex of the commit built>`:
+      # the `--release` every record and upload verb takes.
+      release: ${{ steps.release.outputs.release }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate patch series
         run: python3 scripts/patches.py check
+
+      - name: Name this run's release
+        id: release
+        run: echo "release=binaries-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - name: Compute stale libraries per group
         id: stale
@@ -264,6 +288,39 @@ jobs:
           else
             echo "stale_groups=" >> "$GITHUB_OUTPUT"
           fi
+
+  release:
+    name: Open the run's release
+    needs: plan
+    if: needs.plan.outputs.stale_groups != ''
+    permissions:
+      contents: write
+    runs-on: ubuntu-26.04
+    steps:
+      # The full history, every branch and tag: prune-releases keeps any
+      # per-run release that some version of artifacts.json or Package.swift
+      # on any ref points at, so it must see all of them.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Runs that never committed their manifest (failed, cancelled or
+      # superseded) left releases nothing points at; this deletes them,
+      # including an earlier attempt of this same commit. The concurrency group
+      # guarantees no other run on main is between its upload and its push.
+      - name: Delete releases no manifest points at
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/keys.py prune-releases
+
+      - name: Open ${{ needs.plan.outputs.release }}
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/keys.py open-release \
+            --release ${{ needs.plan.outputs.release }} --commit "${GITHUB_SHA}"
 
   build-apple:
     name: Build apple ${{ matrix.name }}
@@ -348,9 +405,10 @@ jobs:
             --platform ${{ matrix.platform_type }} \
             --release-dir dist/release
 
-      # A rebuild of a published key has to reproduce its bytes (publish-assets
-      # refuses anything else), so no file may carry a build's clock. A stamp
-      # publishes fine once and fails only the rebuild, weeks later.
+      # A key names one build's bytes, so no file may carry a build's clock: a
+      # stamp would make every rebuild of a key a different binary, and a
+      # rebuild checked against its published copy (publish-assets'
+      # verify-on-skip) would fail weeks after the first build published fine.
       - name: Check the zips for a build date (${{ matrix.name }})
         run: bash scripts/test_build_date.sh dist/release/*.zip
 
@@ -365,7 +423,9 @@ jobs:
 
   publish-apple:
     name: Publish apple
-    needs: build-apple
+    # The release job opened the run's release (on main), so it must have
+    # succeeded; elsewhere it opened nothing and succeeds all the same.
+    needs: [plan, build-apple, release]
     permissions:
       contents: write
     runs-on: macos-26
@@ -385,7 +445,9 @@ jobs:
         run: bash scripts/test_build_date.sh dist/release/*.zip
 
       - name: Name frameworks by content and record them
-        run: python3 scripts/keys.py record-frameworks --platform-group apple --release-dir dist/release
+        run: |
+          python3 scripts/keys.py record-frameworks --platform-group apple \
+            --release-dir dist/release --release ${{ needs.plan.outputs.release }}
 
       - name: Render Package.swift from the manifest
         run: python3 scripts/keys.py render --platform-group apple
@@ -406,11 +468,13 @@ jobs:
       - name: Link Objective-C-only SwiftPM consumers on iOS and tvOS
         run: bash scripts/test_spatial_swiftpm.sh dist/release
 
-      - name: Upload binaries that are not published yet
+      - name: Upload this run's binaries to ${{ needs.plan.outputs.release }}
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/keys.py publish-assets --platform-group apple
+        run: |
+          python3 scripts/keys.py publish-assets --platform-group apple \
+            --release ${{ needs.plan.outputs.release }}
 
       - name: Upload manifest for the commit job
         uses: actions/upload-artifact@v4
@@ -469,9 +533,9 @@ jobs:
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["libmpv-linux"])')"
           KEY="${KEY}" ARCH=${{ matrix.arch }} bash platforms/linux/container-build.sh
 
-      # A rebuild of a published key has to reproduce its bytes (publish-assets
-      # refuses anything else), so no file may carry a build's clock. Naming
-      # the symbols zip also fails the leg when packaging did not write it.
+      # A key names one build's bytes, so no file may carry a build's clock
+      # (see build-apple). Naming the symbols zip also fails the leg when
+      # packaging did not write it.
       - name: Check the tarball and symbols for a build date (${{ matrix.arch }})
         run: |
           bash scripts/test_build_date.sh dist/release/*.tar.zst \
@@ -590,10 +654,10 @@ jobs:
       - name: Package dev zip and symbols (${{ matrix.arch }})
         run: bash platforms/windows/package.sh ${{ matrix.arch }}
 
-      # A rebuild of a published key has to reproduce its bytes (publish-assets
-      # refuses anything else), so no file may carry a build's clock. The scan
-      # reaches back to 2020: a restored build tree keeps the stamps of the
-      # runs that compiled each package, weeks before this one.
+      # A key names one build's bytes, so no file may carry a build's clock
+      # (see build-apple). The scan reaches back to 2020: a restored build tree
+      # keeps the stamps of the runs that compiled each package, weeks before
+      # this one.
       - name: Check the zips for a build date (${{ matrix.arch }})
         run: bash scripts/test_build_date.sh dist/release/*.zip
 
@@ -620,12 +684,15 @@ jobs:
     # the group name and its artifact glob, both of which come from the group's
     # own group.json (via `keys.py groups`/`variants`) rather than being
     # restated here.
-    needs: [plan, build-android, build-linux, build-windows]
+    needs: [plan, release, build-android, build-linux, build-windows]
     # always(): a group with nothing stale has a *skipped* build job, and a
     # skipped need would otherwise skip this job -- silently publishing nothing
     # and leaving the commit unpinnable. The per-row gate below decides which
-    # rows actually act; `!cancelled()` keeps a superseded run from publishing.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    # rows actually act; `!cancelled()` keeps a superseded run from publishing,
+    # and the release job must have opened the run's release (on main).
+    if: >-
+      always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+      && needs.release.result == 'success'
     permissions:
       contents: write
     runs-on: ubuntu-26.04
@@ -699,21 +766,25 @@ jobs:
             python3 scripts/keys.py record-platform \
               --platform-group ${{ matrix.group }} \
               --platform "${variant}" \
-              --release-dir dist/release
+              --release-dir dist/release \
+              --release ${{ needs.plan.outputs.release }}
           done
           python3 scripts/keys.py record-packages \
             --platform-group ${{ matrix.group }} \
-            --release-dir dist/release
+            --release-dir dist/release \
+            --release ${{ needs.plan.outputs.release }}
 
       - name: Verify manifest matches this commit
         if: steps.stale.outputs.stale == 'true'
         run: python3 scripts/keys.py verify --platform-group ${{ matrix.group }}
 
-      - name: Upload binaries that are not published yet
+      - name: Upload this run's binaries to ${{ needs.plan.outputs.release }}
         if: steps.stale.outputs.stale == 'true' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/keys.py publish-assets --platform-group ${{ matrix.group }}
+        run: |
+          python3 scripts/keys.py publish-assets --platform-group ${{ matrix.group }} \
+            --release ${{ needs.plan.outputs.release }}
 
       - name: Upload manifest for the commit job
         if: steps.stale.outputs.stale == 'true'
@@ -811,7 +882,8 @@ jobs:
       # Rebasing would land a manifest computed from an older tree on top of the
       # newer one, which is exactly the skew `verify` exists to prevent; the
       # queued run for the newer commit publishes the right manifest instead.
-      # The assets uploaded above are content-addressed, so that run reuses them.
+      # Its release is then one no manifest points at, which the queued run's
+      # release job deletes before it rebuilds into a release of its own.
       - name: Push binary manifest
         if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
         uses: EndBug/add-and-commit@v9
@@ -822,3 +894,13 @@ jobs:
             - artifacts.json
           message: "chore: binaries for ${{ steps.changes.outputs.short_sha }} [skip binaries]"
           push: "origin HEAD:${{ github.ref_name }}"
+
+      # Only once the manifest has landed: a run whose push was rejected leaves
+      # an orphan for the next run to delete, and its notes do not matter.
+      - name: List the source commit and assets in ${{ needs.plan.outputs.release }}
+        if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/keys.py release-notes \
+            --release ${{ needs.plan.outputs.release }} --commit "${GITHUB_SHA}"
