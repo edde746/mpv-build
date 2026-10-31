@@ -59,6 +59,11 @@ LIBRARIES = {"libass": ["libass"], "FFmpeg": ["libavcodec", "libavutil"], "libmp
 COMPONENTS = {"libass": "libass", "FFmpeg": "ffmpeg", "libmpv": "mpv"}
 PLATFORMS = ("ios", "isimulator", "maccatalyst", "macos", "tvos", "tvsimulator")
 ASSET_BASE = "https://github.com/edde746/mpv-build/releases/download/binaries-apple"
+# The publish run the record verbs stamp in these scenarios, and a later one.
+RUN_RELEASE = "binaries-0123456789ab"
+RUN_BASE = f"https://github.com/edde746/mpv-build/releases/download/{RUN_RELEASE}"
+LATER_RELEASE = "binaries-ba9876543210"
+LATER_BASE = f"https://github.com/edde746/mpv-build/releases/download/{LATER_RELEASE}"
 
 VERSIONS = {
     "formatVersion": 1,
@@ -203,12 +208,12 @@ def build_artifacts(repo, libraries=LIBRARIES, platforms=PLATFORMS):
     return release
 
 
-def publish(repo, libraries=LIBRARIES, platforms=PLATFORMS):
+def publish(repo, libraries=LIBRARIES, platforms=PLATFORMS, release=RUN_RELEASE):
     """One full pass: build every leg, name artifacts, record, render."""
     for platform in platforms:
         build_artifacts(repo, libraries=libraries, platforms=[platform])
         run(repo, "record-platform", "--platform", platform, "--release-dir", "dist/release")
-    run(repo, "record-frameworks", "--release-dir", "dist/release")
+    run(repo, "record-frameworks", "--release-dir", "dist/release", "--release", release)
     run(repo, "render")
 
 
@@ -462,8 +467,12 @@ with tempfile.TemporaryDirectory() as tmp:
         f"every platform is recorded: {sorted(entry['prebuilt'])}",
     )
     check(
-        entry["prebuilt"]["tvos"] == f"FFmpeg-all-{expected_key}-tvos.zip",
-        f"prebuilt asset name: {entry['prebuilt']['tvos']}",
+        entry["prebuilt"]["tvos"] == {"asset": f"FFmpeg-all-{expected_key}-tvos.zip", "assetBase": RUN_BASE},
+        f"prebuilt asset and its run's release: {entry['prebuilt']['tvos']}",
+    )
+    check(
+        entry["frameworks"]["Libavcodec"]["assetBase"] == RUN_BASE,
+        "a framework is recorded in its run's release",
     )
     asset = entry["frameworks"]["Libavcodec"]["asset"]
     check(asset == f"Libavcodec-{expected_key}.xcframework.zip", f"framework asset name: {asset}")
@@ -477,8 +486,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     package = (repo / "Package.swift").read_text()
     check(
-        f'url: "{ASSET_BASE}/{asset}"' in package,
-        "Package.swift points at the sharded content-addressed asset",
+        f'url: "{RUN_BASE}/{asset}"' in package,
+        "Package.swift points at the content-addressed asset in its run's release",
     )
     check(digest in package, "Package.swift carries the recorded checksum")
     check(
@@ -510,7 +519,7 @@ with tempfile.TemporaryDirectory() as tmp:
     package_path.write_text(good_package, encoding="utf-8")
 
     package_path.write_text(
-        good_package.replace("/binaries-apple/Libmpv-", "/binaries-apple/Libmpv-stale-"),
+        good_package.replace(f"/{RUN_RELEASE}/Libmpv-", f"/{RUN_RELEASE}/Libmpv-stale-"),
         encoding="utf-8",
     )
     result = run(repo, "verify", expect=1)
@@ -535,7 +544,7 @@ with tempfile.TemporaryDirectory() as tmp:
     libmpv = apple_libraries(repo)["libmpv"]["frameworks"]["Libmpv"]
     package_path.write_text(
         good_package.replace(
-            f'url: "{ASSET_BASE}/{libmpv["asset"]}",\n'
+            f'url: "{RUN_BASE}/{libmpv["asset"]}",\n'
             f'            checksum: "{libmpv["checksum"]}"',
             'path: "dist/release/Libmpv.xcframework.zip"',
         ),
@@ -560,7 +569,9 @@ with tempfile.TemporaryDirectory() as tmp:
     for platform in ("ios", "macos"):
         build_artifacts(repo, platforms=[platform])
         run(repo, "record-platform", "--platform", platform, "--release-dir", "dist/release")
-    result = run(repo, "record-frameworks", "--release-dir", "dist/release", expect=1)
+    result = run(
+        repo, "record-frameworks", "--release-dir", "dist/release", "--release", RUN_RELEASE, expect=1
+    )
     check(
         "refusing to record a partial entry" in (result.stdout + result.stderr),
         "a partial platform set is refused",
@@ -584,13 +595,26 @@ with tempfile.TemporaryDirectory() as tmp:
     later.write_text("x\n", encoding="utf-8")
     (repo / "patches/mpv/series.apple").write_text("0025-later.patch\n", encoding="utf-8")
     check(run(repo, "stale").stdout.split() == ["libmpv"], "only libmpv is stale")
-    publish(repo, libraries={"libmpv": ["libmpv"]})
+    # A later run starts from an empty release dir.
+    shutil.rmtree(repo / "dist")
+    publish(repo, libraries={"libmpv": ["libmpv"]}, release=LATER_RELEASE)
     after = apple_libraries(repo)
     check(
         after["FFmpeg"] == before["FFmpeg"],
-        "an untouched library's entry survives a partial publish",
+        "an untouched library's entry survives a partial publish, its older release included",
     )
     check(after["libmpv"] != before["libmpv"], "the rebuilt library's entry is replaced")
+    check(
+        after["libmpv"]["frameworks"]["Libmpv"]["assetBase"] == LATER_BASE
+        and after["FFmpeg"]["frameworks"]["Libavcodec"]["assetBase"] == RUN_BASE,
+        "the rebuilt library is in the later run's release, the untouched one in the earlier's",
+    )
+    package = (repo / "Package.swift").read_text()
+    check(
+        f'{LATER_BASE}/{after["libmpv"]["frameworks"]["Libmpv"]["asset"]}' in package
+        and f'{RUN_BASE}/{after["FFmpeg"]["frameworks"]["Libavcodec"]["asset"]}' in package,
+        "Package.swift renders each framework from its own release",
+    )
     check(
         manifest_of(repo)["platforms"]["android"]
         == {"assetBase": "https://example.invalid", "libraries": {}},
@@ -598,6 +622,50 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     run(repo, "verify")
     print("incremental publish: only the stale library's entry changes")
+
+# 10b. An apple entry recorded before per-run releases (prebuilt as bare names,
+#      no assetBase anywhere) keeps resolving to the group's legacy release,
+#      beside an entry a per-run publish recorded in its own release.
+with tempfile.TemporaryDirectory() as tmp:
+    repo = make_repo(tmp)
+    publish(repo)
+    manifest = manifest_of(repo)
+    for entry in manifest["platforms"]["apple"]["libraries"].values():
+        entry["prebuilt"] = {platform: recorded["asset"] for platform, recorded in entry["prebuilt"].items()}
+        for framework in entry["frameworks"].values():
+            del framework["assetBase"]
+    (repo / "artifacts.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    run(repo, "render")
+    check(run(repo, "stale").stdout.strip() == "", "an entry without assetBase is still published")
+    run(repo, "verify")
+    legacy = apple_libraries(repo)
+    libavcodec = legacy["FFmpeg"]["frameworks"]["Libavcodec"]["asset"]
+    check(
+        f'url: "{ASSET_BASE}/{libavcodec}"' in (repo / "Package.swift").read_text(),
+        "an old framework entry renders from the group's legacy release",
+    )
+
+    later = repo / "patches/mpv/pool/0025-later.patch"
+    later.write_text("x\n", encoding="utf-8")
+    (repo / "patches/mpv/series.apple").write_text("0025-later.patch\n", encoding="utf-8")
+    shutil.rmtree(repo / "dist")
+    publish(repo, libraries={"libmpv": ["libmpv"]}, release=LATER_RELEASE)
+    after = apple_libraries(repo)
+    check(after["FFmpeg"] == legacy["FFmpeg"], "the old entry is left exactly as it was")
+    check(
+        after["libmpv"]["prebuilt"]["ios"]["assetBase"] == LATER_BASE,
+        "the rebuilt library's thin zips are in the later run's release",
+    )
+    package = (repo / "Package.swift").read_text()
+    check(
+        f'url: "{ASSET_BASE}/{libavcodec}"' in package
+        and f'url: "{LATER_BASE}/{after["libmpv"]["frameworks"]["Libmpv"]["asset"]}"' in package,
+        "Package.swift mixes the legacy release and the later run's, one URL per framework",
+    )
+    run(repo, "verify")
+    print("locations: an old entry resolves to the group base, a new one to its run's release")
 
 # 11. group.json-defined groups: platforms/<group>/group.json defines the
 #     group; keys are multi-component; recording is per variant with
@@ -742,9 +810,23 @@ with tempfile.TemporaryDirectory() as tmp:
     # One leg leaves the unkeyed spelling, the other the already-keyed one:
     # record-platform must accept both.
     (release / "libmpv-android-arm64-v8a.tar.gz").write_bytes(b"arm64 bytes")
+    # A group.json group records here, so it has to know the run's release,
+    # and a legacy group release is never one.
     result = run(
         repo, "record-platform", "--platform-group", "android",
-        "--platform", "arm64-v8a", "--release-dir", "dist/release",
+        "--platform", "arm64-v8a", "--release-dir", "dist/release", expect=1,
+    )
+    check("is not a publish run's release" in result.stderr, f"no --release, no record: {result.stderr}")
+    result = run(
+        repo, "record-platform", "--platform-group", "android",
+        "--platform", "arm64-v8a", "--release-dir", "dist/release", "--release", "binaries-android",
+        expect=1,
+    )
+    check("take no new assets" in result.stderr, f"a legacy release takes no new asset: {result.stderr}")
+    check(not (repo / "artifacts.json").exists(), "a refused record writes nothing")
+    result = run(
+        repo, "record-platform", "--platform-group", "android",
+        "--platform", "arm64-v8a", "--release-dir", "dist/release", "--release", RUN_RELEASE,
     )
     arm64_asset = f"libmpv-android-{key}-arm64-v8a.tar.gz"
     check(arm64_asset in result.stdout, "the unkeyed tarball is renamed by content")
@@ -757,6 +839,7 @@ with tempfile.TemporaryDirectory() as tmp:
         recorded["checksum"] == hashlib.sha256(b"arm64 bytes").hexdigest(),
         "the recorded checksum is the sha256 of the asset file",
     )
+    check(recorded["assetBase"] == RUN_BASE, f"the asset is recorded in its run's release: {recorded}")
     check(
         run(repo, "stale", "--platform-group", "android").stdout.split() == ["libmpv-android"],
         "a partially recorded artifact is still stale",
@@ -766,7 +849,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (release / f"libmpv-android-{key}-x86_64.tar.gz").write_bytes(b"x86_64 bytes")
     run(
         repo, "record-platform", "--platform-group", "android",
-        "--platform", "x86_64", "--release-dir", "dist/release",
+        "--platform", "x86_64", "--release-dir", "dist/release", "--release", RUN_RELEASE,
     )
     check(
         run(repo, "stale", "--platform-group", "android").stdout.strip() == "",
@@ -785,13 +868,15 @@ with tempfile.TemporaryDirectory() as tmp:
 
     result = run(repo, "render", "--platform-group", "android")
     check("renders no package manifest" in result.stdout, "render is a no-op for android")
-    run(repo, "record-frameworks", "--platform-group", "android", expect=1)
+    run(repo, "record-frameworks", "--platform-group", "android", "--release", RUN_RELEASE, expect=1)
     run(
         repo, "record-platform", "--platform-group", "android",
-        "--platform", "armeabi-v7a", "--release-dir", "dist/release", expect=1,
+        "--platform", "armeabi-v7a", "--release-dir", "dist/release", "--release", RUN_RELEASE,
+        expect=1,
     )
 
-    # A tampered checksum must fail the gate.
+    # A tampered checksum must fail the gate, and so must an asset located in
+    # a legacy group release or outside the repository's releases.
     manifest = manifest_of(repo)
     entry = manifest["platforms"]["android"]["libraries"]["libmpv-android"]
     good = entry["prebuilt"]["x86_64"]["checksum"]
@@ -802,6 +887,14 @@ with tempfile.TemporaryDirectory() as tmp:
     result = run(repo, "verify", "--platform-group", "android", expect=1)
     check("checksum" in result.stdout, "a bad recorded checksum is reported")
     entry["prebuilt"]["x86_64"]["checksum"] = good
+    for bad_base in (GROUP_JSON["assetBase"], "https://example.invalid/binaries-0123456789ab"):
+        entry["prebuilt"]["x86_64"]["assetBase"] = bad_base
+        (repo / "artifacts.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        result = run(repo, "verify", "--platform-group", "android", expect=1)
+        check("is not a per-run release" in result.stdout, f"assetBase {bad_base} is reported: {result.stdout}")
+    entry["prebuilt"]["x86_64"]["assetBase"] = RUN_BASE
     (repo / "artifacts.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -816,7 +909,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (release / "libmpv-android-arm64-v8a.tar.gz").write_bytes(b"arm64 rebuild")
     run(
         repo, "record-platform", "--platform-group", "android",
-        "--platform", "arm64-v8a", "--release-dir", "dist/release",
+        "--platform", "arm64-v8a", "--release-dir", "dist/release", "--release", RUN_RELEASE,
     )
     entry = manifest_of(repo)["platforms"]["android"]["libraries"]["libmpv-android"]
     check(entry["key"] == new_key, "the entry is re-keyed")
@@ -923,17 +1016,23 @@ with tempfile.TemporaryDirectory() as tmp:
         (release / f"libmpv-android-{variant}.tar.gz").write_bytes(variant.encode())
         run(
             repo, "record-platform", "--platform-group", "android",
-            "--platform", variant, "--release-dir", "dist/release",
+            "--platform", variant, "--release-dir", "dist/release", "--release", RUN_RELEASE,
         )
     check(
         run(repo, "stale", "--platform-group", "android").stdout.split() == ["mpv-android"],
         "recording the tarballs leaves the package stale",
     )
-    result = run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    result = run(
+        repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", RUN_RELEASE,
+    )
     check("not built in this run" in result.stdout, "a package that was not built keeps its entry")
 
     (release / "mpv-android.aar").write_bytes(b"aar bytes")
-    run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    run(
+        repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", RUN_RELEASE,
+    )
     aar = f"mpv-android-{current['mpv-android']}.aar"
     check((release / aar).is_file(), "the unkeyed AAR is renamed by content")
     entry = manifest_of(repo)["platforms"]["android"]["libraries"]["mpv-android"]
@@ -942,6 +1041,7 @@ with tempfile.TemporaryDirectory() as tmp:
             "key": current["mpv-android"],
             "asset": aar,
             "checksum": hashlib.sha256(b"aar bytes").hexdigest(),
+            "assetBase": RUN_BASE,
         },
         f"the package entry: {entry}",
     )
@@ -961,7 +1061,10 @@ with tempfile.TemporaryDirectory() as tmp:
         run(repo, "stale", "--platform-group", "android").stdout.split() == ["mpv-android"],
         "a glue edit makes the package alone stale",
     )
-    result = run(repo, "record-packages", "--platform-group", "apple", "--release-dir", "dist/release")
+    result = run(
+        repo, "record-packages", "--platform-group", "apple", "--release-dir", "dist/release",
+        "--release", RUN_RELEASE,
+    )
     check("no package artifacts" in result.stdout, "record-packages is a no-op for a group without packages")
     print("record-packages: rename, checksum, gate and staleness hold")
 
@@ -1009,7 +1112,8 @@ def write_manifest(repo, manifest):
 def record_android_variant(repo, variant, expect=0):
     return run(
         repo, "record-platform", "--platform-group", "android",
-        "--platform", variant, "--release-dir", "dist/release", expect=expect,
+        "--platform", variant, "--release-dir", "dist/release", "--release", RUN_RELEASE,
+        expect=expect,
     )
 
 
@@ -1059,7 +1163,9 @@ with tempfile.TemporaryDirectory() as tmp:
     )
     entry = manifest_of(repo)["platforms"]["android"]["libraries"]["libmpv-android"]
     check(
-        entry["symbols"] == {"arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols")}},
+        entry["symbols"] == {
+            "arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols"), "assetBase": RUN_BASE}
+        },
         f"the recorded symbols: {entry.get('symbols')}",
     )
     check(
@@ -1112,6 +1218,7 @@ with tempfile.TemporaryDirectory() as tmp:
             "arm64-v8a": {
                 "asset": f"libmpv-android-{new_key}-arm64-v8a-symbols.zip",
                 "checksum": sha256(b"arm64 symbols rebuild"),
+                "assetBase": RUN_BASE,
             }
         },
         f"a key move drops the old key's symbols: {entry['symbols']}",
@@ -1120,13 +1227,15 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # 18. A package's symbols come per input variant (the AAR ships one native
 #     tree per tarball ABI), and publish-assets uploads them with the rest.
-#     publish-assets runs against a fake `gh` that lists a canned release and
-#     logs what it would upload: nothing here reaches GitHub.
+#     publish-assets runs against a fake `gh` that serves canned releases
+#     and logs every call: nothing here reaches GitHub.
 SYMBOLS_PACKAGE_GROUP_JSON = json.loads(json.dumps(PACKAGE_GROUP_JSON))
 SYMBOLS_PACKAGE_GROUP_JSON["artifacts"]["mpv-android"]["symbolsPattern"] = (
     "mpv-android-{key}-{variant}-symbols.zip"
 )
 
+# The releases it serves: {tag: {"assets": [[name, sha256], ...],
+# "prerelease": bool (default true)}}.
 FAKE_GH = """#!{python}
 import json
 import os
@@ -1135,35 +1244,67 @@ import sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\\n")
-if args[:2] == ["release", "view"] and "--json" in args:
-    with open(os.environ["FAKE_GH_PUBLISHED"], encoding="utf-8") as listing:
-        sys.stdout.write(listing.read())
+with open(os.environ["FAKE_GH_RELEASES"], encoding="utf-8") as state:
+    releases = json.load(state)
+if args[:2] == ["release", "list"]:
+    for tag, release in releases.items():
+        sys.stdout.write(tag + " " + str(release.get("prerelease", True)).lower() + "\\n")
+elif args[:2] == ["release", "view"]:
+    release = releases.get(args[2])
+    if release is None:
+        sys.exit(1)
+    if "--json" in args:
+        jq = args[args.index("--jq") + 1]
+        for name, digest in release["assets"]:
+            sys.stdout.write(name + (" sha256:" + digest if "digest" in jq else "") + "\\n")
 """
 
 
-def publish_assets(repo, bin_dir, published, expect=0):
-    """publish-assets against the fake gh; (result, uploaded file names)."""
+def make_fake_gh(bin_dir):
+    (bin_dir / "gh").write_text(FAKE_GH.format(python=sys.executable), encoding="utf-8")
+    (bin_dir / "gh").chmod(0o755)
+
+
+def with_fake_gh(repo, bin_dir, releases, *args, expect=0):
+    """keys.py `args` against the fake gh serving `releases`; (result, its gh calls)."""
     log = bin_dir / "gh.log"
     log.write_text("", encoding="utf-8")
-    listing = bin_dir / "published.txt"
-    listing.write_text("".join(f"{name} sha256:{digest}\n" for name, digest in published), encoding="utf-8")
+    state = bin_dir / "releases.json"
+    state.write_text(json.dumps(releases), encoding="utf-8")
     result = run(
-        repo, "publish-assets", "--platform-group", "android", "--release-dir", "dist/release",
+        repo, *args,
         expect=expect,
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "FAKE_GH_LOG": str(log),
-            "FAKE_GH_PUBLISHED": str(listing),
+            "FAKE_GH_RELEASES": str(state),
         },
     )
+    return result, [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def publish_assets(repo, bin_dir, releases, expect=0, release=RUN_RELEASE):
+    """publish-assets against the fake gh; (result, uploaded names, releases listed)."""
+    result, calls = with_fake_gh(
+        repo, bin_dir, releases,
+        "publish-assets", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", release,
+        expect=expect,
+    )
     uploaded = []
-    for line in log.read_text(encoding="utf-8").splitlines():
-        args = json.loads(line)
+    listed = []
+    for args in calls:
         check(args[:2] in (["release", "view"], ["release", "upload"]), f"unexpected gh call: {args}")
+        if args[:2] == ["release", "view"] and "--json" in args:
+            listed.append(args[2])
         if args[:2] == ["release", "upload"]:
-            check(args[2] == "binaries-android", f"uploads go to the group's release: {args}")
+            check(args[2] == release, f"uploads go only to the run's own release: {args}")
             uploaded += [Path(path).name for path in args[3:]]
-    return result, sorted(uploaded)
+    return result, sorted(uploaded), listed
+
+
+def assets(*pairs):
+    return {"assets": [list(pair) for pair in pairs]}
 
 
 with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_tmp:
@@ -1180,7 +1321,10 @@ with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_
         (release / f"libmpv-android-{variant}.tar.gz").write_bytes(variant.encode())
         record_android_variant(repo, variant)
     (release / "mpv-android.aar").write_bytes(b"aar bytes")
-    result = run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release", expect=1)
+    result = run(
+        repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", RUN_RELEASE, expect=1,
+    )
     check(
         f"mpv-android: arm64-v8a was built without its symbols zip mpv-android-{key}-arm64-v8a-symbols.zip"
         in result.stderr,
@@ -1193,7 +1337,10 @@ with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_
 
     (release / "mpv-android-arm64-v8a-symbols.zip").write_bytes(b"arm64 symbols")
     (release / f"mpv-android-{key}-x86_64-symbols.zip").write_bytes(b"x86_64 symbols")
-    run(repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release")
+    run(
+        repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", RUN_RELEASE,
+    )
     aar = f"mpv-android-{key}.aar"
     arm64_symbols = f"mpv-android-{key}-arm64-v8a-symbols.zip"
     x86_64_symbols = f"mpv-android-{key}-x86_64-symbols.zip"
@@ -1203,9 +1350,10 @@ with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_
             "key": key,
             "asset": aar,
             "checksum": sha256(b"aar bytes"),
+            "assetBase": RUN_BASE,
             "symbols": {
-                "arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols")},
-                "x86_64": {"asset": x86_64_symbols, "checksum": sha256(b"x86_64 symbols")},
+                "arm64-v8a": {"asset": arm64_symbols, "checksum": sha256(b"arm64 symbols"), "assetBase": RUN_BASE},
+                "x86_64": {"asset": x86_64_symbols, "checksum": sha256(b"x86_64 symbols"), "assetBase": RUN_BASE},
             },
         },
         f"the package entry carries its inputs' variants' symbols: {entry}",
@@ -1215,38 +1363,239 @@ with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_
     run(repo, "verify", "--platform-group", "android")
 
     bin_dir = Path(bin_tmp)
-    (bin_dir / "gh").write_text(FAKE_GH.format(python=sys.executable), encoding="utf-8")
-    (bin_dir / "gh").chmod(0o755)
+    make_fake_gh(bin_dir)
     tarball = f"libmpv-android-{current['libmpv-android']}-arm64-v8a.tar.gz"
-    published = [
-        (tarball, sha256(b"arm64-v8a")),
-        (arm64_symbols, sha256(b"arm64 symbols")),
-    ]
-    result, uploaded = publish_assets(repo, bin_dir, published)
+    # An earlier attempt of the same run uploaded two of the assets already.
+    earlier = assets((tarball, sha256(b"arm64-v8a")), (arm64_symbols, sha256(b"arm64 symbols")))
+    result, uploaded, _ = publish_assets(repo, bin_dir, {RUN_RELEASE: earlier})
     check(
         uploaded == sorted([aar, f"libmpv-android-{current['libmpv-android']}-x86_64.tar.gz", x86_64_symbols]),
         f"publish-assets uploads the unpublished assets, symbols included: {uploaded}",
     )
     check(
-        f"published {arm64_symbols} (bytes verified)" in result.stdout,
+        f"published {arm64_symbols} in {RUN_RELEASE} (bytes verified)" in result.stdout,
         f"a published symbols zip is verified against the rebuilt bytes: {result.stdout}",
     )
 
-    result, uploaded = publish_assets(
-        repo, bin_dir, [(tarball, sha256(b"arm64-v8a")), (arm64_symbols, "0" * 64)], expect=1
+    result, uploaded, _ = publish_assets(
+        repo, bin_dir,
+        {RUN_RELEASE: assets((tarball, sha256(b"arm64-v8a")), (arm64_symbols, "0" * 64))},
+        expect=1,
     )
     check(
         f"{arm64_symbols}: rebuilt bytes" in result.stderr and uploaded == [],
         f"a symbols zip whose rebuilt bytes moved stops the upload: {result.stderr.strip()}",
     )
 
+    result, uploaded, _ = publish_assets(repo, bin_dir, {"binaries-android": earlier}, expect=1)
+    check(
+        f"release {RUN_RELEASE} does not exist" in result.stderr and uploaded == [],
+        f"nothing is uploaded before open-release created the run's release: {result.stderr.strip()}",
+    )
+    result, uploaded, _ = publish_assets(
+        repo, bin_dir, {"binaries-android": earlier}, release="binaries-android", expect=1
+    )
+    check(
+        "take no new assets" in result.stderr and uploaded == [],
+        f"a legacy group release is never a run's release: {result.stderr.strip()}",
+    )
+
     (release / x86_64_symbols).unlink()
-    result, uploaded = publish_assets(repo, bin_dir, published, expect=1)
+    result, uploaded, _ = publish_assets(repo, bin_dir, {RUN_RELEASE: earlier}, expect=1)
     check(
         f"mpv-android: {x86_64_symbols}" in result.stderr and uploaded == [],
         f"a symbols zip neither built nor published stops the upload: {result.stderr.strip()}",
     )
     print("symbols: packages record their inputs' variants; publish-assets uploads and verifies them")
+
+# 18b. Each asset resolves to its own release. Tarballs recorded before
+#      per-run releases (no assetBase) are served from the group's legacy
+#      release; the AAR a later run recorded, from that run's. publish-assets
+#      checks a rebuilt copy of a published asset against the release its
+#      entry names (verify-on-skip) and uploads to the run's own alone.
+with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_tmp:
+    repo = make_package_repo(tmp)
+    current = package_keys(repo)
+    release = repo / "dist" / "release"
+    release.mkdir(parents=True)
+    for variant in ("arm64-v8a", "x86_64"):
+        (release / f"libmpv-android-{variant}.tar.gz").write_bytes(variant.encode())
+        record_android_variant(repo, variant)
+    manifest = manifest_of(repo)
+    for recorded in manifest["platforms"]["android"]["libraries"]["libmpv-android"]["prebuilt"].values():
+        del recorded["assetBase"]
+    write_manifest(repo, manifest)
+    (release / "mpv-android.aar").write_bytes(b"aar bytes")
+    run(
+        repo, "record-packages", "--platform-group", "android", "--release-dir", "dist/release",
+        "--release", LATER_RELEASE,
+    )
+    check(android_stale(repo) == [], "a tarball entry without assetBase is still published")
+    run(repo, "verify", "--platform-group", "android")
+    section = manifest_of(repo)["platforms"]["android"]
+    check(
+        all("assetBase" not in recorded for recorded in section["libraries"]["libmpv-android"]["prebuilt"].values()),
+        "recording the package leaves the old tarball entries as they were",
+    )
+    check(section["libraries"]["mpv-android"]["assetBase"] == LATER_BASE, "the AAR is in the later run's release")
+
+    bin_dir = Path(bin_tmp)
+    make_fake_gh(bin_dir)
+    arm64 = f"libmpv-android-{current['libmpv-android']}-arm64-v8a.tar.gz"
+    x86_64 = f"libmpv-android-{current['libmpv-android']}-x86_64.tar.gz"
+    aar = f"mpv-android-{current['mpv-android']}.aar"
+    legacy = assets((arm64, sha256(b"arm64-v8a")), (x86_64, sha256(b"x86_64")))
+    result, uploaded, listed = publish_assets(
+        repo, bin_dir, {"binaries-android": legacy, LATER_RELEASE: assets()}, release=LATER_RELEASE
+    )
+    check(uploaded == [aar], f"only the run's own new asset is uploaded: {uploaded}")
+    check(
+        sorted(set(listed)) == sorted(["binaries-android", LATER_RELEASE]),
+        f"the old entries are looked up in the group's legacy release: {listed}",
+    )
+    check(
+        f"published {arm64} in binaries-android (bytes verified)" in result.stdout,
+        f"verify-on-skip checks an old entry's asset in the legacy release: {result.stdout}",
+    )
+
+    # Verify-on-skip reads the recorded release, not some other copy: the
+    # legacy release's bytes differ even though the run's release holds a
+    # matching copy under the same name.
+    result, uploaded, _ = publish_assets(
+        repo, bin_dir,
+        {
+            "binaries-android": assets((arm64, "0" * 64), (x86_64, sha256(b"x86_64"))),
+            LATER_RELEASE: assets((arm64, sha256(b"arm64-v8a"))),
+        },
+        release=LATER_RELEASE, expect=1,
+    )
+    check(
+        f"{arm64}: rebuilt bytes" in result.stderr and "published in binaries-android" in result.stderr
+        and uploaded == [],
+        f"verify-on-skip uses the recorded release: {result.stderr.strip()}",
+    )
+
+    # An old entry's asset missing from its recorded release is a dead URL; it
+    # is never re-uploaded anywhere to cover for it.
+    result, uploaded, _ = publish_assets(
+        repo, bin_dir,
+        {"binaries-android": assets((x86_64, sha256(b"x86_64"))), LATER_RELEASE: assets()},
+        release=LATER_RELEASE, expect=1,
+    )
+    check(
+        f"{arm64} (recorded in binaries-android, which does not hold it)" in result.stderr and uploaded == [],
+        f"an old asset missing from its release fails the publish: {result.stderr.strip()}",
+    )
+
+    # A third run that rebuilt the AAR's bytes finds them in the later run's
+    # release, where its entry points, and uploads nothing to its own.
+    result, uploaded, listed = publish_assets(
+        repo, bin_dir,
+        {"binaries-android": legacy, LATER_RELEASE: assets((aar, sha256(b"aar bytes"))), RUN_RELEASE: assets()},
+    )
+    check(
+        uploaded == [] and f"published {aar} in {LATER_RELEASE} (bytes verified)" in result.stdout,
+        f"a new entry is verified in its own run's release: {result.stdout}",
+    )
+    print("locations: each asset is listed, verified and uploaded in its own release")
+
+# 18c. The run's release. prune-releases deletes every per-run prerelease that
+#      no artifacts.json or Package.swift on any ref names, and nothing else;
+#      open-release creates the run's prerelease on its commit; release-notes
+#      lists that commit and the release's assets.
+def git(repo, *args):
+    return subprocess.run(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid", *args],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout
+
+
+BRANCH_RELEASE = "binaries-0000000b4a4c"
+ORPHAN_RELEASE = "binaries-00000000dead"
+FINAL_RELEASE = "binaries-0000000f0e1d"
+
+with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as bin_tmp, \
+        tempfile.TemporaryDirectory() as clone_tmp:
+    repo = make_repo(tmp)
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    git(repo, "init", "-q", "-b", "main")
+    publish(repo)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "binaries in the first run's release")
+    # Every library rebuilt by a later run: main's newest manifest no longer
+    # names the first run's release, but its history does.
+    publish(repo, release=LATER_RELEASE)
+    check(RUN_RELEASE not in (repo / "artifacts.json").read_text(), "the newest manifest names only the later run")
+    git(repo, "commit", "-q", "-am", "binaries in the later run's release")
+    git(repo, "checkout", "-q", "-b", "side")
+    (repo / "artifacts.json").write_text(
+        (repo / "artifacts.json").read_text().replace(LATER_RELEASE, BRANCH_RELEASE), encoding="utf-8"
+    )
+    git(repo, "commit", "-q", "-am", "a branch's manifest")
+    git(repo, "checkout", "-q", "main")
+
+    bin_dir = Path(bin_tmp)
+    make_fake_gh(bin_dir)
+    releases = {
+        "binaries-apple": assets(),
+        "1.0.26": assets(),
+        RUN_RELEASE: assets(),
+        LATER_RELEASE: assets(),
+        BRANCH_RELEASE: assets(),
+        ORPHAN_RELEASE: assets(),
+        FINAL_RELEASE: {"assets": [], "prerelease": False},
+    }
+    result, calls = with_fake_gh(repo, bin_dir, releases, "prune-releases")
+    deleted = [args for args in calls if args[:2] == ["release", "delete"]]
+    check(
+        [args[2] for args in deleted] == [ORPHAN_RELEASE],
+        f"only the release no manifest names is deleted: {deleted}",
+    )
+    check(all("--cleanup-tag" in args for args in deleted), "its tag goes with it")
+
+    clone = Path(clone_tmp) / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", f"file://{repo}", str(clone)], check=True, capture_output=True
+    )
+    result, calls = with_fake_gh(clone, bin_dir, releases, "prune-releases", expect=1)
+    check(
+        "shallow" in result.stderr and not any(args[:2] == ["release", "delete"] for args in calls),
+        f"a shallow clone cannot see the history, so it deletes nothing: {result.stderr.strip()}",
+    )
+
+    commit = git(repo, "rev-parse", "HEAD").strip()
+    tag = f"binaries-{commit[:12]}"
+    result, calls = with_fake_gh(repo, bin_dir, releases, "open-release", "--release", tag, "--commit", commit)
+    created = [args for args in calls if args[:2] == ["release", "create"]]
+    check(
+        len(created) == 1 and created[0][2] == tag and "--prerelease" in created[0]
+        and created[0][created[0].index("--target") + 1] == commit,
+        f"open-release creates the commit's prerelease: {created}",
+    )
+    result, calls = with_fake_gh(
+        repo, bin_dir, {**releases, tag: assets()}, "open-release", "--release", tag, "--commit", commit,
+        expect=1,
+    )
+    check(
+        "exists already" in result.stderr and not any(args[:2] == ["release", "create"] for args in calls),
+        f"a release that survived the prune is published and never added to: {result.stderr.strip()}",
+    )
+    result, _ = with_fake_gh(
+        repo, bin_dir, releases, "open-release", "--release", RUN_RELEASE, "--commit", commit, expect=1
+    )
+    check("is not the release of commit" in result.stderr, "the tag must be the commit's")
+
+    result, calls = with_fake_gh(
+        repo, bin_dir, {tag: assets(("b.zip", "1" * 64), ("a.zip", "2" * 64))},
+        "release-notes", "--release", tag, "--commit", commit,
+    )
+    edited = [args for args in calls if args[:2] == ["release", "edit"]]
+    notes = edited[0][edited[0].index("--notes") + 1] if edited else ""
+    check(
+        f"/commit/{commit}" in notes and "`a.zip`" in notes and notes.index("`a.zip`") < notes.index("`b.zip`"),
+        f"the notes name the source commit and list the assets: {notes!r}",
+    )
+    print("releases: orphans pruned, history and branches respected, open and notes hold")
 
 # 19. A malformed symbolsPattern fails loudly.
 with tempfile.TemporaryDirectory() as tmp:

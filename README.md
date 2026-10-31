@@ -7,15 +7,22 @@
 Patched `libmpv` and FFmpeg binaries for the apps Plezy and Tortuga ship, built
 from one set of pins and patch series:
 
-| Platform group | Artifact | Release |
-| --- | --- | --- |
-| apple | XCFrameworks for iOS, tvOS, macOS, Mac Catalyst and the iOS/tvOS simulators, as the SwiftPM product `MPVKit` | [`binaries-apple`](https://github.com/edde746/mpv-build/releases/tag/binaries-apple) |
-| android | `libmpv-android-<key>-<abi>.tar.gz` per ABI, and the `mpv-android-<key>.aar` library | [`binaries-android`](https://github.com/edde746/mpv-build/releases/tag/binaries-android) |
-| linux | `libmpv-linux-<key>-<arch>.tar.zst` (x86_64, aarch64) | [`binaries-linux`](https://github.com/edde746/mpv-build/releases/tag/binaries-linux) |
-| windows | `libmpv-windows-<key>-<arch>.zip` (x86_64, aarch64), the mpv-dev package shape | [`binaries-windows`](https://github.com/edde746/mpv-build/releases/tag/binaries-windows) |
+| Platform group | Artifact |
+| --- | --- |
+| apple | XCFrameworks for iOS, tvOS, macOS, Mac Catalyst and the iOS/tvOS simulators, as the SwiftPM product `MPVKit` |
+| android | `libmpv-android-<key>-<abi>.tar.gz` per ABI, and the `mpv-android-<key>.aar` library |
+| linux | `libmpv-linux-<key>-<arch>.tar.zst` (x86_64, aarch64) |
+| windows | `libmpv-windows-<key>-<arch>.zip` (x86_64, aarch64), the mpv-dev package shape |
 
 Every push to `main` publishes the binaries that commit needs, so any commit on
-`main` can be pinned.
+`main` can be pinned. Each publish run uploads what it built to a prerelease of
+its own, `binaries-<first 12 hex of the commit built>`. Assets published before
+that stay where they are, in
+[`binaries-apple`](https://github.com/edde746/mpv-build/releases/tag/binaries-apple),
+[`binaries-android`](https://github.com/edde746/mpv-build/releases/tag/binaries-android),
+[`binaries-linux`](https://github.com/edde746/mpv-build/releases/tag/binaries-linux) and
+[`binaries-windows`](https://github.com/edde746/mpv-build/releases/tag/binaries-windows),
+which take nothing new.
 
 ## Layout
 
@@ -40,12 +47,12 @@ exist but carry no assets of their own. Consumer notes (pkg-config, AVPlayer
 passthrough, spatial audio): [docs/apple.md](docs/apple.md).
 
 **Android AAR.** Resolve `edde746:mpv-android:<key>@aar` through an Ivy
-repository on the release URL; the key and sha256 come from `artifacts.json`.
-Setup, API and helpers: [docs/android.md](docs/android.md).
+repository on the AAR's release URL; the key, sha256 and release come from
+`artifacts.json`. Setup, API and helpers: [docs/android.md](docs/android.md).
 
 **Linux and Windows.** Download the asset named in `artifacts.json`
-(`platforms.<group>.libraries.libmpv-<group>.prebuilt.<arch>`) from
-`assetBase` and check its sha256. The Windows zip has `libmpv-2.dll`,
+(`platforms.<group>.libraries.libmpv-<group>.prebuilt.<arch>`) from its
+location (below) and check its sha256. The Windows zip has `libmpv-2.dll`,
 `libmpv.dll.a`, `include/mpv/*.h` and `licenses/` at its root
 ([platforms/windows/README.md](platforms/windows/README.md)). The Linux tarball
 holds `lib/`, `include/` and `licenses/`, built in the container
@@ -56,7 +63,15 @@ that commit's `artifacts.json` for every non-SwiftPM asset. Assets are
 content-addressed: the 12-character key in each name is derived from the
 component pins, the resolved patch series, the build flags, the platform
 tuple, the build driver and the toolchain file. A published asset never
-changes.
+changes, and is never deleted while a commit's manifest points at it.
+
+An unchanged library keeps the assets an older run built, so one commit's
+assets can sit in several releases, and the manifest records each asset's
+location: its URL is `<assetBase>/<asset>`, with the `assetBase` beside the
+asset's name (`prebuilt.<variant>.assetBase`, `symbols.<variant>.assetBase`, or
+a package entry's own `assetBase`) or, when it has none, the group section's
+`platforms.<group>.assetBase` (the old `binaries-<group>` release).
+Package.swift already spells out each framework's full URL.
 
 **Known issue for pins.** From the commit that adds mpv patch 0142 (Android:
 queue the subtitle plane as early as the video) onwards, MediaTek Android TV
@@ -70,8 +85,10 @@ here.
 1. A change lands on `main` (from a pull request; `ci.yml` runs the patch
    checks, the host regression tests, the android build and the Demo apps).
 2. `publish.yml` computes each group's keys, builds only what is not published
-   (`keys.py stale`), uploads to the group's rolling release, and records the
-   assets.
+   (`keys.py stale`), uploads what it built to the run's own release
+   `binaries-<sha>`, and records each asset with that release as its location.
+   A run that never commits its manifest leaves a release nothing points at;
+   the next run deletes it before opening its own.
 3. It then commits `artifacts.json` and `Package.swift` to `main` as
    `chore: binaries for <sha> [skip binaries]`. That binaries commit is the one
    to pin: the commit before it has no manifest entries for its new assets.
