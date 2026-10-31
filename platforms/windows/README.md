@@ -137,6 +137,15 @@ Why reusing a restored tree is sound:
   moved pin re-drives exactly its dirty subgraph. There is deliberately no
   skip-if-bootstrapped marker: one existed and recorded intent instead of
   reality, serving stale mingw-w64 headers after a pin move;
+- a patch stamp only stands beside the series and pin that produced it. The
+  patch step's command line is a glob, so an edited patch (a comment
+  included) would not re-run it, and a restored source can sit at the pin
+  unpatched under a stamp that says otherwise (libass on 2026-10-31, which
+  mpv then failed to link against). `build.sh` records each patched
+  package's series digest (pin, patch names and bytes) in
+  `.patch-state/`, and resets the source and drops the package's stamps when
+  the recorded digest differs or the source doesn't hold the bytes the series
+  produces (`pin_packages.py --print-patch-state`);
 - `build.sh` fullcleans and rebuilds mpv on every run: upstream's packaging
   steps embed `BUILDDATE` in their command lines and `postremovebuild`
   deletes build trees after install, so a date rollover would otherwise

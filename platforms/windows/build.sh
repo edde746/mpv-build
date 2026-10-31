@@ -247,6 +247,33 @@ invalidate_stale_pins() {
 }
 invalidate_stale_pins
 
+# A patch stamp says "patched" without saying with what. The patch step's
+# command line is a glob, so editing a staged patch does not re-run it, and a
+# restored source can sit at the pin unpatched while the stamp claims
+# otherwise (2026-10-31: libass rebuilt from such a tree, and mpv failed on its
+# missing ass_set_threads). pin_packages.py decides, per package with a patch
+# step, whether its stamp can stay (see patch_verdict there): a stamped source
+# is reset to the pin and its package purged, so the patch step re-applies the
+# series, when the series digest recorded for the tree is not the current one
+# or the source does not hold the bytes the series produces. The digest is
+# then recorded for the tree the cache will carry forward.
+check_patched_sources() {
+  local state="$BUILD/.patch-state"
+  mkdir -p "$state"
+  python3 "$HERE/pin_packages.py" --winbuild "$SRC" \
+    --print-patch-state "$WORK/src" "$BUILD" "$state" \
+    | while IFS=$'\t' read -r source_name pinned digest reason; do
+    if [[ -n "$reason" ]]; then
+      echo "==> $source_name: $reason; resetting the source and re-applying"
+      git -C "$WORK/src/$source_name" reset --hard -q "$pinned"
+      git -C "$WORK/src/$source_name" clean -qdfx
+      purge_component "$source_name"
+    fi
+    echo "$digest" > "$state/$source_name"
+  done
+}
+check_patched_sources
+
 # A tree restored from the cache holds what earlier runs compiled, clocks
 # included: published key 442b5d101e4c's libmpv-2.dll carries OpenSSL's
 # "built on" date from the run that bumped it, SVT-AV1's __DATE__ __TIME__
