@@ -1,4 +1,4 @@
-// The mpv-android library (README.md, Android library): the JNI glue libplayer.so and its Kotlin API
+// The mpv-android library (docs/android.md): the JNI glue libplayer.so and its Kotlin API
 // (com.edde746.mpv), packed with the libmpv-android tarballs' native set into one self-contained AAR.
 //
 // The tarballs come from -Pmpv.tarballs=<dir>, one libmpv-android-[<key>-]<abi>.tar.gz per ABI; build-aar.sh

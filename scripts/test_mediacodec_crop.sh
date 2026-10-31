@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Compile the production MediaCodec video format parser. Accept an already
-# patched FFmpeg tree for offline use, otherwise fetch the pinned Android source.
+# Compile the production MediaCodec video format parser: MediaTek's configured
+# placeholder crop is ignored, decoded output crops remove buffer padding and
+# follow resolution changes, and Java crop keys and legacy dimensions keep
+# their precedence. Accept an already patched FFmpeg tree for offline use,
+# otherwise fetch the pinned Android source.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

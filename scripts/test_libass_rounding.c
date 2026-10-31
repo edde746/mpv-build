@@ -1,6 +1,10 @@
-// Cross-compile against the patched libass headers and run on ARMv7.
-// VCVT (without R), float narrowing, or dropping the overflow fallback changes
-// outline coordinates. Compare with the device's lrint in every rounding mode.
+// ARMv7 VFP rounding fast path in the patched libass, against the device's
+// lrint: ties, signed limits, non-finite values, subnormals, all four rounding
+// modes and preserved exception state. VCVT (without R), float narrowing, or
+// dropping the overflow fallback changes outline coordinates.
+// Cross-compile with the Android ARMv7 compiler,
+// `-O2 -I<patched-libass>/libass -lm`, and run it on an ARMv7 device; a host
+// build is rejected because it would test the fallback instead.
 #include <fenv.h>
 #include <math.h>
 #include <stdint.h>

@@ -1,4 +1,4 @@
-// The mpv-android library (README.md, Android library): one project, the library itself.
+// The mpv-android library (docs/android.md): one project, the library itself.
 pluginManagement {
     repositories {
         google()

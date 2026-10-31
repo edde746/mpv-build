@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Check the driver's real process capture without downloading or building media libraries.
+# Check the Swift build driver's Utility.launch (Sources/BuildScripts/
+# XCFrameworkBuild/base.swift): short and large child output is captured whole
+# with stderr kept apart, and a failing child's exit code is thrown. Downloads
+# and builds nothing.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work="$(mktemp -d)"

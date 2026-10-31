@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Compile the production video restart/scheduling functions, then reselect video
-# with an already-running AO. Pass a patched source tree for offline use.
+# Compile the production first-frame and A/V scheduling functions
+# (player/video.c, patch 0210), then reselect video with an already-running AO:
+# the A/V delay must start from the written audio timestamp, not wait out the
+# AO's queue (the frozen picture after an iOS background return). Covers queue
+# lengths, speeds 0.5x-2x, audio delay of either sign, negative and missing
+# timestamps, and the unchanged full-seek path. Pass a patched source tree for
+# offline use.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${1:-}"

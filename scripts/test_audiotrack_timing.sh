@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Compile the production AudioTrack clock, write, and reset paths. Pass an
-# already-patched mpv tree for offline use; otherwise fetch and patch the pinned
-# source in a temporary directory. JNI is injected; no Android device is needed.
+# Compile the production AudioTrack clock, write, and reset paths and drive
+# them with deterministic JNI delays: passthrough and PCM clocks, startup,
+# E-AC3 counter wrap, partial writes across stop/reset/recreation, DTS-HD
+# unwrapping, a stalled raw TrueHD track demoting to decode, the 3 s recreate
+# retry, audio-stream-silence feeding and stand-down, and pause/resume without
+# a flush. Pass an already-patched mpv tree for offline use; otherwise fetch
+# and patch the pinned source in a temporary directory. No Android device is
+# needed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

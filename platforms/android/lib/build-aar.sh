@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the mpv-android AAR (README.md, Android library) from four libmpv-android tarballs and leaves it as
+# Builds the mpv-android AAR (docs/android.md) from four libmpv-android tarballs and leaves it as
 # dist/release/mpv-android.aar, the unkeyed name `keys.py record-packages` renames to the group.json
 # assetPattern's content-addressed one, with the debug files of its native libraries beside it as
 # dist/release/mpv-android-<abi>-symbols.zip (renamed the same way, after symbolsPattern). Tarballs whose libraries

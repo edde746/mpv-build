@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Exercise OSD retirement from the final Android patch series. Pass an already-
-# patched mpv tree for offline use; otherwise fetch and patch the pinned source.
+# Exercise live OSD surface replacement from the final Android patch series,
+# without rebuilding the video decoder: retirement waits for the old producer,
+# releases its window exactly once, and starts the replacement without stale
+# requests or timing state. Pass an already-patched mpv tree for offline use;
+# otherwise fetch and patch the pinned source.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source_dir="${1:-}"
