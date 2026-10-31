@@ -58,6 +58,13 @@ component pins, the resolved patch series, the build flags, the platform
 tuple, the build driver and the toolchain file. A published asset never
 changes.
 
+**Known issue for pins.** From the commit that adds mpv patch 0142 (Android:
+queue the subtitle plane as early as the video) onwards, MediaTek Android TV
+boxes such as the Google TV Streamer show subtitles one refresh ahead of the
+picture on HDMI. The cause is the video plane's own lag on that chip
+(plezy#2894), which 0142 no longer masks; it stays until that lag is fixed
+here.
+
 ## Updating
 
 1. A change lands on `main` (from a pull request; `ci.yml` runs the patch

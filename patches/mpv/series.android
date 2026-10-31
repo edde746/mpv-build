@@ -23,3 +23,4 @@
 0139-player-release-vo-mediacodec-frame-with-the-video-chain.patch
 0140-ao-audiotrack-stream-silence-on-passthrough.patch
 0141-ao-audiotrack-pause-without-flushing.patch
+0142-vo-mediacodec-queue-the-osd-plane-as-early-as-the-video.patch
