@@ -252,21 +252,35 @@ invalidate_stale_pins
 # restored source can sit at the pin unpatched while the stamp claims
 # otherwise (2026-10-31: libass rebuilt from such a tree, and mpv failed on its
 # missing ass_set_threads). pin_packages.py decides, per package with a patch
-# step, whether its stamp can stay (see patch_verdict there): a stamped source
-# is reset to the pin and its package purged, so the patch step re-applies the
-# series, when the series digest recorded for the tree is not the current one
-# or the source does not hold the bytes the series produces. The digest is
-# then recorded for the tree the cache will carry forward.
+# step, what its stamped source needs (see patch_verdict there). When the
+# series digest recorded for the tree is not the current one, the source is
+# reset to the pin and the package purged, so it is re-patched and rebuilt.
+# When the series is the recorded one but the source is back at the pin --
+# winbuild's postremovebuild step resets every git source after install --
+# the series is re-applied in place and nothing rebuilds; a source it no
+# longer applies to is purged instead. The digest is then recorded for the
+# tree the cache will carry forward.
 check_patched_sources() {
   local state="$BUILD/.patch-state"
   mkdir -p "$state"
   python3 "$HERE/pin_packages.py" --winbuild "$SRC" \
     --print-patch-state "$WORK/src" "$BUILD" "$state" \
-    | while IFS=$'\t' read -r source_name pinned digest reason; do
-    if [[ -n "$reason" ]]; then
+    | while IFS=$'\t' read -r source_name pinned digest action patches reason; do
+    local src="$WORK/src/$source_name"
+    if [[ "$action" == reapply ]]; then
+      local list=()
+      [[ "$patches" == - ]] || IFS=: read -ra list <<< "$patches"
+      if git -C "$src" reset --hard -q "$pinned" && git -C "$src" apply "${list[@]}"; then
+        echo "==> $source_name: $reason; re-applied its series in place"
+      else
+        action=purge
+        reason="its series no longer applies to its source"
+      fi
+    fi
+    if [[ "$action" == purge ]]; then
       echo "==> $source_name: $reason; resetting the source and re-applying"
-      git -C "$WORK/src/$source_name" reset --hard -q "$pinned"
-      git -C "$WORK/src/$source_name" clean -qdfx
+      git -C "$src" reset --hard -q "$pinned"
+      git -C "$src" clean -qdfx
       purge_component "$source_name"
     fi
     echo "$digest" > "$state/$source_name"
