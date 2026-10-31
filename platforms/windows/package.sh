@@ -10,7 +10,9 @@
 # consumes: libmpv-2.dll, libmpv.dll.a and include/mpv/*.h at the archive ROOT
 # (no wrapping directory), so the plezy windows/CMakeLists.txt swap is a
 # URL + hash change only -- FetchContent and the raw-extraction ARM64 path
-# both keep working unchanged. The name's content key comes from
+# both keep working unchanged. Beside them, licenses/<component>/ holds the
+# licence texts of every component linked into libmpv-2.dll, copied from the
+# source trees the build compiled. The name's content key comes from
 # `scripts/keys.py keys --platform-group windows`.
 set -euo pipefail
 
@@ -68,6 +70,22 @@ mkdir -p "$OUT"
 SYMBOLS="$OUT/libmpv-windows-$ARCH-symbols.zip"
 rm -f "$SYMBOLS"
 python3 "$ROOT/scripts/symbols.py" pack "$SYMBOLS" --pair "$DEV_DIR/libmpv-2.dll" "$PDB"
+
+# Licence texts: pin_packages.py names the components libmpv-2.dll links
+# (mpv's package graph in this build tree, plus the llvm and mingw-w64
+# runtime the toolchain links in) and the source tree each was built from;
+# licenses.py copies their texts and fails on a component without one, and
+# check fails unless every keyed component has its folder.
+LICENCE_SOURCES="$(python3 "$HERE/pin_packages.py" --print-licence-sources "$BUILD")"
+PAIRS=()
+while IFS= read -r pair; do
+  PAIRS+=("$pair")
+done <<< "$LICENCE_SOURCES"
+rm -rf "$DEV_DIR/licenses"
+python3 "$ROOT/scripts/licenses.py" collect --group windows "$DEV_DIR/licenses" "${PAIRS[@]}"
+# --group goes first: the argparse of ubuntu-24.04's Python 3.12.3 gives
+# `check`'s component list nothing when an option follows the directory.
+python3 "$ROOT/scripts/licenses.py" check --group windows "$DEV_DIR/licenses" "${PAIRS[@]%%=*}"
 
 ASSET="$OUT/libmpv-windows-$KEY-$ARCH.zip"
 rm -f "$ASSET"

@@ -51,7 +51,10 @@ EXTRA_COMPONENTS and upstream_patch_step()).
 This script is also the one place that resolves the windows pin: `--print-pins`
 emits the pinned-source inventory build.sh invalidates against, and
 `--print-winbuild-pin` the meta-build checkout's url and commit, which is the
-build-state cache key.
+build-state cache key. It is also the one place that knows winbuild's
+package graph: `--print-licence-sources <build dir>` emits the source tree of
+every component libmpv-2.dll links, which package.sh hands to
+scripts/licenses.py (see linked_packages()).
 
 The script also suppresses the check-git step in cmake/custom_steps.cmake.
 Upstream injects it at configure time whenever a package's source dir already
@@ -67,7 +70,9 @@ at CHECK_GIT_ORIGINAL).
 
 import argparse
 import json
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -462,6 +467,92 @@ def pin_davs2_build_time(text):
     return text.replace(DAVS2_CONFIGURE_END, end, 1)
 
 
+# What libmpv-2.dll links is what `ninja mpv` builds, read from the graph
+# configure wrote: `ninja -t inputs mpv` lists every file the target depends
+# on, transitively, and each ExternalProject step's stamp sits in
+# packages/<pkg>-prefix/src/<pkg>-stamp/. Ninja 1.11 (ubuntu-24.04, where CI
+# builds) and 1.13 print different phony nodes, but both print the stamps.
+STAMP_DIR = re.compile(r"(?:^|/)packages/([^/]+)-prefix/src/\1-stamp/")
+# Built for mpv, yet no code of theirs is in libmpv-2.dll: curl and the
+# libraries only it links (the pinned mpv has no libcurl option, see
+# MPV_MASTER_ONLY_OPTIONS, and ffmpeg's libcurl is off), subrandr (its mpv
+# option is master-only too) and the Vulkan loader (a DLL of its own, which
+# libmpv-2.dll imports). Re-audit when the winbuild or mpv pin moves.
+NOT_LINKED = frozenset({"c-ares", "curl", "libpsl", "nghttp2", "nghttp3", "ngtcp2", "subrandr", "vulkan"})
+# The toolchain packages whose runtime clang links into the DLL statically:
+# llvm (compiler-rt's builtins, libunwind, libc++ and libc++abi) and
+# mingw-w64 (the CRT and winpthreads). build.sh builds them as targets of
+# their own, so mpv's graph does not name them.
+TOOLCHAIN_RUNTIME = ("llvm", "mingw-w64")
+
+
+def source_package(package):
+    """The package whose source `package` builds: x265's per-bit-depth builds
+    (x265-8+10bit, x265-10bit-lib, ...) build x265's, and opus-dnn is the
+    model data opus compiles in."""
+    if package.startswith("x265-"):
+        return "x265"
+    return {"opus-dnn": "opus"}.get(package, package)
+
+
+def linked_packages(inputs):
+    """The winbuild packages whose code libmpv-2.dll links, sorted, from the
+    lines of `ninja -t inputs mpv`; pure for tests."""
+    built = {match.group(1) for line in inputs if (match := STAMP_DIR.search(line.strip()))}
+    if "mpv" not in built:
+        fail(
+            "`ninja -t inputs mpv` named no step of mpv; re-audit the "
+            "licence-source query against the winbuild commit"
+        )
+    return sorted({source_package(package) for package in built} - NOT_LINKED)
+
+
+def licence_folder(package):
+    """The folder of a package's licence texts: the versions.json name of a
+    pinned package (svtav1 is svt-av1), else the package name."""
+    pinned = {Path(relpath).stem: component for component, relpath in EXTRA_COMPONENTS.items()}
+    return pinned.get(package, package)
+
+
+def info_source_dir(text):
+    """The source_dir an ExternalProject <pkg>-gitinfo.txt or <pkg>-urlinfo.txt
+    records, or None; pure for tests."""
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key == "source_dir":
+            return value
+    return None
+
+
+def licence_sources(build, inputs):
+    """(licence folder, source dir) of every component libmpv-2.dll links,
+    sorted, from the winbuild build tree `build` and the lines of `ninja -C
+    <build> -t inputs mpv`.
+
+    The source dir is the one the package's ExternalProject recorded at
+    configure time beside its stamps: <pkg>-gitinfo.txt for a git package
+    (cloned into the shared src/), <pkg>-urlinfo.txt for a tarball (extracted
+    into the per-arch tree). A package whose source tree is missing or empty
+    fails.
+    """
+    rows = []
+    for subdir, packages in (("packages", linked_packages(inputs)), ("toolchain", TOOLCHAIN_RUNTIME)):
+        for package in packages:
+            stamp = Path(build) / subdir / f"{package}-prefix" / "src" / f"{package}-stamp"
+            infos = [path for path in (stamp / f"{package}-gitinfo.txt", stamp / f"{package}-urlinfo.txt")
+                     if path.is_file()]
+            if len(infos) != 1:
+                fail(f"{stamp}: expected exactly one of {package}-gitinfo.txt and {package}-urlinfo.txt")
+            source = info_source_dir(infos[0].read_text(encoding="utf-8"))
+            if source is None:
+                fail(f"{infos[0]}: no source_dir")
+            source = Path(source)
+            if not source.is_dir() or not any(source.iterdir()):
+                fail(f"{package}: no source tree at {source}")
+            rows.append((licence_folder(package), source))
+    return sorted(rows)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
@@ -480,6 +571,12 @@ def main(argv):
         action="store_true",
         help="print the winbuild checkout's url and commit and exit",
     )
+    parser.add_argument(
+        "--print-licence-sources",
+        metavar="BUILD_DIR",
+        help="print <licence folder>=<source dir> for every component libmpv-2.dll "
+        "links, from a built winbuild tree (build/windows/<arch>), and exit",
+    )
     args = parser.parse_args(argv)
 
     repo = Path(args.repo)
@@ -495,6 +592,15 @@ def main(argv):
     if args.print_winbuild_pin:
         pins = resolved_pins(versions, WINBUILD_COMPONENT)
         print(f"{pins['url']}\t{pins['commit']}")
+        return 0
+    if args.print_licence_sources:
+        build = Path(args.print_licence_sources)
+        query = subprocess.run(["ninja", "-C", str(build), "-t", "inputs", "mpv"],
+                               capture_output=True, text=True)
+        if query.returncode != 0:
+            fail(f"ninja -C {build} -t inputs mpv: {query.stderr.strip()}")
+        for folder, source in licence_sources(build, query.stdout.splitlines()):
+            print(f"{folder}={source}")
         return 0
     if not args.winbuild:
         parser.error("--winbuild is required")

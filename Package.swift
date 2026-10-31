@@ -19,6 +19,9 @@ let package = Package(
                 .target(name: "Libluajit", condition: .when(platforms: [.macOS])),
             ],
             path: "Sources/_MPVKit",
+            // The licence texts of every component the package links (scripts/licenses.py apple). Every app that
+            // links MPVKit embeds them in MPVKit__MPVKit.bundle under licenses/<component>/.
+            resources: [.copy("licenses")],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("AVFoundation"),

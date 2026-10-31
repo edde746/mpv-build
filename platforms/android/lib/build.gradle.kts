@@ -5,7 +5,8 @@
 // fetches them (or takes local ones) and names the result. CMake links libplayer.so against the tarball's
 // libmpv.so and libavcodec.so and compiles against its include/ (mpv's and the patched FFmpeg's headers);
 // AGP packages those two with libplayer.so, and every other .so of the tarball, libc++_shared.so included,
-// is staged below as a jniLibs source.
+// is staged below as a jniLibs source. The tarballs' licence texts, with the library's own, become the AAR's
+// assets/licenses/<component>/.
 import org.gradle.api.file.FileSystemOperations
 import javax.inject.Inject
 
@@ -76,6 +77,58 @@ val stageMpvJniLibs = tasks.register<StageMpvJniLibs>("stageMpvJniLibs") {
     outputDir.set(layout.buildDirectory.dir("mpv-jnilibs"))
 }
 
+/**
+ * assets/licenses/<component>/: the licence texts the tarballs carry for everything linked into their libraries,
+ * which every ABI's tarball must carry alike, and mpv-android/, this library's own: the NOTICE of the code it
+ * derives from and mpv-build's licence.
+ */
+abstract class StageMpvLicenses : DefaultTask() {
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val nativeRoot: DirectoryProperty
+
+    /** The ABIs in group.json order; the first one's texts are shipped. */
+    @get:Input
+    abstract val variants: ListProperty<String>
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val ownTexts: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun stage() {
+        fun texts(abi: String): Map<String, ByteArray> {
+            val dir = nativeRoot.get().asFile.resolve("$abi/licenses")
+            return dir.walkTopDown().filter { it.isFile }
+                .associate { it.relativeTo(dir).invariantSeparatorsPath to it.readBytes() }
+        }
+        val (first, others) = variants.get().let { it.first() to it.drop(1) }
+        val shipped = texts(first)
+        if (shipped.isEmpty()) throw GradleException("the $first tarball carries no licenses/: it predates them")
+        for (abi in others) {
+            val texts = texts(abi)
+            if (texts.keys != shipped.keys || texts.any { (path, bytes) -> !bytes.contentEquals(shipped[path]) }) {
+                throw GradleException("the $abi tarball's licenses/ differ from the $first one's")
+            }
+        }
+        val out = outputDir.get().asFile.resolve("licenses")
+        out.deleteRecursively()
+        for ((path, bytes) in shipped) out.resolve(path).apply { parentFile.mkdirs() }.writeBytes(bytes)
+        for (text in ownTexts) text.copyTo(out.resolve("mpv-android/${text.name}"))
+    }
+}
+
+val stageMpvLicenses = tasks.register<StageMpvLicenses>("stageMpvLicenses") {
+    dependsOn(extractMpvNatives)
+    nativeRoot.set(mpvNatives)
+    variants.set(abis)
+    ownTexts.from("NOTICE", "../../../LICENSE")
+    outputDir.set(layout.buildDirectory.dir("mpv-assets"))
+}
+
 android {
     namespace = "com.edde746.mpv"
     compileSdk = 36
@@ -119,6 +172,7 @@ android {
 androidComponents {
     onVariants { variant ->
         variant.sources.jniLibs?.addGeneratedSourceDirectory(stageMpvJniLibs, StageMpvJniLibs::outputDir)
+        variant.sources.assets?.addGeneratedSourceDirectory(stageMpvLicenses, StageMpvLicenses::outputDir)
     }
 }
 

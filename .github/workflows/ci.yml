@@ -162,6 +162,29 @@ jobs:
           shutil.rmtree(work, ignore_errors=True)
           PY
 
+  apple-licences:
+    name: Apple licence texts
+    # Sources/_MPVKit/licenses, which every app linking MPVKit embeds, must be
+    # what scripts/licenses.py apple collects from the sources versions.json
+    # pins: a pin or rule that moves a text fails here until they are
+    # regenerated and committed.
+    permissions:
+      contents: read
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-std's text comes from this toolchain's share/doc/rust, which is the
+      # same on every host; its cargo resolves libdovi's crates.
+      - name: Install the pinned Rust toolchain
+        run: |
+          rust_version="$(sed -n 's/^rust=//p' toolchain/apple.txt)"
+          test -n "$rust_version"
+          rustup toolchain install "$rust_version" --profile minimal --no-self-update
+
+      - name: Check the Apple licence texts
+        run: python3 scripts/licenses.py apple --check
+
   android-plan:
     name: Android plan
     permissions:

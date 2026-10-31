@@ -19,6 +19,13 @@
 #                 series adds): what the mpv-android AAR's JNI glue
 #                 (platforms/android/lib) and any other native consumer of
 #                 these libraries compile against, so nobody vendors them
+#   licenses/<component>/
+#                 the licence texts of every component linked into lib/,
+#                 copied from the sources download.sh fetched (deps/<name>,
+#                 libdovi with the crates it links), for libc++ from the NDK
+#                 and for rust-std (the Rust standard library in libdovi.a)
+#                 from the pinned Rust toolchain; packaging fails when one of
+#                 them has none
 #
 # The mpv-android AAR (platforms/android/lib/build-aar.sh) is assembled from
 # these tarballs; a consumer that needs only the native trees unpacks them
@@ -30,8 +37,18 @@ set -euo pipefail
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 root="$( cd ../.. && pwd )"
 
+. ./include/depinfo.sh
 . ./include/loadarch.sh
 . ./include/path.sh
+
+# libdovi's crates are read through cargo, at the compiler the build used,
+# whose standard library libdovi.a carries (rust-std, its notices).
+RUSTUP_TOOLCHAIN="$(sed -n 's/^rust=//p' "$root/toolchain/android.txt")"
+export RUSTUP_TOOLCHAIN
+sources=("rust-std=$(rustc --print sysroot)/share/doc/rust")
+for component in $components; do
+	sources+=("$component=deps/$component")
+done
 
 arch=
 while [ $# -gt 0 ]; do
@@ -78,6 +95,8 @@ for arch in "${archs[@]}"; do
 	for dir in "${ffmpeg_headers[@]}"; do
 		cp -R "prefix/$prefix_name/include/$dir" "$staging/include/"
 	done
+	python3 "$root/scripts/licenses.py" collect "$staging/licenses" "${sources[@]}" "libc++=$toolchain"
+	python3 "$root/scripts/licenses.py" check --group android "$staging/licenses" libc++ rust-std
 	asset="libmpv-android-$prefix_name.tar.gz"
 	# Reproducible bytes: the release skips re-uploading an existing
 	# content-addressed name, so a rebuild of the same key MUST produce the
@@ -85,7 +104,7 @@ for arch in "${archs[@]}"; do
 	# bytes. Fixed order, owners and mtimes; gzip -n drops its own timestamp.
 	tar --sort=name --owner=0 --group=0 --numeric-owner \
 		--mtime='2020-01-01 00:00:00 UTC' \
-		-C "$staging" -cf - lib include | gzip -n -9 > "$release_dir/$asset"
+		-C "$staging" -cf - lib include licenses | gzip -n -9 > "$release_dir/$asset"
 	rm -rf "$staging"
 	echo "packaged $asset"
 done
