@@ -4,46 +4,46 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
       "libraries": {
         "libmpv-android": {
-          "key": "65eaeb03d72b",
+          "key": "5c4aa0879a36",
           "prebuilt": {
             "arm64-v8a": {
-              "asset": "libmpv-android-65eaeb03d72b-arm64-v8a.tar.gz",
-              "checksum": "15123c2ee60b9165f42a4a4b537164efc6512729aaec0e21b91906187389c149"
+              "asset": "libmpv-android-5c4aa0879a36-arm64-v8a.tar.gz",
+              "checksum": "314ab661c5b6647e3e8db6fb940a5e8c5a3f0b18eb987f7efabfd80fe65911d6"
             },
             "armeabi-v7a": {
-              "asset": "libmpv-android-65eaeb03d72b-armeabi-v7a.tar.gz",
-              "checksum": "cf1e35e6a81a73b1c9d4da0927cc01c61ffa1f83fb27b9dbfd999b34bc3f7c38"
+              "asset": "libmpv-android-5c4aa0879a36-armeabi-v7a.tar.gz",
+              "checksum": "f3d07743bc0a801c2f2b6e188cdd6c56dac51294cb481692599fd2361a0fc783"
             },
             "x86": {
-              "asset": "libmpv-android-65eaeb03d72b-x86.tar.gz",
-              "checksum": "8de8756246bc7d607784c606fbcdb313e0447ff2591d1139e122032a29b5fc00"
+              "asset": "libmpv-android-5c4aa0879a36-x86.tar.gz",
+              "checksum": "84941332c6a75ac0be0949a21e7c1b6a35b792f2a559d04d7c817e34a984c858"
             },
             "x86_64": {
-              "asset": "libmpv-android-65eaeb03d72b-x86_64.tar.gz",
-              "checksum": "74373d648cdd97277cf0366303d1fa822029b67d57bbd1bb65c5c29662b86869"
+              "asset": "libmpv-android-5c4aa0879a36-x86_64.tar.gz",
+              "checksum": "3b15a200e0c91c0d8d23993c44422d7ec7ccdfda7aa89d4cc11fc92eef56810b"
             }
           }
         },
         "mpv-android": {
-          "asset": "mpv-android-8fa5f2dff4ee.aar",
-          "checksum": "3d2f7b2183246ef6839f66ba5b885f25d8499c6b48321dff89ddbcf23a036a29",
-          "key": "8fa5f2dff4ee",
+          "asset": "mpv-android-b1416cbacfcb.aar",
+          "checksum": "3fc2f23e7f17b5168e6a39e3b3a95dc0553e00dd69fc714e4d4e311dba147f09",
+          "key": "b1416cbacfcb",
           "symbols": {
             "arm64-v8a": {
-              "asset": "mpv-android-8fa5f2dff4ee-arm64-v8a-symbols.zip",
-              "checksum": "0a47a92ca5bea431a7b37dabe28040d3326c6b0f0ccaaa1fb99b3fc5c9749d2b"
+              "asset": "mpv-android-b1416cbacfcb-arm64-v8a-symbols.zip",
+              "checksum": "6f422547d30bb2b2bf2d7faf80b94787e6e7d9845570fb95576d76c9ff6c9507"
             },
             "armeabi-v7a": {
-              "asset": "mpv-android-8fa5f2dff4ee-armeabi-v7a-symbols.zip",
-              "checksum": "1b00f7bc67aff4339413e8e0ffb9ee631c928b4edd74020e1ef3896cbadb05b3"
+              "asset": "mpv-android-b1416cbacfcb-armeabi-v7a-symbols.zip",
+              "checksum": "ec3bfdb5b2a059225c79494793d72ee3a9275373030a526998a7b0afbe98b5e7"
             },
             "x86": {
-              "asset": "mpv-android-8fa5f2dff4ee-x86-symbols.zip",
-              "checksum": "330c5ba67085ba488395e97ae7beb3f0510a0ecba77aef3cfaa015d9b4fb9fc0"
+              "asset": "mpv-android-b1416cbacfcb-x86-symbols.zip",
+              "checksum": "bf8ca637a44c8e237b1bc677a5f71e5a90264e97d359977f22c1ff5ddbad6be6"
             },
             "x86_64": {
-              "asset": "mpv-android-8fa5f2dff4ee-x86_64-symbols.zip",
-              "checksum": "d5c0d46fa90e1af83b15eff9c55ca52c02f94ec268b3bd25a8c4d5e2af21fde5"
+              "asset": "mpv-android-b1416cbacfcb-x86_64-symbols.zip",
+              "checksum": "e20a6fd6f6c387182f1288b04396c75133fa095342b14631a40aad5958965568"
             }
           }
         }
