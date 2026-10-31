@@ -11,7 +11,10 @@ Run: python3 platforms/windows/test_pin_packages.py
 
 import hashlib
 import json
+import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -588,6 +591,183 @@ class PinPackagesTest(unittest.TestCase):
         text = "method=url\nsource_dir=/w/x86_64/packages/lzo-prefix/src/lzo\nwork_dir=/w/x86_64\n"
         self.assertEqual(pin_packages.info_source_dir(text), "/w/x86_64/packages/lzo-prefix/src/lzo")
         self.assertIsNone(pin_packages.info_source_dir("method=git\nwork_dir=/w/src\n"))
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def shell_functions(names):
+    """The named function definitions, verbatim, from build.sh."""
+    text = (HERE / "build.sh").read_text(encoding="utf-8")
+    bodies = []
+    for name in names:
+        found = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
+        assert found, f"build.sh: no function {name}"
+        bodies.append(found.group(0))
+    return "".join(bodies)
+
+
+class PatchStateTest(unittest.TestCase):
+    """A warm build's cached libass source against its patch stamp: a checkout
+    pinned by the real main(), a libass source whose pin this test commits,
+    and a one-patch libass series staged where main() stages the real one."""
+
+    COMMENT = "Say new, because the old word was wrong."
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="patch-state-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.winbuild = self.tmp / "mpv-winbuild-cmake"
+        for fixture, relative in CHECKOUT_FILES.items():
+            path = self.winbuild / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(TESTDATA / fixture, path)
+        self.assertEqual(pin_packages.main(["--winbuild", str(self.winbuild), "--repo", str(REPO)]), 0)
+
+        self.sources = self.tmp / "src"
+        self.source = self.sources / "libass"
+        self.source.mkdir(parents=True)
+        git(self.source, "init", "-q")
+        (self.source / "a.c").write_text("old\n", encoding="utf-8")
+        git(self.source, "add", "a.c")
+        git(self.source, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pin")
+        self.commit = git(self.source, "rev-parse", "HEAD")
+
+        # This repo's versions.json with libass pinned to the test's commit,
+        # beside a copy of the driver, so its default --repo finds it.
+        self.repo = self.tmp / "repo"
+        (self.repo / "platforms/windows").mkdir(parents=True)
+        shutil.copyfile(HERE / "pin_packages.py", self.repo / "platforms/windows/pin_packages.py")
+        self.versions = json.loads((REPO / "versions.json").read_text(encoding="utf-8"))
+        libass = self.versions["components"]["libass"]
+        libass.setdefault("overrides", {}).setdefault("windows", {})["commit"] = self.commit
+        (self.repo / "versions.json").write_text(json.dumps(self.versions), encoding="utf-8")
+
+        packages = self.winbuild / "packages"
+        for staged in packages.glob("libass-*.patch"):
+            staged.unlink()
+        self.patch = packages / "libass-0001-say-new.patch"
+        self.write_patch(self.COMMENT)
+
+        self.build = self.tmp / "build" / "x86_64"
+        self.stamps = self.build / "packages/libass-prefix/src/libass-stamp"
+        self.state = self.build / ".patch-state"
+        self.state.mkdir(parents=True)
+
+    def write_patch(self, comment):
+        self.patch.write_text(
+            "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+            "Subject: [PATCH] a: say new\n\n"
+            f"{comment}\n---\n" + PATCH, encoding="utf-8")
+
+    def patched_warm_tree(self):
+        """What a run that patched libass leaves for the cache: the series
+        applied to the source and the patch step's stamps."""
+        git(self.source, "apply", str(self.patch))
+        self.stamps.mkdir(parents=True)
+        for step in ("download", "patch", "configure", "build", "install", "done"):
+            (self.stamps / f"libass-{step}").touch()
+
+    def libass_state(self):
+        rows = pin_packages.patch_state(self.winbuild, self.versions, self.sources,
+                                        self.build, self.state)
+        return {row[0]: row for row in rows}["libass"]
+
+    def record(self, digest):
+        (self.state / "libass").write_text(f"{digest}\n", encoding="utf-8")
+
+    def test_patch_sets_digest_covers_comments_and_the_pin(self):
+        sets = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        _, commit, digest, patches = sets["libass"]
+        self.assertEqual((commit, patches), (self.commit, [self.patch]))
+        self.write_patch("A reworded comment.")
+        reworded = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        self.assertNotEqual(reworded["libass"][2], digest)
+        self.versions["components"]["libass"]["overrides"]["windows"]["commit"] = "0" * 40
+        moved = {row[0]: row for row in pin_packages.patch_sets(self.winbuild, self.versions)}
+        self.assertNotIn(moved["libass"][2], (digest, reworded["libass"][2]))
+        # Only packages with a patch step have a series to check.
+        self.assertNotIn("mingw-w64", sets)
+
+    def test_holds_patches_compares_the_touched_files(self):
+        self.assertFalse(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        git(self.source, "apply", str(self.patch))
+        (self.source / "build-output.o").write_text("objects\n", encoding="utf-8")
+        self.assertTrue(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        # The source's own index is left alone.
+        self.assertEqual(git(self.source, "diff", "--cached", "--name-only"), "")
+        (self.source / "a.c").write_text("newer\n", encoding="utf-8")
+        self.assertFalse(pin_packages.holds_patches(self.source, self.commit, [self.patch]))
+        self.assertFalse(pin_packages.holds_patches(self.tmp / "missing", self.commit, [self.patch]))
+
+    def test_patch_verdict(self):
+        verdict = pin_packages.patch_verdict
+        self.assertIsNone(verdict(False, "other", "d", False))
+        self.assertIsNone(verdict(True, "d", "d", True))
+        self.assertIsNone(verdict(True, None, "d", True))
+        self.assertIn("series or pin changed", verdict(True, "other", "d", True))
+        self.assertIn("does not hold", verdict(True, "d", "d", False))
+        self.assertIn("does not hold", verdict(True, None, "d", False))
+
+    def test_patched_packages_reads_patch_stamps_only(self):
+        self.patched_warm_tree()
+        other = self.build / "packages/mpv-prefix/src/mpv-stamp"
+        other.mkdir(parents=True)
+        (other / "mpv-download").touch()
+        self.assertEqual(pin_packages.patched_packages(self.build), {"libass"})
+
+    def test_stamp_never_stands_beside_another_series(self):
+        _, _, digest, reason = self.libass_state()
+        self.assertEqual(reason, "", "no stamp: the patch step runs anyway")
+        self.patched_warm_tree()
+        self.assertEqual(self.libass_state()[3], "", "a tree cached before digests were kept")
+        self.record(digest)
+        self.assertEqual(self.libass_state()[3], "")
+        # The 2026-10-31 cache: stamped, but the source sits at the pin unpatched.
+        git(self.source, "checkout", "-q", "--", "a.c")
+        self.assertIn("does not hold", self.libass_state()[3])
+        git(self.source, "apply", str(self.patch))
+        self.record("a digest of another series")
+        self.assertIn("series or pin changed", self.libass_state()[3])
+
+    def test_warm_build_reapplies_libass_after_a_comment_change(self):
+        # The demo: build.sh's own check_patched_sources over a warm tree.
+        # Run 1 leaves the series applied and stamped and records its digest;
+        # a comment-only edit to the staged libass patch then makes the next
+        # warm run reset libass to the pin and drop its stamps, so the patch
+        # step re-applies the series, and a third run keeps what that did.
+        script = shell_functions(["drop_stamps", "purge_component", "check_patched_sources"])
+
+        def warm_run():
+            env = dict(os.environ, HERE=str(self.repo / "platforms/windows"), SRC=str(self.winbuild),
+                       WORK=str(self.tmp), BUILD=str(self.build))
+            run = subprocess.run(["bash", "-c", f"set -euo pipefail\n{script}check_patched_sources\n"],
+                                 env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            return run.stdout
+
+        self.patched_warm_tree()
+        self.assertNotIn("libass", warm_run())
+        recorded = (self.state / "libass").read_text(encoding="utf-8")
+        self.assertEqual(warm_run(), "", "an unchanged series keeps the warm tree")
+
+        self.write_patch("Say new; the comment is all that changed.")
+        out = warm_run()
+        self.assertIn("==> libass: its patch series or pin changed since it was patched; "
+                      "resetting the source and re-applying", out)
+        self.assertEqual((self.source / "a.c").read_text(encoding="utf-8"), "old\n")
+        self.assertEqual(sorted(p.name for p in self.stamps.iterdir()), [],
+                         "every libass stamp dropped, so the patch step re-runs")
+        self.assertNotEqual((self.state / "libass").read_text(encoding="utf-8"), recorded)
+
+        # The patch step re-applies the new series; the next warm run keeps it.
+        git(self.source, "apply", str(self.patch))
+        for step in ("download", "patch", "configure", "build", "install", "done"):
+            (self.stamps / f"libass-{step}").touch()
+        self.assertEqual(warm_run(), "")
+        self.assertTrue((self.stamps / "libass-patch").exists())
 
 
 if __name__ == "__main__":

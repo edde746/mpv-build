@@ -69,11 +69,14 @@ at CHECK_GIT_ORIGINAL).
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 COMPONENTS = ("mpv", "ffmpeg", "libass")
@@ -559,6 +562,115 @@ def licence_sources(build, inputs):
     return sorted(rows)
 
 
+def patch_sets(winbuild, versions):
+    """(source dir, commit, digest, patches) for every pinned package whose
+    rewritten file in an already-pinned winbuild checkout has a patch step.
+
+    The patches are the files its `git apply` glob expands to, in glob order.
+    The digest covers the commit and every patch's name and bytes, so any edit
+    to the series, a comment included, changes it. The patch step's command
+    line is a glob and does not change with the files, so build.sh compares
+    this digest instead (see check_patched_sources there).
+    """
+    rows = []
+    files = {component: f"packages/{component}.cmake" for component in COMPONENTS}
+    files.update(EXTRA_COMPONENTS)
+    for component, source_dir, pins in pinned_sources(versions):
+        package_file = Path(winbuild) / files[component]
+        if "PATCH_COMMAND" not in package_file.read_text(encoding="utf-8"):
+            continue
+        patches = sorted(package_file.parent.glob(f"{component}-*.patch"))
+        digest = hashlib.sha256(f"{pins['commit']}\n".encode())
+        for patch in patches:
+            digest.update(f"{patch.name}\n".encode())
+            digest.update(patch.read_bytes())
+        rows.append((source_dir, pins["commit"], digest.hexdigest(), patches))
+    return rows
+
+
+def holds_patches(source, commit, patches):
+    """Whether every file the patches touch holds, in the source's worktree,
+    exactly the bytes `git apply` of them onto `commit` produces.
+
+    Only the touched paths are compared, so build outputs written into the
+    source tree do not count. The expected tree is built in a scratch index,
+    leaving the source's own index and worktree untouched.
+    """
+    source = Path(source)
+    if not (source / ".git").exists():
+        return False
+    scratch = tempfile.NamedTemporaryFile(delete=False)
+    scratch.close()
+    env = dict(os.environ, GIT_INDEX_FILE=scratch.name)
+    try:
+        def git(*args, **kwargs):
+            return subprocess.run(["git", "-C", str(source), *args], env=env,
+                                  capture_output=True, text=True, **kwargs)
+        if git("read-tree", commit).returncode != 0:
+            return False
+        if patches and git("apply", "--cached", *map(str, patches)).returncode != 0:
+            return False
+        tree = git("write-tree").stdout.strip()
+        changed = git("diff", "--name-only", "-z", "--no-renames", commit, tree).stdout
+        for path in filter(None, changed.split("\0")):
+            listed = git("ls-tree", tree, "--", path).stdout.split()
+            expected = listed[2] if listed else None
+            target = source / path
+            actual = (git("hash-object", "--no-filters", "--", path).stdout.strip()
+                      if target.is_file() else None)
+            if actual != expected:
+                return False
+        return True
+    finally:
+        os.unlink(scratch.name)
+
+
+def patched_packages(build):
+    """Names of the packages whose patch stamp exists in a winbuild build tree
+    (<pkg>-stamp/<pkg>-patch), in one walk. Build and install trees hold no
+    stamps and are skipped."""
+    found = set()
+    for root, dirs, files in os.walk(build):
+        dirs[:] = [d for d in dirs if not d.endswith("-build") and d != "install"]
+        name = os.path.basename(root)
+        if name.endswith("-stamp") and f"{name[:-len('-stamp')]}-patch" in files:
+            found.add(name[:-len("-stamp")])
+    return found
+
+
+def patch_verdict(stamped, recorded, digest, held):
+    """Why a package's cached source must be reset before this build, or None.
+
+    A patch stamp may only stand beside a source the current series and pin
+    produced: either the series digest recorded with that tree is this one,
+    or, with nothing recorded (a tree cached before digests were kept), the
+    source holds the bytes this series produces. Without a stamp the patch
+    step runs anyway, and its own reset makes it converge.
+    """
+    if not stamped:
+        return None
+    if recorded is not None and recorded != digest:
+        return "its patch series or pin changed since it was patched"
+    if not held:
+        return "its source does not hold the series its patch stamp claims"
+    return None
+
+
+def patch_state(winbuild, versions, sources, build, state):
+    """(source dir, commit, digest, reason) for every package with a patch
+    step; reason is patch_verdict's, "" when the cached tree can stay."""
+    stamped = patched_packages(build) if Path(build).is_dir() else set()
+    rows = []
+    for source_dir, commit, digest, patches in patch_sets(winbuild, versions):
+        record = Path(state) / source_dir
+        recorded = record.read_text(encoding="utf-8").strip() if record.is_file() else None
+        is_stamped = source_dir in stamped
+        held = is_stamped and holds_patches(Path(sources) / source_dir, commit, patches)
+        reason = patch_verdict(is_stamped, recorded, digest, held) or ""
+        rows.append((source_dir, commit, digest, reason))
+    return rows
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
@@ -582,6 +694,15 @@ def main(argv):
         metavar="BUILD_DIR",
         help="print <licence folder>=<source dir> for every component libmpv-2.dll "
         "links, from a built winbuild tree (build/windows/<arch>), and exit",
+    )
+    parser.add_argument(
+        "--print-patch-state",
+        nargs=3,
+        metavar=("SOURCES_DIR", "BUILD_DIR", "STATE_DIR"),
+        help="with --winbuild (an already-pinned checkout): print <source dir> <commit> "
+        "<series digest> <reason> for every package with a patch step, reason "
+        "non-empty when its cached source in SOURCES_DIR must be reset before the "
+        "build in BUILD_DIR (digests recorded in STATE_DIR/<source dir>), and exit",
     )
     args = parser.parse_args(argv)
 
@@ -607,6 +728,13 @@ def main(argv):
             fail(f"ninja -C {build} -t inputs mpv: {query.stderr.strip()}")
         for folder, source in licence_sources(build, query.stdout.splitlines()):
             print(f"{folder}={source}")
+        return 0
+    if args.print_patch_state:
+        if not args.winbuild:
+            parser.error("--print-patch-state needs --winbuild")
+        sources, build, state = args.print_patch_state
+        for row in patch_state(args.winbuild, versions, sources, build, state):
+            print("\t".join(row))
         return 0
     if not args.winbuild:
         parser.error("--winbuild is required")
