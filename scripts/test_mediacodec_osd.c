@@ -1,9 +1,9 @@
 // Behavioral regressions for the exact freestanding OSD scheduler core of the
-// shared render-ahead pipeline (video/out/osd_ahead.[ch]) and vo_mediacodec's
-// swap lead, extracted by test_mediacodec_osd.sh: the cadence estimator
-// that predicts the next frame's pts, the single-use next-frame pre-render,
-// the read horizon cap, the event warming planner and staging lifetime,
-// and the swap lead. No libass, EGL or mpv thread is modelled here.
+// shared render-ahead pipeline (video/out/osd_ahead.[ch]), extracted by
+// test_mediacodec_osd.sh: the cadence estimator that predicts the next
+// frame's pts, the single-use next-frame pre-render, the read horizon cap,
+// and the event warming planner and staging lifetime. No libass, EGL or mpv
+// thread is modelled here.
 #include <inttypes.h>
 #include <assert.h>
 #include <math.h>
@@ -136,36 +136,6 @@ static void test_spec_plan_respects_horizon_and_eligibility(void)
     CHECK(!osd_spec_plan(&s, 10.0, FRAME, INFINITY, true, &pts),
           "one pre-render at a time, not counted as a skip");
     CHECK(s.skips == 2, "kept pre-render is no skip");
-}
-
-static void test_swap_lead_is_half_the_release_interval_clamped(void)
-{
-    struct osd_swap_lead l;
-    osd_swap_lead_reset(&l);
-    CHECK(l.lead == OSD_SWAP_LEAD_MAX_NS, "conservative lead until measured");
-
-    const int64_t period = 41708333;
-    int64_t t = INT64_C(604800000000000);
-    for (int n = 0; n < 4; n++)
-        osd_swap_lead_observe(&l, t + n * period);
-    CHECK(l.lead == OSD_SWAP_LEAD_MAX_NS, "three intervals are not a cadence");
-    osd_swap_lead_observe(&l, t + 4 * period);
-    CHECK(l.lead == OSD_SWAP_LEAD_MAX_NS, "23.976: half a frame clamps to 18 ms");
-
-    osd_swap_lead_reset(&l);
-    const int64_t period60 = 16666667;
-    for (int n = 0; n < 6; n++)
-        osd_swap_lead_observe(&l, t + n * period60);
-    CHECK(l.lead == period60 / 2, "60 Hz: half a frame");
-
-    osd_swap_lead_reset(&l);
-    const int64_t period240 = 4166667;
-    for (int n = 0; n < 6; n++)
-        osd_swap_lead_observe(&l, t + n * period240);
-    CHECK(l.lead == OSD_SWAP_LEAD_MIN_NS, "240 Hz: never below 6 ms");
-
-    osd_swap_lead_observe(&l, t + 6 * period240 + INT64_C(2000000000));
-    CHECK(l.lead == OSD_SWAP_LEAD_MAX_NS, "a two-second gap starts over");
 }
 
 static struct osd_prefetch static_prefetch(void)
@@ -306,7 +276,6 @@ int main(void)
     test_cadence_resets_on_gap_backwards_and_long_delta();
     test_spec_hit_is_single_use_and_epoch_bound();
     test_spec_plan_respects_horizon_and_eligibility();
-    test_swap_lead_is_half_the_release_interval_clamped();
     test_prefetch_plan_gates();
     test_prefetch_estimate_scales_with_events();
     test_prefetch_plan_fits_before_visible_end_but_may_overrun_start();

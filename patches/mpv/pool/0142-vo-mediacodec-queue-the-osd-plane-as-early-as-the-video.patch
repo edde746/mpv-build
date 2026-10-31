@@ -1,0 +1,183 @@
+Subject: [PATCH] vo_mediacodec: queue the OSD plane as early as the video
+
+On a Google TV Streamer (MediaTek MT8696, Plezy #2894) the subtitle layer
+reaches the screen a refresh after the picture it was timed for on about
+half the frames at 60 Hz and on every frame at 24 Hz. SurfaceFlinger's
+--latency shows the video buffer on its timestamp's vsync every time and
+the OSD buffer, given the same timestamp, one vsync late on 186 of 425
+frames at 60 Hz and 259 of 259 at 24 Hz.
+
+SurfaceFlinger latches a buffer for the vsync at its timestamp a refresh
+plus its own work duration before that vsync, and only once the GPU has
+finished it. The present stage queued the OSD half a frame ahead, at most
+18 ms: the buffers that made the vsync were ready 17.7 ms before it, the
+ones that missed 15.2 ms, and at 24 Hz no buffer queued 18 ms ahead can
+make a 41.7 ms refresh. The video is handed to the codec 50 ms ahead and
+never misses.
+
+The present stage now parks until the codec lead before the timestamp,
+the moment the video buffer is handed over, and the swap-lead estimator
+goes. The compositor holds a buffer with a future timestamp, so an early
+queue changes when the OSD is accepted, not when it shows; a surface with
+every buffer queued blocks the next draw until the compositor frees one,
+which bounds the present thread the way the codec bounds the video. The
+osd-sync line keeps swapLeadMs, now the fixed lead.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 5a5823e..5ec1315 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -775,7 +775,8 @@ Available video output drivers are:
+     source-frame intervals plus a composition display period, capped at 500 ms.
+     Rasterized frames are uploaded while the present thread is idle, and
+     presented through a GLES2 surface over the OSD Surface with the same
+-    presentation timestamp the video buffer got, so both latch on one vsync.
++    presentation timestamp the video buffer got, queued as far ahead of it
++    as the video buffer (50 ms), so both latch on one vsync.
+     The video is never held back for the OSD: under load subtitle updates
+     are skipped or shown late instead. A ``osd-sync`` line in the verbose log
+     every 120 frames and at exit reports render times, pre-render hits, how
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index eaca622..1ffad3b 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -41,17 +41,17 @@
+  *    texture on an EGL surface over the OSD Surface and swaps with
+  *    eglPresentationTimeANDROID set to the exact release timestamp the video
+  *    buffer got, so the compositor latches both on one vsync regardless of
+- *    how long the copy took. Swaps are scheduled half a frame before that
+- *    timestamp, and EGL_ANDROID_get_frame_timestamps reports where they
+- *    actually landed.
++ *    how long the copy took. Swaps are queued as far ahead of that timestamp
++ *    as the video buffer is handed to the codec, and
++ *    EGL_ANDROID_get_frame_timestamps reports where they actually landed.
+  *
+  * Unserved requests are latest-wins under load, but completed frames enter a
+  * bounded FIFO and cannot replace one another while the presenter waits.
+  * Only the render stage waits for queue capacity; video keeps advancing.
+  * A pinned result is presented late rather than dropped. Dirty regions from
+  * skipped requests are folded into the next result. The render stage is
+- * the shared pipeline in osd_ahead.c; its scheduler core and this VO's swap
+- * lead are covered by scripts/test_mediacodec_osd.sh.
++ * the shared pipeline in osd_ahead.c; its scheduler core is covered by
++ * scripts/test_mediacodec_osd.sh.
+  */
+ 
+ #include <dlfcn.h>
+@@ -730,53 +730,6 @@ static struct mp_osd_res mediacodec_osd_geometry(
+ 
+ // --- end mediacodec geometry core
+ 
+-// --- mediacodec osd swap lead
+-
+-// Swap lead of the present stage: half the median of the last eight release
+-// intervals, clamped to 6..18 ms, so the buffer is queued inside the latch
+-// window of its vsync but never so early that it sits in the queue across
+-// the previous one.
+-#define OSD_SWAP_LEAD_SAMPLES 8
+-#define OSD_SWAP_LEAD_MIN_NS INT64_C(6000000)
+-#define OSD_SWAP_LEAD_MAX_NS INT64_C(18000000)
+-#define OSD_SWAP_LEAD_MAX_INTERVAL_NS INT64_C(250000000)
+-
+-struct osd_swap_lead {
+-    int64_t intervals[OSD_SWAP_LEAD_SAMPLES];
+-    int count;
+-    int next;
+-    int64_t last_release;
+-    int64_t lead; // current lead in ns
+-};
+-
+-static void osd_swap_lead_reset(struct osd_swap_lead *l)
+-{
+-    *l = (struct osd_swap_lead){.lead = OSD_SWAP_LEAD_MAX_NS};
+-}
+-
+-static void osd_swap_lead_observe(struct osd_swap_lead *l, int64_t release_ns)
+-{
+-    if (l->last_release) {
+-        int64_t interval = release_ns - l->last_release;
+-        if (interval <= 0 || interval > OSD_SWAP_LEAD_MAX_INTERVAL_NS) {
+-            osd_swap_lead_reset(l);
+-        } else {
+-            l->intervals[l->next] = interval;
+-            l->next = (l->next + 1) % OSD_SWAP_LEAD_SAMPLES;
+-            if (l->count < OSD_SWAP_LEAD_SAMPLES)
+-                l->count++;
+-        }
+-    }
+-    l->last_release = release_ns;
+-    if (l->count < OSD_CADENCE_MIN_SAMPLES)
+-        return;
+-    int64_t lead = osd_median_ns(l->intervals, l->count) / 2;
+-    l->lead = lead < OSD_SWAP_LEAD_MIN_NS ? OSD_SWAP_LEAD_MIN_NS
+-            : lead > OSD_SWAP_LEAD_MAX_NS ? OSD_SWAP_LEAD_MAX_NS : lead;
+-}
+-
+-// --- end mediacodec osd swap lead
+-
+ struct mediacodec_opts {
+     char *video_rect;
+     int osd_vsync_delay;
+@@ -819,7 +772,6 @@ struct osd_plane_stats {
+     uint32_t uploads_ahead, uploads_late; // atlases ready before / at the draw
+     uint32_t composed_ahead, composed_late; // frames blitted from a composed canvas / drawn from parts
+     int64_t upload_ns_last, upload_ns_max; // upload time inside the draw
+-    int64_t swap_lead_ns;
+     const char *present_source; // which timestamp is measured
+     int64_t present_err_last, present_err_worst;
+     uint32_t present_hist[5];   // in vsyncs: <-1.5, <-0.5, <0.5, <1.5, >=1.5
+@@ -1400,7 +1352,6 @@ struct osd_gl {
+     const char *ts_source;
+     struct osd_present_probe probes[OSD_PRESENT_PROBES];
+     int num_probes;
+-    struct osd_swap_lead swap_lead;
+ };
+ 
+ struct osd_vertex {
+@@ -1504,7 +1455,6 @@ static bool osd_gl_init(struct vo *vo, struct osd_gl *g)
+         g->texs[n].key.index = -1;
+     for (int n = 0; n < OSD_COMP_CACHE; n++)
+         g->comps[n].fence = EGL_NO_SYNC_KHR;
+-    osd_swap_lead_reset(&g->swap_lead);
+ 
+     g->display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+     if (g->display == EGL_NO_DISPLAY || !eglInitialize(g->display, NULL, NULL)) {
+@@ -2473,12 +2423,18 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+     int64_t t_draw1 = mp_time_ns();
+ 
+     bool pinned = release.timestamp && g->presentation_time;
+-    if (pinned)
+-        osd_swap_lead_observe(&g->swap_lead, release.timestamp);
+ 
++    // SurfaceFlinger latches a buffer for the vsync at its timestamp a
++    // refresh plus its own work duration before that vsync, and only once
++    // the GPU has finished it. Queued half a frame ahead (18 ms at most),
++    // the OSD missed that latch on half the frames at 60 Hz and on every
++    // frame at 24 Hz on a Google TV Streamer, while the video, handed over
++    // 50 ms ahead, never did: the compositor showed the subtitle a refresh
++    // after its picture. Queue it as early as the video; the compositor
++    // holds both until their timestamp.
+     mp_mutex_lock(&p->osd.lock);
+     bool current = pinned
+-        ? osd_park(vo, g, release.timestamp - g->swap_lead.lead, r.epoch)
++        ? osd_park(vo, g, release.timestamp - MEDIACODEC_CODEC_LEAD_NS, r.epoch)
+         : !s->terminate && s->epoch == r.epoch;
+     if (!current)
+         s->stats.stale++;
+@@ -2559,7 +2515,6 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+     ps->swap_ns_last = t_done - t_swap;
+     if (ps->swap_ns_last > ps->swap_ns_max)
+         ps->swap_ns_max = ps->swap_ns_last;
+-    ps->swap_lead_ns = g->swap_lead.lead;
+     ps->present_source = g->ts_source;
+     if (pinned) {
+         int64_t lead = release.timestamp - t_done;
+@@ -2684,7 +2639,7 @@ static void osd_log_stats_snapshot(struct vo *vo, const char *why,
+                s.plane.late ? (int)(-s.plane.lead_ns_min / 1000000) : 0,
+                (int)(s.plane.lead_ns_last / 1000000),
+                s.plane.have_lead_min ? mp_tprintf(16, "%d", (int)(s.plane.lead_ns_min / 1000000)) : "n/a",
+-               (int)(s.plane.swap_lead_ns / 1000000),
++               (int)(MEDIACODEC_CODEC_LEAD_NS / 1000000),
+                (int)(s.plane.swap_ns_last / 1000000), (int)(s.plane.swap_ns_max / 1000000),
+                (int)(s.plane.upload_ns_last / 1000000), (int)(s.plane.upload_ns_max / 1000000),
+                s.plane.uploads_ahead, s.plane.uploads_late, s.plane.composed_ahead, s.plane.composed_late,
