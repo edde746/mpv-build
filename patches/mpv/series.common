@@ -8,6 +8,7 @@
 0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
 0035-demux-dts-codec-profile-at-load.patch
 0208-demux-keep-the-first-new-packet-after-a-refresh-seek.patch
+0210-player-sync-restored-video-to-running-audio.patch
 # Codec profile at load and the pending-vid property, for the per-file decode
 # routing an embedder decides before the decoder exists.
 0204-demux-codec-profile-from-avcc-and-hvcc.patch

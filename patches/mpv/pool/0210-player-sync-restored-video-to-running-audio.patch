@@ -1,0 +1,36 @@
+player: synchronize restored video with already-running audio
+
+Disabling video resets the A/V delay without emptying the audio output.
+When video is selected again, audio can still have several seconds queued.
+The first video frame is shown immediately in STATUS_SYNCING, but the next
+one is scheduled against that old audio backlog and a near-zero delay,
+freezing the first picture for the backlog's duration.
+
+Initialize the existing delay invariant from the written audio timestamp
+and the first video timestamp when only video is restarting. Ordinary
+loads/seeks synchronize audio separately and keep the existing path.
+
+diff --git a/player/video.c b/player/video.c
+--- a/player/video.c
++++ b/player/video.c
+@@ -376,6 +376,20 @@ static void handle_new_frame(struct MPContext *mpctx)
+     double pts = mpctx->next_frames[0]->pts;
+     bool is_sparse = mpctx->vo_chain && mpctx->vo_chain->is_sparse;
+ 
++    // A video-only restart preserves the AO's queued audio, but resets delay.
++    // Rejoin its timeline once, when the first video timestamp becomes known:
++    // delay is the media time written past this frame, not just audio written
++    // since the video chain was rebuilt. Full seeks/loads also restart audio
++    // and perform their synchronization in the audio startup path instead.
++    if (mpctx->video_status == STATUS_SYNCING &&
++        mpctx->video_pts == MP_NOPTS_VALUE &&
++        mpctx->audio_status == STATUS_PLAYING && pts != MP_NOPTS_VALUE)
++    {
++        double a_pts = written_audio_pts(mpctx);
++        if (a_pts != MP_NOPTS_VALUE)
++            mpctx->delay = a_pts + mpctx->opts->audio_delay - pts;
++    }
++
+     if (mpctx->video_pts != MP_NOPTS_VALUE) {
+         frame_time = pts - mpctx->video_pts;
+         double tolerance = mpctx->demuxer->ts_resets_possible &&

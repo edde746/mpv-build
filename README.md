@@ -566,6 +566,17 @@ before it; and other VOs, the first frame after a reset, display-sync and EOF
 keep upstream behavior. Pass an already-patched source directory to run
 offline.
 
+Run the video-reselection clock regression with `bash scripts/test_player_video_restart.sh`.
+It compiles the production first-frame and A/V scheduling functions from
+`player/video.c` (patch 0210). Restoring video while audio already plays
+initializes the A/V delay from the written audio timestamp and the first
+video timestamp, rather than waiting out the audio output's existing queue.
+This prevents the multi-second frozen picture after an iOS background return
+without decoding video in the background or interrupting audio. The regression
+covers a multi-second queue, playback speeds from 0.5× to 2×, positive and
+negative audio delay, valid negative timestamps, missing timestamps and the
+unchanged full-seek/audio-startup path. Pass a patched source tree to run offline.
+
 Run the audio-reload regression with `bash scripts/test_audio_reload_held_frame.sh`.
 It compiles `reload_audio_output()` and the ao filter's `ao_process()`
 (`player/audio.c`, patch 0034) against pins that behave like `filters/filter.c`:
