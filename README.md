@@ -63,8 +63,8 @@ changes.
 1. A change lands on `main` (from a pull request; `ci.yml` runs the patch
    checks, the host regression tests, the android build and the Demo apps).
 2. `publish.yml` computes each group's keys, builds only what is not published
-   (`keys.py stale`), uploads to the group's rolling release, and records the
-   assets.
+   (`keys.py stale`), and once every build has succeeded uploads to each
+   group's rolling release and records the assets.
 3. It then commits `artifacts.json` and `Package.swift` to `main` as
    `chore: binaries for <sha> [skip binaries]`. That binaries commit is the one
    to pin: the commit before it has no manifest entries for its new assets.

@@ -6,8 +6,9 @@ name: Publish binaries
 # that already exists on a rolling prerelease is byte-identical to the one this
 # run would upload, so it is skipped instead of clobbered.
 #
-# Binaries are sharded per platform group. Each group builds independently,
-# uploads to its own `binaries-<group>` rolling prerelease and contributes only
+# Binaries are sharded per platform group. Each group builds independently and,
+# once every group's build has succeeded, uploads to its own `binaries-<group>`
+# rolling prerelease and contributes only
 # its own `platforms.<group>` section of artifacts.json; one final job splices
 # the sections together and commits the manifest. The plan job's group list
 # comes from `scripts/keys.py groups` (which discovers platforms/*/group.json),
@@ -365,7 +366,14 @@ jobs:
 
   publish-apple:
     name: Publish apple
-    needs: build-apple
+    # No group uploads until every group's build has succeeded (or had nothing
+    # stale). Uploading apple while windows still built let a cancelled run
+    # leave published assets no manifest references, and the next run's
+    # rebuild of the same key then had to match them byte for byte.
+    needs: [build-apple, build-android, build-linux, build-windows]
+    if: >-
+      always() && !cancelled() && needs.build-apple.result == 'success'
+      && !contains(needs.*.result, 'failure')
     permissions:
       contents: write
     runs-on: macos-26
@@ -620,12 +628,16 @@ jobs:
     # the group name and its artifact glob, both of which come from the group's
     # own group.json (via `keys.py groups`/`variants`) rather than being
     # restated here.
-    needs: [plan, build-android, build-linux, build-windows]
+    needs: [plan, build-apple, build-android, build-linux, build-windows]
     # always(): a group with nothing stale has a *skipped* build job, and a
     # skipped need would otherwise skip this job -- silently publishing nothing
     # and leaving the commit unpinnable. The per-row gate below decides which
-    # rows actually act; `!cancelled()` keeps a superseded run from publishing.
-    if: always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+    # rows actually act; `!cancelled()` keeps a superseded run from publishing,
+    # and no failed build anywhere keeps a partial run from uploading (see
+    # publish-apple).
+    if: >-
+      always() && !cancelled() && needs.plan.outputs.stale_groups != ''
+      && !contains(needs.*.result, 'failure')
     permissions:
       contents: write
     runs-on: ubuntu-26.04
