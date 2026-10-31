@@ -75,7 +75,7 @@ jobs:
           * placebo version: v{libplacebo_version}
           * MoltenVK version: v{vulkan_version}
 
-          Binaries are pinned by content hash from the [rolling apple binaries](https://github.com/edde746/mpv-build/releases/tag/binaries-apple) prerelease; this tag carries no assets of its own.
+          Package.swift pins its binaries by URL and checksum from the content-addressed prereleases of the publish runs that built them (the [legacy apple release](https://github.com/edde746/mpv-build/releases/tag/binaries-apple) and the per-run `binaries-<commit>` releases); this tag carries no assets of its own.
           ''').strip() + '\n', encoding='utf-8')
           PY
 

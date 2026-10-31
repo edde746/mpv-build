@@ -104,9 +104,15 @@ class ArgumentOptions {
 /// missing library entry is a soft miss so that a fresh checkout can still
 /// build everything from source.
 final class BinaryManifest {
+    /// One published per-platform zip and where it is downloaded from.
+    struct Asset {
+        let name: String
+        let url: String
+    }
+
     struct Entry {
         let key: String
-        let prebuilt: [PlatformType: String]
+        let prebuilt: [PlatformType: Asset]
         /// Names of the frameworks this library publishes. The manifest on disk
         /// nests an `{asset, checksum}` record per framework, but a prebuilt
         /// restore only needs to know which names the entry carries (the zips
@@ -114,7 +120,6 @@ final class BinaryManifest {
         let frameworks: Set<String>
     }
 
-    let assetBase: String
     private let entries: [String: Entry]
 
     private static var didLoad = false
@@ -137,19 +142,26 @@ final class BinaryManifest {
         else {
             return nil
         }
-        self.assetBase = assetBase
 
         var entries: [String: Entry] = [:]
         for (name, value) in root["libraries"] as? [String: Any] ?? [:] {
             guard let library = value as? [String: Any], let key = library["key"] as? String else {
                 continue
             }
-            var prebuilt: [PlatformType: String] = [:]
-            for (platformName, asset) in library["prebuilt"] as? [String: String] ?? [:] {
+            var prebuilt: [PlatformType: Asset] = [:]
+            for (platformName, recorded) in library["prebuilt"] as? [String: Any] ?? [:] {
                 guard let platform = PlatformType(rawValue: platformName) else {
                     continue
                 }
-                prebuilt[platform] = asset
+                // Every publish run uploads to a release of its own, so a
+                // record names its asset's download base; one recorded before
+                // per-run releases is the bare name, served from the section's.
+                if let asset = recorded as? String {
+                    prebuilt[platform] = Asset(name: asset, url: "\(assetBase)/\(asset)")
+                } else if let record = recorded as? [String: Any], let asset = record["asset"] as? String {
+                    let base = record["assetBase"] as? String ?? assetBase
+                    prebuilt[platform] = Asset(name: asset, url: "\(base)/\(asset)")
+                }
             }
             var frameworks: Set<String> = []
             for (frameworkName, value) in library["frameworks"] as? [String: Any] ?? [:] {
@@ -171,10 +183,6 @@ final class BinaryManifest {
 
     func entry(for library: Library) -> Entry? {
         entries[library.rawValue]
-    }
-
-    func url(ofAsset asset: String) -> String {
-        "\(assetBase)/\(asset)"
     }
 }
 
@@ -274,8 +282,8 @@ class BaseBuild {
     }
 
     func buildALL() throws {
-        if let source = prebuiltSource() {
-            try restoreFromPrebuilt(entry: source.entry, manifest: source.manifest)
+        if let entry = prebuiltSource() {
+            try restoreFromPrebuilt(entry: entry)
             return
         }
         print("Build \(library.rawValue) \(library.version) from source")
@@ -296,7 +304,7 @@ class BaseBuild {
     /// A library is only restored when `use-prebuilt` was requested, it was not named in
     /// `libs=`, and the manifest carries every platform zip plus every framework this
     /// library publishes. Anything less falls back to compiling: correctness over speed.
-    func prebuiltSource() -> (manifest: BinaryManifest, entry: BinaryManifest.Entry)? {
+    func prebuiltSource() -> BinaryManifest.Entry? {
         guard BaseBuild.options.usePrebuilt else {
             return nil
         }
@@ -317,13 +325,13 @@ class BaseBuild {
             print("Prebuilt \(library.rawValue) is missing frameworks \(missingFrameworks.joined(separator: ",")); building from source")
             return nil
         }
-        return (manifest, entry)
+        return entry
     }
 
     /// Unpack the per-platform prebuilt zips of this library and lay them out under
     /// `dist/<library>/` as if they had just been compiled. No xcframework is produced
     /// locally: the published xcframeworks are what `Package.swift` links against.
-    private func restoreFromPrebuilt(entry: BinaryManifest.Entry, manifest: BinaryManifest) throws {
+    private func restoreFromPrebuilt(entry: BinaryManifest.Entry) throws {
         print("Restore \(library.rawValue) from prebuilt binaries (key \(entry.key))")
         let unpackedURL = URL.currentDirectory + "\(library.rawValue)-prebuilt-\(entry.key)"
         try FileManager.default.createDirectory(atPath: unpackedURL.path, withIntermediateDirectories: true, attributes: nil)
@@ -331,7 +339,7 @@ class BaseBuild {
             guard let asset = entry.prebuilt[platform] else {
                 continue
             }
-            let zipURL = unpackedURL + asset
+            let zipURL = unpackedURL + asset.name
             // delete invalid downloaded files
             let attributes = try? FileManager.default.attributesOfItem(atPath: zipURL.path)
             if let fileSize = attributes?[FileAttributeKey.size] as? UInt64, fileSize <= 0 {
@@ -339,7 +347,7 @@ class BaseBuild {
             }
             if !FileManager.default.fileExists(atPath: zipURL.path) {
                 do {
-                    try Utility.launch(path: "wget", arguments: ["-O", asset, manifest.url(ofAsset: asset)], currentDirectoryURL: unpackedURL)
+                    try Utility.launch(path: "wget", arguments: ["-O", asset.name, asset.url], currentDirectoryURL: unpackedURL)
                 } catch {
                     try? FileManager.default.removeItem(at: zipURL)
                     throw error
@@ -348,7 +356,7 @@ class BaseBuild {
             // the per-platform zips share one layout, so unpacking them all into the same
             // directory rebuilds exactly the tree `packageRelease()` would have produced
             if !FileManager.default.fileExists(atPath: (unpackedURL + ["lib", platform.rawValue]).path) {
-                try Utility.launch(path: "/usr/bin/unzip", arguments: ["-o", "-q", asset], currentDirectoryURL: unpackedURL)
+                try Utility.launch(path: "/usr/bin/unzip", arguments: ["-o", "-q", asset.name], currentDirectoryURL: unpackedURL)
             }
         }
 

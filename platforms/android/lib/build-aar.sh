@@ -6,10 +6,10 @@
 # carry no GNU build-id (a key published before platforms/android/include/loadarch.sh linked with one) fail there.
 #
 # Usage: build-aar.sh [--tarballs <dir> | --key <key>] [-- <more Gradle tasks or flags>]
-#   (none)           the tarballs artifacts.json pins at this checkout, fetched from binaries-android and checked
-#                    against the recorded sha256 (fetch-tarballs.py)
-#   --key <key>      the published tarballs of any libmpv-android content key, checked against the sha256 GitHub
-#                    records for each asset
+#   (none)           the tarballs artifacts.json pins at this checkout, fetched from the release it records for each
+#                    and checked against the recorded sha256 (fetch-tarballs.py)
+#   --key <key>      the published tarballs of any libmpv-android content key, from whichever release holds them,
+#                    checked against the sha256 GitHub records for each asset
 #   --tarballs <dir> local tarballs, e.g. dist/release after package.sh (libmpv-android-<abi>.tar.gz) or a
 #                    directory of published ones (libmpv-android-<key>-<abi>.tar.gz)
 #   -- <args>        passed to Gradle after assembleRelease (CI adds testDebugUnitTest assembleDebugAndroidTest)

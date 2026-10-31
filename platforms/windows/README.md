@@ -167,9 +167,9 @@ matters.
 
 ## Reproducible bytes
 
-A rebuild of a published key has to reproduce the published zip byte for
-byte (`keys.py publish-assets` refuses anything else), so nothing in it may
-record when it was built. Key 442b5d101e4c's `libmpv-2.dll` recorded five
+A key names one build's bytes, so nothing in the zip may record when it was
+built: a stamp makes every rebuild of a key a different binary. Key
+442b5d101e4c's `libmpv-2.dll` recorded five
 clocks: the PE header and debug directory `TimeDateStamp` lld-link takes at
 link time, so every rebuild differed; and OpenSSL's "built on" line, SVT-AV1's
 and mpv's `__DATE__ __TIME__` and davs2's build time, which the cached tree

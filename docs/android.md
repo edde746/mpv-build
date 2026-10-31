@@ -1,7 +1,9 @@
 # Android
 
-The android group publishes two things to
-[`binaries-android`](https://github.com/edde746/mpv-build/releases/tag/binaries-android):
+The android group publishes two things, each to the release of the publish run
+that built it (`binaries-<first 12 hex of the commit>`; assets published before
+per-run releases stay in
+[`binaries-android`](https://github.com/edde746/mpv-build/releases/tag/binaries-android)):
 
 - `libmpv-android-<key>-<abi>.tar.gz`, one per ABI (`arm64-v8a`,
   `armeabi-v7a`, `x86`, `x86_64`): libmpv, FFmpeg and their dependencies,
@@ -10,7 +12,9 @@ The android group publishes two things to
   the four tarballs' native libraries with the JNI glue and its Kotlin API.
 
 Both are defined in `platforms/android/group.json` and recorded under
-`platforms.android` in `artifacts.json`.
+`platforms.android` in `artifacts.json`, each asset with its release download
+URL as `assetBase` beside its name; an asset recorded without one is served
+from the section's `platforms.android.assetBase` (`binaries-android`).
 
 ## Native tarballs
 
@@ -109,8 +113,10 @@ recorded beside the tarballs, with one debug-symbols zip per ABI (see
 ```json
 "mpv-android": {
   "key": "<key>", "asset": "mpv-android-<key>.aar", "checksum": "<sha256>",
+  "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-<commit>",
   "symbols": {
-    "arm64-v8a": {"asset": "mpv-android-<key>-arm64-v8a-symbols.zip", "checksum": "<sha256>"},
+    "arm64-v8a": {"asset": "mpv-android-<key>-arm64-v8a-symbols.zip", "checksum": "<sha256>",
+                  "assetBase": "<the same release>"},
     "...": "one per ABI"
   }
 }
@@ -118,16 +124,21 @@ recorded beside the tarballs, with one debug-symbols zip per ABI (see
 
 ### Consuming it
 
-Gradle resolves it through an Ivy repository on the release URL, with the key
-as the version and no authentication:
+Gradle resolves it through an Ivy repository on the AAR's release URL, with the
+key as the version and no authentication. That URL is the entry's `assetBase`
+in the pinned commit's `artifacts.json`, or `platforms.android.assetBase` when
+the entry has none (an AAR published before per-run releases):
 
 ```kotlin
 // settings.gradle.kts
+// The AAR's release, e.g. .../releases/download/binaries-<commit>: read it from
+// the pinned commit's artifacts.json (or a lock file written from it).
+val mpvAndroidBase = "<platforms.android.libraries.mpv-android.assetBase>"
 dependencyResolutionManagement {
     repositories {
         ivy {
-            url = uri("https://github.com/edde746/mpv-build/releases/download")
-            patternLayout { artifact("binaries-android/[artifact]-[revision].[ext]") }
+            url = uri(mpvAndroidBase)
+            patternLayout { artifact("[artifact]-[revision].[ext]") }
             metadataSources { artifact() }
             content { includeModule("edde746", "mpv-android") }
         }
@@ -137,8 +148,12 @@ dependencyResolutionManagement {
 dependencies { implementation("edde746:mpv-android:<key>@aar") }
 ```
 
-Put the sha256 from `artifacts.json` in the app's pin and in Gradle's
-dependency verification.
+A fixed `binaries-android/[artifact]-[revision].[ext]` pattern on
+`.../releases/download` finds only the AARs published before per-run releases:
+a newer key's release is named after the commit that built it, which the key
+does not determine. Put the sha256 from `artifacts.json` in the app's pin and in
+Gradle's dependency verification; verification checks the file's sha256 for
+`edde746:mpv-android:<key>`, wherever the repository URL points.
 
 To try an unpublished AAR, copy it to a directory as
 `mpv-android-<name>.aar` and point the Ivy repository there
