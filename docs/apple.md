@@ -1,7 +1,10 @@
 # Apple
 
-The apple group publishes one XCFramework zip per library to
-[`binaries-apple`](https://github.com/edde746/mpv-build/releases/tag/binaries-apple).
+The apple group publishes one XCFramework zip per library, and the per-platform
+thin zips `make build use-prebuilt` restores, to the release of the publish run
+that built them (`binaries-<first 12 hex of the commit>`; those published
+before per-run releases stay in
+[`binaries-apple`](https://github.com/edde746/mpv-build/releases/tag/binaries-apple)).
 `Package.swift` is rendered from the `platforms.apple` section of
 `artifacts.json` and exposes them as the `MPVKit` product. The build driver is
 the SwiftPM package in `Sources/BuildScripts/` (`make build`); the publish job
