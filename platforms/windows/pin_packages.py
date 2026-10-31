@@ -69,11 +69,14 @@ at CHECK_GIT_ORIGINAL).
 """
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 COMPONENTS = ("mpv", "ffmpeg", "libass")
@@ -559,6 +562,70 @@ def licence_sources(build, inputs):
     return sorted(rows)
 
 
+def patch_sets(winbuild, versions):
+    """(source dir, commit, digest, patches) for every pinned package whose
+    rewritten file in an already-pinned winbuild checkout has a patch step.
+
+    The patches are the files its `git apply` glob expands to, in glob order.
+    The digest covers the commit and every patch's name and bytes, so any edit
+    to the series, a comment included, changes it. The patch step's command
+    line is a glob and does not change with the files, so build.sh compares
+    this digest instead (see check_patched_sources there).
+    """
+    rows = []
+    files = {component: f"packages/{component}.cmake" for component in COMPONENTS}
+    files.update(EXTRA_COMPONENTS)
+    for component, source_dir, pins in pinned_sources(versions):
+        package_file = Path(winbuild) / files[component]
+        if "PATCH_COMMAND" not in package_file.read_text(encoding="utf-8"):
+            continue
+        patches = sorted(package_file.parent.glob(f"{component}-*.patch"))
+        digest = hashlib.sha256(f"{pins['commit']}\n".encode())
+        for patch in patches:
+            digest.update(f"{patch.name}\n".encode())
+            digest.update(patch.read_bytes())
+        rows.append((source_dir, pins["commit"], digest.hexdigest(), patches))
+    return rows
+
+
+def holds_patches(source, commit, patches):
+    """Whether every file the patches touch holds, in the source's worktree,
+    exactly the bytes `git apply` of them onto `commit` produces.
+
+    Only the touched paths are compared, so build outputs written into the
+    source tree do not count. The expected tree is built in a scratch index,
+    leaving the source's own index and worktree untouched.
+    """
+    source = Path(source)
+    if not (source / ".git").exists():
+        return False
+    scratch = tempfile.NamedTemporaryFile(delete=False)
+    scratch.close()
+    env = dict(os.environ, GIT_INDEX_FILE=scratch.name)
+    try:
+        def git(*args, **kwargs):
+            return subprocess.run(["git", "-C", str(source), *args], env=env,
+                                  capture_output=True, text=True, **kwargs)
+        if git("read-tree", commit).returncode != 0:
+            return False
+        if patches and git("apply", "--cached", *map(str, patches)).returncode != 0:
+            return False
+        tree = git("write-tree").stdout.strip()
+        changed = git("diff", "--name-only", "-z", "--no-renames", commit, tree).stdout
+        for path in filter(None, changed.split("\0")):
+            listed = git("ls-tree", tree, "--", path).stdout.split()
+            expected = listed[2] if listed else None
+            target = source / path
+            actual = (git("hash-object", "--no-filters", "--", path).stdout.strip()
+                      if target.is_file() else None)
+            if actual != expected:
+                return False
+        return True
+    finally:
+        os.unlink(scratch.name)
+
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--winbuild", help="mpv-winbuild-cmake checkout to rewrite")
@@ -582,6 +649,13 @@ def main(argv):
         metavar="BUILD_DIR",
         help="print <licence folder>=<source dir> for every component libmpv-2.dll "
         "links, from a built winbuild tree (build/windows/<arch>), and exit",
+    )
+    parser.add_argument(
+        "--print-patch-state",
+        metavar="SOURCES_DIR",
+        help="with --winbuild (an already-pinned checkout): print <source dir> <commit> "
+        "<series digest> <yes|no> for every package with a patch step, yes when "
+        "SOURCES_DIR/<source dir> holds its patches, and exit",
     )
     args = parser.parse_args(argv)
 
@@ -607,6 +681,13 @@ def main(argv):
             fail(f"ninja -C {build} -t inputs mpv: {query.stderr.strip()}")
         for folder, source in licence_sources(build, query.stdout.splitlines()):
             print(f"{folder}={source}")
+        return 0
+    if args.print_patch_state:
+        if not args.winbuild:
+            parser.error("--print-patch-state needs --winbuild")
+        for source_dir, commit, digest, patches in patch_sets(args.winbuild, versions):
+            held = holds_patches(Path(args.print_patch_state) / source_dir, commit, patches)
+            print(f"{source_dir}\t{commit}\t{digest}\t{'yes' if held else 'no'}")
         return 0
     if not args.winbuild:
         parser.error("--winbuild is required")
