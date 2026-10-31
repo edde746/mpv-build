@@ -161,24 +161,24 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-windows",
       "libraries": {
         "libmpv-windows": {
-          "key": "1427515b01b8",
+          "key": "6fcf15b6f9d0",
           "prebuilt": {
             "aarch64": {
-              "asset": "libmpv-windows-1427515b01b8-aarch64.zip",
+              "asset": "libmpv-windows-6fcf15b6f9d0-aarch64.zip",
               "checksum": "c00371400b0488e0caa6767370ff9a8341ae9a5c029b71dde631483c47122f01"
             },
             "x86_64": {
-              "asset": "libmpv-windows-1427515b01b8-x86_64.zip",
+              "asset": "libmpv-windows-6fcf15b6f9d0-x86_64.zip",
               "checksum": "d5db23e511cadc056710762596f51beb4ed7c2023e0db0c94e56ed24693d7641"
             }
           },
           "symbols": {
             "aarch64": {
-              "asset": "libmpv-windows-1427515b01b8-aarch64-symbols.zip",
+              "asset": "libmpv-windows-6fcf15b6f9d0-aarch64-symbols.zip",
               "checksum": "14f35f90e5d9ea360ab871ba2a2c9cce0d4422d631e47256a4ae0defa0c99a72"
             },
             "x86_64": {
-              "asset": "libmpv-windows-1427515b01b8-x86_64-symbols.zip",
+              "asset": "libmpv-windows-6fcf15b6f9d0-x86_64-symbols.zip",
               "checksum": "a6e2720e440f811805a18996fecd57596ef63c9bde82d25a003057f2c459e3a0"
             }
           }
