@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Play IEC 61937 TrueHD or DTS-HD through the real, muted spatial renderer on
+# macOS (see docs/apple.md). Make the IEC file with FFmpeg's spdif muxer
+# (-dtshd_rate 768000 for DTS-HD); the optional libdovi archive is force-loaded
+# to check the prelinked Rust core coexists with it.
 # Usage: test_spatial_renderer.sh <patched-mpv> <built-spatial-dir> <iec-file> <1=truehd|2=dtshd> <expect-failure:0|1> [libdovi-archive]
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

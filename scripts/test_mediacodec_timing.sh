@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Compile production timing, admission and draw/flip from the final Android
-# patch series. Pass an already-patched mpv tree for offline use; otherwise
-# fetch and patch the pinned source in a temporary directory.
+# Compile vo_mediacodec's production timing, admission and draw/flip from the
+# final Android patch series and drive them on a host fixture: cadence
+# prediction, refresh hysteresis, clock drift across the mp_time/CLOCK_MONOTONIC
+# boundary, speed changes, seeks during preparation, still redraws, the 50 ms
+# codec submission lead, releases snapped to the Choreographer's vsync spacing
+# (one-resample outliers ignored, confirmed steps and steady drift followed),
+# the sparse statistics cadence, and rendered-report matching for the
+# video-present histogram. Pass an already-patched mpv tree for offline use;
+# otherwise fetch and patch the pinned source in a temporary directory.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
