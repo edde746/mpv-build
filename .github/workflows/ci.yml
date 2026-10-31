@@ -112,6 +112,8 @@ jobs:
               # series that were actually acquired and applied here.
               fetch(component, group, dest)
               checked += 1
+              if component == 'mpv':
+                subprocess.run(['bash', 'scripts/test_player_video_restart.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'apple':
                 # The player's half of the passthrough fallback: plain C, no
                 # Apple frameworks.
