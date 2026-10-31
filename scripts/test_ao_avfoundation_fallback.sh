@@ -6,7 +6,8 @@
 # test_ao_avfoundation_fallback.m includes the patched audio/out/ao_avfoundation.m
 # and drives it with a real AVPlayer in a process that never services the main
 # dispatch queue, so AVPlayer never asks for the stream and the startup
-# supervisor falls back. Its deadlines run on a fake clock. macOS only.
+# supervisor falls back. Its deadlines run on a fake clock, and the test runs
+# the driver's 50 ms feed ticks itself. macOS only.
 # Pass an already-patched mpv tree for offline use; otherwise fetch and patch
 # the pinned source.
 set -euo pipefail

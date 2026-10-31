@@ -8,15 +8,28 @@
 // whose main thread never services the main dispatch queue. AVPlayer attaches
 // an item there, so it never asks the resource loader for the stream and the
 // startup supervisor has to give up. mp_time_ns() is a clock the test moves,
-// so the supervisor's two 2 s deadlines pass at once. Run
-// scripts/test_ao_avfoundation_fallback.sh, which builds it against the
-// patched mpv source.
+// so the supervisor's two 2 s deadlines pass at once, and the feed timer's
+// ticks are the test's own. Run scripts/test_ao_avfoundation_fallback.sh,
+// which builds it against the patched mpv source.
 
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// The feed timer's ticks are tick() below. Left to the real 50 ms timer, the
+// driver would also run feed_avp() on its own between the test's steps, as
+// soon as 50 ms after start(), and every check that counts reads or clock
+// anchors across a tick would count that one too. Every timer the driver sets
+// stays idle; the driver's own source is still created, resumed and cancelled.
+static void idle_timer(dispatch_source_t source, dispatch_time_t start,
+                       uint64_t interval, uint64_t leeway)
+{
+    dispatch_source_set_timer(source, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+}
+#define dispatch_source_set_timer idle_timer
 
 #include "audio/out/ao_avfoundation.m"
 

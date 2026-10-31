@@ -174,7 +174,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_build_process.sh` | the Swift driver's process launch: output capture and exit codes | main |
 | `platforms/linux/test.sh` | the linux driver's build plan and configure flags, all tools stubbed | PR |
 | `platforms/windows/test_pin_packages.py` (python3) | `pin_packages.py` rewrites winbuild's packages onto the pins | PR |
-| `test_ao_avfoundation_fallback.sh` | AVPlayer sink: PCM fallback, no-resource-request log, clock anchor (macOS) | PR |
+| `test_ao_avfoundation_fallback.sh` | AVPlayer sink: PCM fallback, no-resource-request log, clock anchor; the test drives the clock and feed ticks (macOS) | PR |
 | `test_ao_compressed_audio_option.sh` | the compressed-audio option contract (patch 0019) | main |
 | `test_ao_pcm_lookahead.sh` | bounded PCM lookahead (patch 0015) | main |
 | `test_ao_probe_refusal.sh` | the compressed-audio loader refuses reads past the write head | main |
