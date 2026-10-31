@@ -268,9 +268,15 @@ check_patched_sources() {
     | while IFS=$'\t' read -r source_name pinned digest action patches reason; do
     local src="$WORK/src/$source_name"
     if [[ "$action" == reapply ]]; then
-      local list=()
+      local list=() created
       [[ "$patches" == - ]] || IFS=: read -ra list <<< "$patches"
-      if git -C "$src" reset --hard -q "$pinned" && git -C "$src" apply "${list[@]}"; then
+      # postremovebuild's `git clean -df` keeps ignored files, so a file the
+      # series creates under the source's .gitignore (libass's
+      # m4/ax_pthread.m4) outlives the reset and would block `git apply`.
+      if git -C "$src" reset --hard -q "$pinned" \
+        && created="$(git -C "$src" apply --summary "${list[@]}" | sed -n 's/^ create mode [0-7]* //p')" \
+        && { [[ -z "$created" ]] || (cd "$src" && while read -r path; do rm -f -- "$path"; done <<< "$created"); } \
+        && git -C "$src" apply "${list[@]}"; then
         echo "==> $source_name: $reason; re-applied its series in place"
       else
         action=purge

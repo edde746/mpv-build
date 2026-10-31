@@ -593,6 +593,16 @@ class PinPackagesTest(unittest.TestCase):
         self.assertIsNone(pin_packages.info_source_dir("method=git\nwork_dir=/w/src\n"))
 
 
+CREATED_IGNORED = """diff --git a/m4/extra.m4 b/m4/extra.m4
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/m4/extra.m4
+@@ -0,0 +1 @@
++dnl created by the series
+"""
+
+
 def git(cwd, *args):
     return subprocess.run(["git", "-C", str(cwd), *args], check=True,
                           capture_output=True, text=True).stdout.strip()
@@ -631,7 +641,10 @@ class PatchStateTest(unittest.TestCase):
         self.source.mkdir(parents=True)
         git(self.source, "init", "-q")
         (self.source / "a.c").write_text("old\n", encoding="utf-8")
-        git(self.source, "add", "a.c")
+        # Like libass's m4/ax_pthread.m4: the series creates a file its
+        # source's .gitignore covers.
+        (self.source / ".gitignore").write_text("m4/\n", encoding="utf-8")
+        git(self.source, "add", "a.c", ".gitignore")
         git(self.source, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pin")
         self.commit = git(self.source, "rev-parse", "HEAD")
 
@@ -660,7 +673,7 @@ class PatchStateTest(unittest.TestCase):
         self.patch.write_text(
             "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
             "Subject: [PATCH] a: say new\n\n"
-            f"{comment}\n---\n" + PATCH, encoding="utf-8")
+            f"{comment}\n---\n" + PATCH + CREATED_IGNORED, encoding="utf-8")
 
     def patched_warm_tree(self):
         """What a run that patched libass leaves for the cache: the series
@@ -733,7 +746,7 @@ class PatchStateTest(unittest.TestCase):
         # The same with no recorded series (the 2026-10-31 cache) can't be trusted.
         (self.state / "libass").unlink()
         self.assertEqual(self.libass_state()[3], "purge")
-        git(self.source, "apply", str(self.patch))
+        git(self.source, "apply", "--include=a.c", str(self.patch))
         self.record("a digest of another series")
         self.assertEqual(self.libass_state()[3], "purge")
 
@@ -773,9 +786,12 @@ class PatchStateTest(unittest.TestCase):
             (self.stamps / f"libass-{step}").touch()
         self.assertEqual(warm_run(), "")
 
-        # winbuild's postremovebuild resets the source after install; the next
+        # winbuild's postremovebuild resets the source after install (its
+        # `git clean -df` keeps the ignored file the series created); the next
         # warm run re-applies the series in place and keeps every stamp.
         git(self.source, "reset", "--hard", "-q", self.commit)
+        git(self.source, "clean", "-qdf")
+        self.assertTrue((self.source / "m4/extra.m4").exists())
         self.assertIn("==> libass: its source is back at the pin under its patch stamp; "
                       "re-applied its series in place", warm_run())
         self.assertEqual((self.source / "a.c").read_text(encoding="utf-8"), "new\n")
