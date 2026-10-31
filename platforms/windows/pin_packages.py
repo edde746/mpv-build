@@ -101,6 +101,11 @@ COMPONENTS = ("mpv", "ffmpeg", "libass")
 #     since 6c3b4f36 calls its own renamed MD5 while md5.c is still compiled
 #     out under that define, so the ffmpeg link fails on undefined
 #     aribcc_md5_* symbols. Pinned to the release before the rename.
+#   fontconfig: winbuild builds the main tip and git-ams its own
+#     fontconfig-0001/0002 patches onto it; upstream dff5c35 (2026-10-30)
+#     changed src/fcdir.c and they no longer apply, so every cold build
+#     failed. Pinned to be20036a, the newest main commit both apply to. Drop
+#     the pin once winbuild rebases its fontconfig patches.
 EXTRA_COMPONENTS = {
     "mingw-w64": "toolchain/mingw-w64.cmake",
     "llvm": "toolchain/llvm/llvm.cmake",
@@ -108,6 +113,7 @@ EXTRA_COMPONENTS = {
     "nv-codec-headers": "packages/nvcodec-headers.cmake",
     "openssl": "packages/openssl.cmake",
     "libaribcaption": "packages/libaribcaption.cmake",
+    "fontconfig": "packages/fontconfig.cmake",
 }
 GROUP = "windows"
 # The meta-build checkout build.sh fetches: its commit pins the whole

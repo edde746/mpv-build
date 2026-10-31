@@ -69,9 +69,9 @@ moves.
 ## Key coarseness
 
 `group.json` lists components `mpv`, `ffmpeg`, `libass`,
-`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1`, `nv-codec-headers`
-and `openssl` (the last five being the packages
-`pin_packages.EXTRA_COMPONENTS` pins). The winbuild graph builds ~60 more dependencies (freetype,
+`mpv-winbuild-cmake`, `mingw-w64`, `llvm`, `svt-av1`, `nv-codec-headers`,
+`openssl` and `fontconfig` (the last six being packages
+`pin_packages.EXTRA_COMPONENTS` pins; it also pins `libaribcaption`). The winbuild graph builds ~60 more dependencies (freetype,
 harfbuzz, x264, dav1d, ...). Those are deliberately NOT individual
 versions.json components: they track whatever `GIT_RESET`/URL pins the
 winbuild commit carries, so they are keyed -- coarsely but honestly --
@@ -89,6 +89,11 @@ exists because the 2026-08-29 secure-API header restructure on mingw-w64
 master broke libvpl's MinGW compat macros mid-day; llvm's `release/22.x`
 branch is the remaining live-fetch in the toolchain and freezes only inside
 a warm cache -- pin it the same way if it ever bites.
+
+`fontconfig` is pinned to `be20036a` because winbuild builds its main tip
+and `git am`s its own fontconfig patches, which upstream dff5c35
+(2026-10-30) broke: every cold build failed at fontconfig's patch step.
+Drop the pin once winbuild rebases its fontconfig patches.
 
 ## CI build-state caching
 

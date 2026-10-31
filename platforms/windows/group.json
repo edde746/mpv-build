@@ -19,7 +19,8 @@
         "llvm",
         "svt-av1",
         "nv-codec-headers",
-        "openssl"
+        "openssl",
+        "fontconfig"
       ],
       "variants": [
         "x86_64",
