@@ -707,9 +707,10 @@ class PatchStateTest(unittest.TestCase):
         self.assertIsNone(verdict(False, "other", "d", False))
         self.assertIsNone(verdict(True, "d", "d", True))
         self.assertIsNone(verdict(True, None, "d", True))
-        self.assertIn("series or pin changed", verdict(True, "other", "d", True))
-        self.assertIn("does not hold", verdict(True, "d", "d", False))
-        self.assertIn("does not hold", verdict(True, None, "d", False))
+        self.assertEqual(verdict(True, "other", "d", True)[0], "purge")
+        self.assertEqual(verdict(True, "other", "d", False)[0], "purge")
+        self.assertEqual(verdict(True, None, "d", False)[0], "purge")
+        self.assertEqual(verdict(True, "d", "d", False)[0], "reapply")
 
     def test_patched_packages_reads_patch_stamps_only(self):
         self.patched_warm_tree()
@@ -719,25 +720,29 @@ class PatchStateTest(unittest.TestCase):
         self.assertEqual(pin_packages.patched_packages(self.build), {"libass"})
 
     def test_stamp_never_stands_beside_another_series(self):
-        _, _, digest, reason = self.libass_state()
-        self.assertEqual(reason, "", "no stamp: the patch step runs anyway")
+        _, _, digest, action, patches, reason = self.libass_state()
+        self.assertEqual((action, patches, reason), ("keep", str(self.patch), ""),
+                         "no stamp: the patch step runs anyway")
         self.patched_warm_tree()
-        self.assertEqual(self.libass_state()[3], "", "a tree cached before digests were kept")
+        self.assertEqual(self.libass_state()[3], "keep", "a tree cached before digests were kept")
         self.record(digest)
-        self.assertEqual(self.libass_state()[3], "")
-        # The 2026-10-31 cache: stamped, but the source sits at the pin unpatched.
+        self.assertEqual(self.libass_state()[3], "keep")
+        # What winbuild's postremovebuild leaves: stamped, source at the pin.
         git(self.source, "checkout", "-q", "--", "a.c")
-        self.assertIn("does not hold", self.libass_state()[3])
+        self.assertEqual(self.libass_state()[3], "reapply")
+        # The same with no recorded series (the 2026-10-31 cache) can't be trusted.
+        (self.state / "libass").unlink()
+        self.assertEqual(self.libass_state()[3], "purge")
         git(self.source, "apply", str(self.patch))
         self.record("a digest of another series")
-        self.assertIn("series or pin changed", self.libass_state()[3])
+        self.assertEqual(self.libass_state()[3], "purge")
 
     def test_warm_build_reapplies_libass_after_a_comment_change(self):
         # The demo: build.sh's own check_patched_sources over a warm tree.
         # Run 1 leaves the series applied and stamped and records its digest;
         # a comment-only edit to the staged libass patch then makes the next
         # warm run reset libass to the pin and drop its stamps, so the patch
-        # step re-applies the series, and a third run keeps what that did.
+        # step re-applies the series, and later runs keep what that did.
         script = shell_functions(["drop_stamps", "purge_component", "check_patched_sources"])
 
         def warm_run():
@@ -767,7 +772,15 @@ class PatchStateTest(unittest.TestCase):
         for step in ("download", "patch", "configure", "build", "install", "done"):
             (self.stamps / f"libass-{step}").touch()
         self.assertEqual(warm_run(), "")
-        self.assertTrue((self.stamps / "libass-patch").exists())
+
+        # winbuild's postremovebuild resets the source after install; the next
+        # warm run re-applies the series in place and keeps every stamp.
+        git(self.source, "reset", "--hard", "-q", self.commit)
+        self.assertIn("==> libass: its source is back at the pin under its patch stamp; "
+                      "re-applied its series in place", warm_run())
+        self.assertEqual((self.source / "a.c").read_text(encoding="utf-8"), "new\n")
+        self.assertEqual(len(list(self.stamps.iterdir())), 6)
+        self.assertEqual(warm_run(), "")
 
 
 if __name__ == "__main__":

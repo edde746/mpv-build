@@ -639,26 +639,39 @@ def patched_packages(build):
 
 
 def patch_verdict(stamped, recorded, digest, held):
-    """Why a package's cached source must be reset before this build, or None.
+    """(action, reason) for a package's cached source before this build, or
+    None when it can stay as it is.
 
-    A patch stamp may only stand beside a source the current series and pin
-    produced: either the series digest recorded with that tree is this one,
-    or, with nothing recorded (a tree cached before digests were kept), the
-    source holds the bytes this series produces. Without a stamp the patch
-    step runs anyway, and its own reset makes it converge.
+    A patch stamp may only stand beside the series and pin that produced it,
+    which the series digest recorded with the tree says. A recorded digest
+    that is not the current one ("purge"), or none at all (a tree cached
+    before digests were kept) under a source that does not hold the series,
+    resets the source and drops the package's stamps, so the package is
+    re-patched and rebuilt. At the recorded digest, a source that does not
+    hold the series is winbuild's own doing: its postremovebuild step resets
+    every git source to the pin after install, so a step re-run later (a
+    cascade, a liteclean) would compile it unpatched. That source gets the
+    series re-applied in place ("reapply") and nothing is rebuilt. Without a
+    stamp the patch step runs anyway, and its own reset makes it converge.
     """
     if not stamped:
         return None
     if recorded is not None and recorded != digest:
-        return "its patch series or pin changed since it was patched"
-    if not held:
-        return "its source does not hold the series its patch stamp claims"
-    return None
+        return ("purge", "its patch series or pin changed since it was patched")
+    if held:
+        return None
+    if recorded is None:
+        return ("purge", "its source does not hold the series its patch stamp claims, "
+                         "and no series was recorded with it")
+    return ("reapply", "its source is back at the pin under its patch stamp")
 
 
 def patch_state(winbuild, versions, sources, build, state):
-    """(source dir, commit, digest, reason) for every package with a patch
-    step; reason is patch_verdict's, "" when the cached tree can stay."""
+    """(source dir, commit, digest, action, patches, reason) for every package
+    with a patch step: action and reason are patch_verdict's, "keep" and ""
+    when the cached tree can stay; patches are the series' paths joined by
+    ":", "-" for none. Only the last field may be empty: build.sh reads the
+    rows with a tab IFS, which folds empty fields between tabs."""
     stamped = patched_packages(build) if Path(build).is_dir() else set()
     rows = []
     for source_dir, commit, digest, patches in patch_sets(winbuild, versions):
@@ -666,8 +679,9 @@ def patch_state(winbuild, versions, sources, build, state):
         recorded = record.read_text(encoding="utf-8").strip() if record.is_file() else None
         is_stamped = source_dir in stamped
         held = is_stamped and holds_patches(Path(sources) / source_dir, commit, patches)
-        reason = patch_verdict(is_stamped, recorded, digest, held) or ""
-        rows.append((source_dir, commit, digest, reason))
+        action, reason = patch_verdict(is_stamped, recorded, digest, held) or ("keep", "")
+        rows.append((source_dir, commit, digest, action,
+                     ":".join(map(str, patches)) or "-", reason))
     return rows
 
 
