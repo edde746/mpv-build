@@ -1,0 +1,37 @@
+vd_lavc: remove Vulkan hwdec from auto-safe selection
+
+H.264 High 10 played as a grey picture in Plezy on Windows with an RTX
+5070 Ti and hardware decoding on (edde746/plezy#2921). FFmpeg offers no
+D3D11 surface for 10-bit H.264, so hwdec=auto rejects d3d11va and
+d3d11va-copy (the reporter's two "h264: no frame!" lines) and takes the
+next whitelisted method, vulkan-copy. NVIDIA's driver accepts 10-bit H.264
+over Vulkan Video on Blackwell, and the picture stays grey.
+
+Backport of mpv master d20d108d94 (Kacper Michajłow, 2026-04-15), which
+drops vulkan and vulkan-copy from the auto-safe whitelist because Vulkan
+decoding keeps regressing in FFmpeg. hwdec=auto now moves on to
+dxva2-copy, nvdec-copy and then software; hwdec=vulkan, vulkan-copy and
+auto-unsafe still reach it. mpv master has the same code.
+
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 399e1d5..54ea8fd 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -264,7 +264,7 @@ struct autoprobe_info {
+ // Things not included in this list will be tried last, in random order.
+ const struct autoprobe_info hwdec_autoprobe_info[] = {
+     {"d3d11va",         HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+-    {"vulkan",          HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
++    {"vulkan",          HWDEC_FLAG_AUTO},
+     {"dxva2",           HWDEC_FLAG_AUTO},
+     {"nvdec",           HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+     {"vaapi",           HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+@@ -273,7 +273,7 @@ const struct autoprobe_info hwdec_autoprobe_info[] = {
+     {"mediacodec",      HWDEC_FLAG_AUTO},
+     {"videotoolbox",    HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+     {"d3d11va-copy",    HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+-    {"vulkan-copy",     HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
++    {"vulkan-copy",     HWDEC_FLAG_AUTO},
+     {"dxva2-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+     {"nvdec-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
+     {"vaapi-copy",      HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},

@@ -35,3 +35,5 @@
 # FFmpeg's log lines reach the instance whose thread logged them, with
 # several instances alive at once.
 0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch
+# hwdec=auto no longer picks Vulkan decoding (mpv master d20d108d94).
+0211-vd-lavc-remove-vulkan-hwdec-from-auto-safe-selection.patch
