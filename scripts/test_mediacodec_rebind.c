@@ -29,7 +29,12 @@ typedef void JNIEnv;
 typedef void *jobject;
 typedef struct window { int refs; bool entered, release; } ANativeWindow;
 struct mediacodec_geometry { int width; };
-struct mediacodec_opts { char *video_rect; int osd_vsync_delay; int64_t osd_surface; };
+struct mediacodec_opts {
+    char *video_rect;
+    int osd_vsync_delay;
+    bool letterbox_fill;
+    int64_t osd_surface;
+};
 struct m_config_cache { struct mediacodec_opts *opts; bool dirty; };
 struct mp_osd_res { int w, h; };
 struct osd_slot { void *sbs; };
@@ -62,6 +67,7 @@ struct priv {
     struct osd_ahead osd;
     struct mediacodec_geometry osd_geometry;
     int osd_vsync_delay;
+    bool letterbox_fill;
     struct osd_plane_stats plane;
     double osd_pts;
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
@@ -166,11 +172,12 @@ static void *rebind(void *arg)
 int main(void)
 {
     ANativeWindow a = {0}, b = {0};
-    struct mediacodec_opts opts = {.video_rect = "1920", .osd_vsync_delay = 2};
+    struct mediacodec_opts opts = {.video_rect = "1920", .osd_vsync_delay = 2,
+                                   .letterbox_fill = true};
     struct m_config_cache cache = {.opts = &opts};
     struct priv p = {.opts_cache = &cache, .osd_surface = (intptr_t)&a,
                      .osd = {.paused = true}, .osd_geometry = {.width = 1920},
-                     .osd_vsync_delay = 2};
+                     .osd_vsync_delay = 2, .letterbox_fill = true};
     struct vo vo = {.priv = &p};
     osd_init(&vo);
     pthread_mutex_lock(&gate);
@@ -193,7 +200,8 @@ int main(void)
     assert(pthread_join(handoff, NULL) == 0);
     assert(a.refs == 0 && b.refs == 1 && freed == 1 && p.osd.slots[0].sbs == NULL);
     assert(!p.osd.terminate && p.osd.paused && p.osd.epoch > epoch);
-    assert(p.osd_geometry.width == 1920 && p.osd_vsync_delay == 2 && vo.want_redraw);
+    assert(p.osd_geometry.width == 1920 && p.osd_vsync_delay == 2 && p.letterbox_fill &&
+           vo.want_redraw);
     pthread_mutex_lock(&gate);
     b.release = true;
     pthread_cond_broadcast(&changed);
@@ -215,8 +223,20 @@ int main(void)
     cache.dirty = true;
     update_opts(&vo);
     assert(p.osd_threads_created && !p.osd.terminate && b.refs == 1);
+
+    // Turning the letterbox fill off at runtime repaints even when the
+    // geometry and the subtitles stay put: an unchanged render would never
+    // clear the margins.
+    uint64_t before_fill = p.osd.epoch;
+    vo.want_redraw = false;
+    opts.letterbox_fill = false;
+    cache.dirty = true;
+    update_opts(&vo);
+    assert(!p.letterbox_fill && p.osd.epoch > before_fill && vo.want_redraw);
+
     osd_uninit(&vo);
     assert(b.refs == 0);
-    puts("PASS: OSD rebind waits for producer retirement, releases once, and restarts without stale state");
+    puts("PASS: OSD rebind waits for producer retirement, releases once, and restarts without stale state; "
+         "a letterbox fill change repaints");
     return 0;
 }

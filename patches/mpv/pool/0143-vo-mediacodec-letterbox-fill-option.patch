@@ -1,0 +1,211 @@
+Subject: [PATCH] vo_mediacodec: make the OSD plane's letterbox fill an option
+
+The OSD plane fills the letterbox opaque black (0106, folded into 0100)
+because on MediaTek TV boxes (Google TV Streamer, Fire TV 4K Max) a
+transparent margin scans out as the compositor's own background, which that
+pipeline renders above black in HDR/Dolby Vision output. Amlogic Google TV
+boxes do the opposite. On a Xiaomi TV Box S 3rd Gen (S905X5M, Plezy #2926)
+the filled bars are gray in Dolby Vision output, while ExoPlayer's are
+black: it stacks the same picture-sized video surface under the same
+full-size overlay, and leaves the overlay's margins transparent. On the
+onn 4K Pro (Amlogic, Android 14) players that paint the bars on a graphics
+layer show the same gray in Dolby Vision output only. No SoC field or
+platform API separates the two pipelines - the Amlogic Fire TV Cube 3
+behaves like MediaTek - which is why Kodi and NuvioTV also ended up
+choosing per device.
+
+--vo-mediacodec-letterbox-fill=no leaves the margins transparent; the
+default keeps the fill. The present thread reads the option under the OSD
+lock with the vsync delay, and a runtime change invalidates in-flight work
+the way a geometry change does, since an unchanged subtitle render would
+never repaint the margins.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 5ec1315..1dca159 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -797,6 +797,14 @@ Available video output drivers are:
+     same timestamp; the embedder supplies the offset it measured. Only the
+     presentation time is shifted, the rendered pts is not.
+ 
++    ``--vo-mediacodec-letterbox-fill=<yes|no>`` (default yes) fills the OSD
++    plane outside the video rectangle opaque black. The OSD Surface spans
++    the whole view, so the letterbox shows whatever it holds there; with
++    ``no`` the margins stay transparent and show what is beneath the plane.
++    Display pipelines disagree on which of the two stays black in HDR and
++    Dolby Vision output, so the embedder chooses per device. Takes effect at
++    runtime.
++
+ ``mediacodec_embed`` (Android)
+     Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
+     Requires ``--hwdec=mediacodec`` for hardware decoding, along with
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 1ffad3b..318e06e 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -733,6 +733,7 @@ static struct mp_osd_res mediacodec_osd_geometry(
+ struct mediacodec_opts {
+     char *video_rect;
+     int osd_vsync_delay;
++    bool letterbox_fill;
+     int64_t osd_surface;
+ };
+ 
+@@ -744,10 +745,14 @@ static const struct m_sub_options mediacodec_conf = {
+         {"vo-mediacodec-video-rect", OPT_STRING(video_rect)},
+         {"vo-mediacodec-osd-vsync-delay", OPT_INT(osd_vsync_delay),
+             M_RANGE(0, 3)},
++        {"vo-mediacodec-letterbox-fill", OPT_BOOL(letterbox_fill)},
+         {0},
+     },
+     .size = sizeof(struct mediacodec_opts),
+-    .defaults = &(const struct mediacodec_opts){.video_rect = ""},
++    .defaults = &(const struct mediacodec_opts){
++        .video_rect = "",
++        .letterbox_fill = true,
++    },
+ };
+ #undef OPT_BASE_STRUCT
+ 
+@@ -796,9 +801,11 @@ struct priv {
+     mp_thread osd_present_thread;
+     bool osd_threads_created;
+     struct osd_ahead osd;
+-    // Under osd.lock: the embedder's geometry and the presentation delay.
++    // Under osd.lock: the embedder's geometry, the presentation delay and
++    // whether the presenter fills the letterbox.
+     struct mediacodec_geometry osd_geometry;
+     int osd_vsync_delay;
++    bool letterbox_fill;
+     struct osd_plane_stats plane; // under osd.lock
+     // Render thread only: the geometry latched for the renders in flight.
+     struct mediacodec_geometry osd_render_geometry;
+@@ -2266,15 +2273,19 @@ static int osd_gl_bar(int margin, int surface, int canvas)
+ 
+ // The OSD plane sits below the app window but spans the whole player, so
+ // Android punches the entire container out of the window canvas and the
+-// window's black background never reaches the letterbox. Whatever this plane
+-// leaves transparent outside the picture scans out as the compositor's own
+-// background, which the MediaTek TV pipeline (Google TV Streamer, Fire TV
+-// 4K Max) renders above black while the display is in HDR/Dolby Vision
+-// mode: gray bars on an OLED. Fill the margins opaque black on this plane.
+-// That adds no layer, so the HWC keeps the picture on the video plane - an
+-// extra layer, even a non-overlapping solid color, demotes it to GPU
+-// composition and drops the HDR output - and subtitles placed in the margins
+-// draw over the fill in the same buffer.
++// window's black background never reaches the letterbox: the margins are
++// whatever this plane holds there. Display pipelines disagree on which black
++// survives HDR/Dolby Vision output. A transparent margin scans out as the
++// compositor's own background, which the MediaTek TV pipeline (Google TV
++// Streamer, Fire TV 4K Max) renders above black: gray bars on an OLED. So by
++// default the margins are filled opaque black on this plane. That adds no
++// layer, so the HWC keeps the picture on the video plane - an extra layer,
++// even a non-overlapping solid color, demotes it to GPU composition and
++// drops the HDR output - and subtitles placed in the margins draw over the
++// fill in the same buffer. Amlogic Google TV boxes do the opposite: in Dolby
++// Vision output they raise opaque black on a graphics layer and scan a
++// transparent margin out black, so the embedder turns the fill off there
++// (--vo-mediacodec-letterbox-fill=no).
+ static void osd_gl_fill_letterbox(struct osd_gl *g, const struct osd_slot *slot,
+                                   int sw, int sh)
+ {
+@@ -2308,7 +2319,8 @@ static void osd_gl_fill_letterbox(struct osd_gl *g, const struct osd_slot *slot,
+     gl->ClearColor(0, 0, 0, 0);
+ }
+ 
+-static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *slot)
++static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *slot,
++                        bool fill_letterbox)
+ {
+     struct priv *p = vo->priv;
+     struct GL *gl = g->gl;
+@@ -2319,7 +2331,8 @@ static void osd_gl_draw(struct vo *vo, struct osd_gl *g, const struct osd_slot *
+     g->surface_h = sh;
+     gl->Viewport(0, 0, sw, sh);
+     gl->Clear(GL_COLOR_BUFFER_BIT);
+-    osd_gl_fill_letterbox(g, slot, sw, sh);
++    if (fill_letterbox)
++        osd_gl_fill_letterbox(g, slot, sw, sh);
+ 
+     struct sub_bitmap_list *sbs = slot->sbs;
+     // Canvas pixels -> NDC; the list's w/h is the canvas the parts address.
+@@ -2411,7 +2424,7 @@ static bool osd_park(struct vo *vo, struct osd_gl *g, int64_t deadline_mono,
+ }
+ 
+ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+-                        struct osd_release release)
++                        struct osd_release release, bool fill_letterbox)
+ {
+     struct priv *p = vo->priv;
+     struct osd_ahead *s = &p->osd;
+@@ -2419,7 +2432,7 @@ static void osd_present(struct vo *vo, struct osd_gl *g, struct osd_result r,
+     int64_t t_taken = mp_time_ns();
+     osd_gl_resolve_probes(vo, g);
+     int64_t t_draw0 = mp_time_ns();
+-    osd_gl_draw(vo, g, &p->osd.slots[r.slot]);
++    osd_gl_draw(vo, g, &p->osd.slots[r.slot], fill_letterbox);
+     int64_t t_draw1 = mp_time_ns();
+ 
+     bool pinned = release.timestamp && g->presentation_time;
+@@ -2580,12 +2593,13 @@ static MP_THREAD_VOID osd_present_thread(void *arg)
+             if (release.vsync)
+                 release.vsync += shift;
+         }
++        bool fill_letterbox = p->letterbox_fill;
+         if (!current)
+             s->stats.stale++;
+         mp_mutex_unlock(&p->osd.lock);
+ 
+         if (current)
+-            osd_present(vo, &g, r, release);
++            osd_present(vo, &g, r, release, fill_letterbox);
+ 
+         mp_mutex_lock(&p->osd.lock);
+         // The slot stays held: it is what is on screen, the reference the
+@@ -2739,8 +2753,8 @@ static void osd_init(struct vo *vo)
+     }
+ 
+     // A rebind starts fresh workers, not a new video decoder. Preserve only
+-    // the presentation policy (geometry, vsync delay, pause); no old request,
+-    // slot or termination flag lives on.
++    // the presentation policy (geometry, vsync delay, letterbox fill, pause);
++    // no old request, slot or termination flag lives on.
+     p->osd.log = vo->log;
+     p->osd.osd = vo->osd;
+     p->osd.formats = osd_gl_formats;
+@@ -2809,6 +2823,7 @@ static int preinit(struct vo *vo)
+     if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
+         MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
+     p->osd_vsync_delay = opts->osd_vsync_delay;
++    p->letterbox_fill = opts->letterbox_fill;
+     m_config_cache_set_wakeup_cb(p->opts_cache, opts_wakeup, vo);
+     vo->hwdec_devs = hwdec_devices_create();
+     p->hwctx = (struct mp_hwdec_ctx){
+@@ -3025,6 +3040,7 @@ static void update_opts(struct vo *vo)
+         if (geometry_ok)
+             p->osd_geometry = geometry;
+         p->osd_vsync_delay = opts->osd_vsync_delay;
++        p->letterbox_fill = opts->letterbox_fill;
+         osd_init(vo);
+         vo->want_redraw = true;
+     }
+@@ -3034,11 +3050,16 @@ static void update_opts(struct vo *vo)
+     p->osd_vsync_delay = opts->osd_vsync_delay;
+     bool changed = geometry_ok &&
+                    !mediacodec_geometry_equal(p->osd_geometry, geometry);
+-    if (changed) {
+-        // Publish the new geometry and invalidate in-flight work atomically.
++    if (changed)
+         p->osd_geometry = geometry;
+-        osd_ahead_invalidate(&p->osd, p->osd_pts);
++    if (p->letterbox_fill != opts->letterbox_fill) {
++        p->letterbox_fill = opts->letterbox_fill;
++        changed = true;
+     }
++    // Publish the new policy and invalidate in-flight work atomically: an
++    // unchanged subtitle render would otherwise never repaint the margins.
++    if (changed)
++        osd_ahead_invalidate(&p->osd, p->osd_pts);
+     mp_mutex_unlock(&p->osd.lock);
+     if (changed)
+         vo->want_redraw = true;
