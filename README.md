@@ -244,6 +244,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_player_queue_frames.sh` | frame queueing and durations under vo_mediacodec | PR, main |
 | `test_player_release_held_frame.sh` | ending a file frees the decoder before the next opens (patch 0139) | PR, main |
 | `test_player_video_restart.sh` | restored video syncs to already-running audio (patch 0210) | PR |
+| `test_spdif_truehd_branch.sh` | TrueHD units keep their IEC 61937 carrier offsets across seamless-branch timing jumps (patch 0039) | PR, main |
 | `test_tcp_family_lookup.sh` | per-family hostname lookup and connection race (patch 0029) | PR, main |
 | `test_android_glue.sh` | the mpv-android JNI glue; see [docs/android.md](docs/android.md#tests) | PR, main |
 

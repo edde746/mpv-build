@@ -185,6 +185,9 @@ jobs:
       - name: Test PGS palette cache across an epoch
         run: bash ./scripts/test_pgs_palette.sh
 
+      - name: Test TrueHD MAT padding across a seamless-branch timing jump
+        run: bash ./scripts/test_spdif_truehd_branch.sh
+
       - name: Test TCP hostname lookup by address family
         run: bash ./scripts/test_tcp_family_lookup.sh
 
