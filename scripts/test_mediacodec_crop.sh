@@ -19,9 +19,12 @@ if [[ -z "$source_dir" ]]; then
     (cd "$root" && python3 scripts/patches.py fetch-pinned ffmpeg android "$source_dir")
 fi
 
-# The format-key defines the parser reads, then the parser itself.
+# The format-key defines the parser reads, the static HDR metadata reader it
+# calls, then the parser itself.
 python3 "$root/scripts/extract.py" define "$source_dir/libavcodec/mediacodecdec_common.c" \
-    "$workdir/mediacodec_crop.inc" --name AMEDIAFORMAT_GET_INT32
+    "$workdir/mediacodec_crop.inc" --name AMEDIAFORMAT_GET_INT32 --name MEDIACODEC_HDR_STATIC_INFO_SIZE
+python3 "$root/scripts/extract.py" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
+    "$workdir/mediacodec_crop.inc" --append --return int --fn mediacodec_dec_hdr_static_info
 python3 "$root/scripts/extract.py" symbol "$source_dir/libavcodec/mediacodecdec_common.c" \
     "$workdir/mediacodec_crop.inc" --append --return int --fn mediacodec_dec_parse_video_format
 

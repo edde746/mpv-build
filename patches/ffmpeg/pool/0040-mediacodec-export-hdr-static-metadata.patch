@@ -1,0 +1,423 @@
+Subject: [PATCH] avcodec/mediacodecdec: export the decoder's static HDR metadata on every frame
+
+On an NVIDIA SHIELD (Plezy #2955), an HDR10 file whose mastering display
+and content light metadata sit only in its SEI showed mpv's
+`video-params` as max-luma 10000, min-luma 0, max-cll 0 and max-fall 0:
+mpv's inferred PQ peak and nothing else. FFmpeg's own HEVC decoder (every
+hwaccel, software decode) reads that SEI and attaches it to each frame;
+the MediaCodec wrapper never sees the bitstream's SEI, and a frame it
+wraps for a surface never passes through ff_get_buffer, so not even the
+container's metadata (an MP4's mdcv and clli boxes) reached it. Only
+Matroska's Colour element got through, because mpv's own demuxer reads it.
+
+MediaCodec reports what it parsed in its output format, as the
+"hdr-static-info" CTA-861.3 Static Metadata Descriptor; OMX.Nvidia.h265.decode
+reports the stream's values there once its first frame is out, and all zero
+before that and for ByteBuffer output. The output format parser now reads
+that key into the context, holding the mastering display to the ranges
+FFmpeg's decoders hold the same SEI to (h2645_sei.c) and taking zero light
+levels as unknown. Both wrap paths attach it to the frame as mastering
+display and content light side data the way FFmpeg's decoders do: over the
+container's, unless the caller prefers the container's
+(side_data_prefer_packet). A copied frame has the container's from
+ff_get_buffer; a surface frame now gets whichever of the two wins, and
+only that one is allocated.
+
+Reading the key needed the JNI MediaFormat getBuffer to work at all: it
+read the value through GetDirectBufferAddress, but MediaFormat's buffers
+are heap buffers (android_media_Utils wraps a byte array), so it handed
+back NULL with a size of (size_t)-1 and success. It now copies the
+buffer's remaining bytes through ByteBuffer.duplicate() and get(byte[]),
+and checks for a pending exception before it trusts containsKey's answer;
+the NDK getBuffer, which lent the format's own storage, returns a copy
+too, so both return memory the caller frees. Nothing called getBuffer
+before.
+
+diff --git a/libavcodec/mediacodec_wrapper.c b/libavcodec/mediacodec_wrapper.c
+index 6cae0eb..f03e3fc 100644
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -113,6 +113,13 @@ struct JNIAMediaFormatFields {
+ 
+     jmethodID to_string_id;
+ 
++    // MediaFormat's byte buffers are heap buffers (android_media_Utils wraps a
++    // byte array), which JNI's direct-buffer access cannot read.
++    jclass bytebuffer_class;
++    jmethodID bytebuffer_duplicate_id;
++    jmethodID bytebuffer_remaining_id;
++    jmethodID bytebuffer_get_id;
++
+ };
+ 
+ #define OFFSET(x) offsetof(struct JNIAMediaFormatFields, x)
+@@ -137,6 +144,11 @@ static const struct FFJniField jni_amediaformat_mapping[] = {
+ 
+         { "android/media/MediaFormat", "toString", "()Ljava/lang/String;", FF_JNI_METHOD, OFFSET(to_string_id), 1 },
+ 
++    { "java/nio/ByteBuffer", NULL, NULL, FF_JNI_CLASS, OFFSET(bytebuffer_class), 1 },
++        { "java/nio/ByteBuffer", "duplicate", "()Ljava/nio/ByteBuffer;", FF_JNI_METHOD, OFFSET(bytebuffer_duplicate_id), 1 },
++        { "java/nio/ByteBuffer", "remaining", "()I", FF_JNI_METHOD, OFFSET(bytebuffer_remaining_id), 1 },
++        { "java/nio/ByteBuffer", "get", "([B)Ljava/nio/ByteBuffer;", FF_JNI_METHOD, OFFSET(bytebuffer_get_id), 1 },
++
+     { NULL }
+ };
+ #undef OFFSET
+@@ -973,53 +985,71 @@ fail:
+ 
+ static int mediaformat_jni_getBuffer(FFAMediaFormat* ctx, const char *name, void** data, size_t *size)
+ {
+-    int ret = 1;
++    int ret = 0;
+     FFAMediaFormatJni *format = (FFAMediaFormatJni *)ctx;
+     JNIEnv *env = NULL;
+     jstring key = NULL;
+     jboolean contains_key;
+     jobject result = NULL;
++    jobject view = NULL;
++    jobject self = NULL;
++    jbyteArray bytes = NULL;
++    jint remaining;
+ 
+     av_assert0(format != NULL);
+ 
++    *data = NULL;
++    *size = 0;
++
+     JNI_GET_ENV_OR_RETURN(env, format, 0);
+ 
+     key = ff_jni_utf_chars_to_jstring(env, name, format);
+-    if (!key) {
+-        ret = 0;
++    if (!key)
+         goto fail;
+-    }
+ 
+     contains_key = (*env)->CallBooleanMethod(env, format->object, format->jfields.contains_key_id, key);
+-    if (!contains_key || (ret = ff_jni_exception_check(env, 1, format)) < 0) {
+-        ret = 0;
++    if (ff_jni_exception_check(env, 1, format) < 0 || !contains_key)
+         goto fail;
+-    }
+ 
+     result = (*env)->CallObjectMethod(env, format->object, format->jfields.get_bytebuffer_id, key);
+-    if ((ret = ff_jni_exception_check(env, 1, format)) < 0) {
+-        ret = 0;
++    if (ff_jni_exception_check(env, 1, format) < 0 || !result)
+         goto fail;
+-    }
+ 
+-    *data = (*env)->GetDirectBufferAddress(env, result);
+-    *size = (*env)->GetDirectBufferCapacity(env, result);
++    // Read through a duplicate so the stored buffer's position stays put.
++    view = (*env)->CallObjectMethod(env, result, format->jfields.bytebuffer_duplicate_id);
++    if (ff_jni_exception_check(env, 1, format) < 0 || !view)
++        goto fail;
+ 
+-    if (*data && *size) {
+-        void *src = *data;
+-        *data = av_malloc(*size);
+-        if (!*data) {
+-            ret = 0;
+-            goto fail;
+-        }
++    remaining = (*env)->CallIntMethod(env, view, format->jfields.bytebuffer_remaining_id);
++    if (ff_jni_exception_check(env, 1, format) < 0 || remaining <= 0)
++        goto fail;
++
++    bytes = (*env)->NewByteArray(env, remaining);
++    if (ff_jni_exception_check(env, 1, format) < 0 || !bytes)
++        goto fail;
++
++    self = (*env)->CallObjectMethod(env, view, format->jfields.bytebuffer_get_id, bytes);
++    if (ff_jni_exception_check(env, 1, format) < 0)
++        goto fail;
++
++    *data = av_malloc(remaining);
++    if (!*data)
++        goto fail;
+ 
+-        memcpy(*data, src, *size);
++    (*env)->GetByteArrayRegion(env, bytes, 0, remaining, *data);
++    if (ff_jni_exception_check(env, 1, format) < 0) {
++        av_freep(data);
++        goto fail;
+     }
+ 
++    *size = remaining;
+     ret = 1;
+ fail:
+     (*env)->DeleteLocalRef(env, key);
+     (*env)->DeleteLocalRef(env, result);
++    (*env)->DeleteLocalRef(env, view);
++    (*env)->DeleteLocalRef(env, self);
++    (*env)->DeleteLocalRef(env, bytes);
+ 
+     return ret;
+ }
+@@ -2437,7 +2467,23 @@ static int mediaformat_ndk_getFloat(FFAMediaFormat* ctx, const char *name, float
+ static int mediaformat_ndk_getBuffer(FFAMediaFormat* ctx, const char *name, void** data, size_t *size)
+ {
+     FFAMediaFormatNdk *format = (FFAMediaFormatNdk *)ctx;
+-    return AMediaFormat_getBuffer(format->impl, name, data, size);
++    void *stored = NULL;
++    size_t stored_size = 0;
++
++    *data = NULL;
++    *size = 0;
++
++    // The NDK lends the format's own storage; hand out a copy, like JNI.
++    if (!AMediaFormat_getBuffer(format->impl, name, &stored, &stored_size) ||
++        !stored || !stored_size)
++        return 0;
++
++    *data = av_memdup(stored, stored_size);
++    if (!*data)
++        return 0;
++
++    *size = stored_size;
++    return 1;
+ }
+ 
+ static int mediaformat_ndk_getString(FFAMediaFormat* ctx, const char *name, const char **out)
+diff --git a/libavcodec/mediacodec_wrapper.h b/libavcodec/mediacodec_wrapper.h
+index 2170f33..1552491 100644
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -115,6 +115,12 @@ static inline int ff_AMediaFormat_getFloat(FFAMediaFormat* format, const char *n
+     return format->getFloat(format, name, out);
+ }
+ 
++/**
++ * Copy out the byte buffer stored under name. On success *data is an
++ * av_malloc()ed copy of its remaining bytes, which the caller frees with
++ * av_free(), and *size their count. Returns 0, leaving *data NULL, when the
++ * key is missing, the buffer is empty or it cannot be read.
++ */
+ static inline int ff_AMediaFormat_getBuffer(FFAMediaFormat* format, const char *name, void** data, size_t *size)
+ {
+     return format->getBuffer(format, name, data, size);
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 0afdc0b..3c29287 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -26,6 +26,7 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/common.h"
+ #include "libavutil/hwcontext_mediacodec.h"
++#include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/log.h"
+ #include "libavutil/pixfmt.h"
+@@ -453,6 +454,73 @@ static int64_t mediacodec_dec_input_time_find(const MediaCodecDecContext *s, int
+     return best_ns;
+ }
+ 
++// Whether the caller prefers the container's side data of this type over what
++// the decoder reads from the bitstream: AVCodecContext.side_data_prefer_packet,
++// where a lone -1 means every type.
++static int mediacodec_dec_prefer_packet(const AVCodecContext *avctx, enum AVPacketSideDataType type)
++{
++    if (avctx->nb_side_data_prefer_packet == 1 && avctx->side_data_prefer_packet[0] == -1)
++        return 1;
++    for (unsigned i = 0; i < avctx->nb_side_data_prefer_packet; i++)
++        if (avctx->side_data_prefer_packet[i] == (int)type)
++            return 1;
++    return 0;
++}
++
++static int mediacodec_dec_copy_coded(AVFrame *frame, enum AVFrameSideDataType type,
++                                     const AVPacketSideData *src)
++{
++    AVFrameSideData *dst = av_frame_new_side_data(frame, type, src->size);
++
++    if (!dst)
++        return AVERROR(ENOMEM);
++    memcpy(dst->data, src->data, src->size);
++    return 0;
++}
++
++// Tag a decoded frame with its static HDR metadata the way FFmpeg's own
++// decoders do: what the decoder reports over the container's (coded side
++// data), unless the caller prefers the container's. A copied frame already
++// holds the container's from ff_get_buffer, and ff_decode_*_new settle the
++// preference against it; a surface frame (add_coded) holds none, so it gets
++// only the one that wins.
++static int mediacodec_dec_export_hdr(AVCodecContext *avctx, MediaCodecDecContext *s,
++                                     AVFrame *frame, int add_coded)
++{
++    const AVPacketSideData *coded;
++    int ret;
++
++    coded = add_coded ? ff_get_coded_side_data(avctx, AV_PKT_DATA_MASTERING_DISPLAY_METADATA) : NULL;
++    if ((s->hdr_mastering.has_primaries || s->hdr_mastering.has_luminance) &&
++        !(coded && mediacodec_dec_prefer_packet(avctx, AV_PKT_DATA_MASTERING_DISPLAY_METADATA))) {
++        AVMasteringDisplayMetadata *mastering;
++
++        if ((ret = ff_decode_mastering_display_new(avctx, frame, &mastering)) < 0)
++            return ret;
++        if (mastering)
++            *mastering = s->hdr_mastering;
++    } else if (coded) {
++        if ((ret = mediacodec_dec_copy_coded(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA, coded)) < 0)
++            return ret;
++    }
++
++    coded = add_coded ? ff_get_coded_side_data(avctx, AV_PKT_DATA_CONTENT_LIGHT_LEVEL) : NULL;
++    if ((s->hdr_light.MaxCLL || s->hdr_light.MaxFALL) &&
++        !(coded && mediacodec_dec_prefer_packet(avctx, AV_PKT_DATA_CONTENT_LIGHT_LEVEL))) {
++        AVContentLightMetadata *light;
++
++        if ((ret = ff_decode_content_light_new(avctx, frame, &light)) < 0)
++            return ret;
++        if (light)
++            *light = s->hdr_light;
++    } else if (coded) {
++        if ((ret = mediacodec_dec_copy_coded(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL, coded)) < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
+ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
+                                   MediaCodecDecContext *s,
+                                   ssize_t index,
+@@ -512,6 +580,13 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
+             "Wrapping output buffer %zd (%p) ts=%"PRId64" [%d pending]\n",
+             buffer->index, buffer, buffer->pts, atomic_load(&s->hw_buffer_count));
+ 
++    ret = mediacodec_dec_export_hdr(avctx, s, frame, 1);
++    if (ret < 0) {
++        // The frame owns the buffer now: unref releases it unrendered.
++        av_frame_unref(frame);
++        return ret;
++    }
++
+     return 0;
+ fail:
+     av_freep(&buffer);
+@@ -621,6 +696,9 @@ static int mediacodec_wrap_sw_video_buffer(AVCodecContext *avctx,
+     frame->pts = mediacodec_dec_frame_pts(avctx, s, info->presentationTimeUs);
+     frame->pkt_dts = AV_NOPTS_VALUE;
+ 
++    if ((ret = mediacodec_dec_export_hdr(avctx, s, frame, 0)) < 0)
++        goto done;
++
+     av_log(avctx, AV_LOG_TRACE,
+             "Frame: width=%d stride=%d height=%d slice-height=%d "
+             "crop-top=%d crop-bottom=%d crop-left=%d crop-right=%d encoder=%s "
+@@ -692,6 +770,61 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
+     }                                                                                  \
+ } while (0)                                                                            \
+ 
++// MediaFormat's "hdr-static-info": a CTA-861.3 Static Metadata Descriptor as
++// Android lays it out (ColorUtils' HDRStaticInfo, Media3's ColorInfo): the
++// descriptor ID, 0 for Type 1, then twelve little-endian uint16 -- the red,
++// green, blue and white point chromaticities in units of 0.00002, the
++// mastering display's maximum luminance in cd/m2 and minimum in 0.0001
++// cd/m2, MaxCLL and MaxFALL in cd/m2. A decoder may report the key all zero:
++// OMX.Nvidia.h265.decode does before its first frame, and for ByteBuffer
++// output throughout. The mastering display counts as known by the ranges
++// FFmpeg's own decoders hold the same SEI to (h2645_sei.c), so a frame carries
++// the same metadata whichever decoder read it; zero light levels are unknown.
++// Returns whether anything is known.
++#define MEDIACODEC_HDR_STATIC_INFO_SIZE 25
++
++static int mediacodec_dec_hdr_static_info(const AVCodecContext *avctx,
++                                          const uint8_t *data, size_t size,
++                                          AVMasteringDisplayMetadata *mastering,
++                                          AVContentLightMetadata *light)
++{
++    unsigned value[12];
++
++    memset(mastering, 0, sizeof(*mastering));
++    memset(light, 0, sizeof(*light));
++
++    if (!data || size < MEDIACODEC_HDR_STATIC_INFO_SIZE || data[0] != 0)
++        return 0;
++
++    for (int i = 0; i < 12; i++)
++        value[i] = AV_RL16(data + 1 + 2 * i);
++
++    // Every x within [5, 37000] and every y within [5, 42000].
++    mastering->has_primaries = 1;
++    for (int i = 0; i < 8; i++)
++        mastering->has_primaries &= value[i] >= 5 && value[i] <= (i & 1 ? 42000 : 37000);
++    for (int i = 0; i < 3; i++) {
++        mastering->display_primaries[i][0] = av_make_q(value[2 * i],     50000);
++        mastering->display_primaries[i][1] = av_make_q(value[2 * i + 1], 50000);
++    }
++    mastering->white_point[0] = av_make_q(value[6], 50000);
++    mastering->white_point[1] = av_make_q(value[7], 50000);
++
++    // A peak of 5 to 10000 cd/m2 over a floor of at most 5 cd/m2 below it. A
++    // zero floor passes unless strict: real (Blu-ray) releases carry it.
++    mastering->max_luminance = av_make_q(value[8], 1);
++    mastering->min_luminance = av_make_q(value[9], 10000);
++    mastering->has_luminance = value[8] >= 5 && value[8] <= 10000 &&
++                               value[9] <= 50000 && value[9] < value[8] * 10000 &&
++                               (value[9] >= 1 || avctx->strict_std_compliance < FF_COMPLIANCE_STRICT);
++
++    light->MaxCLL  = value[10];
++    light->MaxFALL = value[11];
++
++    return mastering->has_primaries || mastering->has_luminance ||
++           light->MaxCLL || light->MaxFALL;
++}
++
+ static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDecContext *s,
+                                             int output_format_changed)
+ {
+@@ -791,6 +924,25 @@ static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDe
+     if (color_transfer)
+         avctx->color_trc = ff_AMediaFormatColorTransfer_to_AVColorTransfer(color_transfer);
+ 
++    // MediaCodec parses the bitstream's mastering display and content light
++    // SEI itself and FFmpeg never sees them: the output format is the only
++    // place they surface.
++    {
++        void *hdr = NULL;
++        size_t hdr_size = 0;
++
++        ff_AMediaFormat_getBuffer(s->format, "hdr-static-info", &hdr, &hdr_size);
++        if (mediacodec_dec_hdr_static_info(avctx, hdr, hdr_size, &s->hdr_mastering, &s->hdr_light))
++            av_log(avctx, AV_LOG_INFO,
++                   "Output HDR static metadata: primaries %s, mastering luminance %.4f-%.0f cd/m2 (%s), "
++                   "MaxCLL %u, MaxFALL %u (0 = unknown)\n",
++                   s->hdr_mastering.has_primaries ? "known" : "unknown",
++                   av_q2d(s->hdr_mastering.min_luminance), av_q2d(s->hdr_mastering.max_luminance),
++                   s->hdr_mastering.has_luminance ? "known" : "unknown",
++                   s->hdr_light.MaxCLL, s->hdr_light.MaxFALL);
++        av_free(hdr);
++    }
++
+     av_log(avctx, AV_LOG_INFO,
+         "Output crop parameters top=%d bottom=%d left=%d right=%d, "
+         "resulting dimensions width=%d height=%d\n",
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index ce8b589..19c5cd9 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -30,6 +30,7 @@
+ 
+ #include "libavutil/fifo.h"
+ #include "libavutil/frame.h"
++#include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/pixfmt.h"
+ #include "libavutil/thread.h"
+ 
+@@ -83,6 +84,13 @@ typedef struct MediaCodecDecContext {
+     int display_width;
+     int display_height;
+ 
++    // The static HDR metadata of the last output format ("hdr-static-info"):
++    // what the decoder read from the bitstream or was configured with.
++    // Nothing is known when has_primaries, has_luminance and both light
++    // levels are zero; each decoded frame carries what is known.
++    AVMasteringDisplayMetadata hdr_mastering;
++    AVContentLightMetadata hdr_light;
++
+     uint64_t output_buffer_count;
+     ssize_t current_input_buffer;
+     // An input buffer was taken from the codec since it started or was last

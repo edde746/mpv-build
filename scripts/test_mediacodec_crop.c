@@ -11,11 +11,22 @@
 #define AV_PIX_FMT_NONE (-1)
 #define FFALIGN(value, alignment) (((value) + (alignment) - 1) & ~((alignment) - 1))
 #define av_log(...) ((void)0)
+#define AV_RL16(p) ((unsigned)((const uint8_t *)(p))[0] | ((unsigned)((const uint8_t *)(p))[1] << 8))
+#define FF_COMPLIANCE_STRICT 1
 
 typedef struct { int num, den; } AVRational;
+static AVRational av_make_q(int num, int den) { return (AVRational){num, den}; }
+// The parser's static HDR metadata (test_mediacodec_hdr.c covers it); these
+// formats carry none.
+typedef struct {
+    AVRational display_primaries[3][2], white_point[2], min_luminance, max_luminance;
+    int has_primaries, has_luminance;
+} AVMasteringDisplayMetadata;
+typedef struct { unsigned MaxCLL, MaxFALL; } AVContentLightMetadata;
 typedef struct {
     int width, height, pix_fmt, color_range, colorspace, color_primaries, color_trc;
     AVRational sample_aspect_ratio;
+    int strict_std_compliance;
 } AVCodecContext;
 
 typedef struct {
@@ -32,6 +43,8 @@ typedef struct {
     const char *codec_name;
     int use_ndk_codec, width, height, stride, slice_height, color_format;
     int crop_left, crop_top, crop_right, crop_bottom, display_width, display_height;
+    AVMasteringDisplayMetadata hdr_mastering;
+    AVContentLightMetadata hdr_light;
 } MediaCodecDecContext;
 
 static int ff_AMediaFormat_getInt32(Format *format, const char *key, int32_t *value)
@@ -66,6 +79,13 @@ static char *ff_AMediaFormat_toString(Format *format)
 }
 
 static void av_freep(char **value) { free(*value); *value = NULL; }
+static int ff_AMediaFormat_getBuffer(Format *format, const char *key, void **data, size_t *size)
+{
+    *data = NULL;
+    *size = 0;
+    return 0;
+}
+static void av_free(void *data) { free(data); }
 static int mcdec_map_color_format(AVCodecContext *avctx, MediaCodecDecContext *s, int value) { return value; }
 static AVRational av_div_q(AVRational a, AVRational b) { return (AVRational){a.num * b.den, a.den * b.num}; }
 static void ff_set_sar(AVCodecContext *avctx, AVRational sar) { avctx->sample_aspect_ratio = sar; }

@@ -21,3 +21,4 @@
 0028-mediacodec-output-buffer-timing.patch
 0032-mediacodec-keep-codec-errors-across-a-flush.patch
 0038-mediacodec-media3-rate-switch.patch
+0040-mediacodec-export-hdr-static-metadata.patch
