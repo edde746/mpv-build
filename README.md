@@ -211,6 +211,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
+| `test_avf_shader_target.sh` | the size vo_avfoundation renders `--glsl-shaders` at, and the part of the frame that fills it, per display-layer gravity | main |
 | `test_avf_timebase_servo.sh` | the timebase servo and rate decisions | main |
 | `test_audio_passthrough_fallback.sh` | the player's AO failure handling and PCM fallback (patch 0040) | PR |
 | `test_audio_reload_held_frame.sh` | an AO reload with a held frame still opens the next AO (patch 0034) | PR, main |

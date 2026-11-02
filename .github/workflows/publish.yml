@@ -107,6 +107,9 @@ jobs:
       - name: Test AVFoundation host-mode clock rules
         run: ./scripts/test_avf_host_present.sh
 
+      - name: Test AVFoundation user shader output size
+        run: ./scripts/test_avf_shader_target.sh
+
       - name: Test MediaCodec timing cadence
         run: bash ./scripts/test_mediacodec_timing.sh
 
