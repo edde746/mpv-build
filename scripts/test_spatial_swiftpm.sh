@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Link an Objective-C-only host through the actual SwiftPM product. Unpublished
-# XCFrameworks come from the release directory; unchanged dependencies use their
-# pinned URLs. No consumer Swift files, runtime flags, signing or app execution.
+# Link an Objective-C-only host through the actual SwiftPM product. XCFrameworks
+# this run packaged come from the release directory and the rest use their
+# pinned URLs, so a run that rebuilt only FFmpeg links it against the pinned
+# libmpv, as a consumer would. No consumer Swift files, runtime flags, signing
+# or app execution.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 release_dir="$1"
@@ -21,18 +23,24 @@ frameworks.mkdir()
 for archive in sorted(release.glob('*.xcframework.zip')):
     with zipfile.ZipFile(archive) as zipped:
         zipped.extractall(frameworks)
-if not (frameworks / 'Libmpv.xcframework').is_dir():
-    raise SystemExit('Expected freshly packaged Libmpv.xcframework')
+fresh = {path.name[:-len('.xcframework')] for path in frameworks.glob('*.xcframework')}
+if not fresh:
+    raise SystemExit(f'Expected at least one freshly packaged XCFramework in {release}')
+
+linked = set()
 
 def local_target(match):
     name = match['name']
-    if not (frameworks / f'{name}.xcframework').is_dir():
+    if name not in fresh:
         return match[0]
+    linked.add(name)
     return f'.binaryTarget(name: "{name}", path: "Frameworks/{name}.xcframework")'
 
 text = re.sub(r'\.binaryTarget\(\s*name: "(?P<name>[^"\n]+)",\s*'
               r'url: "[^"\n]+",\s*checksum: "[^"\n]+"\s*\)',
               local_target, manifest.read_text())
+if fresh - linked:
+    raise SystemExit('Freshly packaged but not a binary target of Package.swift: ' + ', '.join(sorted(fresh - linked)))
 (package / 'Package.swift').write_text(text)
 PY
 cat > "$work/Consumer/main.m" <<'OBJC'
