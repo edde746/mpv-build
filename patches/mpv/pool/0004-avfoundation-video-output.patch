@@ -359,11 +359,15 @@ Folded in, in series order:
     pixels (bounds times contentsScale), its videoGravity and the frame's
     sample aspect, at most 8K a side (avf_shader_target, the marked "avf
     shader target" region). Upscalers get the display's pixels to fill, and
-    their //!WHEN conditions see the real output size. A change of the
-    layer's size or gravity, of --glsl-shaders or of --glsl-shader-opts
-    re-renders a paused frame. --glsl-shader-opts, the per-frame hook
-    parameters and the shader cache (--gpu-shader-cache-dir, with the same
-    file names and pruning) work as they do in vo_gpu_next.
+    their //!WHEN conditions see the real output size. --keepaspect=no
+    stretches the whole frame over the layer, as the gpu VOs stretch it over
+    the window, so a shader that composites its own letterbox fill (Plezy's
+    ambient lighting) gets the whole layer; a frame that skips the shaders
+    keeps the layer's gravity and is letterboxed, not stretched. A change of
+    the layer's size or gravity, of --keepaspect, of --glsl-shaders or of
+    --glsl-shader-opts re-renders a paused frame. --glsl-shader-opts, the
+    per-frame hook parameters and the shader cache (--gpu-shader-cache-dir,
+    with the same file names and pruning) work as they do in vo_gpu_next.
 
     Frames skip the shaders, with the reason logged once, when Core Image
     re-renders them (video zoom, pan or scale), when the OSD is composited
@@ -1446,10 +1450,10 @@ index c9cde30..582acbe 100644
      &video_out_gpu,
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 new file mode 100644
-index 0000000..68bf951
+index 0000000..50bf220
 --- /dev/null
 +++ b/video/out/vo_avfoundation.m
-@@ -0,0 +1,5154 @@
+@@ -0,0 +1,5162 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -5845,12 +5849,16 @@ index 0000000..68bf951
 +        update_avfoundation_geometry(vo);
 +        p->shader_layer_valid = true;
 +    }
++    // --keepaspect=no stretches the frame over the whole layer, as the gpu
++    // VOs stretch it over the window. A layer-shaped output fills the layer
++    // under any gravity, and a frame that skips the shaders keeps the
++    // layer's own gravity: letterboxed, not stretched.
++    enum avf_gravity gravity = vo->opts->keepaspect ? p->layer_gravity : AVF_GRAVITY_RESIZE;
 +    struct avf_shaders_target target;
 +    if (!avf_shader_target(MPMIN(mpi->params.w, (int)CVPixelBufferGetWidth(pixbuf)),
 +                           MPMIN(mpi->params.h, (int)CVPixelBufferGetHeight(pixbuf)),
 +                           mpi->params.p_w, mpi->params.p_h, vo->dwidth,
-+                           vo->dheight, p->layer_gravity, AVF_SHADER_MAX_DIM,
-+                           &target))
++                           vo->dheight, gravity, AVF_SHADER_MAX_DIM, &target))
 +    {
 +        skip_user_shaders(vo, "the display layer has no size");
 +        return NULL;
@@ -6492,6 +6500,10 @@ index 0000000..68bf951
 +        update_avfoundation_options(vo);
 +        clear_subtitle_cache(p);
 +        sync_osd_layer_frame(vo);
++        // --keepaspect decides the user shaders' output; re-render a paused
++        // frame with the new one.
++        if (p->shaders_loaded)
++            vo->want_redraw = true;
 +        return VO_TRUE;
 +    case VOCTRL_SET_PANSCAN:
 +        clear_subtitle_cache(p);
