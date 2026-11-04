@@ -65,7 +65,29 @@ fetch_git () {
 	url=$(pin "$component" url)
 	ref=$(pin "$component" ref)
 	commit=$(pin "$component" commit)
-	git clone --depth 1 --branch "$ref" "$@" "$url" "deps/$component"
+	local recurse_submodules=0 arg
+	for arg in "$@"; do
+		if [ "$arg" = "--recurse-submodules" ]; then
+			recurse_submodules=1
+		fi
+	done
+	if [[ "$ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+		# Source-only experiments and upstream review commits may not have a
+		# branch or tag. Fetch the immutable object directly, then verify it
+		# against the separate commit pin below.
+		mkdir -p "deps/$component"
+		git -C "deps/$component" init --quiet
+		if ! git -C "deps/$component" fetch --quiet --depth 1 "$url" "$ref"; then
+			rm -rf "deps/$component"
+			return 1
+		fi
+		git -C "deps/$component" checkout --quiet --detach FETCH_HEAD
+		if [ "$recurse_submodules" -eq 1 ]; then
+			git -C "deps/$component" submodule update --init --recursive --depth 1
+		fi
+	else
+		git clone --depth 1 --branch "$ref" "$@" "$url" "deps/$component"
+	fi
 	if [ -n "$commit" ]; then
 		head=$(git -C "deps/$component" rev-parse HEAD)
 		if [ "$head" != "$commit" ]; then

@@ -94,7 +94,7 @@ diff --git a/video/out/vo.c b/video/out/vo.c
 -            }
 -        }
 +        wait_until = vo_wakeup_deadline(vo, now, wait_until);
-         if (vo->want_redraw && !in->want_redraw) {
+         if (vo->want_redraw) {
              in->want_redraw = true;
              wakeup_core(vo);
 diff --git a/video/out/vo.h b/video/out/vo.h

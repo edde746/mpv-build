@@ -1,12 +1,5 @@
-Subject: [PATCH] avcodec/mediacodec: honor MediaTek crop after output format changes
-
-The configured NDK format may expose a placeholder crop before decoding.
-Keep ignoring it during MediaTek initialization, but use the actual crop
-reported by INFO_OUTPUT_FORMAT_CHANGED instead of exposing padded buffers
-as the visible image. This also handles later resolution changes.
-
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index f0eba4c..4365a50 100644
+index ce1af8a976..914633ff58 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -548,7 +548,8 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
@@ -15,17 +8,16 @@ index f0eba4c..4365a50 100644
  
 -static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDecContext *s)
 +static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDecContext *s,
-+                                            int output_format_changed)
++                                             int output_format_changed)
  {
      int ret = 0;
      int width = 0;
-@@ -601,9 +602,10 @@ static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDe
+@@ -614,8 +615,10 @@ static int mediacodec_dec_parse_video_format(AVCodecContext *avctx, MediaCodecDe
      AMEDIAFORMAT_GET_INT32(s->crop_left,   "crop-left",   0);
      AMEDIAFORMAT_GET_INT32(s->crop_right,  "crop-right",  0);
  
 -    // Try "crop" for NDK
--    // MediaTek SOC return some default value like Rect(0, 0, 318, 238)
--    if (!(s->crop_right && s->crop_bottom) && s->use_ndk_codec && !strstr(s->codec_name, ".mtk."))
+-    if (!(s->crop_right && s->crop_bottom) && s->use_ndk_codec)
 +    // MediaTek's configured format can contain a placeholder crop rectangle.
 +    // Its output-format change supplies the real crop, including decoder padding.
 +    if (!(s->crop_right && s->crop_bottom) && s->use_ndk_codec &&
@@ -33,13 +25,13 @@ index f0eba4c..4365a50 100644
          ff_AMediaFormat_getRect(s->format, "crop", &s->crop_left, &s->crop_top, &s->crop_right, &s->crop_bottom);
  
      if (s->crop_right && s->crop_bottom) {
-@@ -705,12 +707,13 @@ fail:
+@@ -717,12 +720,13 @@ fail:
      return ret;
  }
  
 -static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecContext *s)
 +static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecContext *s,
-+                                     int output_format_changed)
++                                       int output_format_changed)
  {
      if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
          return mediacodec_dec_parse_audio_format(avctx, s);
@@ -49,7 +41,7 @@ index f0eba4c..4365a50 100644
      else
          av_assert0(0);
  }
-@@ -875,7 +878,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -892,7 +896,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
      if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
          s->format = ff_AMediaCodec_getOutputFormat(s->codec);
          if (s->format) {
@@ -58,7 +50,16 @@ index f0eba4c..4365a50 100644
                  av_log(avctx, AV_LOG_ERROR,
                      "Failed to configure context\n");
                  goto fail;
-@@ -1099,7 +1102,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1072,7 +1076,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+                  * video fetches that format at init.
+                  */
+                 s->has_output_format = true;
+-                if ((ret = mediacodec_dec_parse_format(avctx, s)) < 0) {
++                if ((ret = mediacodec_dec_parse_format(avctx, s, 1)) < 0) {
+                     av_log(avctx, AV_LOG_ERROR, "Failed to parse output format\n");
+                     ff_AMediaCodec_releaseOutputBuffer(codec, index, 0);
+                     return ret;
+@@ -1130,7 +1134,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          av_log(avctx, AV_LOG_INFO, "Output MediaFormat changed to %s\n", format);
          av_freep(&format);
  

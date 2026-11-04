@@ -1,32 +1,8 @@
-Subject: [PATCH] avcodec/mediacodec: record when each output buffer moved through the decoder
-
-A player that shows a MediaCodec frame after its deadline cannot tell from
-its own side whether the codec decoded the frame late or the player took,
-queued or released it late: the decoder's hand-off is the only instant it
-sees. On an Amlogic S928X box a 1080i50 recording at 25 Hz reached the
-codec's release call late for about one frame in eighteen while ExoPlayer,
-on the same codec and display mode, kept every frame (Plezy #2485).
-
-Stamp each output buffer, on CLOCK_MONOTONIC (the clock
-releaseOutputBuffer(int, long) takes), with when the access unit it came
-from was queued to the codec, when the codec reported the decoded buffer
-(the asynchronous output callback, or the dequeue itself when the codec runs
-synchronously), and when the decoder handed it to the caller, together with
-how many decoded buffers were still queued behind it and how many the caller
-already held. av_mediacodec_buffer_get_timing() reads them back.
-
-The input instant comes from a 64-entry ring of recent access units, keyed
-by the tagged timestamp the codec echoes and cleared by a flush. A decoder
-that deinterlaces by itself (Amlogic, Tegra, MediaTek) emits a second frame
-per access unit with a timestamp it synthesized half a frame later, so an
-output is matched to the newest access unit at or before its timestamp and
-less than 50 ms earlier.
-
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index 8199ab5..711b816 100644
+index 27201185d6..d33c598baf 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
-@@ -161,6 +161,13 @@ int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
+@@ -163,6 +163,13 @@ int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
      return buffer->pts;
  }
  
@@ -40,7 +16,7 @@ index 8199ab5..711b816 100644
  // Consumer side of the rendered-frame ring; see mediacodec_dec_rendered_push.
  int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
                                   AVMediaCodecRendered *out, int max)
-@@ -297,6 +304,12 @@ int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
+@@ -299,6 +306,12 @@ int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
      return AV_NOPTS_VALUE;
  }
  
@@ -54,10 +30,10 @@ index 8199ab5..711b816 100644
                                   AVMediaCodecRendered *out, int max)
  {
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 072df17..d6b1646 100644
+index 70a24692e8..961f3a0500 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -107,6 +107,34 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
+@@ -109,6 +109,34 @@ int av_mediacodec_render_buffer_at_time(AVMediaCodecBuffer *buffer, int64_t time
   */
  int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer);
  
@@ -93,7 +69,7 @@ index 072df17..d6b1646 100644
   * One frame the surface has rendered, as reported by the platform's
   * frame-rendered callback: the presentation time it was queued with and the
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index bee7b27..10613ac 100644
+index 406263f511..82e2047c4c 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -411,10 +411,53 @@ static void mediacodec_buffer_release(void *opaque, uint8_t *data)
@@ -158,7 +134,7 @@ index bee7b27..10613ac 100644
  
      frame->data[3] = (uint8_t *)buffer;
  
-@@ -875,7 +919,9 @@ static void mediacodec_dec_on_output_available(FFAMediaCodec *codec, void *userd
+@@ -888,7 +932,9 @@ static void mediacodec_dec_on_output_available(FFAMediaCodec *codec, void *userd
                                                 FFAMediaCodecBufferInfo *info)
  {
      MediaCodecDecContext *s = userdata;
@@ -169,7 +145,7 @@ index bee7b27..10613ac 100644
  
      ff_mutex_lock(&s->async_lock);
      if (av_fifo_write(s->async_output, &output, 1) < 0 && !s->async_error)
-@@ -1093,9 +1139,11 @@ enum {
+@@ -1106,9 +1152,11 @@ enum {
  };
  
  // The next output event: 0 with *index and *info filled for a buffer, one of
@@ -182,7 +158,7 @@ index bee7b27..10613ac 100644
                                           int64_t timeout_us)
  {
      MediaCodecAsyncOutput output;
-@@ -1109,6 +1157,8 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1122,6 +1170,8 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
          s->progress++;
          if (idx >= 0) {
              *index = idx;
@@ -191,7 +167,7 @@ index bee7b27..10613ac 100644
              return 0;
          }
          if (ff_AMediaCodec_infoOutputFormatChanged(codec, idx))
-@@ -1120,11 +1170,15 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1133,11 +1183,15 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
      }
  
      for (;;) {
@@ -207,7 +183,7 @@ index bee7b27..10613ac 100644
          if (ret)
              return ret;
          if (output.index == MEDIACODEC_ASYNC_FORMAT_CHANGED)
-@@ -1149,6 +1203,7 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
+@@ -1162,6 +1216,7 @@ static int mediacodec_dec_dequeue_output(MediaCodecDecContext *s, ssize_t *index
      }
      *index = output.index;
      *info = output.info;
@@ -215,7 +191,7 @@ index bee7b27..10613ac 100644
      return 0;
  }
  
-@@ -1169,6 +1224,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -1182,6 +1237,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      // Every shed frame the codec had yet to pass is moot after a flush.
      s->pending_drops = 0;
      ff_mediacodec_reorder_flush(&s->reorder);
@@ -223,7 +199,7 @@ index bee7b27..10613ac 100644
  
      status = ff_AMediaCodec_flush(codec);
      if (status < 0) {
-@@ -1529,6 +1585,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1547,6 +1603,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
              av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
              return AVERROR_EXTERNAL;
          }
@@ -231,7 +207,7 @@ index bee7b27..10613ac 100644
          // The input buffer is the codec's once queued; read the packet's copy.
          mediacodec_dec_reorder_input(avctx, s, media_pts, pkt->data + offset - size, size);
  
-@@ -1550,6 +1607,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1568,6 +1625,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
      size_t size;
      FFAMediaCodec *codec = s->codec;
      FFAMediaCodecBufferInfo info = { 0 };
@@ -239,7 +215,7 @@ index bee7b27..10613ac 100644
      int status;
      int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
  
-@@ -1576,7 +1634,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1594,7 +1652,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          output_dequeue_timeout_us = 0;
      }
  
@@ -248,9 +224,9 @@ index bee7b27..10613ac 100644
      if (ret < 0)
          return ret;
      if (ret == 0) {
-@@ -1605,7 +1663,10 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1636,7 +1694,10 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+             }
  
-         if (info.size) {
              if (s->surface) {
 -                if ((ret = mediacodec_wrap_hw_buffer(avctx, s, index, &info, frame)) < 0) {
 +                timing.input_ns = mediacodec_dec_input_time_find(s, info.presentationTimeUs);
@@ -261,7 +237,7 @@ index bee7b27..10613ac 100644
                      return ret;
                  }
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 9eb6bad..26d0de2 100644
+index 38eb94587e..36309a7ea4 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -48,6 +48,11 @@
@@ -276,7 +252,7 @@ index 9eb6bad..26d0de2 100644
  typedef struct MediaCodecDecContext {
  
      AVCodecContext *avctx;
-@@ -146,6 +151,15 @@ typedef struct MediaCodecDecContext {
+@@ -151,6 +156,15 @@ typedef struct MediaCodecDecContext {
      // Presentation order for decode-order container timestamps
      // (mediacodec_reorder.h). Decoding thread only.
      MediaCodecReorder reorder;
@@ -292,7 +268,7 @@ index 9eb6bad..26d0de2 100644
  } MediaCodecDecContext;
  
  int ff_mediacodec_dec_init(AVCodecContext *avctx,
-@@ -201,6 +215,7 @@ typedef struct MediaCodecBuffer {
+@@ -206,6 +220,7 @@ typedef struct MediaCodecBuffer {
      int64_t pts;
      atomic_int released;
      int serial;
@@ -300,7 +276,7 @@ index 9eb6bad..26d0de2 100644
  
  } MediaCodecBuffer;
  
-@@ -216,6 +231,7 @@ int ff_mediacodec_dec_set_surface(MediaCodecDecContext *s, void *surface,
+@@ -221,6 +236,7 @@ int ff_mediacodec_dec_set_surface(MediaCodecDecContext *s, void *surface,
  typedef struct MediaCodecAsyncOutput {
      int32_t index;
      FFAMediaCodecBufferInfo info;

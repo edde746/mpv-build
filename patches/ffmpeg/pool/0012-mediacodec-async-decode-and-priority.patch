@@ -1,8 +1,8 @@
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index 1ed0ee6..30c0d00 100644
+index ad2735094f..9fc9fb8772 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
-@@ -124,32 +124,36 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
+@@ -124,34 +124,38 @@ int av_mediacodec_release_buffer(AVMediaCodecBuffer *buffer, int render)
  {
      MediaCodecDecContext *ctx = buffer->ctx;
      int released = atomic_fetch_add(&buffer->released, 1);
@@ -16,6 +16,9 @@ index 1ed0ee6..30c0d00 100644
 -        return ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
 +        ret = ff_AMediaCodec_releaseOutputBuffer(ctx->codec, buffer->index, render);
 +        ff_mediacodec_dec_released(ctx);
+     } else if (render) {
+-        return AVERROR(ENOENT);
++        ret = AVERROR(ENOENT);
      }
  
 -    return 0;
@@ -26,7 +29,7 @@ index 1ed0ee6..30c0d00 100644
  {
      MediaCodecDecContext *ctx = buffer->ctx;
      int released = atomic_fetch_add(&buffer->released, 1);
-+    int ret = 0;
++    int ret = AVERROR(ENOENT);
  
      if (!released && (ctx->delay_flush || buffer->serial == atomic_load(&ctx->serial))) {
          atomic_fetch_sub(&ctx->hw_buffer_count, 1);
@@ -38,12 +41,12 @@ index 1ed0ee6..30c0d00 100644
 +        ff_mediacodec_dec_released(ctx);
      }
  
--    return 0;
+-    return AVERROR(ENOENT);
 +    return ret;
  }
  
  int64_t av_mediacodec_buffer_get_pts(const AVMediaCodecBuffer *buffer)
-@@ -192,10 +196,15 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -194,10 +198,15 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
  
      if (!s)
          return AVERROR(ENOSYS);
@@ -64,10 +67,10 @@ index 1ed0ee6..30c0d00 100644
  
  int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index 4c67672..5cbdb87 100644
+index 7ded55a981..88df89fa89 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -139,20 +139,28 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
+@@ -141,20 +141,28 @@ int av_mediacodec_drain_rendered(AVMediaCodecBuffer *buffer,
  const char *av_mediacodec_rendered_source(const AVMediaCodecBuffer *buffer);
  
  /**
@@ -111,23 +114,22 @@ index 4c67672..5cbdb87 100644
  int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
                                        void (*wakeup)(void *opaque), void *opaque);
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index 96a7f76..2cf12b8 100644
+index b06eb14d40..436879ed4e 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -61,9 +61,11 @@ typedef struct MediaCodecH264DecContext {
+@@ -62,9 +62,11 @@ typedef struct MediaCodecContext {
      int amlogic_mpeg2_api23_workaround;
  
      int use_ndk_codec;
--    // Ref. MediaFormat KEY_OPERATING_RATE, KEY_FRAME_RATE
 +    int use_async;
-+    // Ref. MediaFormat KEY_OPERATING_RATE, KEY_FRAME_RATE, KEY_PRIORITY
+     // Ref. MediaFormat KEY_OPERATING_RATE, KEY_FRAME_RATE
      int operating_rate;
      float frame_rate;
 +    int priority;
-     int dolby_vision;
-     int dv_p7_mode;
-     int dv_filter; // DV_FILTER_*
-@@ -960,9 +962,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     // Pre-decode frame shedding state; see mediacodec_shed.h.
+     MediaCodecShedContext shed;
+     int shed_inited;
+@@ -959,9 +961,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      }
      if (s->operating_rate > 0)
          ff_AMediaFormat_setInt32(format, "operating-rate", s->operating_rate);
@@ -147,7 +149,7 @@ index 96a7f76..2cf12b8 100644
  
      s->ctx = av_mallocz(sizeof(*s->ctx));
      if (!s->ctx) {
-@@ -973,6 +982,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -972,6 +981,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
  
      s->ctx->delay_flush = s->delay_flush;
      s->ctx->use_ndk_codec = s->use_ndk_codec;
@@ -155,7 +157,7 @@ index 96a7f76..2cf12b8 100644
      s->ctx->profile_override = profile_override;
      s->ctx->codec_name = codec_name;
      codec_name = NULL;
-@@ -1023,6 +1033,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1022,6 +1032,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         all retained frames. */
      if (s->delay_flush && ff_mediacodec_dec_is_flushing(avctx, s->ctx)) {
          if (!ff_mediacodec_dec_flush(avctx, s->ctx)) {
@@ -163,7 +165,7 @@ index 96a7f76..2cf12b8 100644
              return AVERROR(EAGAIN);
          }
      }
-@@ -1048,10 +1059,12 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1047,10 +1058,12 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
                   * return EAGAIN, which violate the design. A host that
                   * registered a wakeup (av_mediacodec_set_wakeup_callback)
                   * accepts exactly that answer instead of being held here
@@ -177,7 +179,7 @@ index 96a7f76..2cf12b8 100644
                  return ret;
              }
              s->ctx->current_input_buffer = index;
-@@ -1076,8 +1089,10 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1075,8 +1088,10 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
  
              /* An oversized access unit was dropped and the flush it needs
               * waits on retained frames: give them back before feeding on. */
@@ -189,7 +191,7 @@ index 96a7f76..2cf12b8 100644
  
              if (s->amlogic_mpeg2_api23_workaround && s->buffered_pkt.size <= 0) {
                  /* fallthrough to fetch next packet regardless of input buffer space */
-@@ -1134,9 +1149,13 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1133,9 +1148,13 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
          if (ret == AVERROR_EOF) {
              AVPacket null_pkt = { 0 };
              ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
@@ -206,7 +208,7 @@ index 96a7f76..2cf12b8 100644
          } else if (ret == AVERROR(EAGAIN) && s->ctx->current_input_buffer < 0) {
              return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
          } else if (ret < 0) {
-@@ -1189,10 +1208,14 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+@@ -1188,10 +1207,14 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                       OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
      { "ndk_codec", "Use MediaCodec from NDK",
                     OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
@@ -222,7 +224,7 @@ index 96a7f76..2cf12b8 100644
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
      { "dv_p7_mode", "Dolby Vision profile 7 handling",
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index ff66222..a4e5457 100644
+index fd9677fbba..7a37c4e24b 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
 @@ -22,6 +22,7 @@
@@ -342,7 +344,7 @@ index ff66222..a4e5457 100644
      }
      frame->pkt_dts = AV_NOPTS_VALUE;
  
-@@ -746,23 +786,335 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
+@@ -759,23 +799,335 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
          av_assert0(0);
  }
  
@@ -687,7 +689,7 @@ index ff66222..a4e5457 100644
  }
  
  static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContext *s)
-@@ -787,6 +1139,22 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -800,6 +1152,22 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
          return AVERROR_EXTERNAL;
      }
  
@@ -710,7 +712,7 @@ index ff66222..a4e5457 100644
      return 0;
  }
  
-@@ -952,6 +1320,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -970,6 +1338,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
      atomic_init(&s->rendered_tail, 0);
      s->rendered_source = "off:surface";
      s->current_input_buffer = -1;
@@ -719,7 +721,7 @@ index ff66222..a4e5457 100644
  
      if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
          ret = mediacodec_dec_get_audio_codec(avctx, s, mime, format);
-@@ -975,6 +1345,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -993,6 +1363,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
      }
  
      mediacodec_dec_register_rendered(avctx, s);
@@ -727,7 +729,7 @@ index ff66222..a4e5457 100644
  
      status = ff_AMediaCodec_start(s->codec);
      if (status < 0) {
-@@ -1053,6 +1424,12 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1071,6 +1442,12 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
  
          data = ff_AMediaCodec_getInputBuffer(codec, index, &size);
          if (!data) {
@@ -740,7 +742,7 @@ index ff66222..a4e5457 100644
              av_log(avctx, AV_LOG_ERROR, "Failed to get input buffer\n");
              return AVERROR_EXTERNAL;
          }
-@@ -1087,6 +1464,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1105,6 +1482,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
          if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
              pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
          }
@@ -749,7 +751,7 @@ index ff66222..a4e5457 100644
          if (need_draining) {
              uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
  
-@@ -1141,11 +1520,12 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1159,11 +1538,12 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
      }
  
      if (s->draining && ff_mediacodec_dec_host_polls(s)) {
@@ -767,7 +769,7 @@ index ff66222..a4e5457 100644
          output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
      } else if (s->draining) {
          /* If the codec is flushing or need to be flushed, block for a fair
-@@ -1158,19 +1538,21 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1176,19 +1556,21 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          output_dequeue_timeout_us = 0;
      }
  
@@ -795,7 +797,7 @@ index ff66222..a4e5457 100644
              int kept = 0;
              for (int i = 0; i < s->pending_drops; i++) {
                  if (s->pending_drop_pts[i] > pts)
-@@ -1211,7 +1593,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1242,7 +1624,7 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
              }
          }
  
@@ -804,7 +806,7 @@ index ff66222..a4e5457 100644
          char *format = NULL;
  
          if (s->format) {
-@@ -1238,9 +1620,11 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1270,9 +1652,11 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
              return ret;
          }
  
@@ -818,7 +820,7 @@ index ff66222..a4e5457 100644
          if (s->draining && output_dequeue_timeout_us == OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US) {
              av_log(avctx, AV_LOG_ERROR, "Failed to dequeue output buffer within %" PRIi64 "ms "
                                          "while draining remaining frames, output will probably lack frames\n",
-@@ -1248,9 +1632,6 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+@@ -1280,9 +1664,6 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
          } else {
              av_log(avctx, AV_LOG_TRACE, "No output buffer available, try again later\n");
          }
@@ -828,7 +830,7 @@ index ff66222..a4e5457 100644
      }
  
      if (s->draining && s->eos)
-@@ -1293,6 +1674,11 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
+@@ -1325,6 +1706,11 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
      if (!s)
          return 0;
  
@@ -841,7 +843,7 @@ index ff66222..a4e5457 100644
      if (s->codec) {
          if (atomic_load(&s->hw_buffer_count) == 0) {
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index 2b92d6f..37c2a67 100644
+index 4f7921985a..d2a14b51cb 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
 @@ -28,8 +28,10 @@
@@ -855,7 +857,7 @@ index 2b92d6f..37c2a67 100644
  
  #include "avcodec.h"
  #include "mediacodec.h"
-@@ -82,10 +84,43 @@ typedef struct MediaCodecDecContext {
+@@ -87,10 +89,43 @@ typedef struct MediaCodecDecContext {
      atomic_int serial;
  
      bool use_ndk_codec;
@@ -902,7 +904,7 @@ index 2b92d6f..37c2a67 100644
  
      // The hardware device this decoder was opened from; the surface-swap
      // registry in mediacodec.c keys on it.
-@@ -143,6 +178,14 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
+@@ -148,6 +183,14 @@ ssize_t ff_mediacodec_dec_dequeue_input(MediaCodecDecContext *s, int64_t timeout
  // while the codec is busy (av_mediacodec_set_wakeup_callback).
  int ff_mediacodec_dec_host_polls(MediaCodecDecContext *s);
  
@@ -917,7 +919,7 @@ index 2b92d6f..37c2a67 100644
  typedef struct MediaCodecBuffer {
  
      MediaCodecDecContext *ctx;
-@@ -159,6 +202,14 @@ void ff_mediacodec_dec_unregister(MediaCodecDecContext *s);
+@@ -164,6 +207,14 @@ void ff_mediacodec_dec_unregister(MediaCodecDecContext *s);
  int ff_mediacodec_dec_set_surface(MediaCodecDecContext *s, void *surface,
                                    void *native_window);
  

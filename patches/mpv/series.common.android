@@ -1,0 +1,34 @@
+# Android's experimental mpv source override. This replaces the stable
+# series.common list for Android before series.android; Apple, Linux and Windows
+# keep the v0.41.0 list. Keep patch order authoritative.
+0201-aspect-sub-video-rect-aspect-option.patch
+0027-ad-spdif-eac3-carrier-rate-from-codec-rate.patch
+0102-f-output-chain-wake-after-reset-harder.patch
+0034-player-drop-the-frame-held-for-the-old-ao-on-reload.patch
+0035-demux-dts-codec-profile-at-load-android.patch
+0208-demux-keep-the-first-new-packet-after-a-refresh-seek.patch
+# Codec profile at load and the pending-vid property, for the per-file decode
+# routing an embedder decides before the decoder exists.
+0204-demux-codec-profile-from-avcc-and-hvcc-android.patch
+0010-player-pending-vid-property-android.patch
+# GLES renderers (Android, Linux ARM boards, ANGLE). Desktop GL is untouched.
+0202-opengl-treat-gles-direct-rendering-as-slow.patch
+0203-vo-gpu-emulated-unorm16-on-gles-without-norm16.patch
+# The subtitle stack: libass threading and fast blur (both from the patched
+# libass every group builds), the faster draw_bmp blend, rendering outside the
+# OSD and dec_sub locks, and the shared ahead-of-time render pipeline
+# vo_mediacodec and vo_avfoundation present through.
+0205-sd-ass-render-threads.patch
+0206-sd-ass-fast-blur.patch
+0008-draw-bmp-fast-libass-blend.patch
+0009-sub-render-outside-the-osd-and-dec-sub-locks.patch
+0011-sub-render-horizon-for-vo-prefetch-android.patch
+0012-ass-mp-fresh-atlas-when-the-cached-one-is-shared-android.patch
+0013-sd-ass-isolate-event-prefetch-renderer-android.patch
+0014-ass-mp-compact-high-overdraw-atlases-android.patch
+0031-vo-osd-ahead-shared-subtitle-render-pipeline.patch
+# deinterlace=ivtc and the ivtc-active property (needs the fieldmatch and
+# decimate filters every group's FFmpeg enables).
+# FFmpeg's log lines reach the instance whose thread logged them, with
+# several instances alive at once.
+0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch

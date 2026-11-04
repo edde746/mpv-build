@@ -1,33 +1,8 @@
-Subject: [PATCH] avcodec/mediacodec: add media3_rate, Media3's rate keys, on by default for MediaTek
-
-On a MediaTek projector with motion processing on (Plezy #2654), 24 fps
-AV1 in Matroska stutters under mpv and not under ExoPlayer. mpv passes
-frame-rate=24 and an operating rate of 60 at configure, while Media3 1.11
-passes neither for a Matroska stream (its extractor declares no frame
-rate) and sets the operating rate to the estimated frame rate once frames
-are out. With Media3's keys, or with no rate at all, the projector (an
-MT9655, c2.mtk.av1.decoder) plays smoothly, and Media3's keys also fixed
-an MT9630 (OMX.MS.AV1.Decoder).
-
-media3_rate configures without frame-rate and operating-rate, sets the
-operating rate to frame_rate, rounded (the JNI bridge passes it as an
-integer), through setParameters after the first frame, and makes
-av_mediacodec_set_operating_rate ignore the host's rate, including the
-host's speed changes. The decoder logs each step at info level.
-
-The option defaults to auto: on for decoders named c2.mtk., OMX.MTK. or
-OMX.MS., off for the rest. Init names the decoder before building the
-format, through the lookup ff_mediacodec_dec_init falls back on, and
-hands it the name, so the decision is made for the decoder it creates.
-Everywhere else the rate at configure stays: on a Pixel 7 without it, a
-40 Mbps 1080p24 AV1 stream showed about one frame in ten, under Media3's
-keys and ExoPlayer alike (Plezy #2361).
-
 diff --git a/libavcodec/mediacodec.c b/libavcodec/mediacodec.c
-index 711b816..aaf78aa 100644
+index d33c598baf..9f902541e5 100644
 --- a/libavcodec/mediacodec.c
 +++ b/libavcodec/mediacodec.c
-@@ -224,6 +224,10 @@ int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
+@@ -226,6 +226,10 @@ int av_mediacodec_set_operating_rate(AVCodecContext *avctx, int rate)
          return AVERROR(ENOSYS);
      if (rate <= 0)
          return AVERROR(EINVAL);
@@ -39,10 +14,10 @@ index 711b816..aaf78aa 100644
      if (!params)
          return AVERROR(ENOMEM);
 diff --git a/libavcodec/mediacodec.h b/libavcodec/mediacodec.h
-index d6b1646..efee9d7 100644
+index 961f3a0500..06113cf3f5 100644
 --- a/libavcodec/mediacodec.h
 +++ b/libavcodec/mediacodec.h
-@@ -201,7 +201,9 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
+@@ -203,7 +203,9 @@ int av_mediacodec_set_wakeup_callback(AVCodecContext *avctx,
   * Vendors use the rate to pick the codec's clock; whether a running
   * component takes a new value is vendor-defined, and a component that
   * ignores it reports no error, so the effect is only ever confirmed by
@@ -54,10 +29,15 @@ index d6b1646..efee9d7 100644
   * @return 0 when the platform accepted the parameter, AVERROR(ENOSYS) when
   * `avctx` is not an opened MediaCodec decoder or the platform predates
 diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
-index f7b2a65..c365f47 100644
+index ea2c29c450..ec247088f6 100644
 --- a/libavcodec/mediacodecdec.c
 +++ b/libavcodec/mediacodecdec.c
-@@ -26,6 +26,7 @@
+@@ -22,10 +22,12 @@
+ 
+ #include "config_components.h"
+ 
++#include <math.h>
+ #include <stdint.h>
  #include <string.h>
  
  #include "libavutil/avassert.h"
@@ -65,21 +45,17 @@ index f7b2a65..c365f47 100644
  #include "libavutil/common.h"
  #include "libavutil/mem.h"
  #include "libavutil/opt.h"
-@@ -85,6 +86,13 @@ typedef struct MediaCodecH264DecContext {
-     // The SPS reorder bound, for presentation-order recovery
-     // (mediacodec_reorder.h); 0 when the extradata carries no SPS.
+@@ -72,6 +74,9 @@ typedef struct MediaCodecContext {
+     int shed_inited;
+     // SPS reorder bound used by presentation-order recovery.
      int reorder_depth;
-+    // Media3's rate keys for a container that declares no frame rate
-+    // (Matroska): neither frame-rate nor operating-rate at configure, then
-+    // the operating rate at the stream's frame rate once a frame is out,
-+    // and none of the host's. -1 (auto) until init resolves it from the
-+    // decoder's name (media3_rate_resolve).
++    // Media3's rate keys for containers without a declared frame rate.
 +    int media3_rate;
 +    int media3_rate_pending;
- } MediaCodecH264DecContext;
- 
- // convert: rewrite UNSPEC62 to profile 8.1 and drop UNSPEC63; strip: drop both
-@@ -811,6 +819,31 @@ static int video_max_input_size(const AVCodecContext *avctx)
+     int dolby_vision;
+     int dv_p7_mode;
+     int dv_filter; // DV_FILTER_*
+@@ -809,6 +814,31 @@ static int video_max_input_size(const AVCodecContext *avctx)
      return size > INT32_MAX ? 0 : (int)size;
  }
  
@@ -111,7 +87,7 @@ index f7b2a65..c365f47 100644
  static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
  {
      int ret;
-@@ -953,6 +986,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -951,6 +981,12 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
          av_assert0(0);
      }
  
@@ -124,7 +100,7 @@ index f7b2a65..c365f47 100644
      ff_AMediaFormat_setString(format, "mime", codec_mime);
  
      if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-@@ -966,15 +1005,18 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -964,15 +1000,18 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
          ff_AMediaFormat_setInt32(format, "channel-count", avctx->ch_layout.nb_channels);
          ff_AMediaFormat_setInt32(format, "sample-rate", avctx->sample_rate);
      }
@@ -145,7 +121,7 @@ index f7b2a65..c365f47 100644
          if (s->priority >= 0)
              ff_AMediaFormat_setInt32(format, "priority", s->priority);
      }
-@@ -989,6 +1031,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+@@ -987,6 +1026,8 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
      s->ctx->delay_flush = s->delay_flush;
      s->ctx->use_ndk_codec = s->use_ndk_codec;
      s->ctx->use_async = s->use_async;
@@ -154,15 +130,14 @@ index f7b2a65..c365f47 100644
      s->ctx->profile_override = profile_override;
      s->ctx->codec_name = codec_name;
      codec_name = NULL;
-@@ -1181,6 +1225,43 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+@@ -1179,6 +1220,42 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
      return AVERROR(EAGAIN);
  }
  
-+// media3_rate: Media3 declares the operating rate once its frame-rate
-+// estimate settles, which for a container without a frame rate is after
-+// the codec's first frames. The stream's declared rate stands in for the
-+// estimate, rounded: the JNI bridge passes operating-rate as an integer.
-+static void apply_media3_rate(AVCodecContext *avctx, MediaCodecH264DecContext *s)
++// Media3 declares the operating rate once its frame-rate estimate settles,
++// which for a container without a frame rate is after the codec's first
++// frames. Use the stream rate rounded to the integer the JNI API accepts.
++static void apply_media3_rate(AVCodecContext *avctx, MediaCodecContext *s)
 +{
 +    const int rate = lrintf(s->frame_rate);
 +    FFAMediaFormat *params;
@@ -187,7 +162,7 @@ index f7b2a65..c365f47 100644
 +
 +static int mediacodec_receive_frame_cb(AVCodecContext *avctx, AVFrame *frame)
 +{
-+    MediaCodecH264DecContext *s = avctx->priv_data;
++    MediaCodecContext *s = avctx->priv_data;
 +    int ret = mediacodec_receive_frame(avctx, frame);
 +
 +    if (ret >= 0 && s->media3_rate_pending)
@@ -197,8 +172,8 @@ index f7b2a65..c365f47 100644
 +
  static void mediacodec_decode_flush(AVCodecContext *avctx)
  {
-     MediaCodecH264DecContext *s = avctx->priv_data;
-@@ -1232,6 +1313,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+     MediaCodecContext *s = avctx->priv_data;
+@@ -1230,6 +1307,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
              OFFSET(frame_rate), AV_OPT_TYPE_FLOAT, {.dbl = 0}, 0, 1000, VD },
      { "priority", "Codec priority: 0 realtime, 1 best effort (MediaFormat priority), -1 for the platform default",
              OFFSET(priority), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 1, VD },
@@ -207,20 +182,20 @@ index f7b2a65..c365f47 100644
      { "dolby_vision", "Prefer a Dolby Vision decoder for single-layer DV streams",
                        OFFSET(dolby_vision), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
      { "dv_p7_mode", "Dolby Vision profile 7 handling",
-@@ -1265,7 +1348,7 @@ const FFCodec ff_ ## short_name ## _mediacodec_decoder = {
+@@ -1263,7 +1342,7 @@ const FFCodec ff_ ## short_name ## _mediacodec_decoder = {
      .p.priv_class   = &ff_##short_name##_mediacodec_dec_class,                                 \
-     .priv_data_size = sizeof(MediaCodecH264DecContext),                                        \
+     .priv_data_size = sizeof(MediaCodecContext),                                               \
      .init           = mediacodec_decode_init,                                                  \
 -    FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame),                                       \
-+    FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame_cb),                                    \
++    FF_CODEC_RECEIVE_FRAME_CB(mediacodec_receive_frame_cb),                                       \
      .flush          = mediacodec_decode_flush,                                                 \
      .close          = mediacodec_decode_close,                                                 \
      .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
 diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
-index c2dd604..0afdc0b 100644
+index 51c3107eac..e01ce432c8 100644
 --- a/libavcodec/mediacodecdec_common.c
 +++ b/libavcodec/mediacodecdec_common.c
-@@ -1275,11 +1275,22 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
+@@ -1288,11 +1288,28 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
      return 0;
  }
  
@@ -230,44 +205,52 @@ index c2dd604..0afdc0b 100644
 +    const int profile = profile_override > 0
 +        ? profile_override
 +        : ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
++    char *name;
 +
 +    if (profile < 0)
 +        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
-+    return ff_AMediaCodecList_getCodecNameByType(mime, profile, 0,
++    name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0,
 +                                                 profile_override > 0, avctx);
++    if (!name && (avctx->hwaccel_flags & AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH))
++        name = ff_AMediaCodecList_getCodecNameByType(mime, -1, 0,
++                                                     profile_override > 0, avctx);
++    return name;
 +}
 +
  static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecContext *s,
                                            const char *mime, FFAMediaFormat *format)
  {
--    int profile;
+     int profile;
 -
      enum AVPixelFormat pix_fmt;
      static const enum AVPixelFormat pix_fmts[] = {
          AV_PIX_FMT_MEDIACODEC,
-@@ -1312,16 +1323,8 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
-         }
-     }
- 
--    profile = s->profile_override > 0
--        ? s->profile_override
--        : ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+@@ -1328,18 +1345,11 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
+     profile = s->profile_override > 0
+         ? s->profile_override
+         : ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
 -    if (profile < 0) {
 -        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
 -    }
--
+ 
      if (!s->codec_name)
 -        s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0,
--                                                            s->profile_override > 0, avctx);
+-                                                              s->profile_override > 0, avctx);
+-    if (!s->codec_name && (avctx->hwaccel_flags & AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH)) {
 +        s->codec_name = ff_mediacodec_dec_codec_name(avctx, mime, s->profile_override);
++    if (!s->codec_name && (avctx->hwaccel_flags & AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH))
+         profile = -1;
+-        s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0,
+-                                                              s->profile_override > 0, avctx);
+-    }
      if (!s->codec_name) {
+         av_log(avctx, AV_LOG_INFO, "Failed to getCodecNameByType(%s, %d)\n", mime, profile);
          // getCodecNameByType() can fail due to missing JVM, while NDK
-         // mediacodec can be used without JVM.
 diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
-index e9b1418..ce8b589 100644
+index d74a71e064..e17ed103c5 100644
 --- a/libavcodec/mediacodecdec_common.h
 +++ b/libavcodec/mediacodecdec_common.h
-@@ -140,6 +140,9 @@ typedef struct MediaCodecDecContext {
+@@ -145,6 +145,9 @@ typedef struct MediaCodecDecContext {
  
      // Frame-rendered feedback; see av_mediacodec_drain_rendered.
      const char *rendered_source;      // "jni", "ndk" or an "off:" reason, never NULL
@@ -277,15 +260,16 @@ index e9b1418..ce8b589 100644
      AVMediaCodecRendered rendered[FF_MEDIACODEC_RENDERED_RING];
      atomic_uint rendered_head;        // consumer
      atomic_uint rendered_tail;        // producer
-@@ -165,6 +168,15 @@ typedef struct MediaCodecDecContext {
+@@ -170,6 +173,16 @@ typedef struct MediaCodecDecContext {
      unsigned input_times_next;
  } MediaCodecDecContext;
  
 +/**
 + * The video decoder ff_mediacodec_dec_init() looks up for mime when it is
 + * not given one by name: the platform's first match for profile_override
-+ * when that is set, else for the stream's profile. NULL when there is none
-+ * or the lookup needs a JVM that is missing. Free with av_free().
++ * when that is set, else for the stream's profile; when permitted, it may
++ * fall back to a decoder that does not advertise the profile. NULL when
++ * there is none or the lookup needs a JVM that is missing. Free with av_free().
 + */
 +char *ff_mediacodec_dec_codec_name(AVCodecContext *avctx, const char *mime,
 +                                   int profile_override);

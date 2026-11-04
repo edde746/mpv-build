@@ -1,8 +1,8 @@
 diff --git a/filters/f_decoder_wrapper.c b/filters/f_decoder_wrapper.c
-index e6bd7c5..794dc7b 100644
+index 273df0f..aa1a93e 100644
 --- a/filters/f_decoder_wrapper.c
 +++ b/filters/f_decoder_wrapper.c
-@@ -148,6 +148,10 @@ const struct m_sub_options dec_wrapper_conf = {
+@@ -150,6 +150,10 @@ const struct m_sub_options dec_wrapper_conf = {
      },
  };
  
@@ -13,7 +13,7 @@ index e6bd7c5..794dc7b 100644
  struct priv {
      struct mp_log *log;
      struct sh_stream *header;
-@@ -189,6 +193,15 @@ struct priv {
+@@ -191,6 +195,15 @@ struct priv {
      int has_broken_decoded_pts;
  
      int packets_without_output; // number packets sent without frame received
@@ -29,17 +29,17 @@ index e6bd7c5..794dc7b 100644
  
      // Final PTS of previously decoded frame
      double pts;
-@@ -231,7 +244,8 @@ struct priv {
+@@ -233,7 +246,8 @@ struct priv {
      bool attached_picture;
      bool pts_reset;
      int attempt_framedrops; // try dropping this many frames
 -    int dropped_frames; // total frames _probably_ dropped
 +    int dropped_frames; // total frames dropped: exact from a decoder that
 +                        // counts its own, else probably
- };
  
- static int decoder_list_help(struct mp_log *log, const m_option_t *opt,
-@@ -331,6 +345,7 @@ static void decf_reset(struct mp_filter *f)
+     // --- Decoder group.
+     //     The group of decoders this wrapper manages. Decodes dependent streams
+@@ -343,6 +357,7 @@ static void decf_reset(struct mp_filter *f)
      p->pts_reset = false;
      p->attempt_framedrops = 0;
      p->dropped_frames = 0;
@@ -47,7 +47,7 @@ index e6bd7c5..794dc7b 100644
      mp_mutex_unlock(&p->cache_lock);
  
      p->coverart_returned = 0;
-@@ -922,10 +937,23 @@ static void feed_packet(struct priv *p)
+@@ -964,10 +979,23 @@ static void feed_packet(struct priv *p)
          int framedrop_type = 0;
  
          mp_mutex_lock(&p->cache_lock);
@@ -73,7 +73,7 @@ index e6bd7c5..794dc7b 100644
          if (start_pts != MP_NOPTS_VALUE && packet && p->play_dir > 0 &&
              packet->pts < start_pts - .005 && !p->has_broken_packet_pts)
              framedrop_type = 2;
-@@ -1026,7 +1054,29 @@ static void read_frame(struct priv *p)
+@@ -1073,7 +1101,29 @@ static void read_frame(struct priv *p)
      if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
          p->decoded_coverart = frame;
      if (p->attempt_framedrops) {
@@ -105,7 +105,7 @@ index e6bd7c5..794dc7b 100644
          p->dropped_frames += dropped;
      }
 diff --git a/filters/f_decoder_wrapper.h b/filters/f_decoder_wrapper.h
-index 9af0058..3b8f4b6 100644
+index 2dda025..216dc52 100644
 --- a/filters/f_decoder_wrapper.h
 +++ b/filters/f_decoder_wrapper.h
 @@ -19,6 +19,7 @@
@@ -144,10 +144,10 @@ index 9af0058..3b8f4b6 100644
  
  int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
 diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
-index 69c9c34..f837a28 100644
+index 5604e9e..536f3f0 100644
 --- a/video/decode/vd_lavc.c
 +++ b/video/decode/vd_lavc.c
-@@ -143,6 +143,7 @@ struct hwdec_opts {
+@@ -144,6 +144,7 @@ struct hwdec_opts {
      int hwdec_image_format;
      int hwdec_extra_frames;
      int hwdec_threads;
@@ -155,7 +155,7 @@ index 69c9c34..f837a28 100644
  };
  
  const struct m_sub_options hwdec_conf = {
-@@ -160,6 +161,13 @@ const struct m_sub_options hwdec_conf = {
+@@ -161,6 +162,13 @@ const struct m_sub_options hwdec_conf = {
              {"no", INT_MAX}, {"yes", 1}), M_RANGE(1, INT_MAX),
              .flags = UPDATE_HWDEC},
          {"hwdec-threads", OPT_INT(hwdec_threads), M_RANGE(0, DBL_MAX)},
@@ -169,7 +169,7 @@ index 69c9c34..f837a28 100644
          {"vd-lavc-software-fallback", OPT_REPLACED("hwdec-software-fallback")},
          {0}
      },
-@@ -219,6 +227,8 @@ typedef struct lavc_ctx {
+@@ -221,6 +229,8 @@ typedef struct lavc_ctx {
  
      bool intra_only;
      int framedrop_flags;
@@ -178,7 +178,7 @@ index 69c9c34..f837a28 100644
  
      bool hw_probing;
      struct demux_packet **sent_packets;
-@@ -839,6 +849,19 @@ static void init_avctx(struct mp_filter *vd)
+@@ -858,6 +868,19 @@ static void init_avctx(struct mp_filter *vd)
  
      mp_set_avopts(vd->log, avctx, lavc_param->avopts);
  
@@ -198,7 +198,7 @@ index 69c9c34..f837a28 100644
      // Do this after the above avopt handling in case it changes values
      ctx->skip_frame = avctx->skip_frame;
  
-@@ -1155,6 +1178,27 @@ fallback:
+@@ -1171,6 +1194,27 @@ fallback:
      return avcodec_default_get_buffer2(avctx, pic, flags);
  }
  
@@ -226,7 +226,7 @@ index 69c9c34..f837a28 100644
  static void prepare_decoding(struct mp_filter *vd)
  {
      vd_ffmpeg_ctx *ctx = vd->priv;
-@@ -1164,6 +1208,9 @@ static void prepare_decoding(struct mp_filter *vd)
+@@ -1180,6 +1224,9 @@ static void prepare_decoding(struct mp_filter *vd)
      if (!avctx)
          return;
  
@@ -236,7 +236,7 @@ index 69c9c34..f837a28 100644
      int drop = ctx->framedrop_flags;
      if (drop == 1) {
          avctx->skip_frame = opts->framedrop;    // normal framedrop
-@@ -1411,6 +1458,17 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
+@@ -1436,6 +1483,17 @@ static int control(struct mp_filter *vd, enum dec_ctrl cmd, void *arg)
          *(bool *)arg = ctx->force_eof;
          return CONTROL_TRUE;
      }

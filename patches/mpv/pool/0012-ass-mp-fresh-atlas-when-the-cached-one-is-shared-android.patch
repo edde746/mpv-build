@@ -1,0 +1,26 @@
+diff --git a/sub/packer.c b/sub/packer.c
+index 67a8dd7..c6105bf 100644
+--- a/sub/packer.c
++++ b/sub/packer.c
+@@ -74,7 +74,8 @@ static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
+ 
+     if (!p->cached_img || p->cached_img->w < res->packed_w ||
+                           p->cached_img->h < res->packed_h ||
+-                          p->cached_img->imgfmt != imgfmt)
++                          p->cached_img->imgfmt != imgfmt ||
++                          !mp_image_is_writeable(p->cached_img))
+     {
+         talloc_free(p->cached_img);
+         p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
+@@ -85,11 +86,6 @@ static bool pack(struct mp_sub_packer *p, struct sub_bitmaps *res, int imgfmt)
+         talloc_steal(p, p->cached_img);
+     }
+ 
+-    if (!mp_image_make_writeable(p->cached_img)) {
+-        packer_reset(p->packer);
+-        return false;
+-    }
+-
+     res->packed = p->cached_img;
+ 
+     for (int n = 0; n < res->num_parts; n++) {
