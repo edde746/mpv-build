@@ -37,3 +37,7 @@
 0209-av-log-route-ffmpeg-lines-to-their-own-instance.patch
 # hwdec=auto no longer picks Vulkan decoding (mpv master d20d108d94).
 0211-vd-lavc-remove-vulkan-hwdec-from-auto-safe-selection.patch
+# Fewer player wakeups during playback: the cache and OSD refreshes done on
+# playback's own wakeups instead of timers of their own (--coalesce-updates,
+# off by default).
+0212-player-periodic-refreshes-on-playbacks-own-wakeups.patch

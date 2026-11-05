@@ -1,0 +1,122 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:00:00 +0100
+Subject: [PATCH] player: periodic refreshes on playback's own wakeups
+
+Two refreshes run on core timers of their own during playback.
+handle_update_cache() arms a 250 ms timer while the demuxer reads
+(always, for a local file under --demuxer-readahead-secs), and
+update_osd_msg() rate-limits the OSD, terminal status and window title
+to one refresh per 50 ms after any mp_notify(), which every video frame
+sends (MPV_EVENT_TICK): the timer fires whenever the next frame is more
+than 50 ms away. Running playback already wakes the core for every
+video frame and audio refill, so these timers only add wakeups (System
+Trace on an iPhone: the core's only timer wakeups, ~3.4/s at 24 fps;
+~16/s once frames come in pairs, see vo_set_queue_slack()).
+
+--coalesce-updates=yes skips arming both while playback runs (unpaused,
+audio or video playing): the refresh happens on the next playback
+wakeup after it is due. Paused or buffering, the timers run as before.
+Default no.
+
+diff --git a/options/options.c b/options/options.c
+index 4df87e5..84e0646 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -663,6 +663,7 @@ static const m_option_t mp_opts[] = {
+     {"cache-pause", OPT_BOOL(cache_pause)},
+     {"cache-pause-initial", OPT_BOOL(cache_pause_initial)},
+     {"cache-pause-wait", OPT_FLOAT(cache_pause_wait), M_RANGE(0, FLT_MAX)},
++    {"coalesce-updates", OPT_BOOL(coalesce_updates)},
+ 
+ #if HAVE_DVBIN
+     {"dvbin", OPT_SUBSTRUCT(stream_dvb_opts, stream_dvb_conf)},
+diff --git a/options/options.h b/options/options.h
+index 278c347..0a3c5b5 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -326,6 +326,7 @@ typedef struct MPOpts {
+     bool cache_pause;
+     bool cache_pause_initial;
+     float cache_pause_wait;
++    bool coalesce_updates;
+ 
+     struct image_writer_opts *screenshot_image_opts;
+     char *screenshot_template;
+diff --git a/player/core.h b/player/core.h
+index eb7f508..c3e0816 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -598,6 +598,7 @@ void set_osd_bar_chapters(struct MPContext *mpctx, int type);
+ // playloop.c
+ void mp_wait_events(struct MPContext *mpctx);
+ void mp_set_timeout(struct MPContext *mpctx, double sleeptime);
++bool mp_coalesce_updates(struct MPContext *mpctx);
+ void mp_wakeup_core(struct MPContext *mpctx);
+ void mp_wakeup_core_cb(void *ctx);
+ void mp_core_lock(struct MPContext *mpctx);
+diff --git a/player/osd.c b/player/osd.c
+index ac65f62..4909147 100644
+--- a/player/osd.c
++++ b/player/osd.c
+@@ -512,7 +512,8 @@ void update_osd_msg(struct MPContext *mpctx)
+         double delay = 0.050; // update the OSD at most this often
+         double diff = now - mpctx->osd_last_update;
+         if (diff < delay) {
+-            mp_set_timeout(mpctx, delay - diff);
++            if (!mp_coalesce_updates(mpctx))
++                mp_set_timeout(mpctx, delay - diff);
+             return;
+         }
+     }
+diff --git a/player/playloop.c b/player/playloop.c
+index f111920..fa4bf44 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -80,6 +80,16 @@ void mp_set_timeout(struct MPContext *mpctx, double sleeptime)
+     }
+ }
+ 
++// Whether a periodic refresh may wait for the next wakeup that running
++// playback makes anyway (a video frame, an audio refill) instead of arming a
++// timer of its own (--coalesce-updates).
++bool mp_coalesce_updates(struct MPContext *mpctx)
++{
++    return mpctx->opts->coalesce_updates && !mpctx->paused &&
++           (mpctx->video_status == STATUS_PLAYING ||
++            mpctx->audio_status == STATUS_PLAYING);
++}
++
+ // Cause the playloop to run. This can be called from any thread. If called
+ // from within the playloop itself, it will be run immediately again, instead
+ // of going to sleep in the next mp_wait_events().
+@@ -786,7 +796,7 @@ static void handle_update_cache(struct MPContext *mpctx)
+             mpctx->next_cache_update = busy ? now + 0.25 : 0;
+             force_update = true;
+         }
+-        if (mpctx->next_cache_update > 0)
++        if (mpctx->next_cache_update > 0 && !mp_coalesce_updates(mpctx))
+             mp_set_timeout(mpctx, mpctx->next_cache_update - now);
+     }
+ 
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index a1a3c29..be1cf56 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -7892,6 +7892,17 @@ Video Sync
+     out. This delay in reaction time to sudden A/V offsets should be the only
+     side effect of turning this option on, for all sound drivers.
+ 
++``--coalesce-updates=<yes|no>``
++    While playback runs, do the player's periodic refreshes on the wakeups
++    playback already makes for video frames and audio refills instead of on
++    timers of their own (default: no). This covers the cache state
++    (``demuxer-cache-state`` and the other cache properties, and the buffering
++    decision), refreshed every 250 ms while the demuxer reads, and the OSD,
++    terminal status and window title, refreshed at most every 50 ms after a
++    property change, which every video frame makes. Either may then come up
++    to one video frame or audio refill late. Paused or buffering, the timers
++    run as before.
++
+ ``--video-timing-offset=<seconds>``
+     Control how long before video display target time the frame should be
+     rendered (default: 0.050). If a video frame should be displayed at a
