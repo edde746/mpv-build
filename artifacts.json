@@ -4,55 +4,55 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-android",
       "libraries": {
         "libmpv-android": {
-          "key": "c95561d4d481",
+          "key": "198c7fd1848d",
           "prebuilt": {
             "arm64-v8a": {
-              "asset": "libmpv-android-c95561d4d481-arm64-v8a.tar.gz",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "c1e1f115d34386b5824c78c04c95904b6735a75af77eca8ab97c93155c1c91bb"
+              "asset": "libmpv-android-198c7fd1848d-arm64-v8a.tar.gz",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "bc594e7d2100c856283227846fe25cf6bf9e06dfc1274d70dddd5b07c01ae2c5"
             },
             "armeabi-v7a": {
-              "asset": "libmpv-android-c95561d4d481-armeabi-v7a.tar.gz",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "3809866bf211667faa7c28b4b256861aa89602bdbe63fd5a3f1d4aced6aebc0e"
+              "asset": "libmpv-android-198c7fd1848d-armeabi-v7a.tar.gz",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "a31233f3bf99b0d2dc7618d3aec44a94bef39a441f4961152c77c8ce24f20503"
             },
             "x86": {
-              "asset": "libmpv-android-c95561d4d481-x86.tar.gz",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "57ca4714cb5ff3c7d5c297648bc17cd76a4563b81e7d47c7931296526bb9afad"
+              "asset": "libmpv-android-198c7fd1848d-x86.tar.gz",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "e4055317dde0c65623c7f249cd38f91b17a6c2418d4d0f5b4be29b7ea1719e7c"
             },
             "x86_64": {
-              "asset": "libmpv-android-c95561d4d481-x86_64.tar.gz",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "f8899fcb1e2f6a5c1998fadaecd7ed6ac7520c6506072ea70e80003a2e2406f3"
+              "asset": "libmpv-android-198c7fd1848d-x86_64.tar.gz",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "f86bd5ef8083a895d5cef7ebdcb55e68fb506878a0d262afa5cac5a1c84fc231"
             }
           }
         },
         "mpv-android": {
-          "asset": "mpv-android-3961861f0331.aar",
-          "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-          "checksum": "5282280c1d8cb46feb1558a8200d7bdfe54caf549fa63dd38c9abb933100ccc4",
-          "key": "3961861f0331",
+          "asset": "mpv-android-b3f46d9ae458.aar",
+          "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+          "checksum": "6bb230522bed5d9c1178189602d71a5cb6f1048fa145aabae390975d62c2af77",
+          "key": "b3f46d9ae458",
           "symbols": {
             "arm64-v8a": {
-              "asset": "mpv-android-3961861f0331-arm64-v8a-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "5ebffb59009c5ff47dd4ade3d712b16e252f044d8b34c848c535000c94128b7b"
+              "asset": "mpv-android-b3f46d9ae458-arm64-v8a-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "34ae57dd1a103d41e97b7ae018e9f164ba4cc5cf2309498111c513c00064e087"
             },
             "armeabi-v7a": {
-              "asset": "mpv-android-3961861f0331-armeabi-v7a-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "410b3028798eb539934d205d02bf6be2e7aacd1dd4c4c7893515a8ffd44b1b4c"
+              "asset": "mpv-android-b3f46d9ae458-armeabi-v7a-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "8becd55ff36b945c1a9a74e9efc7682839cdbd3a387d08fa5a1e0708fb1d7b51"
             },
             "x86": {
-              "asset": "mpv-android-3961861f0331-x86-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "12193968c07f117e74e8433f2b271ca0e67003acff350120acc7d3547470f681"
+              "asset": "mpv-android-b3f46d9ae458-x86-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "b6865186622b3694f249ea7b5bcf02eae66337b5ed822536dea22b1825ba207c"
             },
             "x86_64": {
-              "asset": "mpv-android-3961861f0331-x86_64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "9b457eb5af4191966fbffa93460826442c15dcc9243b8eff1995792e7eb8c7b4"
+              "asset": "mpv-android-b3f46d9ae458-x86_64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "d0517ba1995aa44deb42e3d1045b0d3af1bfde113e943c9491f506c06d02ddc7"
             }
           }
         }
@@ -64,66 +64,66 @@
         "FFmpeg": {
           "frameworks": {
             "Libavcodec": {
-              "asset": "Libavcodec-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "b8991d6e04fe4c7b98da6cdca9faabb0ca0b363136a2efb5d68d0891e2eb5799"
+              "asset": "Libavcodec-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "81c107bd15e2a86b3cdd02d12b94071cb1261be47305a2233b6b896a42029a6e"
             },
             "Libavdevice": {
-              "asset": "Libavdevice-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libavdevice-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "af5b42c83b91822690fd3f5cf234235784364f7e0a99d3a81f0243e2eb0966c0"
             },
             "Libavfilter": {
-              "asset": "Libavfilter-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libavfilter-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "f513e69d6721e060ec9ef37420866f219f03a8d087ffb3b0f57b504186a13b85"
             },
             "Libavformat": {
-              "asset": "Libavformat-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libavformat-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "71c21953fada4ed4f5c9c429e413fe1b8ea8f7c67951b7e148a7995b6eeee3ad"
             },
             "Libavutil": {
-              "asset": "Libavutil-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libavutil-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "4ecd60cb763b425e280051644dabc941452af6b1c96c4aa50da9172f4f6520d9"
             },
             "Libswresample": {
-              "asset": "Libswresample-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libswresample-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "4092981fe0365988a5db177c1663988887be95e72d2b04d9ccb038b6ff21adb3"
             },
             "Libswscale": {
-              "asset": "Libswscale-640c94e42f0a.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
+              "asset": "Libswscale-797bede1c913.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
               "checksum": "e5b9fb6bc219b14726e966d7f311fe50e79d11f83b1d72c2725b11b06b599c31"
             }
           },
-          "key": "640c94e42f0a",
+          "key": "797bede1c913",
           "prebuilt": {
             "ios": {
-              "asset": "FFmpeg-all-640c94e42f0a-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-ios.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "isimulator": {
-              "asset": "FFmpeg-all-640c94e42f0a-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-isimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "maccatalyst": {
-              "asset": "FFmpeg-all-640c94e42f0a-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-maccatalyst.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "macos": {
-              "asset": "FFmpeg-all-640c94e42f0a-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-macos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "tvos": {
-              "asset": "FFmpeg-all-640c94e42f0a-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-tvos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "tvsimulator": {
-              "asset": "FFmpeg-all-640c94e42f0a-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1"
+              "asset": "FFmpeg-all-797bede1c913-tvsimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             }
           }
         },
@@ -166,36 +166,36 @@
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-0c3267519cb9.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171",
-              "checksum": "0c50a5362ac7f18b16d93e7f3c20b9bb27e52588f9227fdacfc74e789c8c3451"
+              "asset": "Libmpv-9a281b9ee704.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "c911894562a2905221a83f4920892d0cae568cfbde8b8af2e9c010a3b9408752"
             }
           },
-          "key": "0c3267519cb9",
+          "key": "9a281b9ee704",
           "prebuilt": {
             "ios": {
-              "asset": "libmpv-all-0c3267519cb9-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-ios.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "isimulator": {
-              "asset": "libmpv-all-0c3267519cb9-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-isimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "maccatalyst": {
-              "asset": "libmpv-all-0c3267519cb9-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-maccatalyst.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "macos": {
-              "asset": "libmpv-all-0c3267519cb9-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-macos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "tvos": {
-              "asset": "libmpv-all-0c3267519cb9-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-tvos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             },
             "tvsimulator": {
-              "asset": "libmpv-all-0c3267519cb9-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-9929c5e14171"
+              "asset": "libmpv-all-9a281b9ee704-tvsimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792"
             }
           }
         }
@@ -205,29 +205,29 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-linux",
       "libraries": {
         "libmpv-linux": {
-          "key": "f154332939d0",
+          "key": "96baa8272598",
           "prebuilt": {
             "aarch64": {
-              "asset": "libmpv-linux-f154332939d0-aarch64.tar.zst",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "869849784ec97e4a916045433297804179f988ea9c9afcc76ea71c9542b48593"
+              "asset": "libmpv-linux-96baa8272598-aarch64.tar.zst",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "0107b590c470e80ea3baf43260401151c203d2c9cc5ab93ad0f2ad5f4ff0796d"
             },
             "x86_64": {
-              "asset": "libmpv-linux-f154332939d0-x86_64.tar.zst",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "7adfbff55e706b42214e4158f64e8a75cfe296e33c8f2d14dd4518b92fcc9a22"
+              "asset": "libmpv-linux-96baa8272598-x86_64.tar.zst",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "92989c5bd8ad3efb50f65983eff5f09d301e7c3e97d947a1c6a157483eb25f98"
             }
           },
           "symbols": {
             "aarch64": {
-              "asset": "libmpv-linux-f154332939d0-aarch64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "55cc9444380a42d215e523ec0954e81abc63198e4fa304fd20bfc484038808e4"
+              "asset": "libmpv-linux-96baa8272598-aarch64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "223cc100d879a56be980b4e363aba3c46f0175d19901b38d2084b908f4b9224c"
             },
             "x86_64": {
-              "asset": "libmpv-linux-f154332939d0-x86_64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "6055b3caf9302b1e0658fc067014500ff98011a5fa6cd796a806a4f0f54374aa"
+              "asset": "libmpv-linux-96baa8272598-x86_64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "61e1f18e0ea8205eedbdb14f06d15f6fc43f396f0d62bcf6617c0d1a2533d187"
             }
           }
         }
@@ -237,29 +237,29 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-windows",
       "libraries": {
         "libmpv-windows": {
-          "key": "11149e8aa3fa",
+          "key": "cedfd903d233",
           "prebuilt": {
             "aarch64": {
-              "asset": "libmpv-windows-11149e8aa3fa-aarch64.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "95e9e8628f9a5ef59edea88fb9a309ae35f203192f8007c32f1c022dcb396f8f"
+              "asset": "libmpv-windows-cedfd903d233-aarch64.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "545cf8f32cfa1ee906f8aa71c3b0cef3a3cdb039fb985533849d105d696e990e"
             },
             "x86_64": {
-              "asset": "libmpv-windows-11149e8aa3fa-x86_64.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "80de79d3322f1a1cf925c2efa3846bdbfb4ea3bf1c58fa3a94fd7f8eb931a7b0"
+              "asset": "libmpv-windows-cedfd903d233-x86_64.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "66f23bcd0cb20a9d15a66b34fae537efdf52c27159be8cb7a274c632c8c28b9e"
             }
           },
           "symbols": {
             "aarch64": {
-              "asset": "libmpv-windows-11149e8aa3fa-aarch64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "3b26aa101693cc651b923e47836ebe6d1945880a32b1aff19a40d3af8af104a1"
+              "asset": "libmpv-windows-cedfd903d233-aarch64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "73fb69f3936fb093fe01354b8ed20dd315bb735a563db4b58d7efb21930107f2"
             },
             "x86_64": {
-              "asset": "libmpv-windows-11149e8aa3fa-x86_64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-3e8e78a488d1",
-              "checksum": "aa60d1ea91a804ffa3985594b3a4c2822f273e28c287cd90d7f252b6348c905b"
+              "asset": "libmpv-windows-cedfd903d233-x86_64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-63bbd7584792",
+              "checksum": "ef70e683deec29ea28dfae1df2fb3f7033199a260006cee3a2ebe44f17085bdf"
             }
           }
         }
