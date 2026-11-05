@@ -41,8 +41,8 @@ Commands:
         pinned ref whose HEAD is then proven equal to the pinned commit; an
         `archive` pin is a download whose sha256 must match before anything
         is extracted. This is the one implementation of the pin contract; the
-        host regression harnesses call it instead of each carrying their own
-        copy.
+        android driver (platforms/android/download.sh) and the host regression
+        harnesses call it instead of each carrying their own copy.
 
 `check` also enforces versions.json's `platforms` arrays: a component a
 group's build consumes must declare that group. A group's components come from

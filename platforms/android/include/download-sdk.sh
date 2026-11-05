@@ -52,7 +52,8 @@ fi
 mkdir -p sdk && cd sdk
 
 if [ ! -d "android-sdk-${os}" ]; then
-	curl -fsSLO "https://dl.google.com/android/repository/commandlinetools-${os}-${v_cmdline_tools}.zip"
+	curl -fsSLO --retry 3 --retry-all-errors --connect-timeout 30 \
+		"https://dl.google.com/android/repository/commandlinetools-${os}-${v_cmdline_tools}.zip"
 	mkdir "android-sdk-${os}"
 	unzip -q -d "android-sdk-${os}" "commandlinetools-${os}-${v_cmdline_tools}.zip"
 	rm "commandlinetools-${os}-${v_cmdline_tools}.zip"
@@ -66,6 +67,18 @@ sdkmanager () {
 	"$exe" --sdk_root="${ANDROID_HOME}" "$@"
 }
 
-echo y | sdkmanager "ndk;${v_ndk}"
+# dl.google.com has cut the NDK download short ("Premature EOF") and failed the
+# whole leg with it. A retry asks for the same pinned NDK release again; it
+# cannot install another one.
+for attempt in 1 2 3; do
+	if echo y | sdkmanager "ndk;${v_ndk}"; then
+		break
+	fi
+	if [ "$attempt" -eq 3 ]; then
+		echo >&2 "could not install ndk;${v_ndk} after 3 attempts"
+		exit 1
+	fi
+	sleep $((attempt * 5))
+done
 
 cd ..

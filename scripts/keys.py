@@ -486,8 +486,7 @@ def resolved_pins(versions: dict, component: str, group: str) -> dict[str, str]:
     # entry's ref or commit -- describing an unrelated tag and tree -- into the
     # key of a pin that acquires an archive: no tool reads it for an archive,
     # and a bump to the base git pin would move the archive's key for no
-    # reason. This is also the invariant platforms/android/download.sh's
-    # pin_block relies on when it reads an archive's ref back as empty.
+    # reason.
     if resolved_kind(versions, component, group) != "git":
         pins.pop("commit", None)
         pins.pop("ref", None)
