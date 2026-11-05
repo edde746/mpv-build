@@ -1,0 +1,158 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:00:00 +0100
+Subject: [PATCH] vo: queue slack for VOs that present by timestamp
+
+vo_avfoundation hands frames to AVSampleBufferDisplayLayer with their
+presentation time, queue-lead-ms ahead. vo.c still schedules them like
+a VO that flips at display time: the VO thread sleeps until the frame
+is due (minus the lead and --video-timing-offset), wakes the core to
+queue it, then sleeps again until the flip time. Those timed waits are
+most of the player's timer wakeups (System Trace on an iPhone: the vo
+thread takes ~19 of ~27 interrupt wakeups a second on 24 fps video).
+Every core wakeup also re-arms that timer: the audio clock moves the
+frame's target by microseconds each time, and vo_is_ready_for_frame()
+wakes the VO thread for any earlier target, so the vo thread ran on
+every audio period (47 times a second with ao_audiounit) to do nothing.
+
+vo_set_queue_slack() lets such a VO take a frame up to the slack
+before it is due when the core is awake anyway (an audio period, a
+decoded frame), flip it at once, and leave the timer alone for target
+moves under 1 ms. The VO thread's timer still fires at the nominal time
+when nothing else woke the core first. --avfoundation-queue-slack-ms
+sets it; default 0 keeps the old timing.
+
+diff --git a/video/out/vo.c b/video/out/vo.c
+index e3635b2..b109ee1 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -162,6 +162,7 @@ struct vo_internal {
+     int64_t num_successive_vsyncs;
+ 
+     int64_t flip_queue_offset; // queue flip events at most this much in advance
++    int64_t queue_slack;       // vo_set_queue_slack()
+     int64_t timing_offset;     // same (but from options; not VO configured)
+ 
+     int64_t delayed_count;
+@@ -851,9 +852,15 @@ bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts)
+         next_pts -= in->timing_offset;
+         next_pts -= in->flip_queue_offset;
+         int64_t now = mp_time_ns();
+-        if (next_pts > now)
++        // With slack, a core wakeup shortly before the frame is due takes it
++        // (the VO thread's timer below still fires at the nominal time).
++        if (next_pts - in->queue_slack > now)
+             r = false;
+-        if (!in->wakeup_pts || next_pts < in->wakeup_pts) {
++        // The audio clock moves the target by microseconds on most core
++        // wakeups; with slack, re-arming the VO thread's timer for that is a
++        // VO wakeup per core wakeup for nothing.
++        int64_t tolerance = MPMIN(in->queue_slack, MP_TIME_MS_TO_NS(1));
++        if (!in->wakeup_pts || next_pts < in->wakeup_pts - tolerance) {
+             in->wakeup_pts = next_pts;
+             // If we have to wait, update the vo thread's timer.
+             if (!r)
+@@ -954,6 +961,10 @@ static bool render_frame(struct vo *vo)
+ 
+     // Time at which we should flip_page on the VO.
+     int64_t target = frame->display_synced ? 0 : pts - in->flip_queue_offset;
++    // A VO with queue slack presents by timestamp: flip a frame queued early
++    // right away instead of on a timer of its own.
++    if (target && in->queue_slack)
++        target -= in->timing_offset + in->queue_slack;
+ 
+     // "normal" strict drop threshold.
+     in->dropped_frame = duration >= 0 && end_time < now;
+@@ -1348,6 +1359,14 @@ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames)
+     mp_mutex_unlock(&in->lock);
+ }
+ 
++void vo_set_queue_slack(struct vo *vo, int64_t slack_ns)
++{
++    struct vo_internal *in = vo->in;
++    mp_mutex_lock(&in->lock);
++    in->queue_slack = MPMAX(slack_ns, 0);
++    mp_mutex_unlock(&in->lock);
++}
++
+ int vo_get_num_req_frames(struct vo *vo)
+ {
+     struct vo_internal *in = vo->in;
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 160d860..18a3b0c 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -549,6 +549,13 @@ void vo_event(struct vo *vo, int event);
+ int vo_query_and_reset_events(struct vo *vo, int events);
+ struct mp_image *vo_get_current_frame(struct vo *vo);
+ void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames);
++// For VOs that present frames by their timestamp: accept a frame up to
++// slack_ns before it is due if the core is awake anyway, and flip it at once
++// instead of waiting for the flip queue offset. Saves the VO thread's timer
++// wakeups when other wakeups (audio, decoding) come often enough, and leaves
++// the timer alone for target moves under 1 ms (or the slack, if less), which
++// the audio clock makes on most core wakeups. 0 disables.
++void vo_set_queue_slack(struct vo *vo, int64_t slack_ns);
+ int vo_get_num_req_frames(struct vo *vo);
+ double vo_get_vsync_interval(struct vo *vo);
+ double vo_get_estimated_vsync_interval(struct vo *vo);
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 50bf220..80d6b71 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -189,6 +189,7 @@ struct avfoundation_opts {
+     bool composite_osd;
+     bool pip_composite_osd;
+     int queue_lead_ms;
++    int queue_slack_ms;
+     int presentation;
+     int osd_max_height;
+     bool osd_video_res;
+@@ -1490,6 +1491,7 @@ static void update_avfoundation_options(struct vo *vo)
+     bool old_composite_osd = p->opts->composite_osd;
+     bool old_pip_composite_osd = p->opts->pip_composite_osd;
+     int old_queue_lead_ms = p->opts->queue_lead_ms;
++    int old_queue_slack_ms = p->opts->queue_slack_ms;
+     int old_osd_max_height = p->opts->osd_max_height;
+     bool old_osd_video_res = p->opts->osd_video_res;
+ 
+@@ -1498,6 +1500,8 @@ static void update_avfoundation_options(struct vo *vo)
+ 
+     if (old_queue_lead_ms != p->opts->queue_lead_ms)
+         vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    if (old_queue_slack_ms != p->opts->queue_slack_ms)
++        vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+ 
+     bool composite_changed =
+         old_composite_osd != p->opts->composite_osd ||
+@@ -4221,6 +4225,7 @@ static int preinit(struct vo *vo)
+     });
+     [displayLayer release];
+     vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+     p->ready_queue = dispatch_queue_create("avfoundation ready",
+         dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                 QOS_CLASS_USER_INTERACTIVE, 0));
+@@ -4817,9 +4822,11 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     p->next_pts = pts;
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
+     if (p->presentation_host) {
++        // Queue slack lets a frame be stamped that much further ahead.
+         p->next_present_host_ns = avf_host_present_ns(
+             p->last_host_present_ns, p->next_present_host_ns,
+-            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms) + AVF_HOST_PRESENT_SLACK_NS);
++            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms + p->opts->queue_slack_ms) +
++            AVF_HOST_PRESENT_SLACK_NS);
+         p->last_host_present_ns = p->next_present_host_ns;
+     }
+     p->next_media_pts_valid = media_pts_is_valid(pts);
+@@ -5119,6 +5126,10 @@ static const struct m_option avfoundation_options[] = {
+     {"composite-osd", OPT_BOOL(composite_osd)},
+     {"pip-composite-osd", OPT_BOOL(pip_composite_osd)},
+     {"queue-lead-ms", OPT_INT(queue_lead_ms), M_RANGE(0, 1000)},
++    // Frames are presented by timestamp, so one may go to the layer up to
++    // this much earlier than queue-lead-ms on a wakeup the player makes
++    // anyway (audio, decoding), instead of on a VO timer of its own.
++    {"queue-slack-ms", OPT_INT(queue_slack_ms), M_RANGE(0, 1000)},
+     {"presentation", OPT_CHOICE(presentation,
+         {"media", AVF_PRESENTATION_MEDIA},
+         {"host", AVF_PRESENTATION_HOST})},

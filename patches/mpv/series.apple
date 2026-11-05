@@ -27,3 +27,6 @@
 # OSD canvas: per-buffer dirty rects instead of a union, and a cheaper exact
 # libass blend (tests test_avf_osd_{dirty_set,blend}.sh).
 0043-avfoundation-clear-and-blend-the-osd-canvas-for-less.patch
+# vo_avfoundation takes a frame early on a wakeup the player makes anyway,
+# instead of on VO timers of its own (--avfoundation-queue-slack-ms, off).
+0044-vo-queue-slack-for-vos-that-present-by-timestamp.patch
