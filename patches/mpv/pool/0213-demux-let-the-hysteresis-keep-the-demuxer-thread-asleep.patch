@@ -1,0 +1,35 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:00:00 +0100
+Subject: [PATCH] demux: let the hysteresis keep the demuxer thread asleep
+
+--demuxer-hysteresis-secs stops the prefetch until a stream drains to
+the hysteresis, but dequeue_packet() still woke the demuxer thread for
+every packet a decoder took, only for read_packet() to decide not to
+read. On an iPhone playing a local file System Trace shows the core
+waking the demux thread 50-66 times a second, once per packet.
+
+dequeue_packet() now leaves the thread asleep while the hysteresis
+holds and the stream it takes from is still above it; the first packet
+taken below it wakes the thread, which then reads up to the readahead
+in one go. Nothing changes at the default hysteresis of 0.
+
+diff --git a/demux/demux.c b/demux/demux.c
+index 1320040..86a233d 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -2662,7 +2662,14 @@ static int dequeue_packet(struct demux_stream *ds, double min_pts,
+         return 1;
+     }
+ 
+-    if (!in->reading && !in->eof) {
++    // While the hysteresis holds the prefetch and this stream is still above
++    // it, the demuxer thread would only wake to decide not to read; that is a
++    // wakeup per packet the decoders take. Leave it asleep.
++    bool hyst_holds = in->hyst_active && ds->eager && ds->reader_head &&
++                      ds->base_ts != MP_NOPTS_VALUE &&
++                      ds->queue->last_ts != MP_NOPTS_VALUE &&
++                      ds->queue->last_ts - ds->base_ts > in->hyst_secs;
++    if (!in->reading && !in->eof && !hyst_holds) {
+         in->reading = true; // enable demuxer thread prefetching
+         mp_cond_signal(&in->wakeup);
+     }

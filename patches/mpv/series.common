@@ -41,3 +41,6 @@
 # playback's own wakeups instead of timers of their own (--coalesce-updates,
 # off by default).
 0212-player-periodic-refreshes-on-playbacks-own-wakeups.patch
+# --demuxer-hysteresis-secs also spares the demuxer thread its per-packet
+# wakeup while the hysteresis holds (no change at the default 0).
+0213-demux-let-the-hysteresis-keep-the-demuxer-thread-asleep.patch
