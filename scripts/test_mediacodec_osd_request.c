@@ -21,7 +21,7 @@ struct osd_ahead {
     struct osd_release releases[OSD_RELEASE_HISTORY];
     int release_next, present_slot;
     uint64_t release_seq, epoch;
-    bool terminate, present_failed, requested;
+    bool terminate, present_failed, requested, repeat_unchanged;
     struct osd_request request;
     uint64_t served_seq, served_epoch;
     bool served_waiter;
@@ -37,12 +37,14 @@ struct sub_bitmap_list { int change_id; };
 struct osd_render_state {
     bool force_full;
     int64_t posted_change_id;
+    int posted_slot;
     struct osd_request last;
 };
 struct priv {
     struct osd_ahead osd; // first: the render seam recovers priv from it
     double osd_pts;
     bool long_sign;
+    bool no_canvas; // the render pass finds no canvas and renders nothing
     // Host-only state: one renderer survives all requests, like the worker.
     struct osd_render_state renderer;
     void (*after_render)(struct priv *p);
@@ -63,6 +65,8 @@ static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
                             double pts, int slot)
 {
     struct priv *p = (struct priv *)s;
+    if (p->no_canvas)
+        return false;
     struct sub_bitmap_list *image = &blank;
     double sign_end = p->long_sign ? 11.0 : 10.04;
     if (pts >= 10.0 && pts < sign_end)
@@ -367,6 +371,46 @@ static void test_queued_results_notify_the_presenter(void)
           "a pre-rendered result served from its slot notifies");
 }
 
+// A plane delayed against its video is presented on every frame: a pinned
+// request whose OSD did not change posts the pixels on screen again, from
+// their own slot, with its own frame's release.
+static void test_delayed_plane_repeats_the_slot_on_screen(void)
+{
+    struct priv p = warmed();
+    p.osd.repeat_unchanged = true;
+    request(&p, 10.02, 101, false); // sign
+    request(&p, 10.03, 102, false); // the same sign, its result still queued
+    struct osd_result *head = osd_result_head(&p.osd.results);
+    check(p.osd.results.count == 2 &&
+          p.osd.results.entries[(p.osd.results.first + 1) % OSD_RESULT_CAPACITY].slot == head->slot,
+          "an unchanged frame repeats the queued slot");
+    struct osd_result a = take(&p, &sign, publish(&p, 101));
+    struct osd_result b = take(&p, &sign, publish(&p, 102));
+    check(a.slot == b.slot, "each frame presents the same pixels from the same slot");
+
+    osd_spec_store(&p.osd.spec, 10.035, p.osd.epoch, -1); // pre-render: unchanged
+    request(&p, 10.035, 103, false);
+    check(p.osd.results.count == 1 && osd_result_head(&p.osd.results)->slot == b.slot,
+          "a pre-render that found nothing new repeats the slot on screen");
+    take(&p, &sign, publish(&p, 103));
+
+    request(&p, 10.06, 104, false); // blank, accepted but not yet shown
+    p.osd_pts = 10.06;
+    invalidate(&p); // discards it and files a full repaint
+    p.no_canvas = true;
+    service_pending(&p);
+    request(&p, 10.07, 105, false);
+    check(!osd_result_head(&p.osd.results),
+          "a forced render that could not run repeats no discarded slot");
+    p.no_canvas = false;
+    request(&p, 10.08, 106, false);
+    take(&p, &dialogue, publish(&p, 106));
+
+    p.osd.repeat_unchanged = false;
+    request(&p, 10.09, 107, false);
+    check(!osd_result_head(&p.osd.results), "without the delay an unchanged OSD posts nothing");
+}
+
 int main(void)
 {
     test_flip_thread_presenter_takes_the_newest_flipped_result();
@@ -376,6 +420,7 @@ int main(void)
     test_render_finishing_after_cancellation_can_still_clear();
     test_expired_release_does_not_authorize_or_suppress_a_clear();
     test_queued_results_notify_the_presenter();
+    test_delayed_plane_repeats_the_slot_on_screen();
     printf("mediacodec osd requests: all content scenarios passed\n");
     return 0;
 }

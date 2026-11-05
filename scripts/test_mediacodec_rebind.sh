@@ -25,7 +25,7 @@ python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/osd_ahead.c" \
     --fn osd_ahead_stop --fn osd_ahead_destroy
 python3 "$root/scripts/extract.py" symbol "$source_dir/video/out/vo_mediacodec.c" \
     "$workdir/mediacodec_rebind.inc" --append --return void \
-    --fn osd_init --fn osd_uninit --fn update_opts
+    --fn osd_set_vsync_delay --fn osd_init --fn osd_uninit --fn update_opts
 cc -std=c11 -Wall -Wextra -Werror -pthread -I"$workdir" \
     "$root/scripts/test_mediacodec_rebind.c" -o "$workdir/test"
 "$workdir/test"
