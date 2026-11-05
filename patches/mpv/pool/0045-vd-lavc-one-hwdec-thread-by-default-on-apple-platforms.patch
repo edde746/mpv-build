@@ -1,0 +1,63 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 14:00:00 +0100
+Subject: [PATCH] vd_lavc: one hwdec thread by default on Apple platforms
+
+The VideoToolbox hwaccels declare neither of libavcodec's thread-safety
+caps, so frame threads parse and decode one packet at a time under a
+shared lock, and VT decodes each frame in one synchronous call. Extra
+threads only let the next packet's header parsing overlap the player's
+own work between decode calls. Each one also delays output by a frame
+and keeps another decoded surface alive for the length of the pipeline:
+three 20 MB P010 surfaces at 4K with the default of 4. Default
+--hwdec-threads to 1 on Apple platforms, where VideoToolbox is the only
+hardware decoder; software decoding, including the fallback from a
+failed hwdec, keeps its own --vd-lavc-threads.
+
+On an iPhone Air the maximum decode rate with 1 and 4 threads is 132.0
+and 131.3 fps for 4K HEVC at 90 Mb/s, 144.4 and 143.1 fps for 4K60 HEVC
+at 80 Mb/s with 8 B-frames, 424 and 402 fps for 1080p H.264, and 108
+and 101 fps with videotoolbox-copy. The footprint drops 34% at 1080p
+and 20% at 4K, startup and seeks get faster, and no run dropped frames.
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index a1a3c29..d94950d 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -1877,10 +1877,13 @@ Video
+             Enable vdpau decoding for h264 and mpeg2 only.
+ 
+ ``--hwdec-threads=<N>``
+-    Number of threads used for hardware decoding (default: 4). This, as opposed
+-    to vd-queue, enables frame and slice threading in libavcodec. It can help
+-    with pipelining the decoding process and improve performance. The exact
+-    behavior depends on the hardware decoder API used.
++    Number of threads used for hardware decoding (default: 4, 1 on Apple
++    platforms). This, as opposed to vd-queue, enables frame and slice threading
++    in libavcodec. It can help with pipelining the decoding process and improve
++    performance. The exact behavior depends on the hardware decoder API used.
++    VideoToolbox decodes one frame at a time whatever the thread count, so
++    there extra threads gain no throughput and each holds back one more
++    decoded surface.
+ 
+     If this is set to 0, the number of threads will be automatically determined
+     by the number of CPU cores available.
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 2c681e5..4b7b76e 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -171,7 +171,15 @@ const struct m_sub_options hwdec_conf = {
+         // for example, if vo_gpu increases the number of reference surfaces for
+         // interpolation, this value has to be increased too.
+         .hwdec_extra_frames = 6,
++#ifdef __APPLE__
++        // VideoToolbox, the only hardware decoder there, decodes one frame
++        // at a time: its hwaccels are not thread-safe, so frame threads gain
++        // no decode throughput, while each holds back another decoded
++        // surface (20 MB for a 4K P010 picture).
++        .hwdec_threads = 1,
++#else
+         .hwdec_threads = 4,
++#endif
+     },
+ };
+ 
