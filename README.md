@@ -181,8 +181,11 @@ python3 scripts/patches.py fetch-pinned mpv apple <srcdir>       # fetch the pin
 ```
 
 `fetch-pinned` checks a `git` pin's commit or an `archive` pin's sha256 before
-applying. `ci.yml` applies every nonempty series to its pinned source, so a
-version bump that breaks a patch fails before anything builds.
+applying. It tries each source three times, then the pin's `mirror` if it has
+one, which has to match the same commit or sha256. The android driver's
+`download.sh` fetches every source through it. `ci.yml` applies every nonempty
+series to its pinned source, so a version bump that breaks a patch fails before
+anything builds.
 
 ## Tests
 

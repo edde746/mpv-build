@@ -3268,7 +3268,10 @@ static void check_pause_outlasts_the_stall_timeout(void)
 
 int main(void)
 {
-    alarm(15); // fail a regression that holds the reset lock, rather than hang CI
+    // Fail a regression that holds the reset lock, rather than hang CI. The
+    // alarm covers the whole suite, whose real-time waits take 9 s on an M5 Pro
+    // and reached 15 s on a CI runner, so it leaves room for both.
+    alarm(60);
     check_raw_partial_reset();
     check_raw_dtshd(13, 48000, 1);
     check_raw_dtshd(14, 96000, 2);

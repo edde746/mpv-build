@@ -207,8 +207,9 @@
       "kind": "archive",
       "version": "5.2.4",
       "url": "https://www.lua.org/ftp/lua-5.2.4.tar.gz",
+      "mirror": "https://sources.buildroot.net/lua/lua-5.2.4.tar.gz",
       "sha256": "b9e2e4aad6789b3b63a056d442f7b39f0ecfca3ae0f1fc0ae4e9614401b69f4b",
-      "provenance": "Hashed the complete archive fetched from upstream lua.org over https on 2026-09-01; the digest equals lua.org's long-published 5.2.4 checksum. libmpv-android pinned the same version over plain http without a hash.",
+      "provenance": "Hashed the complete archive fetched from upstream lua.org over https on 2026-09-01; the digest equals lua.org's long-published 5.2.4 checksum. libmpv-android pinned the same version over plain http without a hash. The mirror is Buildroot's source backup site, added 2026-11-05 after connections to www.lua.org timed out on android build legs of four CI and publish runs that day; it served the archive with this same digest that day. lua.org keeps no standing mirror (its PUC-Rio mirror is only brought up while lua.org is unreachable). The mirror is consulted only after the primary fails, and the sha256 pin is verified identically either way.",
       "platforms": [
         "android"
       ],
