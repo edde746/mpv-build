@@ -24,3 +24,6 @@
 0040-ao-decode-the-playing-track-to-pcm-when-passthrough-fails.patch
 0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch
 0042-avfoundation-anchor-the-passthrough-clock-to-the-playhead.patch
+# OSD canvas: per-buffer dirty rects instead of a union, and a cheaper exact
+# libass blend (tests test_avf_osd_{dirty_set,blend}.sh).
+0043-avfoundation-clear-and-blend-the-osd-canvas-for-less.patch

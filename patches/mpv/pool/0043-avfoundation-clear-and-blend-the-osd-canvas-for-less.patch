@@ -1,0 +1,518 @@
+vo_avfoundation: clear and blend the OSD canvas for less
+
+With heavily styled ASS (karaoke, signs, \move; a new frame of subtitles
+for every video frame) the inline OSD layer cost an iPhone Air's E cores
+20.9 % of a core against 3.2 % for the same file without subtitles. The VO
+thread spent 70 % of its time in the libass-over-BGRA blend and 21 % in
+memset clearing the 2736x1260 canvas, on every frame.
+
+Clearing: each pool buffer remembered the union of what was last drawn into
+it, so a sign at the top and dialogue at the bottom cleared the whole canvas
+between them, and only 4 buffers were tracked while the pool cycles 5-9 of
+them (the layer holds a 128 ms queue lead plus the shown and the cached
+sample): every buffer came back unknown and was cleared whole, 13.8 MB per
+frame. A buffer now records up to 16 rects (avf_dirty_set: rects merge only
+when one box is no more pixels to clear than both, the cheapest merge makes
+room when full) and 12 buffers are tracked. A tracked surface is released as
+soon as the pool has freed it, rather than pinned for 2 s.
+
+Blending: the NEON kernel divided every channel by 65025 through a 64-bit
+magic multiply. It now uses one saturating doubling multiply-high
+(floor(y/65025) == y * ceil(2^46/65025) >> 46 for y < 2^24); an opaque
+color (the common case) drops to 16-bit math, since 255 factors out of the
+division; an all-255 mask group with an opaque color stores the color
+without reading the canvas; zero groups are skipped with a scalar test.
+Bit-exact with the scalar reference: checked once over every mask, color,
+alpha and destination value, and guarded by scripts/test_avf_osd_blend.sh.
+
+On the iPhone Air (anime-ass.mkv, vo=avfoundation, hwdec=videotoolbox,
+interleaved n=3) CPU drops from 20.9 to 15.6 % of a core and CPU energy by
+31 %, with the footprint unchanged. osd-perf now reports the pixels cleared, the
+full clears and the tracked buffers.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 50bf220..ed31b8d 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -68,6 +68,81 @@ struct avf_osd_canvas {
+     struct mp_osd_res res;
+ };
+ 
++// --- avf osd dirty set (host-testable; keep freestanding)
++// What one overlay buffer had drawn into it, as a few rects rather than
++// their union: a sign at the top and dialogue at the bottom would otherwise
++// clear the whole canvas between them. Rects merge only when clearing the
++// merged box costs no more than clearing both, so the set never clears more
++// than the parts covered plus their overlaps; once full, the merge that
++// grows the cleared area least makes room.
++#define AVF_OSD_DIRTY_MAX 16
++
++struct avf_dirty_set {
++    int num;  // -1: contents unknown, clear everything
++    struct mp_rect r[AVF_OSD_DIRTY_MAX];
++};
++
++static int64_t avf_rect_area(struct mp_rect r)
++{
++    return (int64_t)(r.x1 - r.x0) * (r.y1 - r.y0);
++}
++
++static struct mp_rect avf_rect_bounds(struct mp_rect a, struct mp_rect b)
++{
++    return (struct mp_rect){MPMIN(a.x0, b.x0), MPMIN(a.y0, b.y0),
++                            MPMAX(a.x1, b.x1), MPMAX(a.y1, b.y1)};
++}
++
++static void avf_dirty_add(struct avf_dirty_set *s, struct mp_rect r)
++{
++    if (s->num < 0 || r.x1 <= r.x0 || r.y1 <= r.y0)
++        return;
++    for (;;) {
++        // Absorb every rect that is cheaper to clear as one box with r; the
++        // grown box may reach further ones, so rescan after each merge.
++        for (int i = 0; i < s->num; i++) {
++            struct mp_rect u = avf_rect_bounds(s->r[i], r);
++            if (avf_rect_area(u) <= avf_rect_area(s->r[i]) + avf_rect_area(r)) {
++                r = u;
++                s->r[i] = s->r[--s->num];
++                i = -1;
++            }
++        }
++        if (s->num < AVF_OSD_DIRTY_MAX)
++            break;
++        int best = 0;
++        int64_t best_cost = INT64_MAX;
++        for (int i = 0; i < s->num; i++) {
++            int64_t cost = avf_rect_area(avf_rect_bounds(s->r[i], r)) -
++                           avf_rect_area(s->r[i]);
++            if (cost < best_cost) {
++                best_cost = cost;
++                best = i;
++            }
++        }
++        r = avf_rect_bounds(s->r[best], r);
++        s->r[best] = s->r[--s->num];
++    }
++    s->r[s->num++] = r;
++}
++
++// Pixels a clear of s touches on a w x h canvas.
++static int64_t avf_dirty_pixels(const struct avf_dirty_set *s, int w, int h)
++{
++    if (s->num < 0)
++        return (int64_t)w * h;
++    int64_t px = 0;
++    for (int i = 0; i < s->num; i++) {
++        struct mp_rect r = s->r[i];
++        int x0 = MPCLAMP(r.x0, 0, w), x1 = MPCLAMP(r.x1, 0, w);
++        int y0 = MPCLAMP(r.y0, 0, h), y1 = MPCLAMP(r.y1, 0, h);
++        if (x1 > x0 && y1 > y0)
++            px += (int64_t)(x1 - x0) * (y1 - y0);
++    }
++    return px;
++}
++// --- end avf osd dirty set
++
+ // --- avf osd ahead policy
+ 
+ // How long flip_page may wait for its frame's subtitles before it enqueues
+@@ -466,11 +541,15 @@ struct priv {
+     // backing surface lets the clear touch just those rows instead of the
+     // whole display-sized buffer. The CFRetain on the surface pins its
+     // pointer so an entry can never alias a different (recycled) surface.
++    // There must be an entry for every buffer the pool cycles through: the
++    // layer holds a queue lead's worth of samples (8 at 60 fps with the
++    // default 128 ms) plus the shown and the cached one, and a buffer whose
++    // entry was evicted gets a full-canvas clear.
+     struct osd_buf_state {
+-        IOSurfaceRef surf;     // CFRetained
+-        struct mp_rect dirty;  // drawn region from the surface's last use
++        IOSurfaceRef surf;          // CFRetained
++        struct avf_dirty_set dirty; // drawn regions from the surface's last use
+         int64_t last_used_ns;
+-    } osd_buf_states[4];
++    } osd_buf_states[12];
+     int osd_buf_state_count;
+ 
+     // OSD performance counters; accumulation is unconditional (cheap),
+@@ -479,6 +558,10 @@ struct priv {
+         int renders, skipped, empty, frames;
+         int64_t total_ns, max_ns;
+         int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
++        // Canvas clears: pixels cleared, and clears of a buffer whose
++        // contents were unknown (new to the pool, or its entry evicted).
++        int64_t clear_px;
++        int clear_full;
+         int64_t enqueue_ns, video_sample_ns;
+         // Scheduling margin of enqueued OSD samples: sample PTS minus the
+         // timebase position at enqueue. Negative/small lead means the
+@@ -2245,7 +2328,8 @@ static int clip_u10(double value)
+ 
+ // Union of the part destination rects, clamped to the OSD buffer. Both draw
+ // paths only write inside these rects, so this bounds everything non-blank
+-// without scanning the rendered pixels.
++// without scanning the rendered pixels. drawn (optional) collects the rects
++// themselves, for the buffer's next clear.
+ static void reset_subtitle_bounds(struct priv *p)
+ {
+     p->subtitle_x0 = p->osd_w;
+@@ -2254,7 +2338,8 @@ static void reset_subtitle_bounds(struct priv *p)
+     p->subtitle_y1 = 0;
+ }
+ 
+-static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs)
++static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs,
++                                   struct avf_dirty_set *drawn)
+ {
+     if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
+         return;
+@@ -2265,18 +2350,25 @@ static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs)
+             continue;
+         int dw = sb->dw > 0 ? sb->dw : sb->w;
+         int dh = sb->dh > 0 ? sb->dh : sb->h;
+-        p->subtitle_x0 = MPMIN(p->subtitle_x0, MPCLAMP(sb->x, 0, p->osd_w));
+-        p->subtitle_y0 = MPMIN(p->subtitle_y0, MPCLAMP(sb->y, 0, p->osd_h));
+-        p->subtitle_x1 = MPMAX(p->subtitle_x1, MPCLAMP(sb->x + dw, 0, p->osd_w));
+-        p->subtitle_y1 = MPMAX(p->subtitle_y1, MPCLAMP(sb->y + dh, 0, p->osd_h));
++        struct mp_rect r = {
++            MPCLAMP(sb->x, 0, p->osd_w), MPCLAMP(sb->y, 0, p->osd_h),
++            MPCLAMP(sb->x + dw, 0, p->osd_w), MPCLAMP(sb->y + dh, 0, p->osd_h),
++        };
++        p->subtitle_x0 = MPMIN(p->subtitle_x0, r.x0);
++        p->subtitle_y0 = MPMIN(p->subtitle_y0, r.y0);
++        p->subtitle_x1 = MPMAX(p->subtitle_x1, r.x1);
++        p->subtitle_y1 = MPMAX(p->subtitle_y1, r.y1);
++        if (drawn)
++            avf_dirty_add(drawn, r);
+     }
+ }
+ 
+ static void update_subtitle_bounds_from_parts(struct priv *p,
+-                                              struct sub_bitmaps *imgs)
++                                              struct sub_bitmaps *imgs,
++                                              struct avf_dirty_set *drawn)
+ {
+     reset_subtitle_bounds(p);
+-    extend_subtitle_bounds(p, imgs);
++    extend_subtitle_bounds(p, imgs, drawn);
+ }
+ 
+ // Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
+@@ -2312,12 +2404,20 @@ static void reset_osd_buf_states(struct priv *p)
+     p->osd_buf_state_count = 0;
+ }
+ 
+-// Entries pin their IOSurface only briefly past the pool's own lifetime;
+-// drop ones the pool has likely aged out so they don't hold memory.
++// An entry's retain is the only one left once the pool has freed the
++// buffer (aged out or flushed); it must not keep the surface's memory alive.
++// Entries otherwise pin their IOSurface only briefly past the pool's own
++// lifetime.
++static bool osd_buf_state_stale(struct osd_buf_state *st, int64_t now)
++{
++    return CFGetRetainCount(st->surf) <= 1 ||
++           now - st->last_used_ns > MP_TIME_MS_TO_NS(2000);
++}
++
+ static void prune_osd_buf_states(struct priv *p, int64_t now)
+ {
+     for (int i = 0; i < p->osd_buf_state_count;) {
+-        if (now - p->osd_buf_states[i].last_used_ns > MP_TIME_MS_TO_NS(2000)) {
++        if (osd_buf_state_stale(&p->osd_buf_states[i], now)) {
+             CFRelease(p->osd_buf_states[i].surf);
+             p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
+         } else {
+@@ -2334,42 +2434,45 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+         return NULL;
+ 
+     int64_t now = mp_time_ns();
+-    struct osd_buf_state *oldest = NULL;
+     for (int i = 0; i < p->osd_buf_state_count; i++) {
+         struct osd_buf_state *st = &p->osd_buf_states[i];
+         if (st->surf == surf) {
+             st->last_used_ns = now;
+             return st;
+         }
+-        if (!oldest || st->last_used_ns < oldest->last_used_ns)
+-            oldest = st;
+     }
+ 
++    // A surface new to this code usually replaces one the pool freed.
++    prune_osd_buf_states(p, now);
+     struct osd_buf_state *st;
+     if (p->osd_buf_state_count < (int)MP_ARRAY_SIZE(p->osd_buf_states)) {
+         st = &p->osd_buf_states[p->osd_buf_state_count++];
+     } else {
+-        st = oldest;
++        st = &p->osd_buf_states[0];
++        for (int i = 1; i < p->osd_buf_state_count; i++) {
++            if (p->osd_buf_states[i].last_used_ns < st->last_used_ns)
++                st = &p->osd_buf_states[i];
++        }
+         CFRelease(st->surf);
+     }
+     *st = (struct osd_buf_state){
+         .surf = (IOSurfaceRef)CFRetain(surf),
+         // Contents unknown until this code has drawn into it: clear fully.
+-        .dirty = {0, 0, INT_MAX, INT_MAX},
++        .dirty = {.num = -1},
+         .last_used_ns = now,
+     };
+     return st;
+ }
+ 
+ static void osd_buf_record_dirty(struct priv *p, CVPixelBufferRef buf,
+-                                 struct mp_rect dirty)
++                                 const struct avf_dirty_set *drawn)
+ {
+     IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
+     if (!surf)
+         return;
+     for (int i = 0; i < p->osd_buf_state_count; i++) {
+         if (p->osd_buf_states[i].surf == surf) {
+-            p->osd_buf_states[i].dirty = dirty;
++            p->osd_buf_states[i].dirty = *drawn;
+             return;
+         }
+     }
+@@ -2764,9 +2867,9 @@ static void blend_bgra_over_bgra_scalar(uint8_t *dst, size_t dst_stride,
+ 
+ #if defined(__aarch64__)
+ 
+-// NEON versions of the two scalar blends above, bit-exact with them: both
+-// divisions are folded into exact floor-by-255 stages (floor(x/65025) ==
+-// floor(floor(x/255)/255)).
++// NEON versions of the two scalar blends above, bit-exact with them (the
++// libass one was checked exhaustively over every mask, color, alpha and
++// destination value).
+ 
+ // Exact floor(x/255) for u16 lanes.
+ static inline uint16x8_t div255_u16_neon(uint16x8_t x)
+@@ -2775,37 +2878,46 @@ static inline uint16x8_t div255_u16_neon(uint16x8_t x)
+         vaddq_u16(vaddq_u16(x, vdupq_n_u16(1)), vshrq_n_u16(x, 8)), 8);
+ }
+ 
+-// Exact floor(x/255) for u32 lanes (canonical magic-multiply), narrowed to
+-// u16; every reachable numerator here is < 2^24 so the result fits.
+-static inline uint16x4_t div255_u32_to_u16_neon(uint32x4_t x)
++// Exact floor(y/65025) for y < 2^24: y*K >> 46 with K = ceil(2^46/65025)
++// (K*65025 - 2^46 = 48386, and 48386 * 2^24 < 2^46). vqdmulhq_s32 gives
++// (2*y*K) >> 32 = (y*K) >> 31 and cannot saturate here.
++static inline uint16x4_t div65025_u32_neon(uint32x4_t y)
+ {
+-    const uint32x2_t magic = vdup_n_u32(0x80808081u);
+-    uint64x2_t lo = vmull_u32(vget_low_u32(x), magic);
+-    uint64x2_t hi = vmull_u32(vget_high_u32(x), magic);
+-    uint32x2_t l = vmovn_u64(vshrq_n_u64(lo, 39));
+-    uint32x2_t h = vmovn_u64(vshrq_n_u64(hi, 39));
+-    return vmovn_u32(vcombine_u32(l, h));
++    int32x4_t q = vqdmulhq_s32(vreinterpretq_s32_u32(y),
++                               vdupq_n_s32(1082179842));
++    return vshrn_n_u32(vreinterpretq_u32_s32(q), 15);
+ }
+ 
+ // One channel of the libass blend: (aa*c + inv*dst + 32512) / 65025.
+ static inline uint8x8_t blend_libass_channel_neon(uint16x8_t aa, uint16x8_t inv,
+-                                                  uint8_t c, uint8x8_t dst)
++                                                  uint16_t c, uint8x8_t dst)
+ {
+     uint16x8_t d16 = vmovl_u8(dst);
+-    uint32x4_t lo = vmull_n_u16(vget_low_u16(aa), c);
+-    uint32x4_t hi = vmull_n_u16(vget_high_u16(aa), c);
++    uint32x4_t bias = vdupq_n_u32(32512);
++    uint32x4_t lo = vmlal_n_u16(bias, vget_low_u16(aa), c);
++    uint32x4_t hi = vmlal_high_n_u16(bias, aa, c);
+     lo = vmlal_u16(lo, vget_low_u16(inv), vget_low_u16(d16));
+-    hi = vmlal_u16(hi, vget_high_u16(inv), vget_high_u16(d16));
+-    lo = vaddq_u32(lo, vdupq_n_u32(32512));
+-    hi = vaddq_u32(hi, vdupq_n_u32(32512));
+-    uint16x8_t y = vcombine_u16(div255_u32_to_u16_neon(lo),
+-                                div255_u32_to_u16_neon(hi));
+-    return vmovn_u16(div255_u16_neon(y));
++    hi = vmlal_high_u16(hi, inv, d16);
++    return vmovn_u16(vcombine_u16(div65025_u32_neon(lo),
++                                  div65025_u32_neon(hi)));
++}
++
++// The same channel for an opaque color (a == 255): 255 factors out of the
++// 65025 division, leaving floor((m*c + (255-m)*dst + 127) / 255) in 16 bits,
++// computed as (x + 1 + (x >> 8)) >> 8 with x = m*c + (255-m)*dst + 127.
++static inline uint8x8_t blend_opaque_channel_neon(uint8x8_t m, uint8x8_t im,
++                                                  uint8x8_t c, uint8x8_t dst)
++{
++    uint16x8_t x = vmlal_u8(vdupq_n_u16(127), m, c);
++    x = vmlal_u8(x, im, dst);
++    return vaddhn_u16(x, vsraq_n_u16(vdupq_n_u16(1), x, 8));
+ }
+ 
+ // Requires w % 8 == 0; the dispatcher routes the tail through the scalar path.
+ // Mask lanes of 0 come out as dst exactly ((dst*65025 + 32512)/65025 == dst),
+-// so no per-lane select is needed; the vmaxv skip is purely an optimization.
++// so all-zero groups are skipped and no per-lane select is needed. With an
++// opaque color an all-255 group is the color itself, stored without reading
++// the destination: glyph bodies are mostly that.
+ static void blend_libass_bgra_neon(uint8_t *dst, size_t dst_stride,
+                                    uint8_t *src, int src_stride,
+                                    int w, int h, uint32_t color)
+@@ -2814,23 +2926,52 @@ static void blend_libass_bgra_neon(uint8_t *dst, size_t dst_stride,
+     const uint8_t g = (color >> 16) & 0xff;
+     const uint8_t b = (color >>  8) & 0xff;
+     const uint8_t a = 0xff - (color & 0xff);
++
++    if (a == 0xff) {
++        const uint8x8x4_t solid = {{
++            vdup_n_u8(b), vdup_n_u8(g), vdup_n_u8(r), vdup_n_u8(0xff),
++        }};
++        for (int y = 0; y < h; y++) {
++            for (int x = 0; x < w; x += 8) {
++                uint64_t bits;
++                memcpy(&bits, src + x, sizeof(bits));
++                if (!bits)
++                    continue;
++                uint8_t *d = dst + (size_t)x * 4;
++                if (bits == UINT64_MAX) {
++                    vst4_u8(d, solid);
++                    continue;
++                }
++                uint8x8_t m = vcreate_u8(bits);
++                uint8x8_t im = vmvn_u8(m);
++                uint8x8x4_t px = vld4_u8(d);
++                for (int c = 0; c < 4; c++)
++                    px.val[c] = blend_opaque_channel_neon(m, im, solid.val[c], px.val[c]);
++                vst4_u8(d, px);
++            }
++            dst += dst_stride;
++            src += src_stride;
++        }
++        return;
++    }
++
+     const uint8x8_t va = vdup_n_u8(a);
+     const uint16x8_t full = vdupq_n_u16(255 * 255);
+-
+     for (int y = 0; y < h; y++) {
+         for (int x = 0; x < w; x += 8) {
+-            uint8x8_t m = vld1_u8(src + x);
+-            if (!vmaxv_u8(m))
++            uint64_t bits;
++            memcpy(&bits, src + x, sizeof(bits));
++            if (!bits)
+                 continue;
+-
+-            uint16x8_t aa = vmull_u8(m, va);
++            uint16x8_t aa = vmull_u8(vcreate_u8(bits), va);
+             uint16x8_t inv = vsubq_u16(full, aa);
+-            uint8x8x4_t d = vld4_u8(dst + (size_t)x * 4);
+-            d.val[0] = blend_libass_channel_neon(aa, inv, b, d.val[0]);
+-            d.val[1] = blend_libass_channel_neon(aa, inv, g, d.val[1]);
+-            d.val[2] = blend_libass_channel_neon(aa, inv, r, d.val[2]);
+-            d.val[3] = blend_libass_channel_neon(aa, inv, 255, d.val[3]);
+-            vst4_u8(dst + (size_t)x * 4, d);
++            uint8_t *d = dst + (size_t)x * 4;
++            uint8x8x4_t px = vld4_u8(d);
++            px.val[0] = blend_libass_channel_neon(aa, inv, b, px.val[0]);
++            px.val[1] = blend_libass_channel_neon(aa, inv, g, px.val[1]);
++            px.val[2] = blend_libass_channel_neon(aa, inv, r, px.val[2]);
++            px.val[3] = blend_libass_channel_neon(aa, inv, 255, px.val[3]);
++            vst4_u8(d, px);
+         }
+         dst += dst_stride;
+         src += src_stride;
+@@ -3034,22 +3175,28 @@ static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
+ 
+     int64_t t = mp_time_ns();
+     struct osd_buf_state *st = osd_buf_state_acquire(p, pixbuf);
+-    struct mp_rect dirty = st ? st->dirty : (struct mp_rect){0, 0, w, h};
+-    dirty.x0 = MPCLAMP(dirty.x0, 0, w);
+-    dirty.y0 = MPCLAMP(dirty.y0, 0, h);
+-    dirty.x1 = MPCLAMP(dirty.x1, 0, w);
+-    dirty.y1 = MPCLAMP(dirty.y1, 0, h);
+-    if (dirty.x1 > dirty.x0 && dirty.y1 > dirty.y0) {
+-        size_t span = (size_t)(dirty.x1 - dirty.x0) * 4;
+-        uint8_t *row = (uint8_t *)base + (size_t)dirty.y0 * stride +
+-                       (size_t)dirty.x0 * 4;
+-        for (int y = dirty.y0; y < dirty.y1; y++) {
++    struct avf_dirty_set full = {.num = -1};
++    const struct avf_dirty_set *dirty = st ? &st->dirty : &full;
++    p->perf.clear_px += avf_dirty_pixels(dirty, w, h);
++    if (dirty->num < 0) {
++        p->perf.clear_full++;
++        memset(base, 0, stride * CVPixelBufferGetHeight(pixbuf));
++    }
++    for (int i = 0; i < dirty->num; i++) {
++        struct mp_rect r = dirty->r[i];
++        int x0 = MPCLAMP(r.x0, 0, w), x1 = MPCLAMP(r.x1, 0, w);
++        int y0 = MPCLAMP(r.y0, 0, h), y1 = MPCLAMP(r.y1, 0, h);
++        if (x1 <= x0 || y1 <= y0)
++            continue;
++        size_t span = (size_t)(x1 - x0) * 4;
++        uint8_t *row = (uint8_t *)base + (size_t)y0 * stride + (size_t)x0 * 4;
++        for (int y = y0; y < y1; y++) {
+             memset(row, 0, span);
+             row += stride;
+         }
+     }
+     if (st)
+-        st->dirty = (struct mp_rect){0, 0, 0, 0};
++        st->dirty = (struct avf_dirty_set){0};
+     p->perf.clear_ns += mp_time_ns() - t;
+ 
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+@@ -3365,10 +3512,9 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+                 CVPixelBufferRelease(p->cachedSubtitleBuffer);
+             p->cachedSubtitleBuffer = subtitleBuffer;
+             int64_t t_bounds = mp_time_ns();
+-            update_subtitle_bounds_from_parts(p, imgs);
+-            osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
+-                p->subtitle_x0, p->subtitle_y0,
+-                p->subtitle_x1, p->subtitle_y1});
++            struct avf_dirty_set drawn = {0};
++            update_subtitle_bounds_from_parts(p, imgs, &drawn);
++            osd_buf_record_dirty(p, subtitleBuffer, &drawn);
+             p->perf.bounds_ns += mp_time_ns() - t_bounds;
+             rendered = true;
+         }
+@@ -3514,11 +3660,10 @@ static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
+ 
+     int64_t t_bounds = mp_time_ns();
+     reset_subtitle_bounds(p);
++    struct avf_dirty_set drawn = {0};
+     for (int n = 0; n < list->num_items; n++)
+-        extend_subtitle_bounds(p, list->items[n]);
+-    osd_buf_record_dirty(p, subtitleBuffer, (struct mp_rect){
+-        p->subtitle_x0, p->subtitle_y0,
+-        p->subtitle_x1, p->subtitle_y1});
++        extend_subtitle_bounds(p, list->items[n], &drawn);
++    osd_buf_record_dirty(p, subtitleBuffer, &drawn);
+     p->perf.bounds_ns += mp_time_ns() - t_bounds;
+ 
+     int64_t render_ns = mp_time_ns() - t_render;
+@@ -4672,14 +4817,16 @@ static void report_osd_perf(struct vo *vo)
+         double ne = MPMAX(p->perf.enq_count, 1);
+         MP_VERBOSE(vo,
+             "osd-perf: n=%d avg=%.2fms max=%.2fms "
+-            "[clear %.2f blend %.2f cg %.2f bounds %.2f] enq %.2f | "
++            "[clear %.2f (%.0fk px, %d full) blend %.2f cg %.2f bounds %.2f] enq %.2f | "
+             "vid %.3f (/frame) | "
+             "margin avg=%.1f min=%.1fms drops=%d | "
+-            "skip=%d empty=%d osd=%dx%d\n",
++            "skip=%d empty=%d osd=%dx%d bufs=%d\n",
+             p->perf.renders,
+             p->perf.total_ns / n / 1e6,
+             p->perf.max_ns / 1e6,
+             p->perf.clear_ns / n / 1e6,
++            p->perf.clear_px / n / 1e3,
++            p->perf.clear_full,
+             p->perf.blend_ns / n / 1e6,
+             p->perf.cg_ns / n / 1e6,
+             p->perf.bounds_ns / n / 1e6,
+@@ -4688,7 +4835,8 @@ static void report_osd_perf(struct vo *vo)
+             p->perf.lead_sum_ns / ne / 1e6,
+             p->perf.enq_count ? p->perf.lead_min_ns / 1e6 : 0.0,
+             p->perf.enq_drops,
+-            p->perf.skipped, p->perf.empty, p->osd_w, p->osd_h);
++            p->perf.skipped, p->perf.empty, p->osd_w, p->osd_h,
++            p->osd_buf_state_count);
+     }
+     memset(&p->perf, 0, sizeof(p->perf));
+ }

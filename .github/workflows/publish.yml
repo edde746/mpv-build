@@ -101,6 +101,12 @@ jobs:
       - name: Test AVFoundation subtitle wait policy
         run: ./scripts/test_avf_osd_ahead.sh
 
+      - name: Test AVFoundation OSD canvas dirty set
+        run: ./scripts/test_avf_osd_dirty_set.sh
+
+      - name: Test AVFoundation OSD blend kernel
+        run: ./scripts/test_avf_osd_blend.sh
+
       - name: Test AVFoundation Dolby Vision profile 5 RPU selection
         run: ./scripts/test_avf_dovi_profile5_rpu.sh
 
