@@ -127,6 +127,25 @@ static void mp_thread_set_name(const char *name) { (void)name; }
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
+// set_pause reads a resumed passthrough track's head between sleeps
+// (AudioTrack_awaitResumedHead). A sleep advances the fake clock by what it
+// asked for. On sleep number resume_moves_at the device starts rendering
+// (tracks[0].head advances by resume_step); on sleep number sleep_hook_at
+// sleep_hook_fn runs, standing in for the worker reading the clock meanwhile.
+static int sleeps, resume_moves_at, sleep_hook_at;
+static uint32_t resume_step;
+static void (*sleep_hook_fn)(void);
+static void mp_sleep_ns(int64_t ns)
+{
+    atomic_fetch_add(&now_ns, ns);
+    mp_mutex_lock(&gate);
+    const int n = ++sleeps;
+    if (n == resume_moves_at)
+        tracks[0].head += resume_step;
+    mp_mutex_unlock(&gate);
+    if (n == sleep_hook_at && sleep_hook_fn)
+        sleep_hook_fn();
+}
 // Verbose lines are discarded except the playhead-step diagnostic, which the
 // step check reads back.
 static int step_lines;
@@ -459,6 +478,9 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
     new_failures = 0;
     response = input_bytes = track_count = underrun_queries = step_lines = 0;
     last_write_count = 0;
+    sleeps = resume_moves_at = sleep_hook_at = 0;
+    resume_step = 0;
+    sleep_hook_fn = NULL;
     atomic_store(&hook_lock, NULL);
     hook_after_warning = NULL;
     atomic_store(&watched_lock, NULL);
@@ -3096,6 +3118,22 @@ static void check_pause_requalifies_the_timestamp(void)
     puts("PASS: a pause requalifies the timestamp instead of extrapolating it across the pause");
 }
 
+// 10000 frames written and three 40 ms polls of a head that plays them, so
+// the passthrough smoother has a window to carry.
+static void run_passthrough_clock(struct fixture *f)
+{
+    mp_mutex_lock(&f->p.lock);
+    f->p.written_frames = 10000;
+    mp_mutex_unlock(&f->p.lock);
+    for (int n = 1; n <= 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 1920 * n;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(f, 10000, 1920 * n);
+    }
+}
+
 // The passthrough clock is the smoothed head. A pause stands the head still
 // while the clock runs on; carried across it, the smoothing window would read
 // the pause as a jump and report the buffer drained. The pause restarts the
@@ -3104,16 +3142,7 @@ static void check_pause_restarts_the_passthrough_smoother(void)
 {
     struct fixture f;
     setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
-    mp_mutex_lock(&f.p.lock);
-    f.p.written_frames = 10000;
-    mp_mutex_unlock(&f.p.lock);
-    for (int n = 1; n <= 3; n++) {
-        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
-        mp_mutex_lock(&gate);
-        tracks[0].head = 1920 * n;
-        mp_mutex_unlock(&gate);
-        expect_delay_played(&f, 10000, 1920 * n);
-    }
+    run_passthrough_clock(&f);
 
     set_pause(&f.ao, true);
     atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
@@ -3122,6 +3151,78 @@ static void check_pause_restarts_the_passthrough_smoother(void)
     park_worker(&f);
     teardown(&f);
     puts("PASS: a pause restarts the passthrough smoother instead of reading as a jump");
+}
+
+static struct fixture *sleep_fixture;
+
+// The worker reading the clock while the resumed head still stands.
+static void read_the_standing_clock(void)
+{
+    mp_mutex_lock(&sleep_fixture->p.lock);
+    int64_t sample_time = 0;
+    (void)AudioTrack_getLatency(&sleep_fixture->ao, &sample_time);
+    mp_mutex_unlock(&sleep_fixture->p.lock);
+}
+
+// Plezy #2302: a resumed passthrough track renders nothing until the HAL has
+// restarted the bitstream, 55-72 ms on a DTS track. buffer.c restarts the
+// core's clock when set_pause returns, so set_pause returns once the head
+// moves, not at play(). The smoother then starts on the moving head: a
+// sample the worker took while the head stood would read as the same step.
+static void check_resume_waits_for_the_passthrough_head(bool raw)
+{
+    struct fixture f;
+    setup(&f, raw, raw ? 7 /* ENCODING_DTS */ : AudioFormat.ENCODING_IEC61937, true);
+    run_passthrough_clock(&f);
+    set_pause(&f.ao, true);
+    atomic_fetch_add(&now_ns, MP_TIME_S_TO_NS(1));
+
+    // The head stands through 30 polls; the worker reads the clock after 10.
+    sleep_fixture = &f;
+    sleep_hook_fn = read_the_standing_clock;
+    sleep_hook_at = 10;
+    resume_moves_at = 30;
+    resume_step = 480;
+    const int64_t resumed = atomic_load(&now_ns);
+    set_pause(&f.ao, false);
+    assert(plays == 1 && sleeps == 30);
+    assert(atomic_load(&now_ns) - resumed == 30 * RESUME_HEAD_POLL_NS);
+    expect_delay_played(&f, 10000, 5760 + 480);
+    park_worker(&f);
+    teardown(&f);
+}
+
+// A head that never moves again holds the resume no longer than
+// RESUME_HEAD_WAIT_NS; the stall monitor owns a device that stays dead.
+static void check_resume_wait_is_bounded(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+    run_passthrough_clock(&f);
+    set_pause(&f.ao, true);
+    const int64_t resumed = atomic_load(&now_ns);
+    set_pause(&f.ao, false);
+    const int64_t waited = atomic_load(&now_ns) - resumed;
+    assert(plays == 1);
+    assert(waited >= RESUME_HEAD_WAIT_NS && waited < RESUME_HEAD_WAIT_NS + RESUME_HEAD_POLL_NS);
+    expect_delay_played(&f, 10000, 5760);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a resumed passthrough head that never moves holds the resume for a bounded time");
+}
+
+// A PCM track resumes at once: its clock is the timestamp the pause
+// requalified, and 0141 measured no late frame after a resume.
+static void check_pcm_resume_does_not_wait(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    set_pause(&f.ao, true);
+    set_pause(&f.ao, false);
+    assert(plays == 1 && !sleeps);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a PCM resume does not wait for the head");
 }
 
 // A pause that outlasts the stall timeout is no stall: the monitor stands by
@@ -3222,6 +3323,11 @@ int main(void)
     check_pause_keeps_the_raw_rest();
     check_pause_requalifies_the_timestamp();
     check_pause_restarts_the_passthrough_smoother();
+    check_resume_waits_for_the_passthrough_head(false);
+    check_resume_waits_for_the_passthrough_head(true);
+    puts("PASS: a passthrough resume returns once the head moves and restarts the smoother on it");
+    check_resume_wait_is_bounded();
+    check_pcm_resume_does_not_wait();
     check_pause_outlasts_the_stall_timeout();
     check_truehd_stall_demotes(); // last: the demotion is process-wide
     return 0;

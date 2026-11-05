@@ -1,0 +1,140 @@
+Subject: [PATCH] ao_audiotrack: resume the clock when a passthrough track plays
+
+A resumed passthrough track renders nothing until the HAL has restarted
+the bitstream, and its playback head stands where the pause left it
+meanwhile: 55-72 ms on a Swisscom IP1800 with DTS (Plezy #2302). The core
+restarted its audio clock before it called set_pause(false), so the video
+ran that far ahead of audio that had not started; once the smoothed head
+caught up, the clock stepped back and the video held 1-4 frames on every
+unpause.
+
+buffer.c now restarts the clock (end_time_ns = queued_time_ns + now) after
+the driver's set_pause(false) has returned, under the lock, since a pull
+AO's worker may already be reading. ao_audiotrack's set_pause(false) on a
+passthrough track (raw or the IEC 61937 carrier) reads the head before
+play() and then waits, at most 250 ms and polling every 2 ms, for it to
+move. It then restarts the passthrough smoother on the moving head:
+samples the worker took while the head stood would read as the same step.
+A PCM track resumes at once, as 0141 measured with no late frame.
+
+diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
+index ba1d623..3e839f6 100644
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -61,6 +61,11 @@ static int jni_static_use_count = 0;
+ // the format.
+ #define RECREATE_GRACE_NS MP_TIME_S_TO_NS(3)
+ #define RECREATE_RETRY_NS MP_TIME_MS_TO_NS(100)
++// A resumed passthrough track: how long set_pause waits for the playhead to
++// move again, and how often it reads it (AudioTrack_awaitResumedHead). The
++// HAL restarts the bitstream first; 55-72 ms on a DTS track in the wild.
++#define RESUME_HEAD_WAIT_NS MP_TIME_MS_TO_NS(250)
++#define RESUME_HEAD_POLL_NS MP_TIME_MS_TO_NS(2)
+ 
+ // android.os.Process.THREAD_PRIORITY_AUDIO: the niceness of the platform's
+ // own audio client threads.
+@@ -4309,6 +4314,60 @@ static void start(struct ao *ao)
+     mp_cond_signal(&p->wakeup);
+ }
+ 
++// The current track's playback head, read as the monitor does; false when
++// there is no track to read (its replacement is pending).
++static bool AudioTrack_readHead(struct ao *ao, uint32_t *head)
++{
++    struct priv *p = ao->priv;
++    JNIEnv *env = MP_JNI_GET_ENV(ao);
++    bool ok = false;
++    mp_mutex_lock(&p->track_lock);
++    if (p->audiotrack) {
++        *head = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++        ok = MP_JNI_EXCEPTION_LOG(ao) >= 0;
++    }
++    mp_mutex_unlock(&p->track_lock);
++    return ok;
++}
++
++// A resumed passthrough track plays nothing until the HAL has restarted the
++// bitstream, and its head stands where the pause left it meanwhile: 55-72 ms
++// on a Swisscom IP1800 with DTS (Plezy #2302). buffer.c restarts the core's
++// clock when set_pause returns, so a resume that returned at play() ran the
++// video that far ahead of audio that had not started; the smoothed head then
++// caught up and held 1-4 frames on every unpause. Wait, bounded, for the
++// head to move, then restart the smoothing on the moving head: samples the
++// worker took while it stood would read as the same step.
++static void AudioTrack_awaitResumedHead(struct ao *ao, uint32_t paused_head)
++{
++    struct priv *p = ao->priv;
++    const int64_t begin = mp_time_ns();
++    bool moved = false;
++    while (true) {
++        uint32_t head = 0;
++        if (!AudioTrack_readHead(ao, &head))
++            return; // replaced meanwhile; the new track anchors itself
++        if (head != paused_head) {
++            moved = true;
++            break;
++        }
++        if (mp_time_ns() - begin >= RESUME_HEAD_WAIT_NS)
++            break;
++        mp_sleep_ns(RESUME_HEAD_POLL_NS);
++    }
++    const int waited_ms = (int)((mp_time_ns() - begin) / 1000000);
++    if (moved) {
++        MP_VERBOSE(ao, "resume: playhead moved after %d ms\n", waited_ms);
++    } else {
++        MP_VERBOSE(ao, "resume: playhead still after %d ms; resuming the clock "
++                   "anyway\n", waited_ms);
++    }
++    mp_mutex_lock(&p->lock);
++    AudioTrack_resetPlayheadSmoothing(p);
++    p->step_anchored = false;
++    mp_mutex_unlock(&p->lock);
++}
++
+ // The core's pause. Without this hook the core paused the AO through reset,
+ // that is stop(), whose flush() dropped what the track held: a PCM track
+ // holds at least 500 ms, all of it already gone from the core's queue, so
+@@ -4319,11 +4378,21 @@ static void start(struct ao *ao)
+ // write the pause interrupts keeps its rest pending (AudioTrack_write). A
+ // seek while paused still reaches stop(), which flushes, and the resume after
+ // it is a start(). With --audio-stream-silence the core never pauses the AO.
++// A passthrough resume returns once the head moves again
++// (AudioTrack_awaitResumedHead); a PCM track resumes at once, which 0141
++// measured with no late frame on a Fire TV.
+ static bool set_pause(struct ao *ao, bool paused)
+ {
+     struct priv *p = ao->priv;
+     if (!paused) {
++        const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
++                                 p->raw_passthrough;
++        uint32_t head = 0;
++        const bool await = passthrough && !p->ka_enabled &&
++                           AudioTrack_readHead(ao, &head);
+         start(ao);
++        if (await)
++            AudioTrack_awaitResumedHead(ao, head);
+         return true;
+     }
+     // Nothing is due from the track: the monitor stands by, and a
+diff --git a/audio/out/buffer.c b/audio/out/buffer.c
+index 277b524..420e306 100644
+--- a/audio/out/buffer.c
++++ b/audio/out/buffer.c
+@@ -441,8 +441,16 @@ void ao_set_paused(struct ao *ao, bool paused, bool eof)
+                 ao->driver->set_pause(ao, true);
+                 p->queued_time_ns = p->end_time_ns - mp_time_ns();
+             } else {
+-                p->end_time_ns = p->queued_time_ns + mp_time_ns();
++                // The clock restarts when the device does, which is when
++                // set_pause returns: ao_audiotrack holds it until a
++                // passthrough track's playhead moves again. Stamped before
++                // the call, the clock would run ahead of audio that had not
++                // started. Under the lock: the device plays now, so a pull
++                // AO's worker may be reading and stamping end_time_ns too.
+                 ao->driver->set_pause(ao, false);
++                mp_mutex_lock(&p->lock);
++                p->end_time_ns = p->queued_time_ns + mp_time_ns();
++                mp_mutex_unlock(&p->lock);
+             }
+         } else {
+             if (paused)
