@@ -19,3 +19,6 @@
 0031-videotoolbox-cache-the-derived-colour-space.patch
 0033-videotoolbox-skip-the-wait-after-a-synchronous-decode.patch
 0034-videotoolbox-leave-matching-attachments-alone.patch
+# The NAL unescape scan, VideoToolbox's largest FFmpeg leaf at high bitrates;
+# builds without NEON or fast 64-bit loads keep the original scan.
+0041-h2645-find-escapes-and-start-codes-a-zero-pair-at-a-time.patch
