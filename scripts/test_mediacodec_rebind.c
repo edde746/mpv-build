@@ -51,7 +51,7 @@ struct osd_ahead {
     struct osd_ahead_callbacks cb;
     mp_mutex lock;
     mp_cond wakeup;
-    bool terminate, paused;
+    bool terminate, paused, repeat_unchanged;
     uint64_t epoch;
     int present_slot;
     struct osd_slot slots[OSD_SLOTS];
@@ -202,6 +202,7 @@ int main(void)
     assert(!p.osd.terminate && p.osd.paused && p.osd.epoch > epoch);
     assert(p.osd_geometry.width == 1920 && p.osd_vsync_delay == 2 && p.letterbox_fill &&
            vo.want_redraw);
+    assert(p.osd.repeat_unchanged); // the delayed plane still repeats after the rebind
     pthread_mutex_lock(&gate);
     b.release = true;
     pthread_cond_broadcast(&changed);

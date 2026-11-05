@@ -73,12 +73,14 @@ a package entry's own `assetBase`) or, when it has none, the group section's
 `platforms.<group>.assetBase` (the old `binaries-<group>` release).
 Package.swift already spells out each framework's full URL.
 
-**Known issue for pins.** From the commit that adds mpv patch 0142 (Android:
-queue the subtitle plane as early as the video) onwards, MediaTek Android TV
-boxes such as the Google TV Streamer show subtitles one refresh ahead of the
-picture on HDMI. The cause is the video plane's own lag on that chip
-(plezy#2894), which 0142 no longer masks; it stays until that lag is fixed
-here.
+**Known issue for pins.** On Amlogic and MediaTek Android TV boxes (such as
+the Google TV Streamer) the video plane reaches the screen a refresh after
+a subtitle plane given the same timestamp, so subtitles lead their picture
+on HDMI (plezy#2894); from the commit that adds mpv patch 0142 (Android:
+queue the subtitle plane as early as the video) onwards that includes
+MediaTek. Nothing on the device reports the lag, so the embedder sets
+`--vo-mediacodec-osd-vsync-delay=1` on those chips; from patch 0145 on, the
+delay no longer makes the video judder on Amlogic.
 
 ## Updating
 
@@ -233,7 +235,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_mediacodec_geometry.sh` | vo_mediacodec geometry (patch 0100) | main |
 | `test_mediacodec_input.sh` | an access unit too large for its input buffer is dropped whole | PR, main |
 | `test_mediacodec_letterbox.sh` | the OSD plane's letterbox fill | PR, main |
-| `test_mediacodec_osd.sh` | the shared subtitle render-ahead pipeline (patch 0031) | main |
+| `test_mediacodec_osd.sh` | the shared subtitle render-ahead pipeline (patch 0031), and a delayed plane repeating an unchanged frame (0214) | main |
 | `test_mediacodec_paused.sh` | a paused decoder is not polled and never holds the decode thread | PR, main |
 | `test_mediacodec_rate.sh` | the `media3_rate` operating-rate option | PR, main |
 | `test_mediacodec_rebind.sh` | OSD surface retirement without rebuilding the decoder; a letterbox-fill change repaints (patch 0143) | PR, main |

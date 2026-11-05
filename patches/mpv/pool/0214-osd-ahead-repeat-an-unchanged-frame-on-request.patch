@@ -1,0 +1,135 @@
+Subject: [PATCH] osd_ahead: repeat an unchanged frame on request
+
+A VO that presents its OSD plane a refresh or more after the video can
+need that plane presented on every video frame, not only when the OSD
+changes: vo_mediacodec on Amlogic (0145, Plezy #2894).
+
+osd_ahead gains repeat_unchanged, a VO -> render field under the lock that
+osd_ahead_start carries over like the pause state. With it set, a pinned
+request whose render left the OSD unchanged, served on demand or from a
+pre-render that found nothing new, posts the slot that is queued or on
+screen again, with its own frame's release. Nothing repeats while
+force_full is set: results may have been discarded since the last post,
+and that slot is then not what the screen shows. Unset, the default,
+nothing changes for any VO.
+
+diff --git a/video/out/osd_ahead.c b/video/out/osd_ahead.c
+index 69dfb8d..5167ec8 100644
+--- a/video/out/osd_ahead.c
++++ b/video/out/osd_ahead.c
+@@ -96,7 +96,7 @@ double osd_cadence_delta(const struct osd_cadence *c)
+ 
+ enum osd_spec_result {
+     OSD_SPEC_MISS,     // render on demand
+-    OSD_SPEC_HIT,      // post spec->slot (or nothing when it is -1)
++    OSD_SPEC_HIT,      // post spec->slot (-1: nothing, or the repeat)
+ };
+ 
+ // A request for pts arrived. The speculation is consumed either way. A match
+@@ -301,6 +301,7 @@ struct osd_render_state {
+     int last_w, last_h;
+     bool force_full;
+     int64_t posted_change_id; // sub_bitmap_list.change_id of the last result
++    int posted_slot;          // that result's slot; valid while !force_full
+     struct osd_request last;  // last serviced request
+     uint64_t planned_seq;     // last.seq whose pre-renders were decided
+     // Per OSD object: the change id libass last reported, and when that
+@@ -537,6 +538,7 @@ static bool osd_post_result(struct osd_ahead *s, struct osd_render_state *rs,
+         return false;
+     }
+     rs->posted_change_id = s->slots[slot].sbs->change_id;
++    rs->posted_slot = slot;
+     rs->force_full = false;
+     mp_cond_broadcast(&s->wakeup);
+     return true;
+@@ -548,7 +550,18 @@ static void osd_notify_posted(struct osd_ahead *s, bool queued)
+         s->cb.result_posted(s->cb.ctx);
+ }
+ 
+-// Locked. The request is done: its result, if the OSD changed, is posted.
++// Locked. With repeat_unchanged, the slot a pinned request whose render left
++// the OSD unchanged posts again, so every video frame gets a presentation;
++// otherwise -1. Only while !force_full: a forced render may follow discarded
++// results, and then the last posted slot is not what the screen shows.
++static int osd_repeat_slot(struct osd_ahead *s, struct osd_render_state *rs,
++                           const struct osd_request *req)
++{
++    return s->repeat_unchanged && req->seq && !rs->force_full ? rs->posted_slot : -1;
++}
++
++// Locked. The request is done: its result, if the OSD changed (or it
++// repeats), is posted.
+ static void osd_mark_served(struct osd_ahead *s, const struct osd_request *req)
+ {
+     s->served_seq = req->seq;
+@@ -577,6 +590,8 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+                                                 rs->force_full, req.delta);
+     s->spec.slot = -1;
+     if (hit == OSD_SPEC_HIT) {
++        if (spec_slot < 0)
++            spec_slot = osd_repeat_slot(s, rs, &req);
+         bool queued = spec_slot >= 0 && osd_post_result(s, rs, spec_slot, &req);
+         osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
+         osd_mark_served(s, &req);
+@@ -599,7 +614,8 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+     bool posted = osd_render_pass(s, rs, req.pts, slot);
+ 
+     mp_mutex_lock(&s->lock);
+-    bool queued = posted && osd_post_result(s, rs, slot, &req);
++    int post_slot = posted ? slot : osd_repeat_slot(s, rs, &req);
++    bool queued = post_slot >= 0 && osd_post_result(s, rs, post_slot, &req);
+     osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
+     osd_mark_served(s, &req);
+     mp_mutex_unlock(&s->lock);
+@@ -653,7 +669,7 @@ static MP_THREAD_VOID osd_render_thread(void *arg)
+     if (s->cb.thread_init)
+         s->cb.thread_init(s->cb.ctx);
+ 
+-    struct osd_render_state rs = {.force_full = true};
++    struct osd_render_state rs = {.force_full = true, .posted_slot = -1};
+ 
+     mp_mutex_lock(&s->lock);
+     while (!s->terminate) {
+@@ -833,6 +849,7 @@ bool osd_ahead_start(struct osd_ahead *s)
+         .cb = s->cb,
+         .epoch = s->epoch + 1,
+         .paused = s->paused,
++        .repeat_unchanged = s->repeat_unchanged,
+         .present_slot = -1,
+     };
+     for (int n = 0; n < OSD_SLOTS; n++)
+diff --git a/video/out/osd_ahead.h b/video/out/osd_ahead.h
+index 7d62fc4..cc9614a 100644
+--- a/video/out/osd_ahead.h
++++ b/video/out/osd_ahead.h
+@@ -188,6 +188,10 @@ struct osd_ahead {
+     // VO -> render
+     bool requested;
+     struct osd_request request;
++    // Post a result for every pinned request, the slot on screen again when
++    // the OSD did not change, so the presenter shows the plane on every video
++    // frame instead of only when its content changes.
++    bool repeat_unchanged;
+     // VO -> presenter
+     struct osd_release releases[OSD_RELEASE_HISTORY];
+     int release_next;
+@@ -196,7 +200,8 @@ struct osd_ahead {
+     struct osd_result_queue results;
+     int present_slot;           // slot on screen or being presented, -1 none
+     // render -> presenter: the last request the render thread finished,
+-    // whether or not it posted a result (an unchanged OSD posts none).
++    // whether or not it posted a result (an unchanged OSD posts none unless
++    // repeat_unchanged).
+     uint64_t served_seq, served_epoch;
+     bool served_waiter;         // broadcast wakeup when a request is served
+ 
+@@ -213,7 +218,8 @@ struct osd_ahead {
+ };
+ 
+ // VO thread. Start the render thread with fresh state; only the epoch
+-// advances and the pause state carries over. The slots must be empty.
++// advances and the pause state and repeat_unchanged carry over. The slots
++// must be empty.
+ // Returns false, with nothing left running, when the thread cannot start.
+ bool osd_ahead_start(struct osd_ahead *s);
+ // VO thread. Terminate and join the render thread; the lock stays usable

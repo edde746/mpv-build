@@ -1,0 +1,99 @@
+Subject: [PATCH] vo_mediacodec: present a delayed OSD plane on every video frame
+
+--vo-mediacodec-osd-vsync-delay=1 lines subtitles up with their picture on
+Amlogic boxes, but there it made the video judder. On an S905X4 (SEI Box R
+4K Plus, the chip of the Onn 4K Pro in Plezy #2894) at 4K59.94 with 23.976
+content and dialogue subtitles, SurfaceFlinger showed 30 of 2,200 frames
+held a refresh long and as many a refresh short, while the OSD plane was
+presented 49 times, only when a subtitle changed. With a subtitle that
+changed on every frame the same delay put in no judder.
+
+A delayed plane is now presented on every video frame: vo_mediacodec sets
+osd_ahead's repeat_unchanged (0214) together with the delay, so a frame
+whose OSD did not change gets a result too, and the presenter draws the
+slot on screen again from the composed canvas and swaps it at that frame's
+delayed timestamp. At the default delay 0 nothing changes.
+
+Measured with the delay at 1, on SurfaceFlinger and on HDMI captures of
+clips that draw the frame index into the picture and into the subtitle
+(one cue per frame, or 2 s cues with 1 s gaps):
+- S905X4, 4K59.94: 1 judder pair in 2,196 frames (30 in 2,200 before).
+  The subtitle is on its picture on all 1,308 captured refreshes of the
+  per-frame clip and at all 55 cue edges of the sparse one.
+- S905X4, 4K23.976: no judder before or after (2,216 and 2,191 frames);
+  all cue edges in 2,395 captured refreshes on their frame.
+- Google TV Streamer (MediaTek MT8696), 4K60 and 1080p23.976: the
+  subtitle on its picture on every captured refresh of the per-frame clip
+  and at every cue edge (52 at 4K60). The 4K60 cadence is the same as
+  before.
+
+While the delay is on, the plane costs a swap per video frame instead of
+one per subtitle change. The render thread already rendered every frame to
+find it unchanged; a repeat adds no upload, only a draw of the composed
+canvas.
+
+diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
+index 1dca159..3d7d4c2 100644
+--- a/DOCS/man/vo.rst
++++ b/DOCS/man/vo.rst
+@@ -795,7 +795,10 @@ Available video output drivers are:
+     that many display periods after the video's timestamp. Some hardware
+     codec paths put the picture on screen a vsync after a GL layer given the
+     same timestamp; the embedder supplies the offset it measured. Only the
+-    presentation time is shifted, the rendered pts is not.
++    presentation time is shifted, the rendered pts is not. A delayed plane
++    is presented on every video frame, its unchanged content again, rather
++    than only when the content changes; on Amlogic, updates that arrived
++    only with a subtitle change made the video judder.
+ 
+     ``--vo-mediacodec-letterbox-fill=<yes|no>`` (default yes) fills the OSD
+     plane outside the video rectangle opaque black. The OSD Surface spans
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index 318e06e..d5ac76c 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -2735,6 +2735,17 @@ static void stats_tick(struct vo *vo)
+     }
+ }
+ 
++// Under osd.lock once the workers run. A delayed plane is presented on every
++// video frame, not only when its content changes: on Amlogic, a plane a
++// refresh behind its picture that updated only with its content put a judder
++// pair into the video at most updates, and one updated on every frame put in
++// none.
++static void osd_set_vsync_delay(struct priv *p, int delay)
++{
++    p->osd_vsync_delay = delay;
++    p->osd.repeat_unchanged = delay > 0;
++}
++
+ static void osd_init(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -2822,7 +2833,7 @@ static int preinit(struct vo *vo)
+     p->osd_surface = opts->osd_surface;
+     if (!mediacodec_geometry_parse(opts->video_rect, &p->osd_geometry))
+         MP_WARN(vo, "Invalid --vo-mediacodec-video-rect; ignoring geometry.\n");
+-    p->osd_vsync_delay = opts->osd_vsync_delay;
++    osd_set_vsync_delay(p, opts->osd_vsync_delay);
+     p->letterbox_fill = opts->letterbox_fill;
+     m_config_cache_set_wakeup_cb(p->opts_cache, opts_wakeup, vo);
+     vo->hwdec_devs = hwdec_devices_create();
+@@ -3039,7 +3050,7 @@ static void update_opts(struct vo *vo)
+         p->osd_surface = opts->osd_surface;
+         if (geometry_ok)
+             p->osd_geometry = geometry;
+-        p->osd_vsync_delay = opts->osd_vsync_delay;
++        osd_set_vsync_delay(p, opts->osd_vsync_delay);
+         p->letterbox_fill = opts->letterbox_fill;
+         osd_init(vo);
+         vo->want_redraw = true;
+@@ -3047,7 +3058,7 @@ static void update_opts(struct vo *vo)
+     if (!p->osd_threads_created)
+         return;
+     mp_mutex_lock(&p->osd.lock);
+-    p->osd_vsync_delay = opts->osd_vsync_delay;
++    osd_set_vsync_delay(p, opts->osd_vsync_delay);
+     bool changed = geometry_ok &&
+                    !mediacodec_geometry_equal(p->osd_geometry, geometry);
+     if (changed)
