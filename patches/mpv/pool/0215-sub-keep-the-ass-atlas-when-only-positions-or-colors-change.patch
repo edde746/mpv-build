@@ -1,0 +1,444 @@
+Subject: [PATCH] sub: keep the ASS atlas when only positions or colors change
+
+mp_ass_packer copied every libass bitmap into a fresh atlas on every frame
+libass reported as changed. libass reports a change for a new color as
+for new content, so a fade, a \move or a karaoke color step repacked (and
+a GPU VO re-uploaded) the whole atlas although every bitmap was the one
+already in it. Rendering the bench's anime-ass.mkv frame by frame with
+this libass, 523 of the 779 changed frames (67%) draw exactly the previous
+frame's bitmaps, and 94% of the bitmap bytes of all changed frames were in
+the previous frame.
+
+With --sub-ass-atlas-reuse (default yes), sd_ass' packer holds the image
+list it packed last with ass_frame_ref (libass 0006), so none of its
+bitmaps can be freed and their memory taken by a bitmap of the next frame:
+equal pointer, size and stride then mean equal pixels. A frame whose parts
+are, in order, exactly those bitmaps keeps the atlas: each part keeps its
+place in it and only its screen position and color change. The result
+carries the atlas' new atlas_id field (sub_bitmaps), equal across such
+frames, which tells a VO that caches the atlas on the GPU that it can draw
+the new frame from the uploaded copy; change_id still changes, so every
+other consumer behaves as before. osd_ahead's dedup carries atlas_id over
+with the atlas it adopts. Only mask atlases from a single list (sd_ass)
+are reused; the BGRA path bakes the colors into the atlas.
+
+A new atlas is still needed for the other frames, and consumers hold the
+previous ones (osd_ahead slots, an upload in flight), so every such frame
+allocated afresh: on Android a scudo secondary allocation, which means an
+mmap, a page fault per page during the copy, and a munmap when the last
+consumer lets go. --sub-ass-atlas-pool keeps that many earlier atlases
+and reuses one nobody references any more. It defaults to 4 on Android
+and to 0 elsewhere: on an iPhone the spares saved no CPU and held 7 MB.
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index be1cf56..b82d6cc 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -2674,6 +2674,23 @@ Subtitles
+ 
+     Default: 0.
+ 
++``--sub-ass-atlas-reuse=<yes|no>``
++    When a libass frame draws exactly the bitmaps of the previous frame, only
++    at other positions or in other colors (a fade, a ``\move``, a karaoke
++    color step), keep the previous frame's packed atlas instead of copying
++    every bitmap into a new one. VOs that cache the atlas on the GPU
++    (``vo_mediacodec``) then skip its upload as well. The output is the same.
++
++    Default: yes.
++
++``--sub-ass-atlas-pool=<0-8>``
++    How many earlier subtitle atlases to keep, so that a new atlas can reuse
++    one a VO has finished with instead of allocating (and page-faulting) a
++    fresh one. Spares are at most the size the atlas has grown to. 0
++    allocates every atlas anew.
++
++    Default: 4 on Android, 0 elsewhere.
++
+ ``--sub-ass-styles=<filename>``
+     Load all SSA/ASS styles found in the specified file and use them for
+     rendering text subtitles. The syntax of the file is exactly like the ``[V4
+diff --git a/options/options.c b/options/options.c
+index 9df186f..3c4fbb5 100644
+--- a/options/options.c
++++ b/options/options.c
+@@ -351,6 +351,9 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         {"sub-lavc-o", OPT_KEYVALUELIST(sub_avopts), .flags = UPDATE_SUB_HARD},
+         {"sub-glyph-limit", OPT_INT(sub_glyph_limit)},
+         {"sub-bitmap-max-size", OPT_INT(sub_bitmap_max_size)},
++        {"sub-ass-atlas-reuse", OPT_BOOL(sub_ass_atlas_reuse)},
++        {"sub-ass-atlas-pool", OPT_INT(sub_ass_atlas_pool),
++            M_RANGE(0, 8)}, // MP_ASS_PACKER_POOL_MAX
+         {0}
+     },
+     .size = sizeof(OPT_BASE_STRUCT),
+@@ -370,6 +373,10 @@ const struct m_sub_options mp_subtitle_sub_opts = {
+         .ass_video_aspect = 0,
+         .sub_shaper = 1,
+         .use_embedded_fonts = true,
++        .sub_ass_atlas_reuse = true,
++        // On Android a fresh atlas costs an mmap and a page fault per page
++        // (scudo); elsewhere the spares only hold memory.
++        .sub_ass_atlas_pool = HAVE_ANDROID ? 4 : 0,
+     },
+     .change_flags = UPDATE_OSD,
+ };
+diff --git a/options/options.h b/options/options.h
+index ed193ea..83b2858 100644
+--- a/options/options.h
++++ b/options/options.h
+@@ -135,6 +135,8 @@ struct mp_subtitle_opts {
+     bool sub_past_video_end;
+     int sub_glyph_limit;
+     int sub_bitmap_max_size;
++    bool sub_ass_atlas_reuse;
++    int sub_ass_atlas_pool;
+     char **sub_avopts;
+ };
+ 
+diff --git a/sub/ass_mp.c b/sub/ass_mp.c
+index b5eebf9..31a3ac7 100644
+--- a/sub/ass_mp.c
++++ b/sub/ass_mp.c
+@@ -200,6 +200,12 @@ static void draw_ass_rgba(unsigned char *src, int src_w, int src_h,
+     }
+ }
+ 
++// A part's libass bitmap, as packed into the current atlas.
++struct packed_src {
++    const unsigned char *bitmap;
++    int w, h, stride;
++};
++
+ struct mp_ass_packer {
+     struct sub_bitmap *cached_parts; // only for the array memory
+     struct mp_image *cached_img;
+@@ -207,17 +213,98 @@ struct mp_ass_packer {
+     bool cached_subs_valid;
+     struct sub_bitmap rgba_imgs[MP_SUB_BB_LIST_MAX];
+     struct bitmap_packer *packer;
++    // Spare atlases: earlier cached_img, still referenced by consumers or
++    // free again. A free one is reused instead of allocating, which on
++    // Android means a fresh mmap, page faults on every page of the copy, and
++    // a munmap when the last consumer lets go, per changed frame.
++    int pool_max;
++    struct mp_image *spare[MP_ASS_PACKER_POOL_MAX];
++    int num_spare;
++    // Atlas reuse (single image list only): the list packed last, held with
++    // ass_frame_ref so its bitmaps stay allocated and pointer equality means
++    // pixel equality, and its parts' bitmaps in cached_parts order.
++    bool reuse;
++    ASS_Image *held;
++    struct packed_src *src;
++    int num_src;            // -1: cached_subs isn't a mask atlas of src
+ };
+ 
+-// Free with talloc_free().
++// Identifies an atlas' pixels across sub_bitmaps copies; 0 is never used.
++static _Atomic uint64_t next_atlas_id;
++
++// Free with talloc_free(), after mp_ass_packer_release().
+ struct mp_ass_packer *mp_ass_packer_alloc(void *ta_parent)
+ {
+     struct mp_ass_packer *p = talloc_zero(ta_parent, struct mp_ass_packer);
+     p->packer = talloc_zero(p, struct bitmap_packer);
+     p->packer->padding = 1; // assume bilinear sampling
++    p->num_src = -1;
+     return p;
+ }
+ 
++void mp_ass_packer_configure(struct mp_ass_packer *p, bool reuse, int pool)
++{
++    if (!reuse)
++        mp_ass_packer_release(p);
++    p->reuse = reuse;
++    p->pool_max = MPCLAMP(pool, 0, MP_ASS_PACKER_POOL_MAX);
++    while (p->num_spare > p->pool_max)
++        talloc_free(p->spare[--p->num_spare]);
++}
++
++void mp_ass_packer_release(struct mp_ass_packer *p)
++{
++    ass_frame_unref(p->held);
++    p->held = NULL;
++    p->num_src = -1;
++}
++
++static bool atlas_fits(struct mp_image *img, int imgfmt, int w, int h)
++{
++    return img && img->imgfmt == imgfmt && img->w >= w && img->h >= h &&
++           mp_image_is_writeable(img);
++}
++
++// Retire cached_img into the spares; the oldest spare goes when full.
++static void retire_atlas(struct mp_ass_packer *p)
++{
++    if (!p->cached_img)
++        return;
++    if (!p->pool_max) {
++        talloc_free(p->cached_img);
++    } else {
++        if (p->num_spare == p->pool_max) {
++            talloc_free(p->spare[0]);
++            memmove(&p->spare[0], &p->spare[1], --p->num_spare * sizeof(p->spare[0]));
++        }
++        p->spare[p->num_spare++] = p->cached_img;
++    }
++    p->cached_img = NULL;
++}
++
++// An atlas for imgfmt that holds w x h: the current one if nothing else
++// references it, else a free spare, else a new one of the packer's size.
++static struct mp_image *take_atlas(struct mp_ass_packer *p, int imgfmt, int w, int h)
++{
++    if (atlas_fits(p->cached_img, imgfmt, w, h))
++        return p->cached_img;
++    retire_atlas(p);
++    int best = -1;
++    for (int n = p->num_spare - 1; n >= 0 && best < 0; n--) {
++        if (atlas_fits(p->spare[n], imgfmt, w, h))
++            best = n;
++    }
++    if (best >= 0) {
++        p->cached_img = p->spare[best];
++        memmove(&p->spare[best], &p->spare[best + 1], (--p->num_spare - best) * sizeof(p->spare[0]));
++    } else {
++        p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
++        if (p->cached_img)
++            talloc_steal(p, p->cached_img);
++    }
++    return p->cached_img;
++}
++
+ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+ {
+     packer_set_size(p->packer, res->num_parts);
+@@ -236,23 +323,15 @@ static bool pack(struct mp_ass_packer *p, struct sub_bitmaps *res, int imgfmt)
+ 
+     // A consumer still holding the previous atlas (a VO keeps frames in
+     // flight) makes it read-only. Nothing reads an atlas outside the parts
+-    // packed into it, so start a fresh one rather than copy tens of
+-    // megabytes to unshare it.
+-    if (!p->cached_img || p->cached_img->w < res->packed_w ||
+-                          p->cached_img->h < res->packed_h ||
+-                          p->cached_img->imgfmt != imgfmt ||
+-                          !mp_image_is_writeable(p->cached_img))
+-    {
+-        talloc_free(p->cached_img);
+-        p->cached_img = mp_image_alloc(imgfmt, p->packer->w, p->packer->h);
+-        if (!p->cached_img) {
+-            packer_reset(p->packer);
+-            return false;
+-        }
+-        talloc_steal(p, p->cached_img);
++    // packed into it, so start a fresh one (or a free spare) rather than
++    // copy tens of megabytes to unshare it.
++    if (!take_atlas(p, imgfmt, res->packed_w, res->packed_h)) {
++        packer_reset(p->packer);
++        return false;
+     }
+ 
+     res->packed = p->cached_img;
++    res->atlas_id = ++next_atlas_id;
+ 
+     for (int n = 0; n < res->num_parts; n++) {
+         struct sub_bitmap *b = &res->parts[n];
+@@ -393,15 +472,43 @@ static bool pack_rgba(struct mp_ass_packer *p, struct sub_bitmaps *res)
+     return true;
+ }
+ 
+-// Pack the contents of image_lists[0] to image_lists[num_image_lists-1] into
+-// a single image, and make *out point to it. *out is completely overwritten.
+-// If libass reported any change, image_lists_changed must be set (it then
+-// repacks all images). preferred_osd_format is a bitmask of supported
+-// (1 << SUBBITMAP_*) formats. Prefer masks unless heavy overlap makes their
+-// upload substantially larger than a composited image.
+-void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+-                        int num_image_lists, bool image_lists_changed, bool video_color_space,
+-                        int preferred_osd_format, struct sub_bitmaps *out)
++// Whether res (just filled from the image list) draws exactly the bitmaps
++// packed into the current mask atlas, in the same order: then only positions
++// and colors moved, and the atlas holds every part already. Sound because
++// the previous list is held: none of its bitmaps can have been freed and
++// their memory reused by a bitmap of this frame.
++static bool reuse_atlas(struct mp_ass_packer *p, struct sub_bitmaps *res,
++                        bool cached_valid)
++{
++    if (!p->reuse || p->num_src != res->num_parts || !cached_valid ||
++        p->cached_subs.format != SUBBITMAP_LIBASS ||
++        p->cached_subs.packed != p->cached_img || !p->cached_img)
++        return false;
++    for (int n = 0; n < res->num_parts; n++) {
++        const struct sub_bitmap *b = &res->parts[n];
++        const struct packed_src *s = &p->src[n];
++        if (b->bitmap != s->bitmap || b->w != s->w || b->h != s->h ||
++            b->stride != s->stride)
++            return false;
++    }
++    uint8_t *base = p->cached_img->planes[0];
++    int stride = p->cached_img->stride[0];
++    for (int n = 0; n < res->num_parts; n++) {
++        struct sub_bitmap *b = &res->parts[n];
++        b->bitmap = base + b->src_y * stride + b->src_x;
++        b->stride = stride;
++    }
++    res->packed = p->cached_img;
++    res->packed_w = p->cached_subs.packed_w;
++    res->packed_h = p->cached_subs.packed_h;
++    res->atlas_id = p->cached_subs.atlas_id;
++    return true;
++}
++
++static void pack_lists(struct mp_ass_packer *p, ASS_Image **image_lists,
++                       int num_image_lists, bool image_lists_changed,
++                       bool video_color_space, int preferred_osd_format,
++                       struct sub_bitmaps *out)
+ {
+     if (p->cached_subs_valid && !image_lists_changed &&
+         (preferred_osd_format & (1 << p->cached_subs.format)))
+@@ -411,6 +518,7 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+     }
+ 
+     *out = (struct sub_bitmaps){.change_id = 1};
++    bool was_valid = p->cached_subs_valid;
+     p->cached_subs_valid = false;
+ 
+     struct sub_bitmaps res = {
+@@ -420,6 +528,8 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+         .video_color_space = video_color_space,
+     };
+ 
++    // Parts keep their slot's src_x/src_y from the last pack: reuse_atlas
++    // relies on part n being bitmap n of that pack.
+     for (int n = 0; n < num_image_lists; n++) {
+         for (struct ass_image *img = image_lists[n]; img; img = img->next) {
+             if (img->w == 0 || img->h == 0)
+@@ -458,9 +568,22 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+ 
+     bool r = false;
+     if (format == SUBBITMAP_BGRA) {
++        p->num_src = -1;
+         r = pack_rgba(p, &res);
++    } else if (reuse_atlas(p, &res, was_valid)) {
++        r = true;
+     } else {
++        p->num_src = -1;
++        if (p->reuse) {
++            MP_TARRAY_GROW(p, p->src, res.num_parts);
++            for (int n = 0; n < res.num_parts; n++) {
++                const struct sub_bitmap *b = &res.parts[n];
++                p->src[n] = (struct packed_src){b->bitmap, b->w, b->h, b->stride};
++            }
++        }
+         r = pack_libass(p, &res);
++        if (r && p->reuse)
++            p->num_src = res.num_parts;
+     }
+ 
+     if (!r)
+@@ -472,6 +595,33 @@ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+     p->cached_subs_valid = true;
+ }
+ 
++// Pack the contents of image_lists[0] to image_lists[num_image_lists-1] into
++// a single image, and make *out point to it. *out is completely overwritten.
++// If libass reported any change, image_lists_changed must be set (it then
++// repacks all images). preferred_osd_format is a bitmask of supported
++// (1 << SUBBITMAP_*) formats. Prefer masks unless heavy overlap makes their
++// upload substantially larger than a composited image.
++// With reuse configured and a single list, a frame that draws the previous
++// frame's bitmaps at other positions or in other colors keeps that atlas
++// (and its atlas_id) instead of packing again.
++void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
++                        int num_image_lists, bool image_lists_changed, bool video_color_space,
++                        int preferred_osd_format, struct sub_bitmaps *out)
++{
++    // Keep the previous list until the comparison is done.
++    ASS_Image *prev = p->held;
++    p->held = NULL;
++    if (p->reuse && num_image_lists == 1) {
++        p->held = image_lists[0];
++        ass_frame_ref(p->held);
++    } else {
++        p->num_src = -1;
++    }
++    pack_lists(p, image_lists, num_image_lists, image_lists_changed,
++               video_color_space, preferred_osd_format, out);
++    ass_frame_unref(prev);
++}
++
+ // Set *out_rc to [x0, y0, x1, y1] of the graphical bounding box in script
+ // coordinates.
+ // Set it to [inf, inf, -inf, -inf] if empty.
+diff --git a/sub/ass_mp.h b/sub/ass_mp.h
+index a1f02ba..da988d5 100644
+--- a/sub/ass_mp.h
++++ b/sub/ass_mp.h
+@@ -56,6 +56,15 @@ ASS_Library *mp_ass_init(struct mpv_global *global,
+ struct sub_bitmaps;
+ struct mp_ass_packer;
+ struct mp_ass_packer *mp_ass_packer_alloc(void *ta_parent);
++// At most this many spare atlases (mp_ass_packer_configure's pool).
++#define MP_ASS_PACKER_POOL_MAX 8
++// reuse: keep the atlas for a frame whose bitmaps are the previous frame's
++// (holds a reference on the last packed ASS_Image list; call
++// mp_ass_packer_release before the renderer's ass_renderer_done). pool:
++// how many earlier atlases to keep for reuse once consumers let go.
++void mp_ass_packer_configure(struct mp_ass_packer *p, bool reuse, int pool);
++// Drop the held image list. Required before ass_renderer_done.
++void mp_ass_packer_release(struct mp_ass_packer *p);
+ // preferred_osd_format is a bitmask of supported (1 << SUBBITMAP_*) formats.
+ void mp_ass_packer_pack(struct mp_ass_packer *p, ASS_Image **image_lists,
+                         int num_image_lists, bool changed, bool video_color_space,
+diff --git a/sub/osd.h b/sub/osd.h
+index 30feacd..0fcded7 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -73,6 +73,12 @@ struct sub_bitmaps {
+     // box. (The origin of the box is at (0,0).)
+     int packed_w, packed_h;
+ 
++    // Nonzero: identifies the pixels of packed. Items with the same
++    // atlas_id have the same atlas contents (parts may sit at other screen
++    // positions or have other colors: change_id still says that), so a VO
++    // may keep an uploaded copy. 0: unknown, key on change_id.
++    uint64_t atlas_id;
++
+     int change_id;  // Incremented on each change (0 is never used)
+ 
+     bool video_color_space; // True if the bitmap is in video color space
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index 44c8dda..e16ab9d 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -279,6 +279,9 @@ static void set_renderer_cache_limits(struct sd *sd, ASS_Renderer *renderer)
+ static void destroy_renderer(void *ptr)
+ {
+     struct ass_render_state *r = ptr;
++    // The packer may hold one of this renderer's image lists.
++    if (r->packer)
++        mp_ass_packer_release(r->packer);
+     if (r->renderer)
+         ass_renderer_done(r->renderer);
+ }
+@@ -886,6 +889,8 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
+     // Keep those masks rather than flattening colors before that adjustment.
+     if (!converted && (format & (1 << SUBBITMAP_LIBASS)) && mangle_colors(sd, NULL))
+         format &= ~(1 << SUBBITMAP_BGRA);
++    mp_ass_packer_configure(r->packer, opts->sub_ass_atlas_reuse,
++                            opts->sub_ass_atlas_pool);
+     mp_ass_packer_pack(r->packer, &imgs, 1, changed, !converted, format, res);
+ 
+ done:
+diff --git a/video/out/osd_ahead.c b/video/out/osd_ahead.c
+index 5167ec8..3cdb02d 100644
+--- a/video/out/osd_ahead.c
++++ b/video/out/osd_ahead.c
+@@ -395,6 +395,7 @@ static void osd_adopt_item(struct sub_bitmaps *dst, const struct sub_bitmaps *ca
+     dst->packed_w = canon->packed_w;
+     dst->packed_h = canon->packed_h;
+     dst->change_id = canon->change_id;
++    dst->atlas_id = canon->atlas_id;
+ }
+ 
+ // libass reports a change relative to its previous render, and this

@@ -1,0 +1,63 @@
+ass: export ass_frame_ref and ass_frame_unref
+
+ass_render_frame's image lists are already reference counted inside
+libass: the renderer keeps the previous list alive while it renders the
+next one, which is what makes ass_detect_change's pointer comparison
+sound. Export the two functions so a caller can hold a list across
+renders too. While a list is referenced, its bitmaps (cache entries or
+owned buffers) stay allocated, so a bitmap of a later frame can't occupy
+the memory of one of them: equal bitmap pointer, equal pixels, also across
+cache trims and ass_reconfigure. mpv's packer uses that to keep a packed
+atlas when the next frame draws the very same bitmaps at other positions
+or in other colors (a fade, a \move, a karaoke color step).
+
+The count is not atomic; the documentation says on which thread to use
+it and that every reference must be dropped before ass_renderer_done.
+
+diff --git a/libass/ass.h b/libass/ass.h
+index 8d0bf15..c98c086 100644
+--- a/libass/ass.h
++++ b/libass/ass.h
+@@ -662,6 +662,29 @@ void ass_set_cache_limits(ASS_Renderer *priv, int glyph_max,
+ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+                             long long now, int *detect_change);
+ 
++/**
++ * \brief Keep an image list returned by ass_render_frame() alive.
++ *
++ * Normally a list, and the bitmaps its images point to, are valid until the
++ * next ass_render_frame() on the same renderer. A reference keeps them valid
++ * until the matching ass_frame_unref(), even across later renders, cache
++ * trims and reconfiguration: while a list is referenced, no bitmap a later
++ * render returns can occupy the memory of one of its bitmaps, so an equal
++ * bitmap pointer means equal pixels.
++ *
++ * The count is not atomic: take and drop references on the thread that
++ * calls ass_render_frame() for this renderer (or while no render runs), and
++ * drop every reference before ass_renderer_done().
++ * \param image_list image list returned by ass_render_frame(), or NULL
++ */
++void ass_frame_ref(ASS_Image *image_list);
++
++/**
++ * \brief Release a reference taken with ass_frame_ref().
++ * \param image_list the same image list, or NULL
++ */
++void ass_frame_unref(ASS_Image *image_list);
++
+ 
+ /*
+  * The following functions operate on track objects and do not need
+diff --git a/libass/libass.sym b/libass/libass.sym
+index 1b5a3bd..14b0891 100644
+--- a/libass/libass.sym
++++ b/libass/libass.sym
+@@ -19,6 +19,8 @@ ass_set_line_spacing
+ ass_get_available_font_providers
+ ass_set_fonts
+ ass_render_frame
++ass_frame_ref
++ass_frame_unref
+ ass_new_track
+ ass_free_track
+ ass_alloc_style

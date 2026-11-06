@@ -1,0 +1,70 @@
+Subject: [PATCH] vo_mediacodec: draw a reused ASS atlas from its texture
+
+The OSD textures were keyed by (render_index, change_id), so every changed
+subtitle frame uploaded its whole atlas: on a Pixel 7, glTexSubImage2D and
+the Mali driver's conversion to its block layout were 7.7% of the app's
+cycles on heavy ASS, on a Fire TV Stick 4K 8.3% plus the kernel time of
+the PowerVR upload ioctls.
+
+Key the texture on sub_bitmaps.atlas_id (0215) when the item has one, and
+on change_id otherwise: a frame that only moves or recolors the previous
+frame's bitmaps keeps the packer's atlas and atlas_id, and draws from the
+uploaded texture. Composed frames are still keyed on the whole frame
+(change_id and atlas), so the canvas is composed anew with the new
+positions and colors.
+
+diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
+index d5ac76c..888a93f 100644
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -1281,7 +1281,8 @@ static struct mp_osd_res osd_canvas_res(void *ctx, int w, int h)
+ 
+ struct osd_tex_key {
+     int index;      // sub_bitmaps.render_index
+-    int change_id;  // sub_bitmaps.change_id: equal ids are the same pixels
++    int change_id;  // sub_bitmaps.change_id: equal ids are the same frame
++    uint64_t atlas; // sub_bitmaps.atlas_id: equal ids are the same atlas
+ };
+ 
+ // One item's atlas on the GPU.
+@@ -1656,14 +1657,29 @@ static void osd_gl_resolve_probes(struct vo *vo, struct osd_gl *g)
+     }
+ }
+ 
++// Whether a and b draw from the same atlas pixels: the same atlas_id, or
++// without one, the same change_id. A frame that moves or recolors the
++// previous frame's bitmaps keeps the packer's atlas_id, and its texture.
+ static bool osd_tex_key_equal(struct osd_tex_key a, struct osd_tex_key b)
+ {
+-    return a.index == b.index && a.change_id == b.change_id;
++    if (a.index != b.index)
++        return false;
++    if (a.atlas || b.atlas)
++        return a.atlas == b.atlas;
++    return a.change_id == b.change_id;
++}
++
++// Whether a and b are the same frame of an item: same atlas, same parts.
++static bool osd_tex_key_same_frame(struct osd_tex_key a, struct osd_tex_key b)
++{
++    return a.index == b.index && a.change_id == b.change_id &&
++           a.atlas == b.atlas;
+ }
+ 
+ static struct osd_tex_key osd_tex_key_of(const struct sub_bitmaps *imgs)
+ {
+-    return (struct osd_tex_key){imgs->render_index, imgs->change_id};
++    return (struct osd_tex_key){imgs->render_index, imgs->change_id,
++                                imgs->atlas_id};
+ }
+ 
+ static struct osd_tex *osd_tex_find(struct osd_gl *g, struct osd_tex_key key)
+@@ -1963,7 +1979,7 @@ static bool osd_comp_key_equal(const struct osd_comp_key *a, const struct osd_co
+         a->canvas_h != b->canvas_h)
+         return false;
+     for (int i = 0; i < a->num_items; i++) {
+-        if (!osd_tex_key_equal(a->items[i], b->items[i]))
++        if (!osd_tex_key_same_frame(a->items[i], b->items[i]))
+             return false;
+     }
+     return true;

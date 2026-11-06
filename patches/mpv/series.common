@@ -45,3 +45,7 @@
 # --demuxer-hysteresis-secs also spares the demuxer thread its per-packet
 # wakeup while the hysteresis holds (no change at the default 0).
 0213-demux-let-the-hysteresis-keep-the-demuxer-thread-asleep.patch
+# A libass frame that only moves or recolors the previous frame's bitmaps
+# keeps its packed atlas (and atlas_id), and new atlases come from a small
+# pool of free ones (--sub-ass-atlas-reuse, --sub-ass-atlas-pool).
+0215-sub-keep-the-ass-atlas-when-only-positions-or-colors-change.patch
