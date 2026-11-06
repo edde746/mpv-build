@@ -1,0 +1,235 @@
+ass: load the fonts directory once per library, mapped
+
+Every font selector read the whole fonts_dir into the library again:
+ass_set_fonts -> ass_fontselect_init -> ass_embedded_fonts_add_provider ->
+load_fonts_from_dir -> ass_add_font, a malloc + memcpy per file with no
+dedupe, freed only at ass_library_done. A library with two renderers held
+the directory twice, and every renderer created later appended another
+copy, which every live renderer then parsed with FreeType as one more set
+of embedded faces. mpv recreates its event-prefetch renderer after each
+seek and subtitle option change, so with sub-fonts-dir set (Tortuga's and
+Plezy's 16.7 MB Go Noto pair on Android) the native heap grew by the
+directory on every seek.
+
+The directory is now loaded by the first selector that needs it and kept
+in fontdata for the library's lifetime; a later selector finds it there,
+and a different fonts_dir loads again. On POSIX each file is mapped
+read-only instead of copied: clean file-backed pages, of which only the
+ones FreeType touches become resident, and which the kernel can drop
+under pressure. Windows keeps the copy. A file that can't be mapped falls
+back to the copy.
+
+diff --git a/libass/ass_fontselect.c b/libass/ass_fontselect.c
+index 57f6c49..653314d 100644
+--- a/libass/ass_fontselect.c
++++ b/libass/ass_fontselect.c
+@@ -35,6 +35,11 @@
+ #include FT_SFNT_NAMES_H
+ #include FT_TRUETYPE_IDS_H
+ #include FT_TRUETYPE_TABLES_H
++#ifndef _WIN32
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ 
+ #include "ass_utils.h"
+ #include "ass.h"
+@@ -164,6 +169,31 @@ static ASS_FontProviderFuncs ft_funcs = {
+     .destroy_font      = destroy_font_ft,
+ };
+ 
++#ifndef _WIN32
++// Map path read-only; NULL (nothing mapped) on failure or an empty file. A
++// mapped font is clean file-backed memory: only the pages FreeType touches
++// become resident, and the kernel can drop them under pressure.
++static char *map_font_file(const char *path, int *size)
++{
++    int fd = open(path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return NULL;
++    struct stat st;
++    char *data = NULL;
++    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
++        st.st_size <= INT_MAX)
++    {
++        data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++        if (data == MAP_FAILED)
++            data = NULL;
++        else
++            *size = st.st_size;
++    }
++    close(fd);
++    return data;
++}
++#endif
++
+ static void load_fonts_from_dir(ASS_Library *library, const char *dir)
+ {
+     ASS_Dir d;
+@@ -179,6 +209,14 @@ static void load_fonts_from_dir(ASS_Library *library, const char *dir)
+         if (!path)
+             continue;
+         ass_msg(library, MSGL_INFO, "Loading font file '%s'", path);
++#ifndef _WIN32
++        int mapped_size = 0;
++        char *mapped = map_font_file(path, &mapped_size);
++        if (mapped) {
++            ass_add_font_mapped(library, name, mapped, mapped_size);
++            continue;
++        }
++#endif
+         size_t size = 0;
+         void *data = ass_load_file(library, path, FN_DIR_LIST, &size);
+         if (data) {
+@@ -1027,7 +1065,15 @@ ass_embedded_fonts_add_provider(ASS_FontSelector *selector, size_t *num_emfonts)
+     ASS_Library *lib = selector->library;
+ 
+     if (lib->fonts_dir && lib->fonts_dir[0]) {
+-        load_fonts_from_dir(lib, lib->fonts_dir);
++        // The files stay in fontdata for the library's lifetime, so a
++        // second selector (another renderer) finds them there.
++        if (!lib->fonts_dir_loaded ||
++            strcmp(lib->fonts_dir_loaded, lib->fonts_dir))
++        {
++            load_fonts_from_dir(lib, lib->fonts_dir);
++            free(lib->fonts_dir_loaded);
++            lib->fonts_dir_loaded = strdup(lib->fonts_dir);
++        }
+     }
+ 
+     for (size_t i = 0; i < lib->num_fontdata; i++)
+diff --git a/libass/ass_library.c b/libass/ass_library.c
+index d4b61a8..dea0b9c 100644
+--- a/libass/ass_library.c
++++ b/libass/ass_library.c
+@@ -27,6 +27,9 @@
+ #ifdef CONFIG_UNIBREAK
+ #include <linebreak.h>
+ #endif
++#ifndef _WIN32
++#include <sys/mman.h>
++#endif
+ 
+ #include "ass.h"
+ #include "ass_library.h"
+@@ -114,42 +117,82 @@ void ass_set_style_overrides(ASS_Library *priv, char **list)
+         *q = strdup(*p);
+ }
+ 
+-void ass_add_font(ASS_Library *priv, const char *name, const char *data, int size)
++// A new fontdata slot, or NULL when the array can't grow.
++static ASS_Fontdata *fontdata_append(ASS_Library *priv)
+ {
+     size_t idx = priv->num_fontdata;
+-    if (!name || !data || !size)
+-        return;
+     if (!(idx & (idx - 32)) && // power of two >= 32, or zero --> time for realloc
+             !ASS_REALLOC_ARRAY(priv->fontdata, FFMAX(2 * idx, 32)))
++        return NULL;
++    priv->fontdata[idx] = (ASS_Fontdata) {0};
++    return &priv->fontdata[idx];
++}
++
++void ass_add_font(ASS_Library *priv, const char *name, const char *data, int size)
++{
++    if (!name || !data || !size)
++        return;
++    ASS_Fontdata *fd = fontdata_append(priv);
++    if (!fd)
+         return;
+ 
+-    priv->fontdata[idx].name = strdup(name);
+-    priv->fontdata[idx].data = malloc(size);
++    fd->name = strdup(name);
++    fd->data = malloc(size);
+ 
+-    if (!priv->fontdata[idx].name || !priv->fontdata[idx].data)
++    if (!fd->name || !fd->data)
+         goto error;
+ 
+-    memcpy(priv->fontdata[idx].data, data, size);
++    memcpy(fd->data, data, size);
+ 
+-    priv->fontdata[idx].size = size;
++    fd->size = size;
+ 
+     priv->num_fontdata++;
+     return;
+ 
+ error:
+-    free(priv->fontdata[idx].name);
+-    free(priv->fontdata[idx].data);
++    free(fd->name);
++    free(fd->data);
++}
++
++static void fontdata_free_data(ASS_Fontdata *fd)
++{
++#ifndef _WIN32
++    if (fd->mapped) {
++        munmap(fd->data, fd->size);
++        return;
++    }
++#endif
++    free(fd->data);
++}
++
++void ass_add_font_mapped(ASS_Library *priv, const char *name, char *data,
++                         int size)
++{
++    ASS_Fontdata *fd = fontdata_append(priv);
++    if (fd)
++        fd->name = strdup(name);
++    if (!fd || !fd->name) {
++        ASS_Fontdata tmp = {.data = data, .size = size, .mapped = 1};
++        fontdata_free_data(&tmp);
++        return;
++    }
++    fd->data = data;
++    fd->size = size;
++    fd->mapped = 1;
++    priv->num_fontdata++;
+ }
+ 
+ void ass_clear_fonts(ASS_Library *priv)
+ {
+     for (size_t i = 0; i < priv->num_fontdata; i++) {
+         free(priv->fontdata[i].name);
+-        free(priv->fontdata[i].data);
++        fontdata_free_data(&priv->fontdata[i]);
+     }
+     free(priv->fontdata);
+     priv->fontdata = NULL;
+     priv->num_fontdata = 0;
++    free(priv->fonts_dir_loaded);
++    priv->fonts_dir_loaded = NULL;
+ }
+ 
+ /*
+diff --git a/libass/ass_library.h b/libass/ass_library.h
+index 9bcc671..0c5860a 100644
+--- a/libass/ass_library.h
++++ b/libass/ass_library.h
+@@ -28,10 +28,12 @@ typedef struct {
+     char *name;
+     char *data;
+     int size;
++    int mapped;     // data is a read-only file mapping, not a malloc'd copy
+ } ASS_Fontdata;
+ 
+ struct ass_library {
+     char *fonts_dir;
++    char *fonts_dir_loaded; // the fonts_dir whose files are in fontdata
+     int extract_fonts;
+     char **style_overrides;
+ 
+@@ -47,5 +49,8 @@ struct ass_library {
+ };
+ 
+ char *ass_load_file(struct ass_library *library, const char *fname, FileNameSource hint, size_t *bufsize);
++// Takes ownership of data, a read-only mapping of size bytes (POSIX only).
++void ass_add_font_mapped(struct ass_library *library, const char *name,
++                         char *data, int size);
+ 
+ #endif                          /* LIBASS_LIBRARY_H */
