@@ -27,3 +27,8 @@
 # n9.0.2; drop it once the pin carries it. mpv patch 0026 recreates the muxer
 # on seek, which this fix relies on.
 0039-spdifenc-preserve-truehd-mat-padding-across-branches.patch
+# NEON inverse MDCT for aarch64, which the float AAC, AC-3/E-AC-3, Opus and
+# Vorbis decoders run through: upstream a122b3c3b6 and 31d17a6cac (on
+# release/9.1); drop it once the pin carries them. Other architectures, and
+# the Apple slices built without asm (Catalyst), keep the C transform.
+0042-lavu-tx-aarch64-neon-inverse-mdct.patch
