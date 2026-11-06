@@ -122,6 +122,45 @@ class MpvPlayerDeviceTest {
         }
     }
 
+    /**
+     * On the video plane a replacement repoints the running decoder instead of rebuilding the output. Playing,
+     * the next frame reaches the new Surface by itself and nothing seeks; paused, the picture already went to the
+     * old Surface and only a re-decode can show it on the new one (plezy#2987: black until play was pressed). A
+     * loop would restart playback too, so this test plays the media once: it needs some ten seconds of video.
+     */
+    @Test
+    fun planeReplacementShowsThePausedPictureWithoutSeekingWhilePlaying() {
+        val recorder = Recorder()
+        val player = createPlayer(recorder, vo = "mediacodec", hwdec = "mediacodec", loop = false)
+        val video1 = sink("plane-1")
+        player.attachSurfaces(video1.surface, null, videoGeneration = 1, osdGeneration = 1)
+        player.observeProperty("pause", PropertyFormat.Flag)
+
+        val entry = player.command("loadfile", mediaUrl) ?: throw AssertionError("loadfile returned no playlist entry")
+        recorder.awaitEvent("playback-restart") { it is MpvEvent.PlaybackRestart && it.sourceId == entry }
+        video1.awaitFrames(3, "the first plane Surface")
+        assertEquals("the media does not decode to the plane", "mediacodec", player.getString("hwdec-current"))
+        assertEquals("mediacodec", player.getString("current-vo"))
+
+        val restarts = recorder.countEvents { it is MpvEvent.PlaybackRestart }
+        val video2 = sink("plane-2")
+        player.attachSurfaces(video2.surface, null, videoGeneration = 2, osdGeneration = 2)
+        video2.awaitFrames(3, "the plane Surface replaced while playing")
+        assertEquals(
+            "replacing the plane Surface while playing restarted playback",
+            restarts,
+            recorder.countEvents { it is MpvEvent.PlaybackRestart },
+        )
+
+        player.setProperty("pause", true)
+        recorder.awaitChange("pause to be reported") { it == PropertyChange.Flag("pause", true, entry) }
+        Thread.sleep(SETTLE_MILLIS)
+        val video3 = sink("plane-3")
+        player.attachSurfaces(video3.surface, null, videoGeneration = 3, osdGeneration = 3)
+        video3.awaitFrames(1, "the plane Surface replaced while paused")
+        assertEquals(true, player.getFlag("pause"))
+    }
+
     @Test
     fun closeFromInsideTheListenerEndsDelivery() {
         lateinit var player: MpvPlayer
@@ -172,13 +211,18 @@ class MpvPlayerDeviceTest {
         assertNotNull(player.getString("idle-active"))
     }
 
-    private fun createPlayer(listener: MpvPlayer.Listener): MpvPlayer =
+    private fun createPlayer(
+        listener: MpvPlayer.Listener,
+        vo: String = "gpu",
+        hwdec: String = "no",
+        loop: Boolean = true,
+    ): MpvPlayer =
         MpvPlayer.create(instrumentation.targetContext, listener, hookTimeoutMillis = 10_000) {
             setOption("ao", "null")
-            setOption("vo", "gpu")
+            setOption("vo", vo)
             setOption("gpu-context", "android")
-            setOption("hwdec", "no")
-            setOption("loop-file", "inf")
+            setOption("hwdec", hwdec)
+            setOption("loop-file", if (loop) "inf" else "no")
             setLogLevel("info")
         }.also { players += it }
 
@@ -235,6 +279,8 @@ class MpvPlayerDeviceTest {
         }
 
         fun awaitEvent(what: String, matches: (MpvEvent) -> Boolean) = await(what) { events.any(matches) }
+
+        fun countEvents(matches: (MpvEvent) -> Boolean): Int = lock.withLock { events.count(matches) }
 
         fun awaitChange(what: String, matches: (PropertyChange) -> Boolean) = await(what) { changes.any(matches) }
 

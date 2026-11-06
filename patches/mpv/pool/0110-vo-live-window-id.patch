@@ -6,7 +6,7 @@ diff --git a/player/command.c b/player/command.c
 index e75d144..fe22c09 100644
 --- a/player/command.c
 +++ b/player/command.c
-@@ -7982,6 +7982,13 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
+@@ -7982,6 +7982,19 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
          mpctx->ipc_ctx = mp_init_ipc(mpctx->clients, mpctx->global);
      }
  
@@ -15,6 +15,12 @@ index e75d144..fe22c09 100644
 +    {
 +        // The VO moved to the new window itself; nothing to rebuild.
 +        flags &= ~(uint64_t)UPDATE_VO;
++        // Except the paused picture: it went to the old window, and a VO
++        // that hands its frames to the window cannot present it again. The
++        // rebuild below re-decoded it with its seek; do the same, paused only,
++        // since playback brings the next frame to the new window by itself.
++        if (opts->pause && mpctx->current_track[0][STREAM_VIDEO])
++            queue_seek(mpctx, MPSEEK_RELATIVE, 0.0, MPSEEK_EXACT, 0);
 +    }
 +
      if (flags & UPDATE_VO && mpctx->video_out) {
@@ -24,13 +30,15 @@ diff --git a/video/out/vo.h b/video/out/vo.h
 index a34324e..17d96c4 100644
 --- a/video/out/vo.h
 +++ b/video/out/vo.h
-@@ -123,6 +123,11 @@ enum mp_voctrl {
+@@ -123,6 +123,13 @@ enum mp_voctrl {
      /* private to vo_gpu and vo_gpu_next */
      VOCTRL_EXTERNAL_RESIZE,
  
 +    // --wid changed at runtime. A VO that can repoint its output at the new
 +    // window without being recreated does so and returns VO_TRUE; anything
-+    // else makes the core rebuild the video output as before.
++    // else makes the core rebuild the video output as before. Paused, the
++    // core then re-decodes the current frame: the VO need not keep it for
++    // the new window.
 +    VOCTRL_SET_WINDOW_ID,               // int64_t*
 +
      // Begin VO dragging.
