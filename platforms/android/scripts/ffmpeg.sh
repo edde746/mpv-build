@@ -38,3 +38,12 @@ cpuflags=
 
 make -j$cores
 make DESTDIR="$prefix_dir" install
+
+# libdovi.sh keeps libdovi's Rust runtime intrinsics to itself; a library
+# that still carries them took memcpy & co. from Rust's generic routines.
+for lib in "$prefix_dir"/lib/lib{avcodec,avdevice,avfilter,avformat,avutil,swresample,swscale}.so; do
+	if llvm-nm "$lib" | grep compiler_builtins >/dev/null; then
+		echo >&2 "$lib links Rust's compiler_builtins (see libdovi.sh)"
+		exit 1
+	fi
+done

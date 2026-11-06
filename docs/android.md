@@ -33,7 +33,12 @@ bash platforms/android/package.sh --arch arm64   # -> dist/release/libmpv-androi
 - libdovi comes from the pinned dovi_tool source, built with `cargo --locked`
   and the Rust version in `toolchain/android.txt`;
   `platforms/android/scripts/libdovi.sh` installs that toolchain and the ABI's
-  target.
+  target. It then makes every symbol of the staticlib that compiler-rt or libc
+  also defines (Rust's `compiler_builtins`: `__aeabi_memcpy` & co., 64-bit
+  division, float conversions) local to the archive, so FFmpeg, which links
+  `-ldovi` into each of its libraries, takes memcpy and friends from bionic
+  and not from Rust's generic loops; `scripts/ffmpeg.sh` fails the build when
+  an FFmpeg library still carries `compiler_builtins`.
 - `download.sh` fetches and patches each source with
   `scripts/patches.py fetch-pinned` (see [Patches](../README.md#patches)), so
   an unreachable host is retried and then replaced by the pin's `mirror`. It

@@ -36,4 +36,24 @@ cargo "+$rust_version" rustc --locked --release \
 	-- -C panic=abort -C relocation-model=pic
 mkdir -p "$prefix_dir/lib" "$prefix_dir/include/libdovi"
 install -m644 "target/$rust_triple/release/libdolby_vision.a" "$prefix_dir/lib/libdovi.a"
+# The staticlib carries Rust's compiler_builtins, which defines the C
+# runtime's own intrinsics: on 32-bit arm __aeabi_memcpy & co. (a
+# word-at-a-time loop), 64-bit division and float conversions. ffmpeg.sh
+# links -ldovi into every FFmpeg library ahead of the NDK's compiler-rt and
+# libc, so on armeabi-v7a those libraries took memcpy, memmove and memset
+# from that loop instead of bionic's NEON routines. Keep every symbol that
+# compiler-rt or libc also defines local to the archive: libdovi's own
+# references and FFmpeg's then bind to the toolchain's, which every link
+# has without asking. (Not libm's: libdovi also defines floor, fmod & co.,
+# and localizing them would leave libdovi needing -lm, which FFmpeg's
+# configure probe for -ldovi does not pass.) llvm-nm prints the stub's
+# dynamic symbols with their version, memcpy@@LIBC: drop it to compare.
+{
+	llvm-nm --defined-only --extern-only --format=just-symbols "$($CC -rtlib=compiler-rt -print-libgcc-file-name)"
+	llvm-nm --dynamic --defined-only --format=just-symbols "$($CC -print-file-name=libc.so)"
+} | ${SED:-sed} 's/@.*//; /:$/d; /^$/d' | LC_ALL=C sort -u >"target/$rust_triple/toolchain-symbols.txt"
+llvm-nm --defined-only --extern-only --format=just-symbols "$prefix_dir/lib/libdovi.a" \
+	| ${SED:-sed} '/:$/d; /^$/d' | LC_ALL=C sort -u \
+	| LC_ALL=C comm -12 - "target/$rust_triple/toolchain-symbols.txt" >"target/$rust_triple/localize-symbols.txt"
+llvm-objcopy --localize-symbols="target/$rust_triple/localize-symbols.txt" "$prefix_dir/lib/libdovi.a"
 install -m644 ../../include/libdovi/rpu_parser.h "$prefix_dir/include/libdovi/rpu_parser.h"
