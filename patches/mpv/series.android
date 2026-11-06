@@ -28,3 +28,4 @@
 0144-ao-audiotrack-resume-the-clock-when-the-passthrough-head-moves.patch
 0145-vo-mediacodec-present-a-delayed-osd-plane-on-every-frame.patch
 0146-vo-mediacodec-draw-a-reused-ass-atlas-from-its-texture.patch
+0150-ao-audiotrack-wait-instead-of-writing-nothing.patch

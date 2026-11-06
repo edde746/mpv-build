@@ -222,7 +222,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_timebase_servo.sh` | the timebase servo and rate decisions | main |
 | `test_audio_passthrough_fallback.sh` | the player's AO failure handling and PCM fallback (patch 0040) | PR |
 | `test_audio_reload_held_frame.sh` | an AO reload with a held frame still opens the next AO (patch 0034) | PR, main |
-| `test_audiotrack_timing.sh` | AudioTrack clock, writes, passthrough, recreate retry, stream silence, pause, the passthrough resume and the core's resume clock (patch 0144) | PR, main |
+| `test_audiotrack_timing.sh` | AudioTrack clock, writes, passthrough, recreate retry, stream silence, pause, the passthrough resume and the core's resume clock (patch 0144), and a track whose core has no audio waiting instead of writing nothing (0150) | PR, main |
 | `test_audiotrack_truehd.sh [media]` | raw TrueHD reassembly from IEC 61937 MAT bursts (needs host ffmpeg) | PR |
 | `test_av_log_routing.sh` | FFmpeg log lines reach the mpv instance that logged them (patch 0209) | PR, main |
 | `test_demux_codec_profile.sh` | demuxer-published codec profile matches the decoder's (patch 0204) | PR, main |

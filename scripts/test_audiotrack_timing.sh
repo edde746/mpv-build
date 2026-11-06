@@ -3,11 +3,12 @@
 # them with deterministic JNI delays: passthrough and PCM clocks, startup,
 # E-AC3 counter wrap, partial writes across stop/reset/recreation, DTS-HD
 # unwrapping, a stalled raw TrueHD track demoting to decode, the 3 s recreate
-# retry, audio-stream-silence feeding and stand-down, and pause/resume without
-# a flush, with a passthrough resume held until the playhead moves and the
-# core's clock (buffer.c) restarted once it returns. Pass an already-patched
-# mpv tree for offline use; otherwise fetch and patch the pinned source in a
-# temporary directory. No Android device is needed.
+# retry, audio-stream-silence feeding and stand-down, a playing track whose
+# core has no audio waiting (backing off to 50 ms) instead of writing nothing,
+# and pause/resume without a flush, with a passthrough resume held until the
+# playhead moves and the core's clock (buffer.c) restarted once it returns.
+# Pass an already-patched mpv tree for offline use; otherwise fetch and patch
+# the pinned source in a temporary directory. No Android device is needed.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

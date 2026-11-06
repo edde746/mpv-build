@@ -1,0 +1,63 @@
+Subject: [PATCH] ao_audiotrack: wait for the core's audio instead of writing nothing
+
+When the core has no audio for a playing track, ao_read_data returns 0
+and the worker wrote that: AudioTrack.write(..., 0) returns at once, so
+the worker went round again with no wait - getPlayState, the latency
+query, the read, ByteBuffer.clear and the write, a spin of JNI calls on
+a full core for as long as the core had nothing. That is every file
+whose audio ends before its video (the core leaves the AO streaming at
+audio EOF and never stops it) and every underrun the core does not
+pause the AO for. On a file with 8 s of audio and 40 s of video the
+ao/audiotrack thread ran 87-91 % of a core after the audio ended: a
+Pixel 7 drew 2.47 W instead of 0.47 W, a SEI box ran 2122 Mcycles/s
+instead of 333.
+
+The worker now waits on its condition instead, from KA_POLL_NS doubling
+to KA_IDLE_NS while the core stays empty (18 wakeups/s at audio EOF), and
+from the first wait again once audio flows. A seek, a resume or a
+reopen goes through start(), which signals the worker at once; only an
+underrun the core recovers from without one waits for the poll, against
+a track that holds at least half a second. TrueHD groups that are
+complete in the reassembly still go out. Steady playback, stream
+silence and padded feeding are unchanged.
+
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -246,6 +246,7 @@
+                                    // the silence; stand the track down
+     bool ka_stood_down;         // paused and empty until the core has audio
+     int64_t ka_wait_ns;         // the next poll for audio while paused (KA_IDLE_NS)
++    int64_t idle_wait_ns;       // the next poll for the core's audio while it has none
+     int64_t ka_feed_started_ns;
+     unsigned ka_feed_units;
+     uint32_t ka_head_seen;      // raw head at the last poll
+@@ -3673,8 +3674,29 @@
+                 // A PCM track stood down, and the core still has nothing:
+                 // its padding is not written to the paused track.
+                 AudioTrack_waitForAudio(ao);
++                continue;
++            } else if (!len && !write_pending(p) && !padded &&
++                       !(p->raw_passthrough && ao->format == AF_FORMAT_S_TRUEHD &&
++                         p->thd_complete >= THD_GROUP_UNITS)) {
++                // The core has no audio for the track (the audio ended before
++                // the video, or an underrun the core did not pause the AO
++                // for), and nothing is held for it. A zero-length write
++                // returns at once, so writing it would turn the worker into a
++                // spin of JNI calls for as long as the core has nothing. Wait
++                // instead, from KA_POLL_NS doubling up to KA_IDLE_NS while
++                // the core stays empty: a pull driver is not told when audio
++                // arrives (ao_start leaves a streaming driver alone), so the
++                // wait bounds how late audio after an underrun is written,
++                // against a track that holds at least half a second. A seek,
++                // a resume or a reopen calls start(), which signals the
++                // worker at once. TrueHD groups that are complete in the
++                // reassembly still go out (AudioTrack_thdGroup).
++                const int64_t wait = MPCLAMP(p->idle_wait_ns, KA_POLL_NS, KA_IDLE_NS);
++                mp_cond_timedwait(&p->wakeup, &p->lock, wait);
++                p->idle_wait_ns = MPMIN(wait * 2, KA_IDLE_NS);
+                 continue;
+             } else {
++                p->idle_wait_ns = 0;
+                 if (padded) {
+                     AudioTrack_keepAlivePad(ao);
+                 } else if (p->ka_enabled || p->ka_pad_silence) {
