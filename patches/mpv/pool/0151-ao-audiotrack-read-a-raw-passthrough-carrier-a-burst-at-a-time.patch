@@ -1,0 +1,66 @@
+Subject: [PATCH] ao_audiotrack: read a raw passthrough carrier a burst at a time
+
+A raw passthrough track read the IEC 61937 carrier in pieces of the
+doubled driver minimum: 3848 bytes on a SEI Box R 4K Plus, against an
+E-AC-3 burst of 24576 (one 1536-sample frame at 4x the rate, padded).
+So the worker took about six passes per frame, ~200 a second, each
+with the play state and playhead queries, and on a direct track
+getPlaybackHeadPosition is a binder call into AudioFlinger
+(AudioSystem::getRenderPosition). The parser then walked the padding a
+word at a time. Profiled on that box, ao/audiotrack was 19 % of the
+app's cycles, and passthrough cost more than decoding the E-AC-3.
+
+A raw track now reads at least one burst per pass (ka_default_burst,
+the unit a stream-silence track already reads in), and the parser skips
+padding with memchr to the next byte that can open Pa. The core's
+queue in front of a raw track is a second (RAW_QUEUE_FLOOR_S), so a
+burst-sized read is no underrun trip-wire. Full-carrier DTS keeps its
+word scan (its sync words have no preamble). TrueHD reads a MAT burst
+per pass as before.
+
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -1952,6 +1952,19 @@
+     int out = 0;
+ 
+     for (int i = 0; i < len;) {
++        if (p->raw_state == RAW_SYNC_PA && !p->raw_have_byte &&
++            ao->format != AF_FORMAT_S_DTS) {
++            // Between bursts the carrier is padding: jump to the next word
++            // whose low byte can open Pa (0xF872, little-endian) instead of
++            // parsing it a word at a time. Full-carrier DTS has no preamble
++            // and keeps the word scan for its sync words.
++            const uint8_t *q = src + i;
++            while ((q = memchr(q, 0x72, len - (q - src))) && ((q - src) - i) & 1)
++                q++;
++            i = q ? (int)(q - src) : len - ((len - i) & 1);
++            if (i == len)
++                break;
++        }
+         if (!p->raw_have_byte) {
+             p->raw_byte = src[i++];
+             p->raw_have_byte = true;
+@@ -4149,11 +4162,19 @@
+     const int bps = af_fmt_to_bytes(ao->format);
+     if (p->raw_passthrough) {
+         // getMinBufferSize answers in bitstream bytes for raw encodings. The
+-        // budget is depth, not granularity: each write stays one doubled
+-        // driver minimum of carrier data, as before (a stream-silence
+-        // track's is cut to one burst, AudioTrack_initKeepAlive).
++        // budget is depth, not granularity. A read takes the carrier a whole
++        // burst at a time (or the doubled driver minimum where that is
++        // more): each burst holds one codec frame and padding up to its
++        // period, so a smaller read is mostly padding, and every pass costs
++        // the play state and playhead queries - on a direct track the head
++        // is a binder call into AudioFlinger (getRenderPosition). With the
++        // doubled minimum (3848 bytes on a SEI box) an E-AC-3 stream took
++        // ~6 passes per frame, ~200 a second, and its passthrough cost more
++        // than decoding it. A stream-silence track's read is one burst too
++        // (AudioTrack_initKeepAlive), and the core's queue in front of a raw
++        // track is a second (RAW_QUEUE_FLOOR_S), so a burst is no trip-wire.
+         const int budget = raw_buffer_budget(ao->format);
+-        p->chunksize = MP_ALIGN_UP(buffer_size * 2, bps);
++        p->chunksize = MP_ALIGN_UP(MPMAX(buffer_size * 2, ka_default_burst(ao->format)), bps);
+         if (ao->format == AF_FORMAT_S_TRUEHD) {
+             // Units arrive a MAT frame at a time and leave in whole groups;
+             // read one burst per pass.
