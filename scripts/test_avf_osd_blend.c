@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MPMIN(a, b) ((a) > (b) ? (b) : (a))
+
 #include "avf_osd_blend.inc"
 
 static int failures;
@@ -104,6 +106,49 @@ int main(void)
         free(mask);
     }
     check(kernel_ok, "the NEON kernel matches the scalar one on libass-like masks");
+
+    // The premultiplied BGRA blend: every source alpha, source channel and
+    // destination value (the scalar one shortcuts an opaque source and an
+    // empty destination; the kernel must give what those give).
+    bool over_ok = true;
+    for (unsigned sa = 0; sa < 256 && over_ok; sa++) {
+        for (unsigned c = 0; c < 256; c++) {
+            uint32_t src[256], want[256], got[256];
+            for (unsigned d = 0; d < 256; d++) {
+                src[d] = sa << 24 | c << 16 | c << 8 | c;
+                // The empty destination in a lane of its own, and one whose
+                // alpha alone is set.
+                want[d] = got[d] = d * 0x01010101u ^ (d == 7 ? 0x07000000u : 0);
+            }
+            blend_bgra_over_bgra_scalar((uint8_t *)want, 256 * 4, (uint8_t *)src, 256 * 4, 256, 1);
+            blend_bgra_over_bgra_neon((uint8_t *)got, 256 * 4, (uint8_t *)src, 256 * 4, 256, 1);
+            over_ok &= !memcmp(want, got, sizeof(want));
+        }
+    }
+    check(over_ok, "the BGRA-over-BGRA kernel matches the scalar one for every alpha, channel and destination");
+
+    // And on random premultiplied bitmaps with transparent and opaque runs.
+    bool over_kernel_ok = true;
+    for (int it = 0; it < 2000 && over_kernel_ok; it++) {
+        int w = 8 * (1 + rand() % 100), h = 1 + rand() % 60, ss = w * 4 + 16 * (rand() % 3);
+        uint8_t *bmp = malloc((size_t)ss * h);
+        for (int i = 0; i < ss * h; i += 4) {
+            int k = rand() % 4;
+            unsigned al = k == 0 ? 0 : k == 1 ? 255 : rand() & 255;
+            bmp[i + 3] = al;
+            for (int ch = 0; ch < 3; ch++)
+                bmp[i + ch] = al ? rand() % (al + 1) : 0;
+        }
+        for (int i = 0; i < STRIDE * H; i++)
+            ref[i] = neon[i] = rand() % 3 ? rand() : 0;
+        int x0 = rand() % (W - w + 1), y0 = rand() % (H - h + 1);
+        size_t off = (size_t)y0 * STRIDE + (size_t)x0 * 4;
+        blend_bgra_over_bgra_scalar(ref + off, STRIDE, bmp, ss, w, h);
+        blend_bgra_over_bgra_neon(neon + off, STRIDE, bmp, ss, w, h);
+        over_kernel_ok = !memcmp(ref, neon, STRIDE * H);
+        free(bmp);
+    }
+    check(over_kernel_ok, "the BGRA-over-BGRA kernel matches the scalar one on random bitmaps");
     free(ref);
     free(neon);
 

@@ -214,8 +214,8 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_dovi_profile5_rpu.sh` | which frames vo_avfoundation uploads with their Dolby Vision RPU | main |
 | `test_avf_host_present.sh` | host-mode frame stamps after a seek, and when a reset re-seeds the timebase | main |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
-| `test_avf_osd_blend.sh` | the OSD's NEON libass blend matches its scalar reference bit for bit (patch 0043; aarch64 host) | main |
-| `test_avf_osd_dirty_set.sh` | each overlay buffer's next clear covers everything last drawn into it (patch 0043) | main |
+| `test_avf_osd_blend.sh` | the OSD's NEON blends, libass masks and premultiplied BGRA, match their scalar references bit for bit (patch 0043; aarch64 host) | main |
+| `test_avf_osd_damage.sh` | an overlay buffer drawn by tile, whatever it held, ends up exactly as a full clear and blend of the frame (patch 0048) | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
 | `test_avf_shader_target.sh` | the size vo_avfoundation renders `--glsl-shaders` at, and the part of the frame that fills it, per display-layer gravity | main |

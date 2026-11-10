@@ -101,8 +101,8 @@ jobs:
       - name: Test AVFoundation subtitle wait policy
         run: ./scripts/test_avf_osd_ahead.sh
 
-      - name: Test AVFoundation OSD canvas dirty set
-        run: ./scripts/test_avf_osd_dirty_set.sh
+      - name: Test AVFoundation OSD canvas damage
+        run: ./scripts/test_avf_osd_damage.sh
 
       - name: Test AVFoundation OSD blend kernel
         run: ./scripts/test_avf_osd_blend.sh

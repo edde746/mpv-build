@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Compile vo_avfoundation's per-buffer OSD dirty set (the marked "avf osd
-# dirty set" region, patch 0043) VERBATIM from the final Apple series. Pass an
+# Compile vo_avfoundation's per-buffer OSD damage (the marked "avf osd damage"
+# region, patch 0048) VERBATIM from the final Apple series. Pass an
 # already-patched mpv tree for offline use; otherwise fetch and patch the
 # pinned source.
 set -euo pipefail
@@ -17,9 +17,9 @@ if [[ -z "$source_dir" ]]; then
 fi
 
 python3 "$root/scripts/extract.py" region "$source_dir/video/out/vo_avfoundation.m" \
-    "$workdir/avf_osd_dirty_set.inc" --start "avf osd dirty set" \
-    --require "avf_dirty_add" --require "avf_dirty_pixels"
+    "$workdir/avf_osd_damage.inc" --start "avf osd damage" \
+    --require "avf_sig_add" --require "avf_damage_apply"
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
-    -o "$workdir/test" "$root/scripts/test_avf_osd_dirty_set.c"
+    -o "$workdir/test" "$root/scripts/test_avf_osd_damage.c"
 "$workdir/test"

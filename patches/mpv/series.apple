@@ -24,8 +24,8 @@
 0040-ao-decode-the-playing-track-to-pcm-when-passthrough-fails.patch
 0041-avfoundation-say-when-avplayer-never-asked-for-the-stream.patch
 0042-avfoundation-anchor-the-passthrough-clock-to-the-playhead.patch
-# OSD canvas: per-buffer dirty rects instead of a union, and a cheaper exact
-# libass blend (tests test_avf_osd_{dirty_set,blend}.sh).
+# OSD canvas: a cheaper exact libass blend (test_avf_osd_blend.sh). Its
+# per-buffer dirty rects are replaced by 0048.
 0043-avfoundation-clear-and-blend-the-osd-canvas-for-less.patch
 # vo_avfoundation takes a frame early on a wakeup the player makes anyway,
 # instead of on VO timers of its own (--avfoundation-queue-slack-ms, off).
@@ -36,3 +36,7 @@
 # and vo_avfoundation waits for the main thread once, not seven times.
 0046-player-first-video-frame-before-the-audio-output-opens.patch
 0047-avfoundation-one-main-thread-trip-to-set-up.patch
+# OSD canvas: a frame clears and blends only the 32 px tiles of its buffer
+# that it changes, and copies from the previous canvas what that one already
+# holds (common 0234's pixel ids; test_avf_osd_damage.sh).
+0048-avfoundation-redraw-only-the-canvas-tiles-a-frame-changes.patch

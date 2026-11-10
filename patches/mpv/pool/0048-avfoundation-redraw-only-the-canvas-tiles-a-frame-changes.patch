@@ -1,0 +1,912 @@
+vo_avfoundation: redraw only the canvas tiles a frame changes
+
+Every frame of subtitles that differed from the last was cleared and
+blended whole into its overlay buffer. Measured on an iPhone Air (2736x1260
+canvas, counters and a pixel comparison of every canvas with the one before
+it): a typeset frame clears 0.8-1.5 Mpx and walks 0.9-1.7 Mpx of bitmap
+rectangles, while 0.016-0.063 Mpx of it differ from the previous canvas,
+inside 3-5 % of its 32 px tiles. The per-buffer dirty rects of 0043 bound
+the clear by the rectangles last drawn, which are mostly empty and get
+merged: 4.3x the covered pixels were cleared, 13.7 % of the process.
+
+The canvas is cut into 32 px tiles. A tile's signature folds in, in drawing
+order, every part that reaches into it: the id of its pixels (common 0234;
+without one the item's change id and the part's place in it), its place,
+size and color. Each pool buffer remembers the signatures of what it holds
+(the buffers are recycled with their contents), and a frame drawn into it
+leaves alone every tile whose signature repeats, copies from the previous
+canvas the tiles that one already holds, and clears and blends the rest,
+each part clipped to them. Tile rows that need the same treatment are done
+as one band. Every pixel of a redrawn tile gets the same blends in the same
+order as before, so the buffer ends up bit for bit as a full clear and a
+full blend leave it. A frame with a part that needs scaling (CoreGraphics)
+is still drawn whole. avf_dirty_set and its test are gone; the composite
+modes go through the same path.
+
+scripts/test_avf_osd_damage.sh drives the marked region verbatim against a
+model pool (rotations of 1-6 buffers, evicted entries, moving, changing and
+static parts, cut tiles): every buffer equals a full redraw. Clipping moves
+pixels between the NEON kernels and their scalar tails, so
+test_avf_osd_blend.sh now also checks the BGRA-over-BGRA kernel against its
+scalar reference for every alpha, channel and destination value.
+
+A buffer whose contents are unknown (new to the pool, as every buffer of
+plain dialogue is: the pool frees them after a second) is cleared whole in
+one piece and is blank from there. One 13.8 MB memset runs about three
+times as fast per byte as the same canvas cleared band by band around the
+subtitles (0.6 ms against 1.1-1.4 ms a canvas), which first cost real plain
+dialogue 2.5 % (3.82 -> 3.92 % of a core, n = 6).
+
+iPhone Air, vo=avfoundation, interleaved with the unpatched build, 30 s
+windows, median (range), no dropped frame in any run:
+  anime-ass.mkv (synthetic typesetting)  14.75 (14.72-14.80) -> 9.55
+    (9.48-9.57) % of a core, CPU energy 8.70 -> 5.03 mJ/s (n = 3)
+  a real opening (komi11, 72 bitmaps)    13.88 (13.75-13.90) -> 12.54
+    (12.51-12.58) %, 7.84 -> 6.97 mJ/s (n = 3; libass and the atlas are
+    the rest)
+  real plain dialogue                    3.82 (3.79-3.97) -> 3.82 (3.81-3.95) %
+  synthetic plain dialogue               3.40 (3.37-3.44) -> 3.39 (3.34-3.42) %
+    (n = 6 each)
+  no subtitles                           3.25 -> 3.24 %
+Footprints equal. With a build that compares every canvas in process with
+a full clear and blend of the same items, 20 runs (five fixtures, both
+apps' option sets, with and without 0049's option; each pauses, seeks,
+plays into the end, reloads, switches the subtitles off and on and has its
+layer rotated, resized and set back) differ in 0 pixels of about 4400
+canvases; paused screenshots against the unpatched build are identical in
+12 of 12 pairs, plain, after a resize and after a rotation and back.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index b541510..2226a2f 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -68,80 +68,166 @@ struct avf_osd_canvas {
+     struct mp_osd_res res;
+ };
+ 
+-// --- avf osd dirty set (host-testable; keep freestanding)
+-// What one overlay buffer had drawn into it, as a few rects rather than
+-// their union: a sign at the top and dialogue at the bottom would otherwise
+-// clear the whole canvas between them. Rects merge only when clearing the
+-// merged box costs no more than clearing both, so the set never clears more
+-// than the parts covered plus their overlaps; once full, the merge that
+-// grows the cleared area least makes room.
+-#define AVF_OSD_DIRTY_MAX 16
+-
+-struct avf_dirty_set {
+-    int num;  // -1: contents unknown, clear everything
+-    struct mp_rect r[AVF_OSD_DIRTY_MAX];
+-};
++// --- avf osd damage (host-testable; keep freestanding)
++// Which pixels of an overlay buffer a frame's subtitles change. The canvas
++// is cut into AVF_TILE x AVF_TILE tiles, and a tile's signature folds in,
++// in drawing order, every part that reaches into it: an id of its pixels,
++// its place, its size and its color. Equal signatures mean equal pixels; 0
++// means nothing is drawn there. Pool buffers come back with their contents,
++// so each remembers the signatures of what it holds, and the next frame
++// drawn into it touches only the tiles whose signature differs: the rest is
++// neither cleared nor blended again (the sign that stays under a karaoke
++// line, the line but for the syllable that changes). Of the tiles that do
++// differ, one the previous canvas already holds is copied from it. A tile
++// that is redrawn gets every part over it blended in order, clipped to it,
++// which is what a full redraw does to those pixels: the buffer ends up, bit
++// for bit, as a full clear and a full blend would leave it.
++
++#define AVF_TILE 32
++// Tiles across the widest canvas handled by tile; a wider one is redrawn whole.
++#define AVF_DAMAGE_MAX_TILES_X 512
+ 
+-static int64_t avf_rect_area(struct mp_rect r)
++static int avf_tiles(int px)
+ {
+-    return (int64_t)(r.x1 - r.x0) * (r.y1 - r.y0);
++    return (px + AVF_TILE - 1) / AVF_TILE;
+ }
+ 
+-static struct mp_rect avf_rect_bounds(struct mp_rect a, struct mp_rect b)
++static uint64_t avf_sig_mix(uint64_t h, uint64_t v)
+ {
+-    return (struct mp_rect){MPMIN(a.x0, b.x0), MPMIN(a.y0, b.y0),
+-                            MPMAX(a.x1, b.x1), MPMAX(a.y1, b.y1)};
++    h = (h ^ v) * UINT64_C(0x9E3779B97F4A7C15);
++    return h ^ (h >> 29);
+ }
+ 
+-static void avf_dirty_add(struct avf_dirty_set *s, struct mp_rect r)
++// Fold a part, identified by key, drawn on r into the signatures of the
++// tiles it reaches. r lies inside the canvas and is not empty.
++static void avf_sig_add(uint64_t *sig, int tiles_x, struct mp_rect r, uint64_t key)
+ {
+-    if (s->num < 0 || r.x1 <= r.x0 || r.y1 <= r.y0)
+-        return;
+-    for (;;) {
+-        // Absorb every rect that is cheaper to clear as one box with r; the
+-        // grown box may reach further ones, so rescan after each merge.
+-        for (int i = 0; i < s->num; i++) {
+-            struct mp_rect u = avf_rect_bounds(s->r[i], r);
+-            if (avf_rect_area(u) <= avf_rect_area(s->r[i]) + avf_rect_area(r)) {
+-                r = u;
+-                s->r[i] = s->r[--s->num];
+-                i = -1;
+-            }
++    for (int ty = r.y0 / AVF_TILE; ty <= (r.y1 - 1) / AVF_TILE; ty++) {
++        for (int tx = r.x0 / AVF_TILE; tx <= (r.x1 - 1) / AVF_TILE; tx++) {
++            uint64_t s = avf_sig_mix(sig[ty * tiles_x + tx], key);
++            sig[ty * tiles_x + tx] = s ? s : 1;
+         }
+-        if (s->num < AVF_OSD_DIRTY_MAX)
+-            break;
+-        int best = 0;
+-        int64_t best_cost = INT64_MAX;
+-        for (int i = 0; i < s->num; i++) {
+-            int64_t cost = avf_rect_area(avf_rect_bounds(s->r[i], r)) -
+-                           avf_rect_area(s->r[i]);
+-            if (cost < best_cost) {
+-                best_cost = cost;
+-                best = i;
+-            }
+-        }
+-        r = avf_rect_bounds(s->r[best], r);
+-        s->r[best] = s->r[--s->num];
+     }
+-    s->r[s->num++] = r;
+ }
+ 
+-// Pixels a clear of s touches on a w x h canvas.
+-static int64_t avf_dirty_pixels(const struct avf_dirty_set *s, int w, int h)
+-{
+-    if (s->num < 0)
+-        return (int64_t)w * h;
+-    int64_t px = 0;
+-    for (int i = 0; i < s->num; i++) {
+-        struct mp_rect r = s->r[i];
+-        int x0 = MPCLAMP(r.x0, 0, w), x1 = MPCLAMP(r.x1, 0, w);
+-        int y0 = MPCLAMP(r.y0, 0, h), y1 = MPCLAMP(r.y1, 0, h);
+-        if (x1 > x0 && y1 > y0)
+-            px += (int64_t)(x1 - x0) * (y1 - y0);
++enum {
++    AVF_TILE_KEEP,      // the buffer holds what is wanted
++    AVF_TILE_COPY,      // the previous canvas holds it
++    AVF_TILE_CLEAR,     // nothing is wanted where something is
++    AVF_TILE_DRAW,      // the buffer is empty there: blend
++    AVF_TILE_REDRAW,    // clear, then blend
++};
++
++struct avf_damage_ops {
++    void *ctx;
++    void (*clear)(void *ctx, struct mp_rect r);
++    void (*copy)(void *ctx, struct mp_rect r);  // from the previous canvas
++    void (*draw)(void *ctx, struct mp_rect r);  // the frame's parts, clipped to r
++};
++
++// Pixels each operation covered.
++struct avf_damage_px {
++    int64_t cleared, copied, drawn;
++};
++
++// have NULL: the buffer is blank (avf_damage_apply cleared it whole).
++static int avf_tile_op(const uint64_t *have, const uint64_t *prev,
++                       const uint64_t *want, int i)
++{
++    uint64_t h = have ? have[i] : 0, w = want ? want[i] : 0;
++    if (h == w)
++        return AVF_TILE_KEEP;
++    if (w && prev && prev[i] == w)
++        return AVF_TILE_COPY;
++    if (!w)
++        return AVF_TILE_CLEAR;
++    return h ? AVF_TILE_REDRAW : AVF_TILE_DRAW;
++}
++
++// One band of tile rows, y0 to y1, that all need op[] across.
++static void avf_damage_band(const uint8_t *op, int tiles_x, int w, int y0, int y1,
++                            const struct avf_damage_ops *ops,
++                            struct avf_damage_px *px)
++{
++    for (int tx = 0; tx < tiles_x;) {
++        int o = op[tx], e = tx + 1;
++        bool draws = o >= AVF_TILE_DRAW;
++        while (e < tiles_x && (draws ? op[e] >= AVF_TILE_DRAW : op[e] == o))
++            e++;
++        struct mp_rect r = {tx * AVF_TILE, y0, MPMIN(w, e * AVF_TILE), y1};
++        int64_t area = (int64_t)(r.x1 - r.x0) * (r.y1 - r.y0);
++        if (o == AVF_TILE_COPY) {
++            ops->copy(ops->ctx, r);
++            px->copied += area;
++        } else if (o == AVF_TILE_CLEAR) {
++            ops->clear(ops->ctx, r);
++            px->cleared += area;
++        } else if (draws) {
++            // Parts are blended over the whole run at once; the tiles of it
++            // that hold something are cleared first.
++            for (int k = tx; k < e;) {
++                int k1 = k + 1;
++                if (op[k] == AVF_TILE_REDRAW) {
++                    while (k1 < e && op[k1] == AVF_TILE_REDRAW)
++                        k1++;
++                    struct mp_rect c = {k * AVF_TILE, y0, MPMIN(w, k1 * AVF_TILE), y1};
++                    ops->clear(ops->ctx, c);
++                    px->cleared += (int64_t)(c.x1 - c.x0) * (c.y1 - c.y0);
++                }
++                k = k1;
++            }
++            ops->draw(ops->ctx, r);
++            px->drawn += area;
++        }
++        tx = e;
++    }
++}
++
++// Make a w x h buffer whose tiles hold `have` (NULL: contents unknown) hold
++// `want` (NULL: nothing), through ops. prev: what the canvas ops->copy reads
++// holds, NULL without one. Tile rows that need the same treatment across
++// are done as one band. A buffer of unknown contents is cleared whole, in
++// one piece (one large clear is several times faster per byte than the same
++// bytes row by row), and is blank from there.
++static void avf_damage_apply(const uint64_t *have, const uint64_t *prev,
++                             const uint64_t *want, int w, int h,
++                             const struct avf_damage_ops *ops,
++                             struct avf_damage_px *px)
++{
++    int tiles_x = avf_tiles(w), tiles_y = avf_tiles(h);
++    struct mp_rect all = {0, 0, w, h};
++    if (tiles_x > AVF_DAMAGE_MAX_TILES_X) {
++        ops->clear(ops->ctx, all);
++        ops->draw(ops->ctx, all);
++        px->cleared += (int64_t)w * h;
++        px->drawn += (int64_t)w * h;
++        return;
++    }
++    if (!have) {
++        ops->clear(ops->ctx, all);
++        px->cleared += (int64_t)w * h;
++    }
++    uint8_t band[AVF_DAMAGE_MAX_TILES_X], row[AVF_DAMAGE_MAX_TILES_X];
++    int band_y0 = 0, band_y1 = 0;
++    for (int ty = 0; ty <= tiles_y; ty++) {
++        if (ty < tiles_y) {
++            for (int tx = 0; tx < tiles_x; tx++)
++                row[tx] = avf_tile_op(have, prev, want, ty * tiles_x + tx);
++            if (band_y1 > band_y0 && !memcmp(row, band, tiles_x)) {
++                band_y1 = MPMIN(h, (ty + 1) * AVF_TILE);
++                continue;
++            }
++        }
++        if (band_y1 > band_y0)
++            avf_damage_band(band, tiles_x, w, band_y0, band_y1, ops, px);
++        if (ty < tiles_y) {
++            memcpy(band, row, tiles_x);
++            band_y0 = ty * AVF_TILE;
++            band_y1 = MPMIN(h, band_y0 + AVF_TILE);
++        }
+     }
+-    return px;
+ }
+-// --- end avf osd dirty set
++// --- end avf osd damage
+ 
+ // --- avf osd ahead policy
+ 
+@@ -536,32 +622,40 @@ struct priv {
+         int64_t wait_ns, wait_max_ns;
+     } ahead_perf;
+ 
+-    // Per-IOSurface dirty-rect tracking for partial OSD buffer clears. Pool
+-    // buffers are recycled with their previous contents intact and this code
+-    // is their only writer, so remembering what was last drawn into each
+-    // backing surface lets the clear touch just those rows instead of the
+-    // whole display-sized buffer. The CFRetain on the surface pins its
+-    // pointer so an entry can never alias a different (recycled) surface.
+-    // There must be an entry for every buffer the pool cycles through: the
+-    // layer holds a queue lead's worth of samples (8 at 60 fps with the
+-    // default 128 ms) plus the shown and the cached one, and a buffer whose
+-    // entry was evicted gets a full-canvas clear.
++    // What each overlay buffer of the pool holds, as tile signatures (the
++    // "avf osd damage" region). Pool buffers are recycled with their
++    // contents intact and this code is their only writer, so a frame drawn
++    // into one touches only the tiles it changes instead of the whole
++    // display-sized buffer. The CFRetain on the surface pins its pointer so
++    // an entry can never alias a different (recycled) surface. There must be
++    // an entry for every buffer the pool cycles through: the layer holds a
++    // queue lead's worth of samples (8 at 60 fps with the default 128 ms)
++    // plus the shown and the cached one, and a buffer whose entry was
++    // evicted is cleared and drawn whole.
+     struct osd_buf_state {
+-        IOSurfaceRef surf;          // CFRetained
+-        struct avf_dirty_set dirty; // drawn regions from the surface's last use
++        IOSurfaceRef surf;      // CFRetained
++        uint64_t *sig;          // osd_sig_tiles signatures of its contents
++        bool sig_known;         // false: contents unknown
+         int64_t last_used_ns;
+     } osd_buf_states[12];
+     int osd_buf_state_count;
++    // Signatures of the frame being drawn, and of cachedSubtitleBuffer while
++    // that is osd_sig_prev_buf: the canvas unchanged tiles are copied from.
++    uint64_t *osd_sig_want, *osd_sig_prev;
++    size_t osd_sig_tiles;
++    CVPixelBufferRef osd_sig_prev_buf;  // compared, never dereferenced
++    uint64_t osd_sig_salt;
+ 
+     // OSD performance counters; accumulation is unconditional (cheap),
+     // formatted output is gated on -v.
+     struct {
+         int renders, skipped, empty, frames;
+         int64_t total_ns, max_ns;
+-        int64_t clear_ns, blend_ns, cg_ns, bounds_ns;
+-        // Canvas clears: pixels cleared, and clears of a buffer whose
+-        // contents were unknown (new to the pool, or its entry evicted).
+-        int64_t clear_px;
++        int64_t clear_ns, copy_ns, blend_ns, cg_ns, bounds_ns;
++        // Canvas tiles: pixels cleared, copied from the previous canvas and
++        // blended over, and buffers whose contents were unknown (new to the
++        // pool, or their entry evicted) and so were done whole.
++        int64_t clear_px, copy_px, draw_px;
+         int clear_full;
+         int64_t enqueue_ns, video_sample_ns;
+         // Scheduling margin of enqueued OSD samples: sample PTS minus the
+@@ -2380,8 +2474,7 @@ static int clip_u10(double value)
+ 
+ // Union of the part destination rects, clamped to the OSD buffer. Both draw
+ // paths only write inside these rects, so this bounds everything non-blank
+-// without scanning the rendered pixels. drawn (optional) collects the rects
+-// themselves, for the buffer's next clear.
++// without scanning the rendered pixels.
+ static void reset_subtitle_bounds(struct priv *p)
+ {
+     p->subtitle_x0 = p->osd_w;
+@@ -2390,8 +2483,7 @@ static void reset_subtitle_bounds(struct priv *p)
+     p->subtitle_y1 = 0;
+ }
+ 
+-static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs,
+-                                   struct avf_dirty_set *drawn)
++static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs)
+ {
+     if (!imgs || p->osd_w <= 0 || p->osd_h <= 0)
+         return;
+@@ -2410,17 +2502,14 @@ static void extend_subtitle_bounds(struct priv *p, struct sub_bitmaps *imgs,
+         p->subtitle_y0 = MPMIN(p->subtitle_y0, r.y0);
+         p->subtitle_x1 = MPMAX(p->subtitle_x1, r.x1);
+         p->subtitle_y1 = MPMAX(p->subtitle_y1, r.y1);
+-        if (drawn)
+-            avf_dirty_add(drawn, r);
+     }
+ }
+ 
+ static void update_subtitle_bounds_from_parts(struct priv *p,
+-                                              struct sub_bitmaps *imgs,
+-                                              struct avf_dirty_set *drawn)
++                                              struct sub_bitmaps *imgs)
+ {
+     reset_subtitle_bounds(p);
+-    extend_subtitle_bounds(p, imgs, drawn);
++    extend_subtitle_bounds(p, imgs);
+ }
+ 
+ // Map mpv image format to the CVPixelBuffer format the frame is uploaded as.
+@@ -2450,8 +2539,8 @@ static bool create_sw_upload_pool(struct vo *vo, int w, int h, OSType format)
+ static void reset_osd_buf_states(struct priv *p)
+ {
+     for (int i = 0; i < p->osd_buf_state_count; i++) {
+-        if (p->osd_buf_states[i].surf)
+-            CFRelease(p->osd_buf_states[i].surf);
++        CFRelease(p->osd_buf_states[i].surf);
++        talloc_free(p->osd_buf_states[i].sig);
+     }
+     p->osd_buf_state_count = 0;
+ }
+@@ -2471,6 +2560,7 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
+     for (int i = 0; i < p->osd_buf_state_count;) {
+         if (osd_buf_state_stale(&p->osd_buf_states[i], now)) {
+             CFRelease(p->osd_buf_states[i].surf);
++            talloc_free(p->osd_buf_states[i].sig);
+             p->osd_buf_states[i] = p->osd_buf_states[--p->osd_buf_state_count];
+         } else {
+             i++;
+@@ -2478,6 +2568,8 @@ static void prune_osd_buf_states(struct priv *p, int64_t now)
+     }
+ }
+ 
++// The entry of buf's surface, with room for osd_sig_tiles signatures; a
++// surface new to this code gets one whose contents are unknown.
+ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+                                                    CVPixelBufferRef buf)
+ {
+@@ -2497,6 +2589,7 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+     // A surface new to this code usually replaces one the pool freed.
+     prune_osd_buf_states(p, now);
+     struct osd_buf_state *st;
++    uint64_t *sig = NULL;
+     if (p->osd_buf_state_count < (int)MP_ARRAY_SIZE(p->osd_buf_states)) {
+         st = &p->osd_buf_states[p->osd_buf_state_count++];
+     } else {
+@@ -2506,35 +2599,23 @@ static struct osd_buf_state *osd_buf_state_acquire(struct priv *p,
+                 st = &p->osd_buf_states[i];
+         }
+         CFRelease(st->surf);
++        sig = st->sig;
+     }
+     *st = (struct osd_buf_state){
+         .surf = (IOSurfaceRef)CFRetain(surf),
+-        // Contents unknown until this code has drawn into it: clear fully.
+-        .dirty = {.num = -1},
++        .sig = sig ? sig : talloc_array(p, uint64_t, p->osd_sig_tiles),
++        // Contents unknown until this code has drawn into it.
++        .sig_known = false,
+         .last_used_ns = now,
+     };
+     return st;
+ }
+ 
+-static void osd_buf_record_dirty(struct priv *p, CVPixelBufferRef buf,
+-                                 const struct avf_dirty_set *drawn)
+-{
+-    IOSurfaceRef surf = buf ? CVPixelBufferGetIOSurface(buf) : NULL;
+-    if (!surf)
+-        return;
+-    for (int i = 0; i < p->osd_buf_state_count; i++) {
+-        if (p->osd_buf_states[i].surf == surf) {
+-            p->osd_buf_states[i].dirty = *drawn;
+-            return;
+-        }
+-    }
+-}
+-
+ static bool create_osd_pool(struct vo *vo, int w, int h)
+ {
+     struct priv *p = vo->priv;
+-    // The pool is about to be recreated: its buffers (and their recorded
+-    // dirty state) are going away.
++    // The pool is about to be recreated: its buffers (and what is known of
++    // their contents) are going away.
+     if (p->osdPool && (p->osd_pool_w != w || p->osd_pool_h != h))
+         reset_osd_buf_states(p);
+     return create_pixel_buffer_pool(vo, &p->osdPool, &p->osd_pool_w,
+@@ -3195,146 +3276,141 @@ static CGImageRef render_subtitle_image(struct vo *vo, struct sub_bitmaps *imgs)
+     return result;
+ }
+ 
+-static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
+-{
+-    struct priv *p = vo->priv;
+-    int w = p->osd_w;
+-    int h = p->osd_h;
+-
+-    if (w <= 0 || h <= 0)
+-        return NULL;
+-
+-    if (!create_osd_pool(vo, w, h))
+-        return NULL;
+-
+-    CVPixelBufferRef pixbuf = NULL;
+-    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
+-        kCFAllocatorDefault, p->osdPool, &pixbuf);
+-
+-    if (status != kCVReturnSuccess || !pixbuf) {
+-        MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
+-        return NULL;
+-    }
+-
+-    CVPixelBufferLockBaseAddress(pixbuf, 0);
+-    void *base = CVPixelBufferGetBaseAddress(pixbuf);
+-    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
+-    if (!base || !stride) {
+-        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        CVPixelBufferRelease(pixbuf);
+-        return NULL;
+-    }
++// What the tile operations of one overlay buffer work on (avf_damage_ops).
++struct osd_tile_ctx {
++    struct priv *p;
++    uint8_t *base;              // the buffer being drawn
++    size_t stride;
++    const uint8_t *prev;        // the previous canvas, for copies
++    size_t prev_stride;
++    struct sub_bitmaps **items; // blended clipped; none when a part needs
++    int num_items;              // CoreGraphics and the frame is drawn whole
++};
+ 
++static void osd_tile_clear(void *ctx, struct mp_rect r)
++{
++    struct osd_tile_ctx *c = ctx;
+     int64_t t = mp_time_ns();
+-    struct osd_buf_state *st = osd_buf_state_acquire(p, pixbuf);
+-    struct avf_dirty_set full = {.num = -1};
+-    const struct avf_dirty_set *dirty = st ? &st->dirty : &full;
+-    p->perf.clear_px += avf_dirty_pixels(dirty, w, h);
+-    if (dirty->num < 0) {
+-        p->perf.clear_full++;
+-        memset(base, 0, stride * CVPixelBufferGetHeight(pixbuf));
+-    }
+-    for (int i = 0; i < dirty->num; i++) {
+-        struct mp_rect r = dirty->r[i];
+-        int x0 = MPCLAMP(r.x0, 0, w), x1 = MPCLAMP(r.x1, 0, w);
+-        int y0 = MPCLAMP(r.y0, 0, h), y1 = MPCLAMP(r.y1, 0, h);
+-        if (x1 <= x0 || y1 <= y0)
+-            continue;
+-        size_t span = (size_t)(x1 - x0) * 4;
+-        uint8_t *row = (uint8_t *)base + (size_t)y0 * stride + (size_t)x0 * 4;
+-        for (int y = y0; y < y1; y++) {
++    size_t span = (size_t)(r.x1 - r.x0) * 4;
++    uint8_t *row = c->base + (size_t)r.y0 * c->stride + (size_t)r.x0 * 4;
++    if (r.x0 == 0 && r.x1 == c->p->osd_w && r.y1 > r.y0) {
++        // Whole rows are one run of memory (with the padding between them).
++        memset(row, 0, c->stride * (size_t)(r.y1 - r.y0 - 1) + span);
++    } else {
++        for (int y = r.y0; y < r.y1; y++, row += c->stride)
+             memset(row, 0, span);
+-            row += stride;
+-        }
+     }
+-    if (st)
+-        st->dirty = (struct avf_dirty_set){0};
+-    p->perf.clear_ns += mp_time_ns() - t;
+-
+-    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-    return pixbuf;
++    c->p->perf.clear_ns += mp_time_ns() - t;
+ }
+ 
+-static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
+-                                                     struct sub_bitmaps *imgs)
++static void osd_tile_copy(void *ctx, struct mp_rect r)
+ {
+-    struct priv *p = vo->priv;
+-    int w = p->osd_w;
+-    int h = p->osd_h;
+-
+-    if (!imgs || imgs->num_parts == 0)
+-        return NULL;
+-
+-    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
+-    if (!pixbuf)
+-        return NULL;
+-
+-    CVPixelBufferLockBaseAddress(pixbuf, 0);
+-    void *base = CVPixelBufferGetBaseAddress(pixbuf);
+-    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
+-    if (!base || !stride) {
+-        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        CVPixelBufferRelease(pixbuf);
+-        return NULL;
+-    }
++    struct osd_tile_ctx *c = ctx;
++    int64_t t = mp_time_ns();
++    size_t span = (size_t)(r.x1 - r.x0) * 4;
++    uint8_t *dst = c->base + (size_t)r.y0 * c->stride + (size_t)r.x0 * 4;
++    const uint8_t *src = c->prev + (size_t)r.y0 * c->prev_stride + (size_t)r.x0 * 4;
++    for (int y = r.y0; y < r.y1; y++, dst += c->stride, src += c->prev_stride)
++        memcpy(dst, src, span);
++    c->p->perf.copy_ns += mp_time_ns() - t;
++}
+ 
++// Blend every part that reaches into r over it, in drawing order: for the
++// pixels of r, what drawing the parts whole does.
++static void osd_tile_draw(void *ctx, struct mp_rect r)
++{
++    struct osd_tile_ctx *c = ctx;
+     int64_t t = mp_time_ns();
+-    if (draw_subtitle_bitmaps_direct(p, base, stride, w, h, imgs)) {
+-        p->perf.blend_ns += mp_time_ns() - t;
+-        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        return pixbuf;
++    for (int n = 0; n < c->num_items; n++) {
++        struct sub_bitmaps *imgs = c->items[n];
++        bool mask = imgs->format == SUBBITMAP_LIBASS;
++        for (int i = 0; i < imgs->num_parts; i++) {
++            struct sub_bitmap *sb = &imgs->parts[i];
++            if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++                continue;
++            int x0 = MPMAX(sb->x, r.x0), x1 = MPMIN(sb->x + sb->w, r.x1);
++            int y0 = MPMAX(sb->y, r.y0), y1 = MPMIN(sb->y + sb->h, r.y1);
++            if (x1 <= x0 || y1 <= y0)
++                continue;
++            uint8_t *dst = c->base + (size_t)y0 * c->stride + (size_t)x0 * 4;
++            uint8_t *src = (uint8_t *)sb->bitmap +
++                (ptrdiff_t)(y0 - sb->y) * sb->stride +
++                (ptrdiff_t)(x0 - sb->x) * (mask ? 1 : 4);
++            if (mask) {
++                blend_libass_bgra(dst, c->stride, src, sb->stride, x1 - x0,
++                                  y1 - y0, sb->libass.color);
++            } else {
++                blend_bgra_over_bgra(dst, c->stride, src, sb->stride, x1 - x0,
++                                     y1 - y0);
++            }
++        }
+     }
+-
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+-    CGContextRef context = colorSpace ? CGBitmapContextCreate(
+-        base, w, h, 8, stride, colorSpace,
+-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+-    ) : NULL;
+-
+-    if (colorSpace)
+-        CGColorSpaceRelease(colorSpace);
+-
+-    if (!context) {
+-        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        CVPixelBufferRelease(pixbuf);
+-        return NULL;
++    c->p->perf.blend_ns += mp_time_ns() - t;
++}
++
++// The tile signatures of items on a w x h canvas, into sig (zeroed). Returns
++// whether every part can be blended directly, and so clipped to tiles. When
++// one needs scaling, CoreGraphics draws the frame whole: its signatures then
++// match no other frame's, so every tile it covers is cleared for it and
++// again after it.
++static bool osd_frame_signatures(struct priv *p, struct sub_bitmaps **items,
++                                 int num_items, int w, int h, uint64_t *sig)
++{
++    bool direct = true;
++    for (int n = 0; n < num_items; n++)
++        direct &= get_direct_osd_draw_path(items[n]) != AVF_OSD_DRAW_COREGRAPHICS;
++    uint64_t salt = direct ? 0 : ++p->osd_sig_salt;
++
++    int tiles_x = avf_tiles(w);
++    for (int n = 0; n < num_items; n++) {
++        struct sub_bitmaps *imgs = items[n];
++        bool mask = imgs->format == SUBBITMAP_LIBASS;
++        for (int i = 0; i < imgs->num_parts; i++) {
++            struct sub_bitmap *sb = &imgs->parts[i];
++            if (!sb->bitmap || sb->w <= 0 || sb->h <= 0)
++                continue;
++            int dw = sb->dw > 0 ? sb->dw : sb->w;
++            int dh = sb->dh > 0 ? sb->dh : sb->h;
++            struct mp_rect r = {
++                MPCLAMP(sb->x, 0, w), MPCLAMP(sb->y, 0, h),
++                MPCLAMP(sb->x + dw, 0, w), MPCLAMP(sb->y + dh, 0, h),
++            };
++            if (r.x1 <= r.x0 || r.y1 <= r.y0)
++                continue;
++            // What the part's pixels are: the id the packer gave them, else
++            // the item's change id and the part's place in the item (an item
++            // whose id repeats has the same parts), else nothing known.
++            uint64_t key;
++            if (mask && sb->libass.pixels_id) {
++                key = avf_sig_mix(1, sb->libass.pixels_id);
++            } else if (imgs->change_id) {
++                key = avf_sig_mix(2 + ((uint64_t)imgs->render_index << 8),
++                                  (uint64_t)imgs->change_id);
++                key = avf_sig_mix(key, (uint64_t)i);
++            } else {
++                key = avf_sig_mix(3, ++p->osd_sig_salt);
++            }
++            key = avf_sig_mix(key, ((uint64_t)(uint32_t)sb->x << 32) | (uint32_t)sb->y);
++            key = avf_sig_mix(key, ((uint64_t)(uint32_t)sb->w << 32) | (uint32_t)sb->h);
++            key = avf_sig_mix(key, ((uint64_t)(uint32_t)dw << 32) | (uint32_t)dh);
++            key = avf_sig_mix(key, mask ? sb->libass.color : 0);
++            key = avf_sig_mix(key, salt);
++            avf_sig_add(sig, tiles_x, r, key);
++        }
+     }
+-
+-    draw_subtitle_bitmaps(context, imgs, h);
+-    CGContextRelease(context);
+-    p->perf.cg_ns += mp_time_ns() - t;
+-
+-    CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-    return pixbuf;
++    return direct;
+ }
+ 
+-// Draw every item of list into one overlay buffer: the frame's subtitles and
+-// OSD share the inline layer, so one item must not replace another. NULL
+-// when nothing could be drawn.
+-static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
+-                                                          struct sub_bitmap_list *list)
++// Draw every item whole: the ones that can be, blended directly, the others
++// through CoreGraphics. False when nothing could be drawn.
++static bool draw_osd_items_whole(struct priv *p, uint8_t *base, size_t stride,
++                                 int w, int h, struct sub_bitmaps **items,
++                                 int num_items)
+ {
+-    struct priv *p = vo->priv;
+-    int w = p->osd_w;
+-    int h = p->osd_h;
+-
+-    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
+-    if (!pixbuf)
+-        return NULL;
+-
+-    CVPixelBufferLockBaseAddress(pixbuf, 0);
+-    void *base = CVPixelBufferGetBaseAddress(pixbuf);
+-    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
+-    if (!base || !stride) {
+-        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+-        CVPixelBufferRelease(pixbuf);
+-        return NULL;
+-    }
+-
+     CGContextRef context = NULL;
+     bool drawn = false;
+-    for (int n = 0; n < list->num_items; n++) {
+-        struct sub_bitmaps *imgs = list->items[n];
++    for (int n = 0; n < num_items; n++) {
++        struct sub_bitmaps *imgs = items[n];
+         if (!imgs->num_parts)
+             continue;
+         int64_t t = mp_time_ns();
+@@ -3360,15 +3436,137 @@ static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
+     }
+     if (context)
+         CGContextRelease(context);
++    return drawn;
++}
++
++// An overlay buffer from the pool that holds items (none: an empty canvas).
++// The frame's subtitles and OSD share the inline layer, so every item goes
++// into the one buffer. A pool buffer comes back with what was last drawn
++// into it; only the tiles this frame changes in it are cleared, copied from
++// the previous canvas or blended ("avf osd damage"). NULL when there is no
++// buffer or nothing could be drawn.
++static CVPixelBufferRef draw_osd_pixel_buffer(struct vo *vo,
++                                              struct sub_bitmaps **items,
++                                              int num_items)
++{
++    struct priv *p = vo->priv;
++    int w = p->osd_w;
++    int h = p->osd_h;
++
++    if (w <= 0 || h <= 0)
++        return NULL;
+ 
++    if (!create_osd_pool(vo, w, h))
++        return NULL;
++
++    size_t tiles = (size_t)avf_tiles(w) * avf_tiles(h);
++    if (tiles != p->osd_sig_tiles) {
++        // Signatures of another canvas size say nothing about this one.
++        reset_osd_buf_states(p);
++        p->osd_sig_tiles = tiles;
++        p->osd_sig_want = talloc_realloc(p, p->osd_sig_want, uint64_t, tiles);
++        p->osd_sig_prev = talloc_realloc(p, p->osd_sig_prev, uint64_t, tiles);
++        p->osd_sig_prev_buf = NULL;
++    }
++
++    CVPixelBufferRef pixbuf = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
++        kCFAllocatorDefault, p->osdPool, &pixbuf);
++
++    if (status != kCVReturnSuccess || !pixbuf) {
++        MP_ERR(vo, "Failed to get OSD overlay buffer: %d\n", status);
++        return NULL;
++    }
++
++    CVPixelBufferLockBaseAddress(pixbuf, 0);
++    void *base = CVPixelBufferGetBaseAddress(pixbuf);
++    size_t stride = CVPixelBufferGetBytesPerRow(pixbuf);
++    if (!base || !stride) {
++        CVPixelBufferUnlockBaseAddress(pixbuf, 0);
++        CVPixelBufferRelease(pixbuf);
++        return NULL;
++    }
++
++    struct osd_buf_state *st = osd_buf_state_acquire(p, pixbuf);
++    uint64_t *want = p->osd_sig_want;
++    memset(want, 0, tiles * sizeof(want[0]));
++    bool direct = osd_frame_signatures(p, items, num_items, w, h, want);
++
++    // The canvas drawn before this one, while it is still the cached one
++    // and was drawn by tile: what it holds is copied, not blended again.
++    CVPixelBufferRef prev = NULL;
++    if (direct && num_items && p->cachedSubtitleBuffer &&
++        p->cachedSubtitleBuffer == p->osd_sig_prev_buf &&
++        CVPixelBufferGetWidth(p->cachedSubtitleBuffer) == (size_t)w &&
++        CVPixelBufferGetHeight(p->cachedSubtitleBuffer) == (size_t)h &&
++        CVPixelBufferLockBaseAddress(p->cachedSubtitleBuffer,
++            kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess)
++    {
++        prev = p->cachedSubtitleBuffer;
++    }
++
++    struct osd_tile_ctx ctx = {
++        .p = p,
++        .base = base,
++        .stride = stride,
++        .prev = prev ? CVPixelBufferGetBaseAddress(prev) : NULL,
++        .prev_stride = prev ? CVPixelBufferGetBytesPerRow(prev) : 0,
++        .items = items,
++        .num_items = direct ? num_items : 0,
++    };
++    struct avf_damage_ops ops = {&ctx, osd_tile_clear, osd_tile_copy, osd_tile_draw};
++    struct avf_damage_px px = {0};
++    const uint64_t *have = st && st->sig_known ? st->sig : NULL;
++    avf_damage_apply(have, ctx.prev ? p->osd_sig_prev : NULL, want, w, h, &ops, &px);
++    if (prev)
++        CVPixelBufferUnlockBaseAddress(prev, kCVPixelBufferLock_ReadOnly);
++    p->perf.clear_px += px.cleared;
++    p->perf.copy_px += px.copied;
++    p->perf.draw_px += px.drawn;
++    p->perf.clear_full += !have;
++    if (st) {
++        memcpy(st->sig, want, tiles * sizeof(want[0]));
++        st->sig_known = true;
++    }
++
++    bool drawn = direct || draw_osd_items_whole(p, base, stride, w, h, items, num_items);
+     CVPixelBufferUnlockBaseAddress(pixbuf, 0);
+     if (!drawn) {
+         CVPixelBufferRelease(pixbuf);
+         return NULL;
+     }
++    if (num_items) {
++        memcpy(p->osd_sig_prev, want, tiles * sizeof(want[0]));
++        p->osd_sig_prev_buf = direct ? pixbuf : NULL;
++    }
+     return pixbuf;
+ }
+ 
++static CVPixelBufferRef create_empty_osd_pixel_buffer(struct vo *vo)
++{
++    return draw_osd_pixel_buffer(vo, NULL, 0);
++}
++
++static CVPixelBufferRef render_subtitle_pixel_buffer(struct vo *vo,
++                                                     struct sub_bitmaps *imgs)
++{
++    if (!imgs || imgs->num_parts == 0)
++        return NULL;
++    return draw_osd_pixel_buffer(vo, &imgs, 1);
++}
++
++// Every item of list in one overlay buffer. NULL when nothing could be drawn.
++static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
++                                                          struct sub_bitmap_list *list)
++{
++    int parts = 0;
++    for (int n = 0; n < list->num_items; n++)
++        parts += list->items[n]->num_parts;
++    if (!parts)
++        return NULL;
++    return draw_osd_pixel_buffer(vo, list->items, list->num_items);
++}
++
+ // Wrap pixbuf (not consumed) in a sample buffer. An immediate sample is shown
+ // as soon as it arrives instead of at pts on the layer's timebase.
+ static CMSampleBufferRef create_image_sample_buffer(struct vo *vo,
+@@ -3564,9 +3762,7 @@ static void draw_osd_cb(void *ctx, struct sub_bitmaps *imgs)
+                 CVPixelBufferRelease(p->cachedSubtitleBuffer);
+             p->cachedSubtitleBuffer = subtitleBuffer;
+             int64_t t_bounds = mp_time_ns();
+-            struct avf_dirty_set drawn = {0};
+-            update_subtitle_bounds_from_parts(p, imgs, &drawn);
+-            osd_buf_record_dirty(p, subtitleBuffer, &drawn);
++            update_subtitle_bounds_from_parts(p, imgs);
+             p->perf.bounds_ns += mp_time_ns() - t_bounds;
+             rendered = true;
+         }
+@@ -3712,10 +3908,8 @@ static void present_inline_osd_list(struct vo *vo, struct sub_bitmap_list *list)
+ 
+     int64_t t_bounds = mp_time_ns();
+     reset_subtitle_bounds(p);
+-    struct avf_dirty_set drawn = {0};
+     for (int n = 0; n < list->num_items; n++)
+-        extend_subtitle_bounds(p, list->items[n], &drawn);
+-    osd_buf_record_dirty(p, subtitleBuffer, &drawn);
++        extend_subtitle_bounds(p, list->items[n]);
+     p->perf.bounds_ns += mp_time_ns() - t_bounds;
+ 
+     int64_t render_ns = mp_time_ns() - t_render;
+@@ -4876,7 +5070,8 @@ static void report_osd_perf(struct vo *vo)
+         double ne = MPMAX(p->perf.enq_count, 1);
+         MP_VERBOSE(vo,
+             "osd-perf: n=%d avg=%.2fms max=%.2fms "
+-            "[clear %.2f (%.0fk px, %d full) blend %.2f cg %.2f bounds %.2f] enq %.2f | "
++            "[clear %.2f (%.0fk px, %d full) copy %.2f (%.0fk px) "
++            "blend %.2f (%.0fk px) cg %.2f bounds %.2f] enq %.2f | "
+             "vid %.3f (/frame) | "
+             "margin avg=%.1f min=%.1fms drops=%d | "
+             "skip=%d empty=%d osd=%dx%d bufs=%d\n",
+@@ -4886,7 +5081,10 @@ static void report_osd_perf(struct vo *vo)
+             p->perf.clear_ns / n / 1e6,
+             p->perf.clear_px / n / 1e3,
+             p->perf.clear_full,
++            p->perf.copy_ns / n / 1e6,
++            p->perf.copy_px / n / 1e3,
+             p->perf.blend_ns / n / 1e6,
++            p->perf.draw_px / n / 1e3,
+             p->perf.cg_ns / n / 1e6,
+             p->perf.bounds_ns / n / 1e6,
+             p->perf.enqueue_ns / n / 1e6,
