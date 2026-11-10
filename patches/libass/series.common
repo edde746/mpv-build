@@ -29,6 +29,7 @@
 #                      holds it, not every event of the track
 #   blur scratch       stripe buffers and the blur's input kept per thread,
 #                      a single cached bitmap blurred without a copy
+#   shadow shift       ass_shift_bitmap as passes the compiler vectorizes
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
@@ -38,3 +39,4 @@
 0007-ass-never-hash-the-padding-of-a-cache-key.patch
 0008-ass-skip-the-events-that-cannot-be-active.patch
 0009-ass-blur-in-scratch-memory.patch
+0010-ass-shift-shadows-a-row-at-a-time.patch
