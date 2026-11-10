@@ -4,9 +4,11 @@
 # the av_log callback, and log FFmpeg lines from threads of two mpv instances
 # alive at once: each line must reach the instance whose thread logged it,
 # before and after the other instance is gone (an embedder's next player that
-# never saw the "HTTP error 404" FFmpeg logged for it). Pass an
-# already-patched mpv tree for offline use; otherwise fetch and patch the
-# pinned source.
+# never saw the "HTTP error 404" FFmpeg logged for it). The same callback
+# turns a line no instance takes away before its lock (patch 0233): once the
+# levels are known, again after any level reload, and never a line that one
+# instance takes. Pass an already-patched mpv tree for offline use; otherwise
+# fetch and patch the pinned source.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

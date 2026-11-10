@@ -12,7 +12,13 @@
 // destroyed nobody did: Tortuga's next player, created while the last one
 // still terminated, never saw "http: HTTP error 404 Not Found" for a link it
 // could not open.
+//
+// And for patch 0233, the same callback's way out for a line no instance
+// takes: it is turned away without the lock once the levels are known, the
+// first line after any level reload finds them out again, and a line that one
+// instance takes still reaches only that instance.
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -28,6 +34,7 @@ enum { MSGL_FATAL, MSGL_ERR, MSGL_WARN, MSGL_INFO, MSGL_STATUS, MSGL_V, MSGL_DEB
 struct mp_log {
     const char *name;
     struct mp_log *parent;
+    int level; // of a root log; its children log at it too
 };
 
 struct mpv_global {
@@ -42,8 +49,10 @@ typedef struct bstr {
 
 typedef pthread_mutex_t mp_static_mutex;
 #define MP_STATIC_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
-#define mp_mutex_lock pthread_mutex_lock
+static atomic_int locks_taken;
+#define mp_mutex_lock(m) (atomic_fetch_add(&locks_taken, 1), pthread_mutex_lock(m))
 #define mp_mutex_unlock pthread_mutex_unlock
+#define MPMAX(a, b) ((a) > (b) ? (a) : (b))
 #define thread_local _Thread_local
 
 // talloc: the instance list's growth and removal, and frees; a log or a
@@ -87,7 +96,18 @@ struct line {
 static struct line lines[64];
 static int num_lines;
 
-static bool mp_msg_test(struct mp_log *log, int lev) { return true; }
+static int mp_msg_level(struct mp_log *log)
+{
+    while (log->parent)
+        log = log->parent;
+    return log->level;
+}
+
+static bool mp_msg_test(struct mp_log *log, int lev) { return lev <= mp_msg_level(log); }
+
+// msg.c steps this with every level reload of any instance.
+static atomic_ulong levels_generation = 1;
+static unsigned long mp_msg_levels_generation(void) { return atomic_load(&levels_generation); }
 
 static void mp_msg(struct mp_log *log, int lev, const char *fmt, ...)
 {
@@ -104,7 +124,8 @@ static void mp_msg(struct mp_log *log, int lev, const char *fmt, ...)
 
 // --- FFmpeg: the callback slot, and the context an http URLContext logs as.
 
-enum { AV_LOG_FATAL = 8, AV_LOG_ERROR = 16, AV_LOG_WARNING = 24, AV_LOG_INFO = 32, AV_LOG_VERBOSE = 40 };
+enum { AV_LOG_FATAL = 8, AV_LOG_ERROR = 16, AV_LOG_WARNING = 24, AV_LOG_INFO = 32, AV_LOG_VERBOSE = 40,
+       AV_LOG_DEBUG = 48, AV_LOG_TRACE = 56 };
 enum AVMediaType { AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO };
 
 typedef struct AVClass {
@@ -148,6 +169,7 @@ static void av_log(void *ptr, int level, const char *fmt, ...)
 struct job {
     struct mpv_global *owner; // NULL: a thread no instance owns
     const char *text;
+    int level;
 };
 
 static void *log_on_thread(void *arg)
@@ -155,17 +177,17 @@ static void *log_on_thread(void *arg)
     struct job *job = arg;
     if (job->owner)
         mp_av_log_set_thread(job->owner);
-    av_log(&http, AV_LOG_WARNING, "%s", job->text);
+    av_log(&http, job->level, "%s", job->text);
     return NULL;
 }
 
-// Logs one line on a new thread of `owner` and returns the global whose log
-// it reached, or NULL when no mpv log got it.
+// Logs one line at `level` on a new thread of `owner` and returns the global
+// whose log it reached, or NULL when no mpv log got it.
 static struct mpv_global *globals[2];
-static struct mpv_global *log_from(struct mpv_global *owner, const char *text)
+static struct mpv_global *log_level_from(struct mpv_global *owner, int level, const char *text)
 {
     int before = num_lines;
-    struct job job = {owner, text};
+    struct job job = {owner, text, level};
     pthread_t thread;
     if (pthread_create(&thread, NULL, log_on_thread, &job) || pthread_join(thread, NULL))
         abort();
@@ -181,6 +203,18 @@ static struct mpv_global *log_from(struct mpv_global *owner, const char *text)
     return NULL;
 }
 
+static struct mpv_global *log_from(struct mpv_global *owner, const char *text)
+{
+    return log_level_from(owner, AV_LOG_WARNING, text);
+}
+
+// What msg.c does when an instance's levels change.
+static void set_level(struct mpv_global *global, int level)
+{
+    global->log->level = level;
+    atomic_fetch_add(&levels_generation, 1);
+}
+
 static const char *name(struct mpv_global *global)
 {
     return global ? global->log->name : "nobody";
@@ -190,6 +224,7 @@ static struct mpv_global *new_global(const char *log_name)
 {
     struct mpv_global *global = calloc(1, sizeof(*global));
     global->log = mp_log_new(NULL, NULL, log_name);
+    global->log->level = MSGL_TRACE;
     return global;
 }
 
@@ -251,6 +286,49 @@ int main(void)
     init_libav(a);
     got = log_from(a, "HTTP error 404 Not Found\n");
     CHECK(got == a, "an instance created after all were destroyed got its line at %s", name(got));
+
+    // 0233. Both instances log at "v", as a player does: FFmpeg's debug and
+    // trace lines (mpv's trace) are nobody's. The first one after the levels
+    // changed takes the lock to find that out, the rest do not.
+    init_libav(b);
+    got = log_level_from(b, AV_LOG_TRACE, "AVIndex stream 0, sample 0\n");
+    CHECK(got == b, "a trace line of B reached %s with B at trace", name(got));
+    set_level(a, MSGL_V);
+    set_level(b, MSGL_V);
+    got = log_level_from(a, AV_LOG_TRACE, "AVIndex stream 0, sample 0\n");
+    CHECK(!got, "a trace line reached %s with every log at v", name(got));
+    int locks = atomic_load(&locks_taken);
+    for (int n = 0; n < 3; n++) {
+        got = log_level_from(n ? a : b, n == 2 ? AV_LOG_DEBUG : AV_LOG_TRACE,
+                             "AVIndex stream 0, sample 1\n");
+        CHECK(!got, "a line nobody takes reached %s", name(got));
+    }
+    CHECK(atomic_load(&locks_taken) == locks,
+          "%d of 3 lines nobody takes took the lock", atomic_load(&locks_taken) - locks);
+    // What somebody takes is not turned away: FFmpeg's info is mpv's v.
+    got = log_level_from(b, AV_LOG_INFO, "Opening 'x' for reading\n");
+    CHECK(got == b, "an info line of B reached %s with B at v", name(got));
+    got = log_level_from(a, AV_LOG_VERBOSE, "a verbose line\n");
+    CHECK(!got, "a verbose (mpv debug) line reached %s with every log at v", name(got));
+
+    // B turns trace logging on (--msg-level, a client's log buffer, a log
+    // file): its next trace line arrives, and A's still goes nowhere.
+    set_level(b, MSGL_TRACE);
+    got = log_level_from(b, AV_LOG_TRACE, "AVIndex stream 0, sample 2\n");
+    CHECK(got == b, "B's trace line after B went to trace reached %s", name(got));
+    got = log_level_from(a, AV_LOG_TRACE, "AVIndex stream 0, sample 3\n");
+    CHECK(!got, "A's trace line reached %s with only B at trace", name(got));
+
+    // B is gone with its level: trace lines are nobody's again, and an
+    // instance created later is asked.
+    uninit_libav(b);
+    got = log_level_from(a, AV_LOG_TRACE, "AVIndex stream 0, sample 4\n");
+    CHECK(!got, "a trace line reached %s after the instance at trace was destroyed", name(got));
+    b->log->level = MSGL_TRACE;
+    init_libav(b);
+    got = log_level_from(b, AV_LOG_TRACE, "AVIndex stream 0, sample 5\n");
+    CHECK(got == b, "a trace line of an instance created at trace reached %s", name(got));
+    uninit_libav(b);
     uninit_libav(a);
 
     if (failures) {

@@ -50,5 +50,8 @@
 # pool of free ones (--sub-ass-atlas-reuse, --sub-ass-atlas-pool).
 0215-sub-keep-the-ass-atlas-when-only-positions-or-colors-change.patch
 # Startup: a hardware decoder is not opened twice for a file's first H.264
-# packet (demux_mkv's first_packet).
+# packet (demux_mkv's first_packet), and an FFmpeg log line that no instance
+# takes (libavformat logs every sample of an MP4's index) is turned away
+# before the callback's lock.
 0232-vd-lavc-no-first-packet-probe-with-a-hardware-decoder.patch
+0233-av-log-turn-a-line-nobody-takes-away-before-the-lock.patch

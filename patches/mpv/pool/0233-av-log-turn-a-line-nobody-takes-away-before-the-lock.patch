@@ -1,0 +1,169 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0100
+Subject: [PATCH] av_log: turn a line nobody takes away before the lock
+
+The av_log callback took its mutex, looked the calling thread's instance
+up, compared the context's class name with two strings to pick a log,
+and only then asked that log whether it takes the line's level. FFmpeg
+logs far more than anybody reads: libavformat's mov demuxer logs every
+sample of the index it builds at trace level, a million lines for a
+two-hour film (510,300 samples, logged in mov_build_index and again in
+mov_fix_index). On an iPhone Air av_log() was 15 of the 39 ms of CPU
+that opening such a file takes, 8 of them in strcmp().
+
+msg.c now counts the level reloads of every instance in the process
+(mp_msg_levels_generation(), stepped wherever a root's reload_counter
+is), and av_log.c keeps the least important level any instance's FFmpeg
+log takes for one generation. A line below it returns after two atomic
+loads; the first line after a level change, or after an instance came
+or went, takes the lock and looks the levels up again, so a log level
+raised at run time is honoured from its next line on.
+test_av_log_routing.sh checks both directions and that such lines leave
+the lock alone.
+
+iPhone Air, a 2 h MP4 (H.264 + AAC, moov first), ms after loadfile,
+medians of 3 interleaved runs, Plezy's / Tortuga's option set, before
+-> after: FILE_LOADED 52.2 -> 41.3 / 51.8 -> 36.9, PLAYBACK_RESTART
+74.9 -> 64.7 / 73.5 -> 58.7, CPU time until the restart 51.7 -> 39.2 /
+52.2 -> 38.7 ms; for a second player in the process FILE_LOADED
+58.3 -> 37.7 / 59.0 -> 37.3. A 40 s MP4 does not change (48.5 -> 46.9 /
+46.7 -> 46.4 to the restart). The cost is per sample, so slower cores
+and longer files gain proportionally more.
+
+diff --git a/common/av_log.c b/common/av_log.c
+index 61f56a5..b0ff14f 100644
+--- a/common/av_log.c
++++ b/common/av_log.c
+@@ -22,6 +22,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <stdbool.h>
++#include <stdatomic.h>
+ 
+ #include "av_log.h"
+ #include "common/common.h"
+@@ -72,6 +73,14 @@ static mp_static_mutex log_lock = MP_STATIC_MUTEX_INITIALIZER;
+ static struct av_log_instance **log_instances;
+ static int num_log_instances;
+ static thread_local struct mpv_global *log_thread_global;
++// The least important level any instance's FFmpeg log takes, valid while
++// mp_msg_levels_generation() is log_wanted_generation (0: never). libavformat
++// and libavcodec log far more than anybody reads: the mov demuxer logs every
++// sample of a file's index at trace level, a million lines for a two-hour
++// film, and finding out under the lock that nobody takes a line cost more
++// than indexing the sample.
++static atomic_int log_wanted_level;
++static atomic_ulong log_wanted_generation;
+ 
+ static int av_log_level_to_mp_level(int av_level)
+ {
+@@ -145,6 +154,12 @@ static void mp_msg_av_log_callback(void *ptr, int level, const char *fmt,
+     AVClass *avc = ptr ? *(AVClass **)ptr : NULL;
+     int mp_level = av_log_level_to_mp_level(level);
+ 
++    unsigned long generation = mp_msg_levels_generation();
++    if (atomic_load_explicit(&log_wanted_generation, memory_order_relaxed) ==
++            generation &&
++        mp_level > atomic_load_explicit(&log_wanted_level, memory_order_relaxed))
++        return;
++
+     // Note: mp_log is thread-safe, but destruction of the log instances is not.
+     mp_mutex_lock(&log_lock);
+ 
+@@ -156,6 +171,21 @@ static void mp_msg_av_log_callback(void *ptr, int level, const char *fmt,
+         return;
+     }
+ 
++    if (atomic_load(&log_wanted_generation) != generation) {
++        // The generation read before the levels: a change in between leaves
++        // it behind, and the next line looks again.
++        int wanted = -1;
++        for (int n = 0; n < num_log_instances; n++) {
++            struct av_log_instance *i = log_instances[n];
++            wanted = MPMAX(wanted, mp_msg_level(i->root));
++            wanted = MPMAX(wanted, mp_msg_level(i->decaudio));
++            wanted = MPMAX(wanted, mp_msg_level(i->decvideo));
++            wanted = MPMAX(wanted, mp_msg_level(i->demuxer));
++        }
++        atomic_store(&log_wanted_level, wanted);
++        atomic_store(&log_wanted_generation, generation);
++    }
++
+     struct mp_log *log = get_av_log(inst, ptr);
+ 
+     if (mp_msg_test(log, mp_level)) {
+@@ -188,6 +218,7 @@ void init_libav(struct mpv_global *global)
+ 
+     mp_mutex_lock(&log_lock);
+     MP_TARRAY_APPEND(NULL, log_instances, num_log_instances, inst);
++    atomic_store(&log_wanted_generation, 0);
+     if (num_log_instances == 1)
+         av_log_set_callback(mp_msg_av_log_callback);
+     mp_mutex_unlock(&log_lock);
+@@ -209,6 +240,7 @@ void uninit_libav(struct mpv_global *global)
+             break;
+         }
+     }
++    atomic_store(&log_wanted_generation, 0);
+     if (!num_log_instances) {
+         av_log_set_callback(av_log_default_callback);
+         TA_FREEP(&log_instances);
+diff --git a/common/msg.c b/common/msg.c
+index 542f76d..22c9ecc 100644
+--- a/common/msg.c
++++ b/common/msg.c
+@@ -127,6 +127,15 @@ struct mp_log_buffer {
+ static const struct mp_log null_log = {0};
+ struct mp_log *const mp_null_log = (struct mp_log *)&null_log;
+ 
++// Counts the level reloads of every instance in the process (each
++// mp_log_root.reload_counter increment), starting at 1.
++static atomic_ulong levels_generation = 1;
++
++unsigned long mp_msg_levels_generation(void)
++{
++    return atomic_load_explicit(&levels_generation, memory_order_relaxed);
++}
++
+ static bool match_mod(const char *name, const char *mod)
+ {
+     if (!strcmp(mod, "all"))
+@@ -802,6 +811,7 @@ void mp_msg_update_msglevels(struct mpv_global *global, struct MPOpts *opts)
+     m_option_type_msglevels.copy(NULL, &root->msg_levels, &opts->msg_levels);
+ 
+     atomic_fetch_add(&root->reload_counter, 1);
++    atomic_fetch_add(&levels_generation, 1);
+     mp_mutex_unlock(&root->lock);
+ 
+     if (check_new_path(global, opts->log_file, &root->log_path)) {
+@@ -1009,6 +1019,7 @@ struct mp_log_buffer *mp_msg_log_buffer_new(struct mpv_global *global,
+     MP_TARRAY_APPEND(root, root->buffers, root->num_buffers, buffer);
+ 
+     atomic_fetch_add(&root->reload_counter, 1);
++    atomic_fetch_add(&levels_generation, 1);
+     mp_mutex_unlock(&root->lock);
+ 
+     return buffer;
+@@ -1082,6 +1093,7 @@ found:
+     talloc_free(buffer);
+ 
+     atomic_fetch_add(&root->reload_counter, 1);
++    atomic_fetch_add(&levels_generation, 1);
+     mp_mutex_unlock(&root->lock);
+ }
+ 
+diff --git a/common/msg.h b/common/msg.h
+index 61ae28d..cdc33ce 100644
+--- a/common/msg.h
++++ b/common/msg.h
+@@ -60,6 +60,10 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
+ 
+ int mp_msg_level(struct mp_log *log);
+ 
++// Changes whenever the level of any mp_log in the process may have changed
++// (never 0): what a level cached across instances is valid for.
++unsigned long mp_msg_levels_generation(void);
++
+ static inline bool mp_msg_test(struct mp_log *log, int lev)
+ {
+     return lev <= mp_msg_level(log);
