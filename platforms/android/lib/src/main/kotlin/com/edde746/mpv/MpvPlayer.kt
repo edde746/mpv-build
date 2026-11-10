@@ -74,6 +74,9 @@ class MpvPlayer private constructor(
         private const val TAG = "MpvPlayer"
 
         init {
+            // First, so the platform's codec list is read beside the libraries' load, mpv's creation and the first
+            // file's opening, not inside that file's on_preloaded hook (MediaCodecQuery.warmUp).
+            MediaCodecQuery.warmUp()
             System.loadLibrary("mpv")
             System.loadLibrary("player")
         }

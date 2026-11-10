@@ -105,7 +105,7 @@ Playback helpers both apps share, also in `com.edde746.mpv`:
 | Class | What it does |
 | --- | --- |
 | `GpuVoPolicy` | Pure policy, from mpv's properties and the device's answers: when a session leaves the video plane (`vo=mediacodec`) for `gpu` or `gpu-next` (`targetFor`), and how a file's decode is routed before its decoder opens (Dolby Vision options and route, software decode, tone mapping, the decode-stall watch, the BigOcean AV1 rebuild). |
-| `MediaCodecQuery` | Hardware decoder lookup and classification: H.264 High 10, HEVC Main 10, AV1, BigOcean, the Dolby Vision decoders FFmpeg would open, a decoder's highest frame rate at a size. |
+| `MediaCodecQuery` | Hardware decoder lookup and classification: H.264 High 10, HEVC Main 10, AV1, BigOcean, the Dolby Vision decoders FFmpeg would open, a decoder's highest frame rate at a size. `warmUp()` reads the platform's codec list (17 ms on a Pixel 7, 40-80 ms on TV boxes, once per process) on its own thread; `MpvPlayer` calls it as its class loads, so the first file's `on_preloaded` routing does not wait for it. |
 | `GlCapabilities` | `textureNorm16`, probed once per process on a throwaway EGL context. |
 | `MpvPlaceholderSurface` | The Surface mpv holds while the app has none: a consumer that latches and drops every frame on its own GL thread. |
 | `VideoRectPolicy` | The video Surface's size for fit, cover, zoom and stretch on the plane, and the `vo-mediacodec-video-rect` value. |

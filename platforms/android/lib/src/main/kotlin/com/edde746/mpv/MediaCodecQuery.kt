@@ -7,6 +7,7 @@ import android.media.MediaCodecList
 import android.os.Build
 import android.util.Log
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Hardware decoder lookup and classification: the inputs of the per-file decode routing ([GpuVoPolicy]) and of a
@@ -14,6 +15,38 @@ import java.util.Locale
  */
 object MediaCodecQuery {
     private const val TAG = "MediaCodecQuery"
+
+    private val warmUpStarted = AtomicBoolean()
+
+    /**
+     * Starts reading the codec list on a thread of its own and returns at once; later calls do nothing.
+     *
+     * The platform builds its list of every codec and its capabilities the first time a process asks for one,
+     * whoever asks: 17 ms on a Pixel 7 (75 codecs), 61-77 ms on a SHIELD TV (40), 37-78 ms on a Fire TV Stick 4K, a
+     * Google TV Streamer and a SEI box; every query after it takes under a millisecond on the Pixel. Left alone, the
+     * first to ask is the per-file decode routing inside the
+     * `on_preloaded` hook, where mpv holds the file for the answer, or, in an app without routing, FFmpeg's own
+     * decoder lookup as the decoder opens. [MpvPlayer] calls this as its class loads, so the read runs beside the
+     * native libraries' load, mpv's creation and the file's opening; an app that knows sooner that playback is
+     * coming may call it then. A query made while the read is still running waits for it, as any first query waits
+     * for its own.
+     */
+    fun warmUp() {
+        if (!warmUpStarted.compareAndSet(false, true)) return
+        val thread = Thread({
+            try {
+                // What the decode routing reads (GpuVoPolicy.needsSoftwareDecode): the first of them builds the list.
+                hardwareAvcHigh10
+                hardwareHevcMain10
+                hardwareAv1
+            } catch (e: RuntimeException) {
+                // Not this thread's to report: the query that needs the answer fails the same way, in its caller.
+                Log.w(TAG, "Codec list warm-up failed", e)
+            }
+        }, "mpv-codec-query")
+        thread.isDaemon = true
+        thread.start()
+    }
 
     /**
      * Whether a hardware `video/avc` decoder advertises H.264 High 10 (Hi10P). Decoders that do not advertise it either

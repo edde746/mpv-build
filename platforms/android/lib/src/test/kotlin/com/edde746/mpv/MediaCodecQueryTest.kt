@@ -77,4 +77,23 @@ class MediaCodecQueryTest {
             MediaCodecQuery.hardwareVideoDecodeSupport(setOf("video/avc", "video/hevc")),
         )
     }
+
+    @Test
+    fun warmUpReadsTheCodecListOnceOnItsOwnDaemonThread() {
+        fun readers() = Thread.getAllStackTraces().keys.filter { it.name == "mpv-codec-query" }
+        val before = readers().size
+
+        MediaCodecQuery.warmUp()
+        MediaCodecQuery.warmUp()
+
+        val started = readers()
+        assertTrue("a second warm-up started a second read", started.size - before <= 1)
+        for (thread in started) {
+            assertTrue("the read would keep the process alive", thread.isDaemon)
+            thread.join(10_000)
+            assertFalse("the read never finished", thread.isAlive)
+        }
+        // Robolectric's codec list is empty: what a query answers once the warm-up has read it.
+        assertFalse(MediaCodecQuery.hardwareAv1)
+    }
 }
