@@ -1,0 +1,96 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 13:00:00 +0100
+Subject: [PATCH] stream_lavf: keep the HTTP connection across seeks
+
+Every seek of an http(s) stream opened a connection: TCP, TLS, then the
+request. With FFmpeg patches 0080 and 0081 the protocol can keep one, and
+this sets the two options that make it do so where it is cheap, for
+http:// and https:// URLs: multiple_requests=1 (ask for keep-alive) and
+short_seek_size=262144. A reply that was read to its end, which is what
+reading the index at the end of a Matroska or MP4 file leaves behind,
+hands its connection to the request that follows; so does one with at
+most 256 KiB left, which are read and dropped. Any other seek opens a
+connection as before. short_seek_size is set because its default is the
+socket's receive buffer: megabytes on Linux and Android once it has
+grown, nothing on Windows.
+
+The options are set in the stream layer's own open, not in
+mp_setup_av_network_options(): they do not reach the streams a
+libavformat demuxer opens (HLS segments), and --stream-lavf-o overrides
+them (multiple_requests=0 restores a connection per seek).
+
+initial_request_size is left to the embedder. It bounds the first
+request, so that the seek from the headers to the index can keep the
+connection too, and a resumed Matroska file opens on one. But a file
+that needs more than that many bytes before its first frame pays one
+more round trip (at 512 KiB: a 10 Mbit/s ffmpeg-muxed Matroska file, any
+40 Mbit/s file, an MP4 with a moov larger than it), so it has to be
+chosen per file; DOCS/man/options.rst says how.
+
+Measured as for patch 0240, with that patch applied, https, median
+(range) of 3 runs, connections in brackets; the options were passed with
+--stream-lavf-o on the same build:
+
+  RTT 40 ms   resume 30 min      509 (506-524) [3] -> 416 (412-422) [2]
+              first seek         487 (470-506) [2] -> 449 (401-477) [1]
+              ffmpeg-muxed file,
+              resume 30 min      510 (497-513) [3] -> 424 (403-429) [2]
+  RTT 100 ms  resume 30 min      1093 (1058-1099) [3] -> 849 (834-852) [2]
+              first seek         920 (901-927) [2] -> 765 (728-782) [1]
+
+With initial_request_size=524288 the mkvmerge resume is one connection:
+338 (326-339) ms at 40 ms, 688 (683-705) at 100 ms. An open at 0 does
+not change (180 -> 177 ms at 40 ms).
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 817290d..48c2010 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -8105,6 +8105,24 @@ Miscellaneous
+     other options such as e.g. user agent are not available with all protocols,
+     and printing errors for unknown options would end up being too noisy.)
+ 
++    For ``http://`` and ``https://`` URLs, mpv itself sets ``reconnect=1``,
++    ``reconnect_delay_max=7``, and, to keep the connection across a seek that
++    leaves a reply at or near its end (such as the one that read a file's
++    index), ``multiple_requests=1`` and ``short_seek_size=262144``. Values
++    given here override them; ``multiple_requests=0`` restores a new
++    connection for every seek.
++
++    ``initial_request_size=<bytes>`` additionally bounds the first request of
++    a file, so that leaving it for an index at the end of the file leaves at
++    most that much to read, and the connection can be kept if no more than
++    ``short_seek_size`` of it is left. It pays off when playback resumes at a
++    saved position in a file whose headers and first two video frames (roughly
++    a quarter second of its bitrate) fit in it; reading on past it costs one
++    more round trip.
++
++    Unlike mpv's own values, options given here also reach the streams a
++    libavformat demuxer opens itself, such as HLS segments.
++
+     This is a key/value list option. See `List Options`_ for details.
+ 
+ ``--backdrop-type=<auto|none|mica|acrylic|mica-alt>``
+diff --git a/stream/stream_lavf.c b/stream/stream_lavf.c
+index 7910b82..3e3c102 100644
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -404,6 +404,18 @@ static int open_f(stream_t *stream)
+     av_dict_set(&dict, "reconnect", "1", 0);
+     av_dict_set(&dict, "reconnect_delay_max", "7", 0);
+ 
++    // Keep the connection across seeks where that is cheap: a reply that
++    // was read to its end (the index at the end of a file) hands its
++    // connection to the next request, and so does one with at most
++    // short_seek_size bytes left, which are read and dropped. Every other
++    // seek opens a connection as before. --stream-lavf-o overrides both, and
++    // initial_request_size there extends this to the first request of a file.
++    bstr proto = mp_split_proto(bstr0(filename), NULL);
++    if (bstr_equals0(proto, "http") || bstr_equals0(proto, "https")) {
++        av_dict_set(&dict, "multiple_requests", "1", 0);
++        av_dict_set(&dict, "short_seek_size", "262144", 0);
++    }
++
+     mp_setup_av_network_options(&dict, NULL, stream->global, stream->log);
+ 
+     AVIOInterruptCB cb = {
