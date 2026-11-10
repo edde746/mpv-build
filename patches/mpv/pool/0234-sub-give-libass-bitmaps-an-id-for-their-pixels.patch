@@ -1,0 +1,171 @@
+sub: give libass bitmaps an id for their pixels
+
+A consumer that keeps what it drew of a subtitle part (a CPU compositor's
+canvas, a GPU's atlas region) could not tell that a part of this frame is a
+part of the last one: mp_ass_packer copies every bitmap into a new atlas
+whenever anything changed, so pointers and atlas ids differ although nearly
+all bitmaps are the same. On an iPhone, consecutive frames of typeset ASS
+differ in 3-5 % of the canvas while 100 % of it was drawn again.
+
+sub_bitmap.libass.pixels_id is nonzero when it identifies the part's
+pixels: parts with the same id, in this or an earlier sub_bitmaps, have
+identical bitmaps (place and color are separate). The packer gives a bitmap
+the id it had in the list packed last when that list drew the same libass
+bitmap (pointer, size and stride), else a new one from a process-wide
+counter. That is sound for the reason reuse_atlas (0215) is: the last list
+is held with ass_frame_ref while the next is compared, so an equal pointer
+is the same, unchanged bitmap; a bitmap that left the list for one frame
+comes back with a new id. Without a held list (--sub-ass-atlas-reuse=no, or
+several image lists as osd_libass packs them) the id is 0, unknown. Equal
+ids mean equal pixels, not the reverse: a bitmap drawn twice in one list may
+carry two ids.
+
+Nothing but vo_avfoundation reads the field (apple 0048). For every other
+consumer the cost is the assignment: 0.16 us per pack for 70 bitmaps, 27 us
+for 2000 bitmaps that are all new (Apple M5 host, the region compiled by
+scripts/test_ass_pixel_ids.sh, which checks the id rules against a model
+over random lists).
+
+diff --git a/sub/ass_mp.c b/sub/ass_mp.c
+index aa2ff71..eaeab81 100644
+--- a/sub/ass_mp.c
++++ b/sub/ass_mp.c
+@@ -206,6 +206,97 @@ struct packed_src {
+     int w, h, stride;
+ };
+ 
++// --- ass pixel ids (host-testable; keep freestanding)
++
++// A libass bitmap of the list packed last and the id its pixels were given.
++struct part_pixels {
++    const unsigned char *bitmap;
++    int w, h, stride;
++    uint64_t id;
++};
++
++struct pixel_ids {
++    struct part_pixels *last, *next;
++    int num_last;
++    int *index;     // scratch: open-addressed, slot -> index into last
++};
++
++// Identifies a part's pixels across packs and packers; 0 is never used.
++static _Atomic uint64_t next_pixels_id;
++
++static bool same_pixels(const struct part_pixels *s, const struct sub_bitmap *b)
++{
++    return s->bitmap == b->bitmap && s->w == b->w && s->h == b->h &&
++           s->stride == b->stride;
++}
++
++static uint32_t pixels_slot(const void *bitmap, uint32_t mask)
++{
++    return (uint32_t)((((uintptr_t)bitmap >> 4) * UINT64_C(0x9E3779B97F4A7C15)) >> 32) & mask;
++}
++
++// Give each part, which still points at libass' bitmap, an id for its
++// pixels: the one the list packed last gave that bitmap, else a new one.
++// held: that list is still referenced, so none of its bitmaps was freed and
++// an equal pointer is the same, unchanged bitmap (what reuse_atlas relies
++// on); without it nothing is known and every id is 0.
++// A part mostly keeps its place in the list, or moves by as much as the one
++// before it; the index over the last list is built for the first that does
++// neither.
++static void assign_pixels_ids(void *ta_parent, struct pixel_ids *ids,
++                              struct sub_bitmap *parts, int num_parts, bool held)
++{
++    if (!held) {
++        for (int n = 0; n < num_parts; n++)
++            parts[n].libass.pixels_id = 0;
++        ids->num_last = 0;
++        return;
++    }
++    if (num_parts)
++        MP_TARRAY_GROW(ta_parent, ids->next, num_parts - 1);
++    uint32_t cap = 0;
++    int shift = 0;
++    for (int n = 0; n < num_parts; n++) {
++        struct sub_bitmap *b = &parts[n];
++        uint64_t id = 0;
++        int j = n + shift;
++        if (j >= 0 && j < ids->num_last && same_pixels(&ids->last[j], b)) {
++            id = ids->last[j].id;
++        } else if (ids->num_last) {
++            if (!cap) {
++                cap = 16;
++                while (cap < (uint32_t)ids->num_last * 2)
++                    cap *= 2;
++                MP_TARRAY_GROW(ta_parent, ids->index, cap - 1);
++                for (uint32_t i = 0; i < cap; i++)
++                    ids->index[i] = -1;
++                for (int k = 0; k < ids->num_last; k++) {
++                    uint32_t slot = pixels_slot(ids->last[k].bitmap, cap - 1);
++                    while (ids->index[slot] >= 0)
++                        slot = (slot + 1) & (cap - 1);
++                    ids->index[slot] = k;
++                }
++            }
++            uint32_t slot = pixels_slot(b->bitmap, cap - 1);
++            for (int k; (k = ids->index[slot]) >= 0; slot = (slot + 1) & (cap - 1)) {
++                if (same_pixels(&ids->last[k], b)) {
++                    id = ids->last[k].id;
++                    shift = k - n;
++                    break;
++                }
++            }
++        }
++        if (!id)
++            id = ++next_pixels_id;
++        b->libass.pixels_id = id;
++        ids->next[n] = (struct part_pixels){b->bitmap, b->w, b->h, b->stride, id};
++    }
++    MPSWAP(struct part_pixels *, ids->last, ids->next);
++    ids->num_last = num_parts;
++}
++
++// --- end ass pixel ids
++
+ struct mp_ass_packer {
+     struct sub_bitmap *cached_parts; // only for the array memory
+     struct mp_image *cached_img;
+@@ -227,6 +318,8 @@ struct mp_ass_packer {
+     ASS_Image *held;
+     struct packed_src *src;
+     int num_src;            // -1: cached_subs isn't a mask atlas of src
++    // What the bitmaps of the held list were given as pixel ids.
++    struct pixel_ids ids;
+ };
+ 
+ // Identifies an atlas' pixels across sub_bitmaps copies; 0 is never used.
+@@ -257,6 +350,7 @@ void mp_ass_packer_release(struct mp_ass_packer *p)
+     ass_frame_unref(p->held);
+     p->held = NULL;
+     p->num_src = -1;
++    p->ids.num_last = 0;
+ }
+ 
+ static bool atlas_fits(struct mp_image *img, int imgfmt, int w, int h)
+@@ -547,6 +641,7 @@ static void pack_lists(struct mp_ass_packer *p, ASS_Image **image_lists,
+             res.num_parts++;
+         }
+     }
++    assign_pixels_ids(p, &p->ids, res.parts, res.num_parts, p->held != NULL);
+ 
+     int format = SUBBITMAP_LIBASS;
+     if (!(preferred_osd_format & (1 << SUBBITMAP_LIBASS))) {
+diff --git a/sub/osd.h b/sub/osd.h
+index 0fcded7..df69c10 100644
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -49,6 +49,11 @@ struct sub_bitmap {
+ 
+     struct {
+         uint32_t color;
++        // Nonzero: identifies this part's pixels (not where or in which
++        // color they are drawn). Parts with the same id, in this or an
++        // earlier sub_bitmaps, have identical bitmaps, so a consumer that
++        // kept what it made of them need not make it again. 0: unknown.
++        uint64_t pixels_id;
+     } libass;
+ };
+ 

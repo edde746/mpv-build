@@ -191,6 +191,9 @@ jobs:
       - name: Test FFmpeg log lines reaching the instance that logged them
         run: bash ./scripts/test_av_log_routing.sh
 
+      - name: Test the pixel ids of libass bitmaps
+        run: bash ./scripts/test_ass_pixel_ids.sh
+
       - name: Test the codec profile the demuxers publish at load
         run: bash ./scripts/test_demux_codec_profile.sh
 

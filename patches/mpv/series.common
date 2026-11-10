@@ -55,6 +55,12 @@
 # before the callback's lock.
 0232-vd-lavc-no-first-packet-probe-with-a-hardware-decoder.patch
 0233-av-log-turn-a-line-nobody-takes-away-before-the-lock.patch
+# mp_ass_packer gives every libass bitmap an id for its pixels
+# (sub_bitmap.libass.pixels_id), stable while the bitmap stays in the frames'
+# image lists: a consumer that kept what it drew of a part can tell that the
+# part is the same without comparing pixels. Nothing reads it but
+# vo_avfoundation (apple 0048).
+0234-sub-give-libass-bitmaps-an-id-for-their-pixels.patch
 # Opening a file over HTTP: Matroska Tags stored after the clusters (where
 # mkvmerge puts them) wait for the Cues instead of costing two connections
 # before the first packet (--demuxer-mkv-defer-tags), and the stream keeps its
