@@ -1,0 +1,1872 @@
+ass: NEON bitmap engine for 32-bit ARM
+
+libass has assembly for x86 and for AArch64. A 32-bit ARM build, which is
+what Fire TV sticks and many Android TV devices run whatever their cores
+are, rendered with the C functions, and blur and rasterizer are 70% of
+the time a typeset episode takes there.
+
+libass/arm/ holds NEON versions of them, written with intrinsics so that
+they build with the C compiler alone: the blur stripes (unpack, pack,
+shrink, expand and the sixteen blur kernels), the rasterizer tiles (solid,
+halfplane, generic), the bitmap blending (add, imul, mul) and be_blur.
+merge_tile stays C: the compiler makes the same of it. The engine is
+picked where the compiler targets NEON (__ARM_NEON; Android's armeabi-v7a
+always does), there is no runtime detection to get wrong.
+
+Every function gives the bytes its C version gives, within the value
+ranges the engine works in (the AArch64 assembly relies on the same ones).
+libass' checkasm compares them, and now builds for 32-bit ARM (it needs no
+assembly there: an AAPCS call checks nothing). Run on the device:
+
+    checkasm: all 32 tests passed       (eleven seeds, Fire TV Stick 4K Max)
+
+C against NEON on that device's Cortex-A55, checkasm --bench: stripe pack
+5.6x, unpack 3.9x, shrink 4x and 9x, expand 6x and 12x, the blur kernels
+4.9x (radius 1) to 2.5x (radius 8), be_blur 3.9x, fill_solid 2.1x and
+3.2x, fill_halfplane 2x, fill_generic 1.4x and 1.5x (half of it is scalar
+work per segment), add_bitmaps 2.4x, imul and mul_bitmaps 1.15x (the
+compiler vectorizes the C ones).
+
+The heaviest 160 s of a typeset episode on that device, one thread, built
+without and with these functions: 15.4 s and 10.3 s of rendering, 38 and
+20 frames that take longer than their duration, the same bytes.
+
+diff --git a/checkasm/checkasm.c b/checkasm/checkasm.c
+index 857938b..52eae06 100644
+--- a/checkasm/checkasm.c
++++ b/checkasm/checkasm.c
+@@ -74,7 +74,7 @@ static const struct {
+     { "SSE2",               "sse2",      ASS_CPU_FLAG_X86_SSE2 },
+     { "SSSE3",              "ssse3",     ASS_CPU_FLAG_X86_SSSE3 },
+     { "AVX2",               "avx2",      ASS_CPU_FLAG_X86_AVX2 },
+-#elif ARCH_AARCH64
++#elif ARCH_AARCH64 || ARCH_ARM
+     { "NEON",               "neon",      ASS_CPU_FLAG_ARM_NEON },
+ #endif
+     { 0 }
+diff --git a/checkasm/checkasm.h b/checkasm/checkasm.h
+index 3cd7c24..a0c0c03 100644
+--- a/checkasm/checkasm.h
++++ b/checkasm/checkasm.h
+@@ -145,15 +145,14 @@ static inline uint64_t readtime(void) {
+ }
+ #define readtime readtime
+ #endif
+-#elif ARCH_ARM && !defined(_MSC_VER) && __ARM_ARCH >= 7
++#elif ARCH_ARM
++#include <time.h>
++/* The cycle counter needs the kernel to enable user mode access, which no
++ * Android device does: time in nanoseconds instead. */
+ static inline uint64_t readtime(void) {
+-    uint32_t cycle_counter;
+-    /* This requires enabling user mode access to the cycle counter (which
+-     * can only be done from kernel space). */
+-    __asm__ __volatile__("isb\nmrc p15, 0, %0, c9, c13, 0"
+-                         : "=r"(cycle_counter)
+-                         :: "memory");
+-    return cycle_counter;
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
+ }
+ #define readtime readtime
+ #elif ARCH_PPC64LE
+@@ -247,20 +246,6 @@ void checkasm_simd_warmup(void);
+      checked_call(func_new, __VA_ARGS__, 15, 14, 13, 12,\
+                   11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1));\
+     checkasm_set_signal_handler_state(0)
+-#elif ARCH_ARM
+-/* Use a dummy argument, to offset the real parameters by 2, not only 1.
+- * This makes sure that potential 8-byte-alignment of parameters is kept
+- * the same even when the extra parameters have been removed. */
+-void checkasm_checked_call_vfp(void *func, int dummy, ...);
+-#define declare_new(ret, ...)\
+-    ret (*checked_call)(void *, int dummy, __VA_ARGS__,\
+-                        int, int, int, int, int, int, int, int,\
+-                        int, int, int, int, int, int, int) =\
+-    (void *)checkasm_checked_call_vfp;
+-#define call_new(...)\
+-    (checkasm_set_signal_handler_state(1),\
+-     checked_call(func_new, 0, __VA_ARGS__, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0));\
+-    checkasm_set_signal_handler_state(0)
+ #elif ARCH_AARCH64 && !defined(__APPLE__)
+ void checkasm_stack_clobber(uint64_t clobber, ...);
+ #define declare_new(ret, ...)\
+diff --git a/configure.ac b/configure.ac
+index 4344068..b5417d6 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -326,6 +326,11 @@ AS_IF([test "x$enable_asm" != xno], [
+             BITS=64
+             BITTYPE=64
+         ],
++        [arm-*|armv*-*|armeb-*], [
++            cpu_family="arm"
++            BITS=32
++            BITTYPE=32
++        ],
+         [ # default
+             AC_MSG_NOTICE([Assembly optimizations are not yet supported on this architecture; disabling.])
+         ]
+@@ -392,6 +397,23 @@ AS_IF([test "x$enable_asm" != xno], [
+                 ]
+             )
+             can_asm=true
++        ],
++        [arm], [
++            # NEON intrinsics in C: no assembler, but the compiler's baseline
++            # has to include NEON (it does for Android's armeabi-v7a).
++            AC_MSG_CHECKING([whether the compiler targets NEON])
++            AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++                    #ifndef __ARM_NEON
++                    #error NEON is not in the baseline
++                    #endif
++                    #include <arm_neon.h>
++                ]], [[]])], [
++                can_asm=true
++                AC_MSG_RESULT([yes])
++            ], [
++                AC_MSG_RESULT([no])
++                AC_MSG_NOTICE([NEON functions are disabled.])
++            ])
+         ]
+     )
+ ])
+@@ -426,6 +448,7 @@ AM_CONDITIONAL([ASM], [test "x$can_asm" = xtrue])
+ AM_CONDITIONAL([X86], [test "x$cpu_family" = xx86])
+ AM_CONDITIONAL([X86_64], [test "x$cpu_family" = xx86 && test "x$BITS" = x64])
+ AM_CONDITIONAL([AARCH64], [test "x$cpu_family" = xaarch64])
++AM_CONDITIONAL([ARM], [test "x$cpu_family" = xarm])
+ 
+ AM_CONDITIONAL([ENABLE_LARGE_TILES], [test "x$enable_large_tiles" = xyes])
+ 
+@@ -452,6 +475,9 @@ AM_COND_IF([ASM], [
+     AM_COND_IF([AARCH64], [
+         AC_DEFINE(ARCH_AARCH64, 1, [targeting a 64-bit arm host architecture])
+     ])
++    AM_COND_IF([ARM], [
++        AC_DEFINE(ARCH_ARM, 1, [targeting a 32-bit arm host architecture with NEON])
++    ])
+ ], [
+     AC_DEFINE(CONFIG_ASM, 0, [ASM enabled])
+ ])
+diff --git a/libass/Makefile_library.am b/libass/Makefile_library.am
+index 438522c..8e47de6 100644
+--- a/libass/Makefile_library.am
++++ b/libass/Makefile_library.am
+@@ -48,6 +48,13 @@ libass_libass_internal_la_SOURCES += \
+     libass/aarch64/blur.S \
+     libass/aarch64/asm.S
+ endif
++if ARM
++libass_libass_internal_la_SOURCES += \
++    libass/arm/rasterizer.c \
++    libass/arm/blend_bitmaps.c \
++    libass/arm/be_blur.c \
++    libass/arm/blur.c
++endif
+ endif
+ 
+ if FONTCONFIG
+diff --git a/libass/arm/be_blur.c b/libass/arm/be_blur.c
+new file mode 100644
+index 0000000..5316a44
+--- /dev/null
++++ b/libass/arm/be_blur.c
+@@ -0,0 +1,130 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * NEON version of c/c_be_blur.c for 32-bit ARM.
++ *
++ * Rows are processed in blocks of 8 pixels with the same two rows of state
++ * in tmp as the C version. Unlike aarch64/be_blur.S this touches nothing
++ * beyond the width of a row: its end is covered by a last block that overlaps
++ * the one before it, and that block takes its old state from before the
++ * other blocks updated it. Bitmaps narrower than a block are left to
++ * the C version.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <arm_neon.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ass_bitmap_engine.h"
++
++
++#define ALWAYS_INLINE  static inline __attribute__((always_inline))
++
++BeBlurFunc ass_be_blur_c;
++
++
++// [1, 2, 1] of 8 pixels and their neighbours
++ALWAYS_INLINE uint16x8_t blur_horz(uint8x8_t left, uint8x8_t cur, uint8x8_t right)
++{
++    return vaddq_u16(vaddl_u8(left, cur), vaddl_u8(cur, right));
++}
++
++// Add the horizontally blurred block of a new row to the state of its columns
++// and output the block of the row above
++ALWAYS_INLINE void blur_vert(uint8_t *dst, uint16_t *col_pix_buf, uint16_t *col_sum_buf,
++                             uint16x8_t old_pix, uint16x8_t old_sum, uint16x8_t col_pix)
++{
++    uint16x8_t col_sum = vaddq_u16(old_pix, col_pix);
++    vst1q_u16(col_pix_buf, col_pix);
++    vst1q_u16(col_sum_buf, col_sum);
++    vst1_u8(dst, vshrn_n_u16(vaddq_u16(old_sum, col_sum), 4));
++}
++
++// One row of the image: src is the new row, dst the one above it,
++// last is the offset of the last block, first is set for the first row,
++// which only initializes the state
++ALWAYS_INLINE void blur_row(uint8_t *dst, const uint8_t *src,
++                            uint16_t *col_pix_buf, uint16_t *col_sum_buf,
++                            size_t last, const int first)
++{
++    const uint8x8_t zero = vdup_n_u8(0);
++    uint16x8_t last_pix = vdupq_n_u16(0), last_sum = last_pix;
++    if (!first) {
++        last_pix = vld1q_u16(col_pix_buf + last);
++        last_sum = vld1q_u16(col_sum_buf + last);
++    }
++
++    for (size_t x = 0; x < last; x += 8) {
++        uint8x8_t cur = vld1_u8(src + x);
++        uint8x8_t left = x ? vld1_u8(src + x - 1) : vext_u8(zero, cur, 7);
++        uint16x8_t col_pix = blur_horz(left, cur, vld1_u8(src + x + 1));
++        if (first) {
++            vst1q_u16(col_pix_buf + x, col_pix);
++            vst1q_u16(col_sum_buf + x, col_pix);
++        } else {
++            blur_vert(dst + x, col_pix_buf + x, col_sum_buf + x,
++                      vld1q_u16(col_pix_buf + x), vld1q_u16(col_sum_buf + x), col_pix);
++        }
++    }
++
++    uint8x8_t cur = vld1_u8(src + last);
++    uint8x8_t left = last ? vld1_u8(src + last - 1) : vext_u8(zero, cur, 7);
++    uint16x8_t col_pix = blur_horz(left, cur, vext_u8(cur, zero, 1));
++    if (first) {
++        vst1q_u16(col_pix_buf + last, col_pix);
++        vst1q_u16(col_sum_buf + last, col_pix);
++    } else {
++        blur_vert(dst + last, col_pix_buf + last, col_sum_buf + last,
++                  last_pix, last_sum, col_pix);
++    }
++}
++
++/**
++ * \brief Blur with [[1,2,1], [2,4,2], [1,2,1]] kernel
++ */
++void ass_be_blur_neon(uint8_t *restrict buf, ptrdiff_t stride,
++                      size_t width, size_t height, uint16_t *restrict tmp)
++{
++    if (width < 8) {
++        ass_be_blur_c(buf, stride, width, height, tmp);
++        return;
++    }
++
++    uint16_t *col_pix_buf = tmp;
++    uint16_t *col_sum_buf = tmp + stride;
++    const size_t last = width - 8;
++
++    blur_row(NULL, buf, col_pix_buf, col_sum_buf, last, 1);
++
++    for (size_t y = 1; y < height; y++) {
++        uint8_t *dst = buf;
++        buf += stride;
++        blur_row(dst, buf, col_pix_buf, col_sum_buf, last, 0);
++    }
++
++    for (size_t x = 0; x < last; x += 8) {
++        uint16x8_t sum = vaddq_u16(vld1q_u16(col_sum_buf + x), vld1q_u16(col_pix_buf + x));
++        vst1_u8(buf + x, vshrn_n_u16(sum, 4));
++    }
++    uint16x8_t sum = vaddq_u16(vld1q_u16(col_sum_buf + last), vld1q_u16(col_pix_buf + last));
++    vst1_u8(buf + last, vshrn_n_u16(sum, 4));
++}
+diff --git a/libass/arm/blend_bitmaps.c b/libass/arm/blend_bitmaps.c
+new file mode 100644
+index 0000000..aad0315
+--- /dev/null
++++ b/libass/arm/blend_bitmaps.c
+@@ -0,0 +1,167 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * NEON versions of c/c_blend_bitmaps.c for 32-bit ARM.
++ *
++ * Unlike aarch64/blend_bitmaps.S these touch nothing beyond the width of a
++ * row: its end is covered by a last vector that overlaps the one before it.
++ * Where the destination is also a source that vector is computed before the
++ * others are stored.
++ *
++ * The multiplications go two vectors at a time, so that an in-order core has
++ * something to do while it waits for the products.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <arm_neon.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "ass_utils.h"
++
++
++#define ALWAYS_INLINE  static inline __attribute__((always_inline))
++
++enum { BLEND_ADD, BLEND_IMUL, BLEND_MUL };
++
++
++// (a * b + 255) >> 8
++ALWAYS_INLINE uint8x8_t mul8(uint8x8_t a, uint8x8_t b)
++{
++    return vaddhn_u16(vmull_u8(a, b), vdupq_n_u16(255));
++}
++
++ALWAYS_INLINE uint8x16_t mul16(uint8x16_t a, uint8x16_t b)
++{
++    return vcombine_u8(mul8(vget_low_u8(a), vget_low_u8(b)),
++                       mul8(vget_high_u8(a), vget_high_u8(b)));
++}
++
++// What the pixels at src1 and src2 make
++ALWAYS_INLINE uint8x8_t blend8(const uint8_t *src1, const uint8_t *src2, const int op)
++{
++    uint8x8_t a = vld1_u8(src1), b = vld1_u8(src2);
++    return op == BLEND_ADD ? vqadd_u8(a, b) : mul8(a, op == BLEND_MUL ? b : vmvn_u8(b));
++}
++
++ALWAYS_INLINE uint8x16_t blend16(const uint8_t *src1, const uint8_t *src2, const int op)
++{
++    uint8x16_t a = vld1q_u8(src1), b = vld1q_u8(src2);
++    return op == BLEND_ADD ? vqaddq_u8(a, b) : mul16(a, op == BLEND_MUL ? b : vmvnq_u8(b));
++}
++
++// Two vectors at once, stored at dst
++ALWAYS_INLINE void blend32(uint8_t *dst, const uint8_t *src1, const uint8_t *src2,
++                           const int op)
++{
++    uint8x16_t a0 = vld1q_u8(src1), b0 = vld1q_u8(src2);
++    uint8x16_t a1 = vld1q_u8(src1 + 16), b1 = vld1q_u8(src2 + 16);
++    if (op == BLEND_ADD) {
++        vst1q_u8(dst, vqaddq_u8(a0, b0));
++        vst1q_u8(dst + 16, vqaddq_u8(a1, b1));
++        return;
++    }
++    if (op == BLEND_IMUL) {
++        b0 = vmvnq_u8(b0);
++        b1 = vmvnq_u8(b1);
++    }
++    const uint16x8_t round = vdupq_n_u16(255);
++    uint16x8_t lo0 = vmull_u8(vget_low_u8(a0), vget_low_u8(b0));
++    uint16x8_t hi0 = vmull_u8(vget_high_u8(a0), vget_high_u8(b0));
++    uint16x8_t lo1 = vmull_u8(vget_low_u8(a1), vget_low_u8(b1));
++    uint16x8_t hi1 = vmull_u8(vget_high_u8(a1), vget_high_u8(b1));
++    vst1q_u8(dst, vcombine_u8(vaddhn_u16(lo0, round), vaddhn_u16(hi0, round)));
++    vst1q_u8(dst + 16, vcombine_u8(vaddhn_u16(lo1, round), vaddhn_u16(hi1, round)));
++}
++
++// dst = src1 (which may be dst) combined with src2
++ALWAYS_INLINE void blend_bitmaps(uint8_t *dst, ptrdiff_t dst_stride,
++                                 const uint8_t *src1, ptrdiff_t src1_stride,
++                                 const uint8_t *src2, ptrdiff_t src2_stride,
++                                 size_t width, size_t height, const int op)
++{
++    uint8_t *end = dst + dst_stride * height;
++    if (width >= 16) {
++        const size_t last = width - 16;
++        while (dst < end) {
++            uint8x16_t tail = blend16(src1 + last, src2 + last, op);
++            size_t x = 0;
++            for (; x + 16 < last; x += 32)
++                blend32(dst + x, src1 + x, src2 + x, op);
++            if (x < last)
++                vst1q_u8(dst + x, blend16(src1 + x, src2 + x, op));
++            vst1q_u8(dst + last, tail);
++            dst  += dst_stride;
++            src1 += src1_stride;
++            src2 += src2_stride;
++        }
++    } else if (width >= 8) {
++        const size_t last = width - 8;
++        while (dst < end) {
++            uint8x8_t tail = blend8(src1 + last, src2 + last, op);
++            vst1_u8(dst, blend8(src1, src2, op));
++            vst1_u8(dst + last, tail);
++            dst  += dst_stride;
++            src1 += src1_stride;
++            src2 += src2_stride;
++        }
++    } else {
++        while (dst < end) {
++            for (size_t x = 0; x < width; x++) {
++                if (op == BLEND_ADD) {
++                    unsigned out = src1[x] + src2[x];
++                    dst[x] = FFMIN(out, 255);
++                } else {
++                    unsigned mul = op == BLEND_MUL ? src2[x] : 255 - src2[x];
++                    dst[x] = (src1[x] * mul + 255) >> 8;
++                }
++            }
++            dst  += dst_stride;
++            src1 += src1_stride;
++            src2 += src2_stride;
++        }
++    }
++}
++
++void ass_add_bitmaps_neon(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                          const uint8_t *restrict src, ptrdiff_t src_stride,
++                          size_t width, size_t height)
++{
++    blend_bitmaps(dst, dst_stride, dst, dst_stride, src, src_stride,
++                  width, height, BLEND_ADD);
++}
++
++void ass_imul_bitmaps_neon(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                           const uint8_t *restrict src, ptrdiff_t src_stride,
++                           size_t width, size_t height)
++{
++    blend_bitmaps(dst, dst_stride, dst, dst_stride, src, src_stride,
++                  width, height, BLEND_IMUL);
++}
++
++void ass_mul_bitmaps_neon(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                          const uint8_t *restrict src1, ptrdiff_t src1_stride,
++                          const uint8_t *restrict src2, ptrdiff_t src2_stride,
++                          size_t width, size_t height)
++{
++    blend_bitmaps(dst, dst_stride, src1, src1_stride, src2, src2_stride,
++                  width, height, BLEND_MUL);
++}
+diff --git a/libass/arm/blur.c b/libass/arm/blur.c
+new file mode 100644
+index 0000000..09327fd
+--- /dev/null
++++ b/libass/arm/blur.c
+@@ -0,0 +1,856 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * NEON versions of the stripe functions of c/blur_template.h for 32-bit ARM,
++ * with stripes of 8 pixels, after aarch64/blur.S.
++ *
++ * Like the assembly versions, the shrink and expand filters rely on the pixel
++ * range of the internal format, and so do the blurs here, except for the
++ * horizontal ones of radius 1 and 2: they match the C versions for pixels in
++ * [0, 0x7FFF] (the format only uses [0, 0x4000]). The other functions match
++ * for any input.
++ *
++ * The cores these functions are for (Cortex-A53, A55) run NEON instructions
++ * in order, one 128-bit operation per cycle, most of which take 2 to 4
++ * cycles. A loop over single lines is one long dependency chain, hence the
++ * loops that go two lines or two stripes at a time: these give the core
++ * independent work to interleave. Which of the forms is used where is
++ * what measured fastest with what clang makes of them.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <arm_neon.h>
++
++#define STRIPE_WIDTH  8
++
++#ifdef __GNUC__
++#define ALWAYS_INLINE  static inline __attribute__((always_inline))
++#else
++#define ALWAYS_INLINE  static inline
++#endif
++
++// read in place of lines that are outside of the image
++static const int16_t zero_lines[4 * STRIPE_WIDTH] = {0};
++
++/*
++ * Horizontal filters read the same line of several neighboring stripes.
++ * A stripe outside of the image reads as zeros: its pointer stays on zero_lines.
++ */
++ALWAYS_INLINE const int16_t *get_stripe(const int16_t *src, size_t index, size_t count,
++                                        size_t step, size_t *inc)
++{
++    if (index < count) {
++        *inc = STRIPE_WIDTH;
++        return src + index * step;
++    }
++    *inc = 0;
++    return zero_lines;
++}
++
++ALWAYS_INLINE uint16x8_t load_line(const int16_t *ptr)
++{
++    return vld1q_u16((const uint16_t *) ptr);
++}
++
++ALWAYS_INLINE void store_line(int16_t *ptr, uint16x8_t val)
++{
++    vst1q_u16((uint16_t *) ptr, val);
++}
++
++/*
++ * Unpack/Pack Functions
++ */
++
++// (0x4000 * x + 127) / 255 == (0x101 * x + 2) >> 2, a doubled byte is 0x101 * x
++ALWAYS_INLINE void unpack_line(int16_t *dst, size_t step, const uint8_t *src)
++{
++    uint8x16_t val = vld1q_u8(src);
++    uint8x16x2_t res = vzipq_u8(val, val);
++    store_line(dst, vrshrq_n_u16(vreinterpretq_u16_u8(res.val[0]), 2));
++    store_line(dst + step, vrshrq_n_u16(vreinterpretq_u16_u8(res.val[1]), 2));
++}
++
++void ass_stripe_unpack16_neon(int16_t *restrict dst, const uint8_t *restrict src,
++                              ptrdiff_t src_stride, size_t width, size_t height)
++{
++    size_t step = STRIPE_WIDTH * height;
++    size_t stripes = (width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++
++    for (; stripes >= 2; stripes -= 2) {
++        const uint8_t *ptr = src;
++        size_t y = height;
++        for (; y >= 2; y -= 2) {
++            unpack_line(dst, step, ptr);
++            unpack_line(dst + STRIPE_WIDTH, step, ptr + src_stride);
++            dst += 2 * STRIPE_WIDTH;
++            ptr += 2 * src_stride;
++        }
++        if (y) {
++            unpack_line(dst, step, ptr);
++            dst += STRIPE_WIDTH;
++        }
++        dst += step;
++        src += 2 * STRIPE_WIDTH;
++    }
++    if (stripes) {
++        for (size_t y = 0; y < height; y++) {
++            uint8x8_t val = vld1_u8(src);
++            uint8x8x2_t res = vzip_u8(val, val);
++            uint8x16_t doubled = vcombine_u8(res.val[0], res.val[1]);
++            store_line(dst, vrshrq_n_u16(vreinterpretq_u16_u8(doubled), 2));
++            dst += STRIPE_WIDTH;
++            src += src_stride;
++        }
++    }
++}
++
++ALWAYS_INLINE uint8x8_t pack_line(const int16_t *src, int16x8_t dither)
++{
++    int16x8_t val = vld1q_s16(src);
++    val = vaddq_s16(vsubq_s16(val, vshrq_n_s16(val, 8)), dither);
++    return vshrn_n_u16(vreinterpretq_u16_s16(val), 6);
++}
++
++void ass_stripe_pack16_neon(uint8_t *restrict dst, ptrdiff_t dst_stride,
++                            const int16_t *restrict src, size_t width, size_t height)
++{
++    size_t step = STRIPE_WIDTH * height;
++    size_t stripes = (width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t left = dst_stride - STRIPE_WIDTH * stripes;
++
++    // dither is {8, 40, ...} in even rows and {56, 24, ...} in odd ones
++    const int16x8_t dither_even = vreinterpretq_s16_u32(vdupq_n_u32(40 << 16 | 8));
++    const int16x8_t dither_flip = vdupq_n_s16(8 ^ 56);
++
++    for (; stripes >= 2; stripes -= 2) {
++        uint8_t *ptr = dst;
++        int16x8_t dither = dither_even;
++        for (size_t y = 0; y < height; y++) {
++            vst1q_u8(ptr, vcombine_u8(pack_line(src, dither), pack_line(src + step, dither)));
++            dither = veorq_s16(dither, dither_flip);
++            ptr += dst_stride;
++            src += STRIPE_WIDTH;
++        }
++        dst += 2 * STRIPE_WIDTH;
++        src += step;
++    }
++    if (stripes) {
++        // the stride is a multiple of 16: the other half of the store is padding
++        uint8_t *ptr = dst;
++        int16x8_t dither = dither_even;
++        for (size_t y = 0; y < height; y++) {
++            vst1q_u8(ptr, vcombine_u8(pack_line(src, dither), vdup_n_u8(0)));
++            dither = veorq_s16(dither, dither_flip);
++            ptr += dst_stride;
++            src += STRIPE_WIDTH;
++        }
++        dst += 2 * STRIPE_WIDTH;
++        left -= STRIPE_WIDTH;
++    }
++    if (!left)
++        return;
++    for (size_t y = 0; y < height; y++) {
++        memset(dst, 0, left);
++        dst += dst_stride;
++    }
++}
++
++/*
++ * Contract Filters
++ *
++ * Contract image by factor 2 with kernel [1, 5, 10, 10, 5, 1].
++ */
++
++ALWAYS_INLINE uint16x8_t shrink_func(uint16x8_t p1p, uint16x8_t p1n,
++                                     uint16x8_t z0p, uint16x8_t z0n,
++                                     uint16x8_t n1p, uint16x8_t n1n)
++{
++    uint16x8_t p1p_n1n = vaddq_u16(p1p, n1n);
++    uint16x8_t p1n_n1p = vaddq_u16(p1n, n1p);
++    uint16x8_t z0p_z0n = vaddq_u16(z0p, z0n);
++    uint16x8_t r = vhaddq_u16(p1p_n1n, p1n_n1p);
++    r = vhaddq_u16(r, z0p_z0n);
++    r = vhaddq_u16(r, p1n_n1p);
++    r = vhaddq_u16(r, z0p_z0n);
++    return vrshrq_n_u16(r, 1);
++}
++
++ALWAYS_INLINE uint16x8_t shrink_horz_line(const int16_t *ptr_p, const int16_t *ptr_z,
++                                          const int16_t *ptr_n)
++{
++    uint16x8_t line_p = load_line(ptr_p);
++    // even and odd pixels: {-8, -6, -4, -2} twice, {0, 2, ..., 14}
++    uint16x8x2_t prev = vuzpq_u16(line_p, line_p);
++    uint16x8x2_t next = vuzpq_u16(load_line(ptr_z), load_line(ptr_n));
++    return shrink_func(vextq_u16(prev.val[0], next.val[0], 6),
++                       vextq_u16(prev.val[1], next.val[1], 6),
++                       vextq_u16(prev.val[0], next.val[0], 7),
++                       vextq_u16(prev.val[1], next.val[1], 7),
++                       next.val[0], next.val[1]);
++}
++
++void ass_shrink_horz16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height)
++{
++    size_t dst_width = (src_width + 5) >> 1;
++    size_t dst_stripes = (dst_width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t src_stripes = (src_width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    for (size_t x = 0; x < dst_stripes; x++) {
++        size_t inc_p, inc_z, inc_n;
++        const int16_t *ptr_p = get_stripe(src, 2 * x - 1, src_stripes, step, &inc_p);
++        const int16_t *ptr_z = get_stripe(src, 2 * x + 0, src_stripes, step, &inc_z);
++        const int16_t *ptr_n = get_stripe(src, 2 * x + 1, src_stripes, step, &inc_n);
++        size_t y = src_height;
++        for (; y >= 2; y -= 2) {
++            uint16x8_t res0 = shrink_horz_line(ptr_p, ptr_z, ptr_n);
++            uint16x8_t res1 = shrink_horz_line(ptr_p + inc_p, ptr_z + inc_z, ptr_n + inc_n);
++            store_line(dst, res0);
++            store_line(dst + STRIPE_WIDTH, res1);
++            dst += 2 * STRIPE_WIDTH;
++            ptr_p += 2 * inc_p;
++            ptr_z += 2 * inc_z;
++            ptr_n += 2 * inc_n;
++        }
++        if (y) {
++            store_line(dst, shrink_horz_line(ptr_p, ptr_z, ptr_n));
++            dst += STRIPE_WIDTH;
++        }
++    }
++}
++
++void ass_shrink_vert16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height)
++{
++    const uint16x8_t zero = vdupq_n_u16(0);
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        // the four lines above the two that the next output line adds
++        uint16x8_t p1p = zero, p1n = zero, z0p = zero, z0n = zero;
++        for (size_t y = src_height / 4; y > 0; y--) {
++            uint16x8_t line0 = load_line(src + 0 * STRIPE_WIDTH);
++            uint16x8_t line1 = load_line(src + 1 * STRIPE_WIDTH);
++            uint16x8_t line2 = load_line(src + 2 * STRIPE_WIDTH);
++            uint16x8_t line3 = load_line(src + 3 * STRIPE_WIDTH);
++            uint16x8_t res0 = shrink_func(p1p, p1n, z0p, z0n, line0, line1);
++            uint16x8_t res1 = shrink_func(z0p, z0n, line0, line1, line2, line3);
++            store_line(dst, res0);
++            store_line(dst + STRIPE_WIDTH, res1);
++            p1p = line0;
++            p1n = line1;
++            z0p = line2;
++            z0n = line3;
++            dst += 2 * STRIPE_WIDTH;
++            src += 4 * STRIPE_WIDTH;
++        }
++        // up to three lines are left, and zeros below them:
++        // (src_height + 5) / 2 output lines in total
++        size_t left = src_height & 3;
++        uint16x8_t line0 = zero, line1 = zero, line2 = zero;
++        if (left > 0)
++            line0 = load_line(src + 0 * STRIPE_WIDTH);
++        if (left > 1)
++            line1 = load_line(src + 1 * STRIPE_WIDTH);
++        if (left > 2)
++            line2 = load_line(src + 2 * STRIPE_WIDTH);
++        src += left * STRIPE_WIDTH;
++        store_line(dst, shrink_func(p1p, p1n, z0p, z0n, line0, line1));
++        store_line(dst + STRIPE_WIDTH, shrink_func(z0p, z0n, line0, line1, line2, zero));
++        dst += 2 * STRIPE_WIDTH;
++        if (left > 0) {
++            store_line(dst, shrink_func(line0, line1, line2, zero, zero, zero));
++            dst += STRIPE_WIDTH;
++        }
++        if (left > 2) {
++            store_line(dst, shrink_func(line2, zero, zero, zero, zero, zero));
++            dst += STRIPE_WIDTH;
++        }
++    }
++}
++
++/*
++ * Expand Filters
++ *
++ * Expand image by factor 2 with kernel [5, 10, 1], [1, 10, 5].
++ */
++
++ALWAYS_INLINE void expand_func(uint16x8_t *rp, uint16x8_t *rn,
++                               uint16x8_t p1, uint16x8_t z0, uint16x8_t n1)
++{
++    uint16x8_t r = vhaddq_u16(vhaddq_u16(p1, n1), z0);
++    *rp = vrhaddq_u16(vhaddq_u16(r, p1), z0);
++    *rn = vrhaddq_u16(vhaddq_u16(r, n1), z0);
++}
++
++ALWAYS_INLINE uint16x8x2_t expand_horz_line(const int16_t *ptr_p, const int16_t *ptr_z)
++{
++    uint16x8_t line_p = load_line(ptr_p);
++    uint16x8_t line_z = load_line(ptr_z);
++    uint16x8_t rp, rn;
++    expand_func(&rp, &rn, vextq_u16(line_p, line_z, 6), vextq_u16(line_p, line_z, 7), line_z);
++    return vzipq_u16(rp, rn);
++}
++
++void ass_expand_horz16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height)
++{
++    size_t dst_width = 2 * src_width + 4;
++    size_t src_stripes = (src_width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t step = STRIPE_WIDTH * src_height;
++
++    // each source stripe makes two stripes, the last one may only make one
++    size_t index = 0;
++    for (size_t x = STRIPE_WIDTH; x < dst_width; x += 2 * STRIPE_WIDTH) {
++        size_t inc_p, inc_z;
++        const int16_t *ptr_p = get_stripe(src, index - 1, src_stripes, step, &inc_p);
++        const int16_t *ptr_z = get_stripe(src, index - 0, src_stripes, step, &inc_z);
++        size_t y = src_height;
++        for (; y >= 2; y -= 2) {
++            uint16x8x2_t res0 = expand_horz_line(ptr_p, ptr_z);
++            uint16x8x2_t res1 = expand_horz_line(ptr_p + inc_p, ptr_z + inc_z);
++            store_line(dst, res0.val[0]);
++            store_line(dst + STRIPE_WIDTH, res1.val[0]);
++            store_line(dst + step, res0.val[1]);
++            store_line(dst + step + STRIPE_WIDTH, res1.val[1]);
++            dst += 2 * STRIPE_WIDTH;
++            ptr_p += 2 * inc_p;
++            ptr_z += 2 * inc_z;
++        }
++        if (y) {
++            uint16x8x2_t res = expand_horz_line(ptr_p, ptr_z);
++            store_line(dst, res.val[0]);
++            store_line(dst + step, res.val[1]);
++            dst += STRIPE_WIDTH;
++        }
++        dst += step;
++        index++;
++    }
++    if ((dst_width - 1) & STRIPE_WIDTH)
++        return;
++
++    size_t inc_p, inc_z;
++    const int16_t *ptr_p = get_stripe(src, index - 1, src_stripes, step, &inc_p);
++    const int16_t *ptr_z = get_stripe(src, index - 0, src_stripes, step, &inc_z);
++    for (size_t y = 0; y < src_height; y++) {
++        store_line(dst, expand_horz_line(ptr_p, ptr_z).val[0]);
++        dst += STRIPE_WIDTH;
++        ptr_p += inc_p;
++        ptr_z += inc_z;
++    }
++}
++
++void ass_expand_vert16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                            size_t src_width, size_t src_height)
++{
++    const uint16x8_t zero = vdupq_n_u16(0);
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        uint16x8_t p1 = zero, z0 = zero, rp0, rn0, rp1, rn1;
++        if (src_height & 1) {
++            // make the rest an even number of lines
++            z0 = load_line(src);
++            expand_func(&rp0, &rn0, zero, zero, z0);
++            store_line(dst, rp0);
++            store_line(dst + STRIPE_WIDTH, rn0);
++            dst += 2 * STRIPE_WIDTH;
++            src += STRIPE_WIDTH;
++        }
++        // the lines of the stripe, then two zero lines
++        const int16_t *line = src;
++        size_t pairs = src_height / 2;
++        src += 2 * STRIPE_WIDTH * pairs;
++        for (int part = 0; part < 2; part++) {
++            for (; pairs > 0; pairs--) {
++                uint16x8_t n1 = load_line(line);
++                uint16x8_t n2 = load_line(line + STRIPE_WIDTH);
++                expand_func(&rp0, &rn0, p1, z0, n1);
++                expand_func(&rp1, &rn1, z0, n1, n2);
++                store_line(dst + 0 * STRIPE_WIDTH, rp0);
++                store_line(dst + 1 * STRIPE_WIDTH, rn0);
++                store_line(dst + 2 * STRIPE_WIDTH, rp1);
++                store_line(dst + 3 * STRIPE_WIDTH, rn1);
++                p1 = n1;
++                z0 = n2;
++                dst += 4 * STRIPE_WIDTH;
++                line += 2 * STRIPE_WIDTH;
++            }
++            line = zero_lines;
++            pairs = 1;
++        }
++    }
++}
++
++/*
++ * Main Parametric Filters
++ *
++ * Perform 1D convolution with kernel [..., c2, c1, c0, d, c0, c1, c2, ...],
++ * cN = param[N], d = 1 - 2 * (c0 + c1 + c2 + ...),
++ * number of parameters is part of the function name.
++ *
++ * The radius n is a constant in every instance: the taps are spelled out
++ * with FOR_EACH_TAP rather than left to the loop unroller.
++ *
++ * Up to radius 2 the taps are those of the C version,
++ *     center + ((sum(cN * (pixel - center)) + 0x8000) >> 16).
++ * Beyond that the pixels are multiplied as they are,
++ *     (sum(cN * pixel) + d * center + 0x8000) >> 16,
++ * which saves the subtractions and is the same as long as the differences
++ * fit into 16 bits, that is for pixels in [0, 0x7FFF].
++ */
++
++#define FOR_EACH_TAP(TAP) \
++    TAP(1) TAP(2) TAP(3) TAP(4) TAP(5) TAP(6) TAP(7) TAP(8)
++
++typedef struct {
++    int16x4_t coeff[8];
++    int32x4_t center;  // d, for n > 2
++} BlurParam;
++
++ALWAYS_INLINE BlurParam load_param(const int16_t *param, const int n)
++{
++    BlurParam res;
++    int32_t center = 0x10000;
++#define TAP(i) \
++    if (n >= i) { \
++        res.coeff[i - 1] = vdup_n_s16(param[i - 1]); \
++        center -= 2 * param[i - 1]; \
++    }
++    FOR_EACH_TAP(TAP)
++#undef TAP
++    res.center = vdupq_n_s32(center);
++    return res;
++}
++
++// sums of products for 8 pixels
++typedef struct {
++    int32x4_t lo, hi;
++} BlurAcc;
++
++// center only matters for n <= 2
++ALWAYS_INLINE void blur_tap(BlurAcc *acc, int16x8_t line, int16x8_t center,
++                            int16x4_t coeff, const int n)
++{
++    if (n <= 2)
++        line = vsubq_s16(line, center);
++    acc->lo = vmlal_s16(acc->lo, vget_low_s16(line), coeff);
++    acc->hi = vmlal_s16(acc->hi, vget_high_s16(line), coeff);
++}
++
++// the rounding of the narrowing shift is the 0x8000 the C version starts from
++ALWAYS_INLINE int16x8_t round_acc(BlurAcc acc)
++{
++    return vcombine_s16(vrshrn_n_s32(acc.lo, 16), vrshrn_n_s32(acc.hi, 16));
++}
++
++ALWAYS_INLINE void blur_center(BlurAcc *acc, int16x8_t center, const BlurParam *param)
++{
++    acc->lo = vmlaq_s32(acc->lo, vmovl_s16(vget_low_s16(center)), param->center);
++    acc->hi = vmlaq_s32(acc->hi, vmovl_s16(vget_high_s16(center)), param->center);
++}
++
++ALWAYS_INLINE int16x8_t blur_result(BlurAcc acc, int16x8_t center,
++                                    const BlurParam *param, const int n)
++{
++    if (n <= 2)
++        return vaddq_s16(center, round_acc(acc));
++    blur_center(&acc, center, param);
++    return round_acc(acc);
++}
++
++/*
++ * Pixels [k - pos] for k in a line of the current stripe (line2),
++ * line1 and line0 being the same line of the two stripes before it.
++ */
++ALWAYS_INLINE int16x8_t shift_line(int16x8_t line0, int16x8_t line1, int16x8_t line2,
++                                   const int pos)
++{
++    switch (pos) {
++    case  0: return line2;
++    case  1: return vextq_s16(line1, line2, 7);
++    case  2: return vextq_s16(line1, line2, 6);
++    case  3: return vextq_s16(line1, line2, 5);
++    case  4: return vextq_s16(line1, line2, 4);
++    case  5: return vextq_s16(line1, line2, 3);
++    case  6: return vextq_s16(line1, line2, 2);
++    case  7: return vextq_s16(line1, line2, 1);
++    case  8: return line1;
++    case  9: return vextq_s16(line0, line1, 7);
++    case 10: return vextq_s16(line0, line1, 6);
++    case 11: return vextq_s16(line0, line1, 5);
++    case 12: return vextq_s16(line0, line1, 4);
++    case 13: return vextq_s16(line0, line1, 3);
++    case 14: return vextq_s16(line0, line1, 2);
++    case 15: return vextq_s16(line0, line1, 1);
++    default: return line0;
++    }
++}
++
++ALWAYS_INLINE int16x8_t blur_horz_line(int16x8_t line0, int16x8_t line1, int16x8_t line2,
++                                       const BlurParam *param, const int n)
++{
++    int16x8_t center = shift_line(line0, line1, line2, n);
++    BlurAcc acc = { vdupq_n_s32(0), vdupq_n_s32(0) };
++#define TAP(i) \
++    if (n >= i) { \
++        blur_tap(&acc, shift_line(line0, line1, line2, n - i), center, param->coeff[i - 1], n); \
++        blur_tap(&acc, shift_line(line0, line1, line2, n + i), center, param->coeff[i - 1], n); \
++    }
++    FOR_EACH_TAP(TAP)
++#undef TAP
++    return blur_result(acc, center, param, n);
++}
++
++ALWAYS_INLINE void blur_horz(int16_t *restrict dst, const int16_t *restrict src,
++                             size_t src_width, size_t src_height,
++                             const int16_t *restrict param, const int n)
++{
++    size_t dst_width = src_width + 2 * n;
++    size_t dst_stripes = (dst_width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t src_stripes = (src_width + STRIPE_WIDTH - 1) / STRIPE_WIDTH;
++    size_t step = STRIPE_WIDTH * src_height;
++    const BlurParam kernel = load_param(param, n);
++
++    /*
++     * A line of stripe x takes the same line of stripes x - 2 (n > 4), x - 1
++     * and x. Two stripes at a time, except for radius 8: that is as fast
++     * one by one, as the compiler runs out of registers.
++     */
++    size_t x = 0;
++    for (; n < 8 && x + 2 <= dst_stripes; x += 2) {
++        size_t inc0 = 0, inc1, inc2, inc3;
++        const int16_t *ptr0 = zero_lines;
++        if (n > 4)
++            ptr0 = get_stripe(src, x - 2, src_stripes, step, &inc0);
++        const int16_t *ptr1 = get_stripe(src, x - 1, src_stripes, step, &inc1);
++        const int16_t *ptr2 = get_stripe(src, x + 0, src_stripes, step, &inc2);
++        const int16_t *ptr3 = get_stripe(src, x + 1, src_stripes, step, &inc3);
++        for (size_t y = 0; y < src_height; y++) {
++            int16x8_t line1 = vld1q_s16(ptr1);
++            int16x8_t line2 = vld1q_s16(ptr2);
++            int16x8_t line3 = vld1q_s16(ptr3);
++            int16x8_t line0 = line1;
++            if (n > 4)
++                line0 = vld1q_s16(ptr0);
++            vst1q_s16(dst, blur_horz_line(line0, line1, line2, &kernel, n));
++            vst1q_s16(dst + step, blur_horz_line(line1, line2, line3, &kernel, n));
++            dst += STRIPE_WIDTH;
++            ptr0 += inc0;
++            ptr1 += inc1;
++            ptr2 += inc2;
++            ptr3 += inc3;
++        }
++        dst += step;
++    }
++    for (; x < dst_stripes; x++) {
++        size_t inc0 = 0, inc1, inc2;
++        const int16_t *ptr0 = zero_lines;
++        if (n > 4)
++            ptr0 = get_stripe(src, x - 2, src_stripes, step, &inc0);
++        const int16_t *ptr1 = get_stripe(src, x - 1, src_stripes, step, &inc1);
++        const int16_t *ptr2 = get_stripe(src, x - 0, src_stripes, step, &inc2);
++        for (size_t y = 0; y < src_height; y++) {
++            int16x8_t line1 = vld1q_s16(ptr1);
++            int16x8_t line2 = vld1q_s16(ptr2);
++            int16x8_t line0 = line1;
++            if (n > 4)
++                line0 = vld1q_s16(ptr0);
++            vst1q_s16(dst, blur_horz_line(line0, line1, line2, &kernel, n));
++            dst += STRIPE_WIDTH;
++            ptr0 += inc0;
++            ptr1 += inc1;
++            ptr2 += inc2;
++        }
++    }
++}
++
++// filters the line in the middle of 2 * n + 1 consecutive lines
++ALWAYS_INLINE int16x8_t blur_vert_line(const int16_t *line, const BlurParam *param, const int n)
++{
++    int16x8_t center = vld1q_s16(line + n * STRIPE_WIDTH);
++    BlurAcc acc = { vdupq_n_s32(0), vdupq_n_s32(0) };
++#define TAP(i) \
++    if (n >= i) { \
++        blur_tap(&acc, vld1q_s16(line + (n - i) * STRIPE_WIDTH), center, param->coeff[i - 1], n); \
++        blur_tap(&acc, vld1q_s16(line + (n + i) * STRIPE_WIDTH), center, param->coeff[i - 1], n); \
++    }
++    FOR_EACH_TAP(TAP)
++#undef TAP
++    return blur_result(acc, center, param, n);
++}
++
++typedef struct {
++    int16x8_t line[2];
++} BlurPair;
++
++/*
++ * Two lines at a time share all but two of the lines they load.
++ * Radius 3 is faster as two separate filters, the wider ones with
++ * each line multiplied for both of them right after it is loaded.
++ */
++ALWAYS_INLINE BlurPair blur_vert_pair(const int16_t *line, const BlurParam *param, const int n)
++{
++    BlurPair res;
++    if (n <= 3) {
++        res.line[0] = blur_vert_line(line, param, n);
++        res.line[1] = blur_vert_line(line + STRIPE_WIDTH, param, n);
++        return res;
++    }
++
++    BlurAcc acc0 = { vdupq_n_s32(0), vdupq_n_s32(0) }, acc1 = acc0;
++    // line k is tap k - n of the first filter and tap k - n - 1 of the second
++#define LINE(k) \
++    if (k <= 2 * n + 1) { \
++        int16x8_t cur = vld1q_s16(line + k * STRIPE_WIDTH); \
++        if (k < n) \
++            blur_tap(&acc0, cur, cur, param->coeff[n - k - 1], n); \
++        if (k == n) \
++            blur_center(&acc0, cur, param); \
++        if (k > n && k <= 2 * n) \
++            blur_tap(&acc0, cur, cur, param->coeff[k - n - 1], n); \
++        if (k >= 1 && k <= n) \
++            blur_tap(&acc1, cur, cur, param->coeff[n - k], n); \
++        if (k == n + 1) \
++            blur_center(&acc1, cur, param); \
++        if (k > n + 1) \
++            blur_tap(&acc1, cur, cur, param->coeff[k - n - 2], n); \
++    }
++    LINE(0) LINE(1) LINE(2) LINE(3) LINE(4) LINE(5) LINE(6) LINE(7) LINE(8)
++    LINE(9) LINE(10) LINE(11) LINE(12) LINE(13) LINE(14) LINE(15) LINE(16) LINE(17)
++#undef LINE
++    res.line[0] = round_acc(acc0);
++    res.line[1] = round_acc(acc1);
++    return res;
++}
++
++ALWAYS_INLINE void blur_vert(int16_t *restrict dst, const int16_t *restrict src,
++                             size_t src_width, size_t src_height,
++                             const int16_t *restrict param, const int n)
++{
++    size_t step = STRIPE_WIDTH * src_height;
++    const BlurParam kernel = load_param(param, n);
++
++    /*
++     * Every output line takes 2 * n + 1 consecutive lines, of which those
++     * outside of the image are zeros. Lines close to the top and the bottom
++     * of a stripe are filtered from a padded copy, the lines between them
++     * right from the stripe:
++     *     [2 * n zero lines] [first 2 * n + 1 lines]
++     *     [last 2 * n lines] [2 * n zero lines]
++     * With the first copy taking one more line of a stripe of odd height,
++     * each of the three parts is an even number of lines.
++     * A stripe of up to 2 * n lines takes the place of the first lines,
++     * what follows it stays zero.
++     */
++    enum { MAX_TAPS = 2 * 8 };
++    int16_t buf[(4 * MAX_TAPS + 1) * STRIPE_WIDTH];
++    const size_t taps = 2 * n, edge = taps * STRIPE_WIDTH;
++    int16_t *const top = buf + edge, *const bottom = top + edge + STRIPE_WIDTH;
++    memset(buf, 0, (4 * edge + STRIPE_WIDTH) * sizeof(buf[0]));
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        const int16_t *ptr[3];
++        size_t len[3];
++        int count;
++        if (src_height > taps) {
++            size_t odd = src_height & 1;
++            memcpy(top, src, (edge + STRIPE_WIDTH) * sizeof(buf[0]));
++            memcpy(bottom, src + step - edge, edge * sizeof(buf[0]));
++            ptr[0] = buf;
++            len[0] = taps + odd;
++            ptr[1] = src + odd * STRIPE_WIDTH;
++            len[1] = src_height - taps - odd;
++            ptr[2] = bottom;
++            len[2] = taps;
++            count = 3;
++        } else {
++            memcpy(top, src, step * sizeof(buf[0]));
++            ptr[0] = buf;
++            len[0] = src_height + taps;
++            count = 1;
++        }
++        for (int part = 0; part < count; part++) {
++            const int16_t *line = ptr[part];
++            size_t y = len[part];
++            for (; y >= 2; y -= 2) {
++                BlurPair res = blur_vert_pair(line, &kernel, n);
++                vst1q_s16(dst, res.line[0]);
++                vst1q_s16(dst + STRIPE_WIDTH, res.line[1]);
++                dst += 2 * STRIPE_WIDTH;
++                line += 2 * STRIPE_WIDTH;
++            }
++            for (; y > 0; y--) {
++                vst1q_s16(dst, blur_vert_line(line, &kernel, n));
++                dst += STRIPE_WIDTH;
++                line += STRIPE_WIDTH;
++            }
++        }
++        src += step;
++    }
++}
++
++/*
++ * The vertical filters of radius 1 and 2 walk down a stripe and keep
++ * the products of the lines above. With
++ *     a[y] = param[0] * (line[y - 1] - line[y - 2]),
++ *     b[y] = param[1] * (line[y - 0] - line[y - 2]),
++ * the four taps of out[y], which is centered at line[y - 2], add up to
++ *     a[y] - a[y - 1] + b[y] - b[y - 2]:
++ * a line above the center gives the negative of a difference that is
++ * multiplied already (for pixels in [0, 0x7FFF], where no difference
++ * is -0x8000). Radius 1 has
++ *     a[y] = param[0] * (line[y] - line[y - 1]), out[y] from a[y] - a[y - 1].
++ * The lines of a stripe are followed by 2 * n zero lines.
++ */
++
++ALWAYS_INLINE BlurAcc mul_line(int16x8_t line, int16x4_t coeff)
++{
++    BlurAcc res = { vmull_s16(vget_low_s16(line), coeff), vmull_s16(vget_high_s16(line), coeff) };
++    return res;
++}
++
++/*
++ * A sum of two products cannot saturate for pixels in [0, 0x7FFF].
++ * A regular addition would be merged with the multiplications,
++ * and every product would be calculated once per use.
++ */
++ALWAYS_INLINE BlurAcc add_products(BlurAcc a, BlurAcc b)
++{
++    BlurAcc res = { vqaddq_s32(a.lo, b.lo), vqaddq_s32(a.hi, b.hi) };
++    return res;
++}
++
++// center + ((a - b + 0x8000) >> 16)
++ALWAYS_INLINE int16x8_t blur_diff_result(BlurAcc a, BlurAcc b, int16x8_t center)
++{
++    return vaddq_s16(center, vcombine_s16(vrsubhn_s32(a.lo, b.lo), vrsubhn_s32(a.hi, b.hi)));
++}
++
++void ass_blur1_vert16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                           size_t src_width, size_t src_height,
++                           const int16_t *restrict param)
++{
++    const int16x4_t coeff = vdup_n_s16(param[0]);
++    const BlurAcc zero = { vdupq_n_s32(0), vdupq_n_s32(0) };
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        int16x8_t prev = vdupq_n_s16(0);  // line[y - 1]
++        BlurAcc a = zero;                 // a[y - 1]
++        if (src_height & 1) {
++            // make the rest an even number of lines
++            prev = vld1q_s16(src);
++            a = mul_line(prev, coeff);
++            vst1q_s16(dst, round_acc(a));
++            dst += STRIPE_WIDTH;
++            src += STRIPE_WIDTH;
++        }
++        const int16_t *line = src;
++        size_t pairs = src_height / 2;
++        src += 2 * STRIPE_WIDTH * pairs;
++        for (int part = 0; part < 2; part++) {
++            for (; pairs > 0; pairs--) {
++                int16x8_t line0 = vld1q_s16(line);
++                int16x8_t line1 = vld1q_s16(line + STRIPE_WIDTH);
++                BlurAcc a0 = mul_line(vsubq_s16(line0, prev), coeff);
++                BlurAcc a1 = mul_line(vsubq_s16(line1, line0), coeff);
++                vst1q_s16(dst, blur_diff_result(a0, a, prev));
++                vst1q_s16(dst + STRIPE_WIDTH, blur_diff_result(a1, a0, line0));
++                prev = line1;
++                a = a1;
++                dst += 2 * STRIPE_WIDTH;
++                line += 2 * STRIPE_WIDTH;
++            }
++            line = zero_lines;
++            pairs = 1;
++        }
++    }
++}
++
++void ass_blur2_vert16_neon(int16_t *restrict dst, const int16_t *restrict src,
++                           size_t src_width, size_t src_height,
++                           const int16_t *restrict param)
++{
++    const int16x4_t coeff0 = vdup_n_s16(param[0]), coeff1 = vdup_n_s16(param[1]);
++    const BlurAcc zero = { vdupq_n_s32(0), vdupq_n_s32(0) };
++
++    for (size_t x = 0; x < src_width; x += STRIPE_WIDTH) {
++        int16x8_t prev2 = vdupq_n_s16(0), prev1 = prev2;  // line[y - 2], line[y - 1]
++        BlurAcc neg = zero, b = zero;  // a[y - 1] + b[y - 2], b[y - 1]
++        if (src_height & 1) {
++            // make the rest an even number of lines
++            prev1 = vld1q_s16(src);
++            b = mul_line(prev1, coeff1);
++            vst1q_s16(dst, round_acc(b));
++            dst += STRIPE_WIDTH;
++            src += STRIPE_WIDTH;
++        }
++        const int16_t *line = src;
++        size_t pairs = src_height / 2;
++        src += 2 * STRIPE_WIDTH * pairs;
++        for (int part = 0; part < 2; part++) {
++            for (; pairs > 0; pairs--) {
++                int16x8_t line0 = vld1q_s16(line);
++                int16x8_t line1 = vld1q_s16(line + STRIPE_WIDTH);
++                BlurAcc a0 = mul_line(vsubq_s16(prev1, prev2), coeff0);
++                BlurAcc b0 = mul_line(vsubq_s16(line0, prev2), coeff1);
++                BlurAcc a1 = mul_line(vsubq_s16(line0, prev1), coeff0);
++                BlurAcc b1 = mul_line(vsubq_s16(line1, prev1), coeff1);
++                vst1q_s16(dst, blur_diff_result(add_products(a0, b0), neg, prev2));
++                neg = add_products(a0, b);
++                vst1q_s16(dst + STRIPE_WIDTH, blur_diff_result(add_products(a1, b1), neg, prev1));
++                neg = add_products(a1, b0);
++                b = b1;
++                prev2 = line0;
++                prev1 = line1;
++                dst += 2 * STRIPE_WIDTH;
++                line += 2 * STRIPE_WIDTH;
++            }
++            line = zero_lines;
++            pairs = 2;
++        }
++    }
++}
++
++#define DEFINE_BLUR(dir, n) \
++    void ass_blur ## n ## _ ## dir ## 16_neon(int16_t *restrict dst, const int16_t *restrict src, \
++                                              size_t src_width, size_t src_height, \
++                                              const int16_t *restrict param) \
++    { \
++        blur_ ## dir(dst, src, src_width, src_height, param, n); \
++    }
++
++DEFINE_BLUR(horz, 1)
++DEFINE_BLUR(horz, 2)
++DEFINE_BLUR(horz, 3)
++DEFINE_BLUR(vert, 3)
++DEFINE_BLUR(horz, 4)
++DEFINE_BLUR(vert, 4)
++DEFINE_BLUR(horz, 5)
++DEFINE_BLUR(vert, 5)
++DEFINE_BLUR(horz, 6)
++DEFINE_BLUR(vert, 6)
++DEFINE_BLUR(horz, 7)
++DEFINE_BLUR(vert, 7)
++DEFINE_BLUR(horz, 8)
++DEFINE_BLUR(vert, 8)
+diff --git a/libass/arm/rasterizer.c b/libass/arm/rasterizer.c
+new file mode 100644
+index 0000000..e4a9de4
+--- /dev/null
++++ b/libass/arm/rasterizer.c
+@@ -0,0 +1,425 @@
++/*
++ * Copyright (C) 2026 libass contributors
++ *
++ * This file is part of libass.
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * NEON versions of the tile functions of c/rasterizer_template.h for 32-bit
++ * ARM, modelled on aarch64/rasterizer.S. Everything is generic in the tile
++ * order, which is a constant in each of the instantiations at the end.
++ * There is no merge_tile: the compiler makes the same of the C version.
++ *
++ * Tuned on a Cortex-A55, the kind of core that still runs 32-bit code:
++ * in-order, one NEON instruction per cycle whatever else there is to do,
++ * two or three cycles for the load of a vector, a hundred for a call of
++ * memset(), and scalar code is cheap in comparison.
++ */
++
++#include "config.h"
++#include "ass_compat.h"
++
++#include <arm_neon.h>
++#include <string.h>
++
++#include "ass_utils.h"
++#include "ass_rasterizer.h"
++
++
++#define ALWAYS_INLINE  static inline __attribute__((always_inline))
++
++// widest tile in 8-pixel vectors
++#define MAX_VEC  4
++
++
++ALWAYS_INLINE int32_t rescale_ab(int32_t ab, int32_t scale, const int order)
++{
++    return (ab * (int64_t) scale + ((int64_t) 1 << (45 + order))) >> (46 + order);
++}
++
++ALWAYS_INLINE int32_t rescale_c(int64_t c, int32_t scale, const int order)
++{
++    return ((int32_t) (c >> (7 + order)) * (int64_t) scale + ((int64_t) 1 << 44)) >> 45;
++}
++
++// c - a * x for the first 8 pixels of a row
++ALWAYS_INLINE int16x8_t line_start(int c, int a)
++{
++    static const int16_t index[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
++    return vmlsq_s16(vdupq_n_s16(c), vld1q_s16(index), vdupq_n_s16(a));
++}
++
++ALWAYS_INLINE int16x8_t clamp(int16x8_t val, int16x8_t max)
++{
++    return vminq_s16(vmaxq_s16(val, vdupq_n_s16(0)), max);
++}
++
++// The intrinsics below take immediates only.
++
++// res + (val >> (7 - order))
++ALWAYS_INLINE int16x8_t accumulate(int16x8_t res, int16x8_t val, const int order)
++{
++    return order == 4 ? vsraq_n_s16(res, val, 3) : vsraq_n_s16(res, val, 2);
++}
++
++// min(max(val, 0) << (order + 2), 65535):
++// val clamped to 0..full_value and scaled to 16 bits, 65535 for full_value
++ALWAYS_INLINE uint16x8_t clamp_scale(int16x8_t val, const int order)
++{
++    return order == 4 ? vqshluq_n_s16(val, 6) : vqshluq_n_s16(val, 7);
++}
++
++
++ALWAYS_INLINE void fill_solid_tile(uint8_t *buf, ptrdiff_t stride, int set,
++                                   const int order)
++{
++    const int tile_size = 1 << order;
++
++    uint8x16_t value = vdupq_n_u8(set ? 255 : 0);
++    for (int y = 0; y < tile_size; y++) {
++        for (int x = 0; x < tile_size; x += 16)
++            vst1q_u8(buf + x, value);
++        buf += stride;
++    }
++}
++
++
++/*
++ * Halfplane Filling Functions
++ *
++ * See c/rasterizer_template.h for the algorithm. The two clamped values of
++ * a pixel are c2 = cc - aa * x - delta and c1 = c2 + 2 * delta.
++ *
++ * clamp_scale() gives them as (c << (order + 2)) - (c == full_value), and
++ * the pixel is the upper byte of the rounded average of the two: the
++ * rounding makes up for one of them being full_value, so that this is
++ * (c1 + c2) >> (7 - order), and with both it is the 255 the pixel is
++ * clamped to.
++ */
++
++ALWAYS_INLINE void fill_halfplane_tile(uint8_t *buf, ptrdiff_t stride,
++                                       int32_t a, int32_t b, int64_t c, int32_t scale,
++                                       const int order)
++{
++    const int tile_size = 1 << order, n_vec = tile_size / 8;
++    const int full_value = 1 << (14 - order);
++
++    int16_t aa = rescale_ab(a, scale, order), bb = rescale_ab(b, scale, order);
++    int16_t cc = rescale_c(c, scale, order) + full_value / 2 - ((aa + bb) >> 1);
++
++    int16_t abs_a = aa < 0 ? -aa : aa;
++    int16_t abs_b = bb < 0 ? -bb : bb;
++    int16_t delta = (FFMIN(abs_a, abs_b) + 2) >> 2;
++
++    int16x8_t cur[MAX_VEC];
++    cur[0] = line_start(cc - delta, aa);
++    for (int i = 1; i < n_vec; i++)
++        cur[i] = vsubq_s16(cur[i - 1], vdupq_n_s16(aa * 8));
++
++    const int16x8_t vdelta = vdupq_n_s16(delta * 2), vb = vdupq_n_s16(bb);
++    for (int y = 0; y < tile_size; y++) {
++        for (int i = 0; i < n_vec; i += 2) {
++            uint16x8_t lo = vrhaddq_u16(clamp_scale(cur[i], order),
++                                        clamp_scale(vaddq_s16(cur[i], vdelta), order));
++            uint16x8_t hi = vrhaddq_u16(clamp_scale(cur[i + 1], order),
++                                        clamp_scale(vaddq_s16(cur[i + 1], vdelta), order));
++            vst1q_u8(buf + 8 * i, vcombine_u8(vshrn_n_u16(lo, 8), vshrn_n_u16(hi, 8)));
++            cur[i] = vsubq_s16(cur[i], vb);
++            cur[i + 1] = vsubq_s16(cur[i + 1], vb);
++        }
++        buf += stride;
++    }
++}
++
++
++/*
++ * Generic Filling Functions
++ *
++ * See c/rasterizer_template.h for the algorithm. What differs is the
++ * bookkeeping of the winding changes at the ends of the segments.
++ * The C version keeps delta[], whose running sum over the rows is added to
++ * all pixels of a row. An end at row y adds some -k * (64 - pos) to delta[y]
++ * and -k * pos to delta[y + 1]: a step of -64 * k from row y on and
++ * a correction of k * pos for row y alone. Here delta[y] holds both in one
++ * word, the step in the upper half and the correction in the lower one,
++ * which makes one update per end. The correction is signed and borrows from
++ * the step; that is undone when the halves are split as long as it fits into
++ * 16 bits, which MAX_PACKED segments cannot exceed.
++ */
++
++#define MAX_PACKED  128
++
++// Render top/bottom line of the trapezoid with antialiasing,
++// cur[] is c - va[] of the C version; the line is less than a row high
++ALWAYS_INLINE void update_border_line(int16_t *res, const int16x8_t cur[MAX_VEC],
++                                      int abs_a, int b, int abs_b,
++                                      int up, int dn, const int order)
++{
++    const int n_vec = (1 << order) / 8;
++    const int full_value = 1 << (14 - order);
++
++    // All of this fits into int16_t for any segment, as the C version has
++    // it, except for w with large tiles
++    int size = dn - up;
++    int w = full_value + (size << (8 - order)) - abs_a;
++    w = FFMIN(w, full_value) << (2 * order - 5);
++    if (order > 4)
++        w = (int16_t) w;
++
++    int dc_b = abs_b * size >> 6;
++    int dc = (FFMIN(abs_a, dc_b) + 2) >> 2;
++
++    int base = b * (up + dn) >> 7;
++    int offs1 = size - ((base + dc) * w >> 16);
++    int offs2 = size - ((base - dc) * w >> 16);
++
++    size <<= 1;
++    // w is even, so the doubling multiply by w / 2 gives val * w >> 16
++    // exactly and never saturates
++    const int16x8_t vw = vdupq_n_s16(w >> 1);
++    const int16x8_t voffs1 = vdupq_n_s16(offs1), voffs2 = vdupq_n_s16(offs2);
++
++    // Before the clamping c2 is c1 + diff, and 0 <= diff < 128 for any
++    // segment within the preconditions (only an abs_a far above full_value
++    // gets it out of there). The clamped values then follow from c2
++    // saturated to 8 bits, as size <= 126, and so does their sum.
++    int diff = offs2 - offs1;
++    if ((unsigned) diff < 128) {
++        const uint8x16_t vdiff = vdupq_n_u8(diff), vsize = vdupq_n_u8(size);
++        for (int i = 0; i < n_vec; i += 2) {
++            int16x8_t lo = vaddq_s16(vqdmulhq_s16(cur[i], vw), voffs2);
++            int16x8_t hi = vaddq_s16(vqdmulhq_s16(cur[i + 1], vw), voffs2);
++            uint8x16_t c2 = vcombine_u8(vqmovun_s16(lo), vqmovun_s16(hi));
++            uint8x16_t c1 = vminq_u8(vqsubq_u8(c2, vdiff), vsize);
++            uint8x16_t sum = vaddq_u8(c1, vminq_u8(c2, vsize));
++            uint16x8_t res_lo = vreinterpretq_u16_s16(vld1q_s16(res + 8 * i));
++            uint16x8_t res_hi = vreinterpretq_u16_s16(vld1q_s16(res + 8 * i + 8));
++            res_lo = vaddw_u8(res_lo, vget_low_u8(sum));
++            res_hi = vaddw_u8(res_hi, vget_high_u8(sum));
++            vst1q_s16(res + 8 * i, vreinterpretq_s16_u16(res_lo));
++            vst1q_s16(res + 8 * i + 8, vreinterpretq_s16_u16(res_hi));
++        }
++        return;
++    }
++
++    const int16x8_t vsize = vdupq_n_s16(size);
++    for (int i = 0; i < n_vec; i++) {
++        int16x8_t cw = vqdmulhq_s16(cur[i], vw);
++        int16x8_t c1 = clamp(vaddq_s16(cw, voffs1), vsize);
++        int16x8_t c2 = clamp(vaddq_s16(cw, voffs2), vsize);
++        int16x8_t val = vaddq_s16(vld1q_s16(res + 8 * i), vaddq_s16(c1, c2));
++        vst1q_s16(res + 8 * i, val);
++    }
++}
++
++// Running sum of the 8 values
++ALWAYS_INLINE int16x8_t running_sum(int16x8_t val)
++{
++    const int16x8_t zero = vdupq_n_s16(0);
++    val = vaddq_s16(val, vextq_s16(zero, val, 7));
++    val = vaddq_s16(val, vextq_s16(zero, val, 6));
++    return vaddq_s16(val, vextq_s16(zero, val, 4));
++}
++
++// Store clamped absolute value of one row
++ALWAYS_INLINE void store_row(uint8_t *buf, const int16_t *res, int16x8_t cur,
++                             const int n_vec)
++{
++    for (int i = 0; i < n_vec; i += 2) {
++        // -32768 stays negative and ends up as 0, like in the C version
++        int16x8_t lo = vabsq_s16(vaddq_s16(vld1q_s16(res + 8 * i), cur));
++        int16x8_t hi = vabsq_s16(vaddq_s16(vld1q_s16(res + 8 * i + 8), cur));
++        vst1q_u8(buf + 8 * i, vcombine_u8(vqmovun_s16(lo), vqmovun_s16(hi)));
++    }
++}
++
++// res[] is tile_size * tile_size, delta[] is tile_size + 1
++ALWAYS_INLINE void fill_generic_tile(uint8_t *restrict buf, ptrdiff_t stride,
++                                     const struct segment *restrict line, size_t n_lines,
++                                     int winding, int16_t *restrict res,
++                                     uint32_t *restrict delta, const int order)
++{
++    const int tile_size = 1 << order, n_vec = tile_size / 8;
++    const int full_value = 1 << (14 - order);
++    const int16x8_t full = vdupq_n_s16(full_value);
++
++    // The accumulators start out with what the winding adds to every pixel.
++    // (Zeros would do, but the compiler makes them a call of memset(), which
++    // takes three times as long as these stores.)
++    const int16x8_t base = vdupq_n_s16(256 * (int8_t) winding);
++    for (int i = 0; i < tile_size * tile_size; i += 32) {
++        vst1q_s16(res + i, base);
++        vst1q_s16(res + i + 8, base);
++        vst1q_s16(res + i + 16, base);
++        vst1q_s16(res + i + 24, base);
++    }
++    memset(delta, 0, sizeof(*delta) * (tile_size + 1));
++
++    // steps and corrections of the segments before the last MAX_PACKED ones
++    int16_t step_sum[8 * MAX_VEC], corr_sum[8 * MAX_VEC];
++    int unpacked = 0;
++
++    const struct segment *end = line + n_lines;
++    for (;;) {
++        const struct segment *packed_end =
++            (size_t) (end - line) > MAX_PACKED ? line + MAX_PACKED : end;
++        for (; line != packed_end; ++line) {
++            // The multiplications come first: their results are not there
++            // at once, and there is the bookkeeping to do meanwhile.
++            // a and b fit into int16_t for any segment.
++            int a = rescale_ab(line->a, line->scale, order);
++            int b = rescale_ab(line->b, line->scale, order);
++            int c = rescale_c(line->c, line->scale, order);
++
++            uint32_t flags = line->flags;
++            uint32_t up_delta = flags & SEGFLAG_DN ? 4 : 0;
++            uint32_t dn_delta = up_delta;
++            if (!line->x_min && (flags & SEGFLAG_EXACT_LEFT)) dn_delta ^= 4;
++            if (flags & SEGFLAG_UL_DR) {
++                uint32_t tmp = up_delta;
++                up_delta = dn_delta;
++                dn_delta = tmp;
++            }
++
++            int up = line->y_min >> 6, dn = line->y_max >> 6;
++            int up_pos = line->y_min & 63, dn_pos = line->y_max & 63;
++            // both ends are often in the same row: a load right after
++            // a store to the same place would have to wait for it
++            uint32_t delta_up = delta[up], delta_dn = delta[dn];
++            delta_up -= up_delta * ((64 << 16) - up_pos);
++            if (dn == up)
++                delta_dn = delta_up;
++            delta_dn += dn_delta * ((64 << 16) - dn_pos);
++            delta[up] = delta_up;
++            delta[dn] = delta_dn;
++            if (line->y_min == line->y_max)
++                continue;
++
++            c -= (a >> 1) + b * up;
++            int abs_a = a < 0 ? -a : a;
++            int abs_b = b < 0 ? -b : b;
++
++            // c - va[] of the C version, kept up to date with c
++            int16x8_t cur[MAX_VEC];
++            cur[0] = line_start(c, a);
++            for (int i = 1; i < n_vec; i++)
++                cur[i] = vsubq_s16(cur[i - 1], vdupq_n_s16(a * 8));
++            const int16x8_t vb = vdupq_n_s16(b);
++
++            int16_t *row = res + up * tile_size;
++            if (up_pos) {
++                update_border_line(row, cur, abs_a, b, abs_b,
++                                   up_pos, dn == up ? dn_pos : 64, order);
++                if (dn == up)
++                    continue;
++                row += tile_size;
++                up++;
++                for (int i = 0; i < n_vec; i++)
++                    cur[i] = vsubq_s16(cur[i], vb);
++            }
++            if (up < dn) {
++                int dc = (FFMIN(abs_a, abs_b) + 2) >> 2;
++                int base = full_value / 2 - (b >> 1);
++                const int16x8_t dc1 = vdupq_n_s16(base + dc), dc2 = vdupq_n_s16(base - dc);
++                const int16_t *row_end = res + dn * tile_size;
++                do {
++                    for (int i = 0; i < n_vec; i++) {
++                        int16x8_t c1 = clamp(vaddq_s16(cur[i], dc1), full);
++                        int16x8_t c2 = clamp(vaddq_s16(cur[i], dc2), full);
++                        int16x8_t val = accumulate(vld1q_s16(row + 8 * i),
++                                                   vaddq_s16(c1, c2), order);
++                        vst1q_s16(row + 8 * i, val);
++                        cur[i] = vsubq_s16(cur[i], vb);
++                    }
++                    row += tile_size;
++                } while (row != row_end);
++            }
++            if (dn_pos)
++                update_border_line(row, cur, abs_a, b, abs_b, 0, dn_pos, order);
++        }
++        if (line == end)
++            break;
++
++        // more segments than one packed delta[] is good for: split it
++        if (!unpacked) {
++            memset(step_sum, 0, sizeof(step_sum));
++            memset(corr_sum, 0, sizeof(corr_sum));
++            unpacked = 1;
++        }
++        for (int y = 0; y < tile_size; y++) {
++            step_sum[y] += (delta[y] + 0x8000) >> 16;
++            corr_sum[y] += delta[y];
++            delta[y] = 0;
++        }
++    }
++
++    // per row: running sum of the steps plus the correction, added to
++    // the accumulators
++    int16x8_t prev = vdupq_n_s16(0);
++    for (int i = 0; i < n_vec; i++) {
++        const int32x4_t half = vdupq_n_s32(0x8000);
++        int32x4_t lo = vreinterpretq_s32_u32(vld1q_u32(delta + 8 * i));
++        int32x4_t hi = vreinterpretq_s32_u32(vld1q_u32(delta + 8 * i + 4));
++        int16x8_t step = vcombine_s16(vaddhn_s32(lo, half), vaddhn_s32(hi, half));
++        int16x8_t corr = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
++        if (unpacked) {
++            step = vaddq_s16(step, vld1q_s16(step_sum + 8 * i));
++            corr = vaddq_s16(corr, vld1q_s16(corr_sum + 8 * i));
++        }
++        step = vaddq_s16(running_sum(step), prev);
++        prev = vdupq_lane_s16(vget_high_s16(step), 3);
++
++        const int16x8_t cur = vaddq_s16(step, corr);
++        const int16x4_t cur_lo = vget_low_s16(cur), cur_hi = vget_high_s16(cur);
++#define STORE_ROW(half, lane) \
++        store_row(buf, res, vdupq_lane_s16(half, lane), n_vec); \
++        buf += stride; \
++        res += tile_size;
++        STORE_ROW(cur_lo, 0)
++        STORE_ROW(cur_lo, 1)
++        STORE_ROW(cur_lo, 2)
++        STORE_ROW(cur_lo, 3)
++        STORE_ROW(cur_hi, 0)
++        STORE_ROW(cur_hi, 1)
++        STORE_ROW(cur_hi, 2)
++        STORE_ROW(cur_hi, 3)
++#undef STORE_ROW
++    }
++}
++
++
++#define RASTERIZER_TILE(order, tile_size) \
++void ass_fill_solid_tile ## tile_size ## _neon(uint8_t *buf, ptrdiff_t stride, int set) \
++{ \
++    fill_solid_tile(buf, stride, set, order); \
++} \
++\
++void ass_fill_halfplane_tile ## tile_size ## _neon(uint8_t *buf, ptrdiff_t stride, \
++                                                   int32_t a, int32_t b, int64_t c, int32_t scale) \
++{ \
++    fill_halfplane_tile(buf, stride, a, b, c, scale, order); \
++} \
++\
++void ass_fill_generic_tile ## tile_size ## _neon(uint8_t *restrict buf, ptrdiff_t stride, \
++                                                 const struct segment *restrict line, size_t n_lines, \
++                                                 int winding) \
++{ \
++    int16_t res[tile_size * tile_size]; \
++    uint32_t delta[tile_size + 1]; \
++    fill_generic_tile(buf, stride, line, n_lines, winding, res, delta, order); \
++}
++
++RASTERIZER_TILE(4, 16)
++RASTERIZER_TILE(5, 32)
+diff --git a/libass/ass_bitmap_engine.c b/libass/ass_bitmap_engine.c
+index 10961f9..8fd9f85 100644
+--- a/libass/ass_bitmap_engine.c
++++ b/libass/ass_bitmap_engine.c
+@@ -183,7 +183,7 @@ unsigned ass_get_cpu_flags(unsigned mask)
+ 
+ #endif
+ 
+-#if ARCH_AARCH64
++#if ARCH_AARCH64 || (CONFIG_ASM && ARCH_ARM)
+     flags = ASS_CPU_FLAG_ARM_NEON;
+ #endif
+ 
+@@ -223,6 +223,20 @@ BitmapEngine ass_bitmap_engine_init(unsigned mask)
+         ALL_FUNCTIONS(4, 16, neon)
+         return engine;
+     }
++#elif ARCH_ARM
++    if (flags & ASS_CPU_FLAG_ARM_NEON) {
++        // NEON intrinsics (libass/arm/). merge_tile stays C: the compiler
++        // makes the same load, max and store of it, and a Cortex-A55 times
++        // both the same.
++        ALL_PROTOTYPES(16, neon)
++        ALL_FUNCTIONS(4, 16, c)
++        RASTERIZER_FUNCTION(fill_solid, neon)
++        RASTERIZER_FUNCTION(fill_halfplane, neon)
++        RASTERIZER_FUNCTION(fill_generic, neon)
++        GENERIC_FUNCTIONS(neon)
++        BLUR_FUNCTIONS(4, 16, neon)
++        return engine;
++    }
+ #endif
+ #endif
+ 
+diff --git a/libass/ass_bitmap_engine.h b/libass/ass_bitmap_engine.h
+index b3b75b8..1a9dd5c 100644
+--- a/libass/ass_bitmap_engine.h
++++ b/libass/ass_bitmap_engine.h
+@@ -94,7 +94,7 @@ enum {
+     ASS_CPU_FLAG_X86_SSE2      = 0x0001,
+     ASS_CPU_FLAG_X86_SSSE3     = 0x0002,
+     ASS_CPU_FLAG_X86_AVX2      = 0x0004,
+-#elif ARCH_AARCH64
++#elif ARCH_AARCH64 || ARCH_ARM
+     ASS_CPU_FLAG_ARM_NEON      = 0x0001,
+ #endif
+     ASS_CPU_FLAG_ALL           = 0x0FFF,
+diff --git a/libass/meson.build b/libass/meson.build
+index 9eda958..375e49a 100644
+--- a/libass/meson.build
++++ b/libass/meson.build
+@@ -37,6 +37,13 @@ src_aarch64 = files(
+     'aarch64/blur.S',
+     'aarch64/rasterizer.S',
+ )
++# 32-bit ARM: NEON intrinsics, compiled as part of the library itself
++src_arm = files(
++    'arm/be_blur.c',
++    'arm/blend_bitmaps.c',
++    'arm/blur.c',
++    'arm/rasterizer.c',
++)
+ src_fontconfig = files('ass_fontconfig.c')
+ src_directwrite = files('ass_directwrite.c')
+ src_coretext = files('ass_coretext.c')
+@@ -88,11 +95,13 @@ if enable_asm
+         asm_sources = src_x86
+     elif generic_cpu_family == 'aarch64'
+         asm_sources = src_aarch64
++    elif generic_cpu_family == 'arm'
++        libass_src += src_arm
+     endif
+ 
+     if asm_is_nasm
+         libass_src += asm_sources
+-    else
++    elif asm_sources.length() > 0
+         asm_lib = static_library(
+             'ass_asm',
+             config_h,
+diff --git a/meson.build b/meson.build
+index b57c943..e062644 100644
+--- a/meson.build
++++ b/meson.build
+@@ -375,6 +375,15 @@ if not asm_option.disabled()
+         if host_system == 'darwin'
+             asm_args += '-DPREFIX'
+         endif
++    elif generic_cpu_family == 'arm'
++        # NEON intrinsics in C: no assembler, but the compiler's baseline has
++        # to include NEON (it does for Android's armeabi-v7a).
++        if cc.get_define('__ARM_NEON').strip() != ''
++            enable_asm = true
++            conf.set('ARCH_ARM', 1)
++        else
++            warning('NEON is not in the compiler baseline; NEON functions are disabled.')
++        endif
+     else
+         warning(
+             'Assembly optimizations are not yet supported for the "@0@" architecture; disabling.'.format(

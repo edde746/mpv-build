@@ -231,6 +231,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_libass_series.sh` | the libass series: change detection, renderer handoff, shape cache, a frame's events however the track changed (event blocks), cache keys whatever their padding holds | main |
 | `test_libass_rounding.c` | ARMv7 VFP rounding; cross-compile and run on an ARMv7 device (header) | manual |
 | `test_libass_key_padding.c` | the cache key harness of `test_libass_series.sh` on the one ABI that pads those keys; cross-compile and run on an ARMv7 device (header) | manual |
+| libass `checkasm` | the 32-bit ARM NEON kernels against the C ones, byte for byte; libass' own tool, built with the series for `armeabi-v7a`, run on an ARMv7 device | manual |
 | `test_mediacodec_crop.sh` | MediaCodec output crop parsing | PR, main |
 | `test_mediacodec_dv_filter.sh` | the Dolby Vision access-unit filter (patch 0101) | main |
 | `test_mediacodec_eos.sh` | end of stream through the async decoder after a flush | PR, main |
