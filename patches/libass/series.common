@@ -25,6 +25,8 @@
 #   key padding        cache keys hashed member by member where the ABI pads
 #                      them (ARM EABI): the threads patch hashed the padding,
 #                      so ARMv7 missed its caches and re-rendered at random
+#   event blocks       a frame walks the blocks of 64 events whose time span
+#                      holds it, not every event of the track
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
@@ -32,3 +34,4 @@
 0005-ass-load-the-fonts-directory-once-per-library.patch
 0006-ass-export-frame-references.patch
 0007-ass-never-hash-the-padding-of-a-cache-key.patch
+0008-ass-skip-the-events-that-cannot-be-active.patch

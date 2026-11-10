@@ -3,9 +3,10 @@
 # behavioral harnesses against it: a static frame rendered twice is reported
 # unchanged the second time (the layout cache must not hand the next frame a
 # copy with a fresh bitmap pointer), a cached shaping result is only reused
-# for a run whose every HarfBuzz input matches, and a cached glyph is found
-# again whatever a key's padding holds. Pass an already-patched libass tree
-# for offline use; otherwise
+# for a run whose every HarfBuzz input matches, a frame shows exactly its
+# active events however the track changed (the event blocks), and a cached
+# glyph is found again whatever a key's padding holds. Pass an already-patched
+# libass tree for offline use; otherwise
 # fetch and patch the pinned source in a temporary directory. Needs the host's
 # freetype, fribidi, harfbuzz and libunibreak via pkg-config, autotools, and a
 # system font.
@@ -74,7 +75,7 @@ case "$(uname -s)" in
     Darwin) link=(-liconv -framework CoreText -framework CoreFoundation) ;;
 esac
 for harness in test_libass_change_detection test_libass_shape_cache \
-        test_libass_key_padding; do
+        test_libass_event_index test_libass_key_padding; do
     cc -O1 -std=c11 -Wall -Wextra -Werror -I"$source_dir" \
         -o "$workdir/$harness" "$root/scripts/$harness.c" \
         "$build/libass/.libs/libass.a" \

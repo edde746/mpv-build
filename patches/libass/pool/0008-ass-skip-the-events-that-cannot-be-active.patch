@@ -1,0 +1,256 @@
+ass: skip the blocks of events that cannot be active
+
+ass_render_frame read Start and Duration of every event of the track to
+find the few that are on screen. A track of frame-by-frame typesetting has
+tens of thousands of events (36880 and 45106 in two episodes of the series
+this was measured with), three megabytes of event structs walked for every
+frame: 0.4 ms on a Fire TV Stick 4K Max's Cortex-A55 at full speed, more
+at the frequency it idles at between frames. That is all a frame without
+a change costs, and was 6.6% of the time the episode takes to render
+there; such a frame now takes 0.1 ms.
+
+The events array is now described in blocks of 64 events by the earliest
+start and the latest end in the block, and a frame walks only the blocks
+whose span holds it. The frame's events are the same, in the same order.
+
+ASS_Track is a public struct and callers edit it: mpv settles the duration
+of the newest events after the fact, fills events in after
+ass_alloc_event, and drops old ones by moving the array down. So the
+blocks are trusted only as far as this goes:
+- an event is looked at before it is rendered, so a span that got shorter
+  costs a look at its block and nothing else;
+- the last two blocks are described again for every frame;
+- events added or removed through libass update or void the blocks, and a
+  count or an array that changed behind libass' back voids them, at the
+  next ass_alloc_event or frame;
+- a share of the older blocks is described again for every frame, so a
+  write that extends or moves an old event without any of the above is
+  honored after 32 frames at the latest.
+Tracks of fewer than 512 events are walked as before.
+
+scripts/test_libass_event_index.c renders through all of these and
+compares every frame with the events that are active.
+
+diff --git a/libass/ass.c b/libass/ass.c
+index f0feb94..c27dfbe 100644
+--- a/libass/ass.c
++++ b/libass/ass.c
+@@ -72,6 +72,7 @@ void ass_free_track(ASS_Track *track)
+         return;
+ 
+     if (track->parser_priv) {
++        free(track->parser_priv->event_blocks);
+         free(track->parser_priv->read_order_bitmap);
+         free(track->parser_priv->fontname);
+         free(track->parser_priv->fontdata);
+@@ -126,6 +127,11 @@ int ass_alloc_event(ASS_Track *track)
+ 
+     assert(track->n_events <= track->max_events);
+ 
++    // The caller dropped or added events on its own since libass last
++    // counted them: whatever the blocks say about the array is void.
++    if (track->n_events != track->parser_priv->seen_events)
++        track->parser_priv->indexed_events = 0;
++
+     if (track->n_events == track->max_events) {
+         if (track->max_events >= FFMIN(SIZE_MAX, INT_MAX) / 2)
+             return -1;
+@@ -136,10 +142,99 @@ int ass_alloc_event(ASS_Track *track)
+     }
+ 
+     eid = track->n_events++;
++    track->parser_priv->seen_events = track->n_events;
+     memset(track->events + eid, 0, sizeof(ASS_Event));
+     return eid;
+ }
+ 
++// Undo the ass_alloc_event() that returned the last event.
++static void discard_last_event(ASS_Track *track)
++{
++    ass_free_event(track, track->n_events - 1);
++    track->n_events--;
++    track->parser_priv->seen_events = track->n_events;
++}
++
++static void describe_events(const ASS_Event *events, int count, EventBlock *block)
++{
++    long long min_start = LLONG_MAX, max_end = LLONG_MIN;
++    for (int i = 0; i < count; i++) {
++        long long start = events[i].Start, end = start + events[i].Duration;
++        if (start < min_start)
++            min_start = start;
++        if (end > max_end)
++            max_end = end;
++    }
++    block->min_start = min_start;
++    block->max_end = max_end;
++}
++
++// Shorter tracks are walked whole: the blocks would save nothing.
++#define EVENT_INDEX_MIN_EVENTS (8 * EVENT_BLOCK_SIZE)
++// Share of the blocks described anew by every call.
++#define EVENT_RECHECK_SHIFT 5
++
++const EventBlock *ass_event_blocks(ASS_Track *track)
++{
++    ASS_ParserPriv *priv = track->parser_priv;
++    int n_events = track->n_events;
++
++    if (n_events < EVENT_INDEX_MIN_EVENTS) {
++        priv->indexed_events = 0;
++        priv->seen_events = n_events;
++        return NULL;
++    }
++
++    int n_blocks = (n_events + EVENT_BLOCK_SIZE - 1) >> EVENT_BLOCK_ORDER;
++    if (n_blocks > priv->event_blocks_size) {
++        int size = FFMAX(n_blocks, 2 * priv->event_blocks_size);
++        EventBlock *blocks = ass_try_realloc_array(priv->event_blocks, size, sizeof(*blocks));
++        if (!blocks) {
++            priv->indexed_events = 0;
++            priv->seen_events = n_events;
++            return NULL;
++        }
++        priv->event_blocks = blocks;
++        priv->event_blocks_size = size;
++    }
++
++    // Events come and go through libass (which counts them) or by the caller
++    // editing the array, which shows as another array or another count.
++    if (track->events != priv->indexed_array || n_events != priv->seen_events ||
++            n_events < priv->indexed_events)
++        priv->indexed_events = 0;
++    priv->indexed_array = track->events;
++    priv->seen_events = n_events;
++
++    // New events, and always the last two blocks: a caller that fills in
++    // an event after ass_alloc_event(), or settles the duration of the
++    // newest ones later, does it there.
++    int first = priv->indexed_events >> EVENT_BLOCK_ORDER;
++    first = FFMIN(first, FFMAX(n_blocks - 2, 0));
++    for (int b = first; b < n_blocks; b++) {
++        int start = b << EVENT_BLOCK_ORDER;
++        describe_events(track->events + start,
++                        FFMIN(EVENT_BLOCK_SIZE, n_events - start),
++                        priv->event_blocks + b);
++    }
++    priv->indexed_events = n_events;
++
++    // ASS_Track is a public struct, and nothing tells libass of a write to an
++    // older event's Start or Duration. A span that got shorter only costs a
++    // look at its block; for one that grew or moved, describe a share of the
++    // blocks again each time, so that such a write is honored after
++    // (1 << EVENT_RECHECK_SHIFT) frames at the latest.
++    int recheck = (first >> EVENT_RECHECK_SHIFT) + 1;
++    for (int i = 0; i < recheck && first > 0; i++) {
++        int b = priv->recheck_block % first;
++        priv->recheck_block = b + 1;
++        describe_events(track->events + (b << EVENT_BLOCK_ORDER),
++                        EVENT_BLOCK_SIZE, priv->event_blocks + b);
++    }
++
++    return priv->event_blocks;
++}
++
+ // defined in ass_render.c; frees any cached layout snapshot before the struct
+ void ass_render_priv_done(ASS_RenderPriv *priv);
+ 
+@@ -1043,8 +1138,7 @@ static int process_events_line(ASS_Track *track, char *str)
+             return 0;
+         }
+         // If something went wrong, discard the useless Event
+-        ass_free_event(track, eid);
+-        track->n_events--;
++        discard_last_event(track);
+         return ret;
+     } else if (!strncmp(str, "Comment:", 8)) {
+         // Ignore Comments
+@@ -1360,8 +1454,7 @@ void ass_process_chunk(ASS_Track *track, const char *data, int size,
+ //              dump_events(tid);
+     } while (0);
+     // some error
+-    ass_free_event(track, eid);
+-    track->n_events--;
++    discard_last_event(track);
+ 
+ cleanup:
+     free(str);
+@@ -1379,6 +1472,8 @@ void ass_flush_events(ASS_Track *track)
+             ass_free_event(track, eid);
+         track->n_events = 0;
+     }
++    track->parser_priv->indexed_events = 0;
++    track->parser_priv->seen_events = 0;
+     free(track->parser_priv->read_order_bitmap);
+     track->parser_priv->read_order_bitmap = NULL;
+     track->parser_priv->read_order_elems = 0;
+@@ -1422,6 +1517,8 @@ void ass_prune_events(ASS_Track *track, long long deadline)
+         }
+     }
+     track->n_events = n_kept;
++    track->parser_priv->indexed_events = 0;
++    track->parser_priv->seen_events = n_kept;
+ }
+ 
+ #ifdef CONFIG_ICONV
+diff --git a/libass/ass_priv.h b/libass/ass_priv.h
+index ac6ec50..1f425cb 100644
+--- a/libass/ass_priv.h
++++ b/libass/ass_priv.h
+@@ -68,6 +68,35 @@ struct parser_priv {
+ 
+     long long prune_delay;
+     long long prune_next_ts;
++
++    // Time index over the events array, see ass_event_blocks().
++    struct event_block *event_blocks;
++    int event_blocks_size;      // allocated entries
++    int indexed_events;         // leading events the blocks describe
++    ASS_Event *indexed_array;   // track->events when they were described
++    int seen_events;            // n_events as libass itself last left it
++    int recheck_block;          // where the next frame's recheck starts
+ };
+ 
++// The events array in blocks of EVENT_BLOCK_SIZE, each with the time span its
++// events cover, so that a frame only walks the blocks that can hold an active
++// event: a track of frame-by-frame typesetting has tens of thousands of
++// events, and reading all of them for every frame costs more than rendering
++// the two or three that are visible.
++#define EVENT_BLOCK_ORDER 6
++#define EVENT_BLOCK_SIZE (1 << EVENT_BLOCK_ORDER)
++
++typedef struct event_block {
++    long long min_start, max_end;
++} EventBlock;
++
++/**
++ * \brief The track's event blocks, brought up to date.
++ * Block b describes events [b * EVENT_BLOCK_SIZE, (b + 1) * EVENT_BLOCK_SIZE):
++ * none of them is active at a time outside [min_start, max_end).
++ * \return the blocks, or NULL if every event has to be looked at
++ * (a short track, or no memory)
++ */
++const EventBlock *ass_event_blocks(ASS_Track *track);
++
+ #endif /* LIBASS_PRIV_H */
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 12526cf..c3a82c5 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -4544,8 +4544,16 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+     }
+ 
+     // render events separately
++    const EventBlock *blocks = ass_event_blocks(track);
+     int cnt = 0;
+     for (int i = 0; i < track->n_events; i++) {
++        if (blocks && !(i & (EVENT_BLOCK_SIZE - 1))) {
++            const EventBlock *block = blocks + (i >> EVENT_BLOCK_ORDER);
++            if (now < block->min_start || now >= block->max_end) {
++                i += EVENT_BLOCK_SIZE - 1;
++                continue;
++            }
++        }
+         ASS_Event *event = track->events + i;
+         if ((event->Start <= now)
+             && (now < (event->Start + event->Duration))) {

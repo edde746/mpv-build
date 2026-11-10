@@ -228,7 +228,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_demux_codec_profile.sh` | demuxer-published codec profile matches the decoder's (patch 0204) | PR, main |
 | `test_demux_refresh.sh` | a refresh seek queues nothing twice and keeps the next subtitle (patch 0208) | PR, main |
 | `test_lavc_busy_policy.sh` | decoders that wake the filter themselves are not spun | PR, main |
-| `test_libass_series.sh` | the libass series: change detection, renderer handoff, shape cache, cache keys whatever their padding holds | main |
+| `test_libass_series.sh` | the libass series: change detection, renderer handoff, shape cache, a frame's events however the track changed (event blocks), cache keys whatever their padding holds | main |
 | `test_libass_rounding.c` | ARMv7 VFP rounding; cross-compile and run on an ARMv7 device (header) | manual |
 | `test_libass_key_padding.c` | the cache key harness of `test_libass_series.sh` on the one ABI that pads those keys; cross-compile and run on an ARMv7 device (header) | manual |
 | `test_mediacodec_crop.sh` | MediaCodec output crop parsing | PR, main |
