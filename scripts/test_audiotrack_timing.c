@@ -126,6 +126,7 @@ static void check_query_stall(const char *name, bool raw, bool iec, bool timesta
         .format = iec ? AudioFormat.ENCODING_IEC61937 : 1,
         .raw_passthrough = raw,
         .raw_rate_mult = multiplier,
+        .cfg_head_reuse = true, // the AO's default
         .timestamp_set = timestamp,
         .timestamp_stable = 20,
         .timestamp_fetched = mp_raw_time_ns(),
