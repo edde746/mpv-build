@@ -50,6 +50,32 @@ live in different toolchain directories. The SwiftPM wrapper contains Swift
 source for the same reason, so C and Objective-C consumers also get the Swift
 runtime and back-deployment libraries.
 
+## Starting a file quickly on iOS and tvOS
+
+Measured on an iPhone Air, a local file plays 45-55 ms after `loadfile`
+(80 ms for 4K HEVC); `mpv_create` and `mpv_initialize` take under 8 ms
+together. Three things outside libmpv decide whether it stays there:
+
+- **Activate the audio session before `loadfile`**, off the main thread
+  (`AVAudioSession.setCategory`, then `setActive(true)`). An audio output
+  that finds the session inactive activates it itself, on mpv's core thread:
+  42 ms the first time in a process and about 26 ms after the last output
+  deactivated it, during which nothing else of the file starts. The first
+  video frame no longer waits for that (patch 0046), the start of playback
+  does.
+- **Do not hold the main thread.** `vo=avfoundation` reads and changes the
+  display layer on the main thread and waits for it: once when the VO is
+  created (patch 0047; seven times before it) and once for each change of the
+  layer's size, scale or gravity. A main thread that works in pieces with
+  gaps costs nothing; one that is busy for 100 ms delays the first frame by
+  up to that long. Never call libmpv from the main thread in a way that
+  waits for the VO.
+- **Network files pay per connection.** FFmpeg's http protocol opens a new
+  connection for every seek, and a Matroska file muxed by mkvmerge has its
+  Cues and Tags at the end: three connections before the first frame against
+  one for a file with only the Cues there, 220 ms against 90 ms with 50 ms
+  per response. An MP4 with its `moov` at the end pays the same.
+
 ## AVPlayer passthrough output
 
 `ao_avfoundation`'s compressed (AVPlayer) sink needs a host that services the
