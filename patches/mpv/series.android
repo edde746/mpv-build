@@ -30,3 +30,4 @@
 0146-vo-mediacodec-draw-a-reused-ass-atlas-from-its-texture.patch
 0150-ao-audiotrack-wait-instead-of-writing-nothing.patch
 0151-ao-audiotrack-read-a-raw-passthrough-carrier-a-burst-at-a-time.patch
+0152-builtin-conf-libmpv-leaves-the-builtin-scripts-unloaded.patch

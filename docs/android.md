@@ -99,6 +99,13 @@ player.close()
   handoff, so the glue and libmpv must come from the same commit. A retirement
   that times out quarantines the old producer instead of releasing resources it
   may still use.
+- mpv's builtin Lua scripts stay unloaded: the `[libmpv]` profile that
+  `mpv_create` applies sets `load-stats-overlay`, `load-console`,
+  `load-auto-profiles`, `load-select`, `load-positioning`, `load-commands` and
+  `load-context-menu` to `no` on Android (mpv patch 0152), as upstream's does
+  for `osc`. Each loaded script is a Lua state on its own thread, and the first
+  `loadfile` waits for all of them. An option set back to `yes`, in `create`'s
+  block or later, loads its script; `ytdl` keeps mpv's default.
 
 Playback helpers both apps share, also in `com.edde746.mpv`:
 

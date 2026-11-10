@@ -1,0 +1,50 @@
+Subject: [PATCH] builtin.conf: the libmpv profile leaves the builtin scripts unloaded
+
+mpv_create() applies the [libmpv] profile, which turns the OSC off and
+nothing else of the builtin scripts: stats, console, auto_profiles,
+select, positioning, commands and context_menu still load in every
+player an embedder creates. Each is a Lua state on a thread of its own,
+mpv_initialize() starts them all, and the first loadfile waits until
+every one has run its top level. None of them can be reached in an
+Android app: the same profile removes the default key bindings and the
+terminal, and there is no config file for auto_profiles to read a
+profile from.
+
+The profile now sets their options to no. It is applied before the
+embedder sets anything, so an option set to yes afterwards, before or
+after mpv_initialize(), loads that script as before (with
+load-stats-overlay and load-console set back, exactly lua/stats and
+lua/console run). ytdl is left as it was.
+
+Unpatched against patched library with the options Plezy sets (it sets
+none of these), interleaved, from the player's creation to the first
+frame of a local H.264 MP4, median (range):
+  SEI Box R 4K Plus, n = 5       534 (516-562) -> 457 (435-489) ms
+  Fire TV Stick 4K 2nd gen, n = 10
+                                 391 (344-424) -> 339 (269-393) ms
+  Pixel 7, n = 5                 144 (132-147) -> 123 (120-144) ms
+Process CPU up to that frame 740 -> 680, 670 -> 565 and 280 -> 230 ms;
+six threads fewer for as long as the player lives, and 3.6 MB less
+native heap in an idle player on both boxes.
+
+--- a/etc/builtin.conf
++++ b/etc/builtin.conf
+@@ -24,6 +24,18 @@ idle=yes
+ terminal=no
+ input-terminal=no
+ osc=no
++# Android: the other builtin scripts stay unloaded too. Each one is a Lua state
++# on a thread of its own in every player, the first loadfile waits until all of
++# them have run their top level, and none can be reached here: there are no
++# default key bindings (below), no terminal, and auto_profiles has no config
++# file to read a profile from. An embedder that wants one sets its option back.
++load-stats-overlay=no
++load-console=no
++load-auto-profiles=no
++load-select=no
++load-positioning=no
++load-commands=no
++load-context-menu=no
+ input-default-bindings=no
+ input-vo-keyboard=no
+ # macOS global input hooks
