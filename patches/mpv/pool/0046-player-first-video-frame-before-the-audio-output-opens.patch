@@ -1,0 +1,109 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0100
+Subject: [PATCH] player: let the first video frame out before the audio output opens
+
+Opening an audio output is synchronous on the core thread, and
+fill_audio_out_buffers() does it as soon as the audio filters know their
+format, which is before write_video() looks at the first decoded frame:
+run_playloop() calls them in that order. So the frame, decoded and
+waiting, is shown only after the output is open, although audio cannot
+start before that frame has given it a timestamp to sync to
+(get_sync_pts() waits for video_status >= STATUS_READY).
+
+On iOS the wait is long: ao_avfoundation's init takes 7 ms when the app
+has already activated its audio session and 42 ms when it has to
+activate it (26 ms once it has been active before), all of it on the
+core thread, and a route that has to wake up takes longer still. An
+iPhone's log of a second load: frame decoded at +36 ms, "Trying audio
+driver 'avfoundation'" at +37, AO open at +72, frame shown at +77.
+
+While a file starts with a video track whose first frame has not been
+queued, and no audio output is open, leave the output closed;
+run_playloop() comes back for it as soon as write_video() has queued the
+frame (or the video chain ended, failed or turned out sparse). The
+restart itself is where it was: the same work, in another order.
+
+In series.apple only. Where the video decoder runs on its own thread
+(--vd-queue-enable, as Plezy sets on Android) the output used to open
+while the decoder worked, and waiting for the frame would add the open
+to the restart there; that needs its own measurement.
+
+iPhone Air, ms after loadfile until AVSampleBufferDisplayLayer reports
+its first frame ready (1 kHz poll), medians of 3 interleaved runs,
+Plezy's / Tortuga's option set, before -> after:
+  H.264 1080p MP4, audio session activated by the AO
+                                  89.4 -> 52.7 / 88.3 -> 51.5
+  the same, session already active     48.5 -> 38.8 / 45.8 -> 39.8
+  the same, second player in the process
+                                  71.8 -> 37.1 / 72.7 -> 37.5
+  HEVC 4K 90 Mb/s                121.0 -> 89.6 / 122.6 -> 87.1
+  HEVC 1080p + ASS subtitles      86.0 -> 49.4 / 87.1 -> 49.9
+PLAYBACK_RESTART for the same rows: 92.8 -> 92.9 / 90.2 -> 91.2,
+48.9 -> 46.1 / 47.1 -> 46.8, 73.8 -> 75.0 / 74.3 -> 74.9,
+124.1 -> 127.0 / 124.1 -> 125.3, 93.6 -> 97.7 / 89.0 -> 90.7.
+
+diff --git a/player/audio.c b/player/audio.c
+index e581066..565ada4 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -912,6 +912,22 @@ static void handle_ao_events(struct MPContext *mpctx)
+     issue_refresh_seek(mpctx, MPSEEK_EXACT);
+ }
+ 
++// Opening an audio output takes this thread tens of milliseconds, and far
++// longer where the route has to wake up first (activating an iOS audio
++// session, a Bluetooth route). While a file starts, a decoded first video
++// frame would sit behind that, although audio cannot start before the frame
++// has given it a timestamp to sync to (get_sync_pts). So the output opens
++// once that frame went to the VO; run_playloop() comes back for it.
++bool audio_output_waits_for_video(struct MPContext *mpctx)
++{
++    struct ao_chain *ao_c = mpctx->ao_chain;
++    return ao_c && ao_c->filter->ao_needs_update && !mpctx->ao &&
++           mpctx->opts->initial_audio_sync &&
++           mpctx->audio_status == STATUS_SYNCING &&
++           mpctx->vo_chain && !mpctx->vo_chain->is_sparse &&
++           mpctx->video_status == STATUS_SYNCING;
++}
++
+ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -930,6 +946,8 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+     }
+ 
+     if (ao_c->filter->ao_needs_update) {
++        if (audio_output_waits_for_video(mpctx))
++            return;
+         if (reinit_audio_filters_and_output(mpctx) < 0)
+             return;
+     }
+diff --git a/player/core.h b/player/core.h
+index c3e0816..ac01925 100644
+--- a/player/core.h
++++ b/player/core.h
+@@ -511,6 +511,7 @@ float audio_get_gain(struct MPContext *mpctx);
+ void audio_update_volume(struct MPContext *mpctx);
+ void reload_audio_output(struct MPContext *mpctx);
+ void audio_start_ao(struct MPContext *mpctx);
++bool audio_output_waits_for_video(struct MPContext *mpctx);
+ 
+ // configfiles.c
+ void mp_parse_cfgfiles(struct MPContext *mpctx);
+diff --git a/player/playloop.c b/player/playloop.c
+index fa4bf44..50baad5 100644
+--- a/player/playloop.c
++++ b/player/playloop.c
+@@ -1279,8 +1279,12 @@ void run_playloop(struct MPContext *mpctx)
+     if (mpctx->lavfi && mp_filter_has_failed(mpctx->lavfi))
+         mpctx->stop_play = AT_END_OF_FILE;
+ 
++    bool ao_waited = audio_output_waits_for_video(mpctx);
+     fill_audio_out_buffers(mpctx);
+     write_video(mpctx);
++    // The audio output that let the first video frame go first.
++    if (ao_waited && !audio_output_waits_for_video(mpctx))
++        mp_wakeup_core(mpctx);
+ 
+     handle_playback_restart(mpctx);
+ 
