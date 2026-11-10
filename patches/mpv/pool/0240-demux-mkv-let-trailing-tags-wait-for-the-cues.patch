@@ -1,0 +1,414 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0100
+Subject: [PATCH] demux_mkv: let trailing Tags wait for the Cues on network streams
+
+demux_mkv_open() defers the Cues only when they are the one level 1
+element behind the clusters. mkvmerge writes the Cues and then the Tags
+there, so every file it muxes was opened with a seek to the end of the
+file and one back to the first cluster. Over HTTP each of those is a new
+connection (three before the first packet, four when playback resumes at
+a saved position), and the last one fetches the first cluster only to
+drop it for the resume seek.
+
+On a network stream the Tags now wait with the Cues
+(--demuxer-mkv-defer-tags, default yes): opening such a file reads
+nothing behind the clusters, and the first seek reads the Cues and, on
+the way, the Tags that follow them. Tags are never fetched on their own,
+so a file that never seeks, or whose index sits in front, does not read
+them. Read that late, only the tags of the file itself can still be
+published (as a metadata update); track, chapter and edition tags are
+dropped, because the player reads those structures without locking once
+the file is open. mkvmerge's Tags are its per-track statistics (BPS,
+DURATION, NUMBER_OF_FRAMES ...), which mpv only passes on as track
+metadata. Local files, files with their Tags in front (ffmpeg's muxer),
+anything else behind the clusters (chapters, attachments), --replaygain
+other than no (its values may live in the Tags), and
+--demuxer-mkv-defer-tags=no read what they read before.
+
+Measured with netbench.py (real TCP and TLS 1.3 through a relay that
+delays each direction by RTT/2), a 2 h 10 Mbit/s mkvmerge file, time
+from mpv opening the URL to "playback restart complete", median (range)
+of 3 interleaved runs, connections in brackets:
+
+  RTT 40 ms   open at 0     443 (438-451) [3] -> 180 (178-182) [1]
+              resume 30 min 661 (620-667) [4] -> 509 (506-524) [3]
+  RTT 100 ms  open at 0     974 (974-999) [3] -> 391 (366-420) [1]
+              resume 30 min 1356 (1354-1362) [4] -> 1093 (1058-1099) [3]
+
+The first seek after an open at 0 now reads the Cues: at 40 ms it takes
+487 (470-506) ms on two connections instead of 381 (358-387) on one.
+With the kept connections of mpv patch 0241 that seek is one connection
+and two requests (449 ms), and the resume two connections (416 ms).
+
+A seek to a header element that fails is now tried once more on a
+network stream. One refused or dropped connection used to leave the file
+without its index (before this patch too, when the Cues were read while
+opening), and a seek then builds one by reading the file from its start:
+with the first connection to the Cues closed unanswered, a resume at
+30 min took 24.4 s and 2.3 GB on loopback, and takes 0.7 s now.
+
+demux_metadata_changed() now asks demux_update() for a merge outright.
+demux_update() tells a change by looking up the entries for the last and
+the current playback position in the list as it is at that moment, so an
+entry that arrives at or before the position playback is at was the answer
+for both and never reached the metadata. That is where a seek puts the
+Tags it reads: the ones a resume (--start) read were published only if
+the player happened not to poll between the seek and their arrival
+(iPhone, loopback http with 50 ms per response: "metadata" stayed empty
+in 12 of 12 resumes, and has the file's tags at the restart in 6 of 6 now).
+
+test_demux_mkv_defer_tags.sh replays what opening and the first seek
+read for each layout.
+
+diff --git a/DOCS/man/options.rst b/DOCS/man/options.rst
+index 97ad814..817290d 100644
+--- a/DOCS/man/options.rst
++++ b/DOCS/man/options.rst
+@@ -4143,6 +4143,19 @@ Demuxer
+     also reads the first timestamp, which may increase latency by one frame
+     (which may be relevant for live streams).
+ 
++``--demuxer-mkv-defer-tags=<yes|no>``
++    On a network stream, do not read Tags stored after the clusters when
++    opening the file (default: yes). mkvmerge writes its Tags there, behind the
++    Cues, and reading them on opening costs a seek to the end of the file and
++    one back before the first packet: over HTTP, two more connections. With
++    this option they are read on the way when the first seek reads the Cues.
++    Until then, and for good if nothing seeks, their values are missing from
++    ``metadata``. Track, chapter and edition tags (such as mkvmerge's per-track
++    statistics) read that late are not published at all, since those cannot
++    change once the file is open. Local files, files whose Tags precede the
++    clusters, and playback with ``--replaygain`` enabled always read them on
++    opening.
++
+ ``--demuxer-mkv-probe-video-duration=<yes|no|full>``
+     When opening the file, seek to the end of it, and check what timestamp the
+     last video packet has, and report that as file duration. This is strictly
+diff --git a/demux/demux.c b/demux/demux.c
+index 86a233d..7032b87 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -3090,6 +3090,11 @@ void demux_metadata_changed(demuxer_t *demuxer)
+ 
+     mp_mutex_lock(&in->lock);
+     add_timed_metadata(in, demuxer->metadata, NULL, MP_NOPTS_VALUE);
++    // demux_update() finds a change by looking up the entries for the last
++    // and the current position in the list as it is now. An entry that lands
++    // at or before the position playback is at (Matroska Tags read by a
++    // seek) is the answer for both from then on, and would never be merged.
++    in->force_metadata_update = true;
+     mp_mutex_unlock(&in->lock);
+ }
+ 
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index 6c2e773..f9930d3 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -192,6 +192,10 @@ typedef struct mkv_demuxer {
+     int num_tracks;
+ 
+     struct ebml_tags *tags;
++    // Tags stored after the clusters that wait for the Cues to be read.
++    bool tags_deferred;
++    // demux_mkv_open() has returned.
++    bool opened;
+ 
+     int64_t tc_scale, cluster_tc;
+ 
+@@ -240,6 +244,7 @@ struct demux_mkv_opts {
+     int probe_duration;
+     bool probe_start_time;
+     bool crop_compat;
++    bool defer_tags;
+ };
+ 
+ const struct m_sub_options demux_mkv_conf = {
+@@ -254,6 +259,7 @@ const struct m_sub_options demux_mkv_conf = {
+             {"no", 0}, {"yes", 1}, {"full", 2})},
+         {"probe-start-time", OPT_BOOL(probe_start_time)},
+         {"crop-compat", OPT_BOOL(crop_compat)},
++        {"defer-tags", OPT_BOOL(defer_tags)},
+         {0}
+     },
+     .size = sizeof(struct demux_mkv_opts),
+@@ -263,6 +269,7 @@ const struct m_sub_options demux_mkv_conf = {
+         .subtitle_preroll_secs_index = 10.0,
+         .probe_start_time = true,
+         .crop_compat = true,
++        .defer_tags = true,
+     },
+     .change_flags = UPDATE_DEMUXER,
+ };
+@@ -1291,6 +1298,14 @@ static void process_tags(demuxer_t *demuxer)
+     if (!tags)
+         return;
+ 
++    // Tags that waited for the first seek (see trailing_headers_can_wait())
++    // arrive after the file was opened. Only the global ones can still be
++    // published: the player reads the chapters, the editions and the stream
++    // tags without locking from then on.
++    bool late = mkv_d->opened;
++    bool late_changed = false;
++    int late_dropped = 0;
++
+     for (int i = 0; i < tags->n_tag; i++) {
+         struct ebml_tag tag = tags->tag[i];
+         struct mp_tags *dst = NULL;
+@@ -1330,7 +1345,13 @@ static void process_tags(demuxer_t *demuxer)
+             dst = demuxer->metadata;
+         }
+ 
++        if (late && dst && dst != demuxer->metadata) {
++            dst = NULL;
++            late_dropped++;
++        }
++
+         if (dst) {
++            late_changed |= tag.n_simple_tag > 0;
+             for (int j = 0; j < tag.n_simple_tag; j++) {
+                 if (tag.simple_tag[j].tag_name && tag.simple_tag[j].tag_string) {
+                     char *name = tag.simple_tag[j].tag_name;
+@@ -1345,6 +1366,13 @@ static void process_tags(demuxer_t *demuxer)
+             }
+         }
+     }
++
++    if (late_dropped) {
++        MP_VERBOSE(demuxer, "%d track, chapter or edition tag(s) read after "
++                   "opening are not published.\n", late_dropped);
++    }
++    if (late && late_changed)
++        demux_metadata_changed(demuxer);
+ }
+ 
+ static int demux_mkv_read_attachments(demuxer_t *demuxer)
+@@ -1488,7 +1516,12 @@ static int read_deferred_element(struct demuxer *demuxer,
+     MP_VERBOSE(demuxer, "Seeking to %"PRIu64" to read header element "
+                "0x%"PRIx32".\n",
+                elem->pos, elem->id);
+-    if (!stream_seek(s, elem->pos)) {
++    // Over the network a seek is a request, and one refused or dropped
++    // connection must not cost the file its index: without it a seek reads the
++    // file from its start to build one. Ask once more.
++    if (!stream_seek(s, elem->pos) &&
++        !(demuxer->is_network && stream_seek(s, elem->pos)))
++    {
+         MP_WARN(demuxer, "Failed to seek when reading header element.\n");
+         return 0;
+     }
+@@ -1501,6 +1534,28 @@ static int read_deferred_element(struct demuxer *demuxer,
+     return read_header_element(demuxer, elem->id, elem->pos);
+ }
+ 
++// Whether every level 1 element stored after the clusters can wait until a
++// seek needs the index. Reading them on opening means leaving the clusters for
++// the end of the file and coming back, which over HTTP is two more connections
++// before the first packet. The Cues can always wait. With defer_tags the Tags
++// wait with them: nothing needs them to start playback, and they are read on
++// the way when the Cues are (read_deferred_cues()). Anything else found there
++// (chapters, attachments, another seek head) is read on opening.
++static bool trailing_headers_can_wait(struct mkv_demuxer *mkv_d, bool defer_tags)
++{
++    int waiting = 0;
++    for (int n = 0; n < mkv_d->num_headers; n++) {
++        struct header_elem *elem = &mkv_d->headers[n];
++        if (elem->parsed)
++            continue;
++        if (elem->id != MATROSKA_ID_CUES &&
++            !(defer_tags && elem->id == MATROSKA_ID_TAGS))
++            return false;
++        waiting++;
++    }
++    return waiting > 0;
++}
++
+ static void read_deferred_cues(demuxer_t *demuxer)
+ {
+     mkv_demuxer_t *mkv_d = demuxer->priv;
+@@ -1508,12 +1563,107 @@ static void read_deferred_cues(demuxer_t *demuxer)
+     if (mkv_d->index_complete || demuxer->opts->index_mode != 1)
+         return;
+ 
++    // Tags that waited are read only on the way to Cues that are read anyway:
++    // mkvmerge writes one right after the other, so one read returns both.
++    bool with_tags = false;
+     for (int n = 0; n < mkv_d->num_headers; n++) {
+         struct header_elem *elem = &mkv_d->headers[n];
++        if (elem->id == MATROSKA_ID_CUES && !elem->parsed)
++            with_tags = mkv_d->tags_deferred;
++    }
++    mkv_d->tags_deferred = false;
+ 
+-        if (elem->id == MATROSKA_ID_CUES)
+-            read_deferred_element(demuxer, elem);
++    // In file order, to read the end of the file in one piece.
++    while (1) {
++        struct header_elem *lowest = NULL;
++        for (int n = 0; n < mkv_d->num_headers; n++) {
++            struct header_elem *elem = &mkv_d->headers[n];
++            if (elem->parsed)
++                continue;
++            if (elem->id != MATROSKA_ID_CUES &&
++                !(with_tags && elem->id == MATROSKA_ID_TAGS))
++                continue;
++            if (!lowest || elem->pos < lowest->pos)
++                lowest = elem;
++        }
++        if (!lowest)
++            break;
++        read_deferred_element(demuxer, lowest);
+     }
++
++    if (with_tags)
++        process_tags(demuxer);
++}
++
++// Read the level 1 elements stored after the clusters (i.e. the ones that
++// require seeking), or leave them to read_deferred_cues() if all can wait.
++// Note: reading might increase ->num_headers.
++//       Likewise, ->headers might be reallocated.
++static int read_trailing_headers(struct demuxer *demuxer, bool want_replaygain)
++{
++    struct mkv_demuxer *mkv_d = demuxer->priv;
++    stream_t *s = demuxer->stream;
++    int64_t end = stream_get_size(s);
++
++    bool cues_waiting = false, tags_waiting = false;
++    for (int n = 0; n < mkv_d->num_headers; n++) {
++        struct header_elem *elem = &mkv_d->headers[n];
++        if (elem->parsed)
++            continue;
++        // Warn against incomplete files and skip headers outside of range.
++        if (elem->pos >= end || !s->seekable) {
++            elem->parsed = true; // don't bother if file is incomplete
++            if (end < 0 || !s->seekable) {
++                MP_WARN(demuxer, "Stream is not seekable or unknown size, "
++                        "not reading mkv metadata at end of file.\n");
++            } else if (!mkv_d->eof_warning &&
++                       !(mkv_d->probably_webm_dash_init &&  elem->pos == end))
++            {
++                MP_WARN(demuxer, "mkv metadata beyond end of file - incomplete "
++                        "file?\n");
++                mkv_d->eof_warning = true;
++            }
++            continue;
++        }
++        cues_waiting |= elem->id == MATROSKA_ID_CUES;
++        tags_waiting |= elem->id == MATROSKA_ID_TAGS;
++    }
++
++    // Tags may wait where leaving the clusters is expensive, unless replaygain
++    // needs their values before the first sample plays.
++    bool defer_tags = tags_waiting && mkv_d->opts->defer_tags &&
++                      demuxer->is_network && !want_replaygain;
++
++    if (trailing_headers_can_wait(mkv_d, defer_tags)) {
++        // Read them when they are needed, to avoid seeking on opening.
++        MP_VERBOSE(demuxer, "Deferring reading %s%s%s.\n",
++                   cues_waiting ? "cues" : "",
++                   cues_waiting && defer_tags ? " and " : "",
++                   defer_tags ? "tags" : "");
++        mkv_d->tags_deferred = defer_tags;
++        return 0;
++    }
++
++    // Read them by ascending position to reduce unneeded seeks.
++    // O(n^2) because the number of elements is very low.
++    while (1) {
++        struct header_elem *lowest = NULL;
++        for (int n = 0; n < mkv_d->num_headers; n++) {
++            struct header_elem *elem = &mkv_d->headers[n];
++            if (elem->parsed)
++                continue;
++            if (!lowest || elem->pos < lowest->pos)
++                lowest = elem;
++        }
++
++        if (!lowest)
++            break;
++
++        if (read_deferred_element(demuxer, lowest) < 0)
++            return -1;
++    }
++
++    return 0;
+ }
+ 
+ static void add_coverart(struct demuxer *demuxer)
+@@ -2506,6 +2656,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+ 
+     struct MPOpts *mp_opts = mp_get_config_group(mkv_d, demuxer->global, &mp_opt_root);
+     mkv_d->edition_id = mp_opts->edition_id;
++    bool want_replaygain = mp_opts->rgain_mode != 0;
+     talloc_free(mp_opts);
+ 
+     mkv_d->opts = mp_get_config_group(mkv_d, demuxer->global, &demux_mkv_conf);
+@@ -2531,58 +2682,8 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+             return -1;
+     }
+ 
+-    int64_t end = stream_get_size(s);
+-
+-    // Read headers that come after the first cluster (i.e. require seeking).
+-    // Note: reading might increase ->num_headers.
+-    //       Likewise, ->headers might be reallocated.
+-    int only_cue = -1;
+-    for (int n = 0; n < mkv_d->num_headers; n++) {
+-        struct header_elem *elem = &mkv_d->headers[n];
+-        if (elem->parsed)
+-            continue;
+-        // Warn against incomplete files and skip headers outside of range.
+-        if (elem->pos >= end || !s->seekable) {
+-            elem->parsed = true; // don't bother if file is incomplete
+-            if (end < 0 || !s->seekable) {
+-                MP_WARN(demuxer, "Stream is not seekable or unknown size, "
+-                        "not reading mkv metadata at end of file.\n");
+-            } else if (!mkv_d->eof_warning &&
+-                       !(mkv_d->probably_webm_dash_init &&  elem->pos == end))
+-            {
+-                MP_WARN(demuxer, "mkv metadata beyond end of file - incomplete "
+-                        "file?\n");
+-                mkv_d->eof_warning = true;
+-            }
+-            continue;
+-        }
+-        only_cue = only_cue < 0 && elem->id == MATROSKA_ID_CUES;
+-    }
+-
+-    // If there's only 1 needed element, and it's the cues, defer reading.
+-    if (only_cue == 1) {
+-        // Read cues when they are needed, to avoid seeking on opening.
+-        MP_VERBOSE(demuxer, "Deferring reading cues.\n");
+-    } else {
+-        // Read them by ascending position to reduce unneeded seeks.
+-        // O(n^2) because the number of elements is very low.
+-        while (1) {
+-            struct header_elem *lowest = NULL;
+-            for (int n = 0; n < mkv_d->num_headers; n++) {
+-                struct header_elem *elem = &mkv_d->headers[n];
+-                if (elem->parsed)
+-                    continue;
+-                if (!lowest || elem->pos < lowest->pos)
+-                    lowest = elem;
+-            }
+-
+-            if (!lowest)
+-                break;
+-
+-            if (read_deferred_element(demuxer, lowest) < 0)
+-                return -1;
+-        }
+-    }
++    if (read_trailing_headers(demuxer, want_replaygain) < 0)
++        return -1;
+ 
+     if (!stream_seek(s, start_pos)) {
+         MP_ERR(demuxer, "Couldn't seek back after reading headers?\n");
+@@ -2602,6 +2703,7 @@ static int demux_mkv_open(demuxer_t *demuxer, enum demux_check check)
+     probe_dts_profile(demuxer);
+     probe_if_image(demuxer);
+ 
++    mkv_d->opened = true;
+     return 0;
+ }
+ 

@@ -55,3 +55,7 @@
 # before the callback's lock.
 0232-vd-lavc-no-first-packet-probe-with-a-hardware-decoder.patch
 0233-av-log-turn-a-line-nobody-takes-away-before-the-lock.patch
+# Opening a file over HTTP: Matroska Tags stored after the clusters (where
+# mkvmerge puts them) wait for the Cues instead of costing two connections
+# before the first packet (--demuxer-mkv-defer-tags).
+0240-demux-mkv-let-trailing-tags-wait-for-the-cues.patch

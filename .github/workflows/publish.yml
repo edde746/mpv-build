@@ -185,6 +185,9 @@ jobs:
       - name: Test the packets a refresh seek reads back
         run: bash ./scripts/test_demux_refresh.sh
 
+      - name: Test what demux_mkv reads behind the clusters, and when
+        run: bash ./scripts/test_demux_mkv_defer_tags.sh
+
       - name: Test FFmpeg log lines reaching the instance that logged them
         run: bash ./scripts/test_av_log_routing.sh
 

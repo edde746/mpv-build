@@ -226,6 +226,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_audiotrack_truehd.sh [media]` | raw TrueHD reassembly from IEC 61937 MAT bursts (needs host ffmpeg) | PR |
 | `test_av_log_routing.sh` | FFmpeg log lines reach the mpv instance that logged them (patch 0209), and one that no instance takes is turned away before the lock (0233) | PR, main |
 | `test_demux_codec_profile.sh` | demuxer-published codec profile matches the decoder's (patch 0204) | PR, main |
+| `test_demux_mkv_defer_tags.sh` | Matroska Tags behind the clusters wait for the Cues on network streams and nowhere else; tags read after opening reach only the file's metadata (patch 0240) | PR, main |
 | `test_demux_refresh.sh` | a refresh seek queues nothing twice and keeps the next subtitle (patch 0208) | PR, main |
 | `test_http_persistent.sh` | HTTP keeps its connection across seeks, byte for byte, against servers that keep alive, close, ignore Range, send chunked bodies, redirect, cut a reply short, stall or go silent, and changes nothing on the wire without the new options (FFmpeg patches 0080, 0081; builds a minimal host FFmpeg) | PR, main |
 | `test_lavc_busy_policy.sh` | decoders that wake the filter themselves are not spun | PR, main |
