@@ -200,6 +200,9 @@ jobs:
       - name: Test TCP hostname lookup by address family
         run: bash ./scripts/test_tcp_family_lookup.sh
 
+      - name: Test HTTP connection reuse across seeks
+        run: bash ./scripts/test_http_persistent.sh
+
       # The mpv-android AAR's JNI glue (platforms/android/lib/src/main/cpp)
       # against fakes, compiled with the patched mpv and FFmpeg headers.
       - name: Test the android JNI glue

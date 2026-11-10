@@ -1,0 +1,216 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:30:00 +0100
+Subject: [PATCH] avformat/http: reuse a connection only when that is safe
+
+The persistent connections of patch 0080 (upstream's, unchanged on
+release/9.1) hand a connection to the next request whenever the reply in
+progress has at most the short seek size left. test_http_persistent.sh
+shows four ways in which that goes wrong, each with the options mpv
+patch 0241 sets:
+
+- Chunked replies. The bytes left are counted as body bytes and read
+  off the socket as such, so the chunk headers stay behind and the next
+  reply is parsed out of them. The request is then usually refused
+  ("Unexpected offset") and repeated on a new connection, one wasted
+  round trip per seek. A seek to offset 0 is not refused: the chunk
+  framing and the real reply's headers are delivered as the first bytes
+  of the file. A chunked reply is now only left behind once its last
+  chunk was read.
+
+- Redirects. A seek goes back to the original address, but the kept
+  connection is one to the redirect's target, so the request for the
+  first server was sent to the second one, whose answer, if it has one
+  for that path, was taken for the file. The connection is now kept
+  across a seek only when the redirect is remembered (301, 308, or
+  cacheable) and leads to the same target again. A redirect also ended
+  initial_request_size for good, because the 30x reply does not say that
+  ranges work; that is now left to the reply that follows it.
+
+- Stalls. Reading out the rest of a reply blocked for as long as the
+  read timeout (60 s under mpv) when the rest never came, where a new
+  connection would have answered at once: the natural thing to do
+  with a stream that hangs is to seek. The rest is now read without
+  blocking, and given up, for a new connection, once nothing has arrived
+  for twice the longest request latency seen (at least 50 ms, at most
+  500).
+
+- Idle connections. A request sent into a connection that a NAT or a
+  server dropped without a FIN is answered by the read timeout. A
+  connection that carried nothing for 4 s (less than the shortest
+  keep-alive timeout servers commonly use, Apache's 5 s) is not asked
+  again, neither by a seek nor by the request that continues a bounded
+  range.
+
+Against the 0080 build the test reports wrong bytes for the first two
+(chunked rewind at byte 0; the redirect at two of the seek targets) and
+5.1 s and 10.3 s where the last two now take well under 1.5 s. None of
+this is upstream; it should go there, and this patch goes when the pin
+has it.
+
+diff --git a/libavformat/http.c b/libavformat/http.c
+index 029023d..6a1f7ec 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -58,6 +58,9 @@
+ #define BUFFER_SIZE   (MAX_URL_SIZE + HTTP_HEADERS_SIZE)
+ #define MAX_REDIRECTS 8
+ #define MAX_CACHED_REDIRECTS 32
++/* A connection that carried nothing for this long is not given another
++ * request: a server or a NAT may have dropped it without a word. */
++#define MAX_REUSE_IDLE_US 4000000
+ #define HTTP_SINGLE   1
+ #define HTTP_MUTLI    2
+ #define MAX_DATE_LEN  19
+@@ -157,6 +160,7 @@ typedef struct HTTPContext {
+     int nb_redirects;
+     int64_t sum_latency; /* divide by nb_requests */
+     int64_t max_latency;
++    int64_t last_io; /* av_gettime_relative() of the last reply or body data */
+     int max_redirects;
+     uint64_t oc_filesize; /* Complete size (200 Content-Length or Content-Range total) */
+     int end_of_resource; /* The end of an unknown-size resource was reached */
+@@ -1527,7 +1531,10 @@ static int http_read_header(URLContext *h)
+     if (s->seekable == -1 && s->is_mediagateway && s->filesize == 2000000000)
+         h->is_streamed = 1; /* we can in fact _not_ seek */
+ 
+-    if (h->is_streamed)
++    /* A redirect or an authentication challenge says nothing about ranges;
++     * the reply to the request that follows it does. */
++    if (h->is_streamed && !(is_redirect(s->http_code) && s->new_location) &&
++        s->http_code != 401 && s->http_code != 407)
+         s->initial_requests = 0; /* unable to use partial requests */
+ 
+     // add any new cookies into the existing cookie string
+@@ -1743,6 +1750,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
+     int64_t latency = av_gettime();
+     err = http_read_header(h);
+     latency = av_gettime() - latency;
++    s->last_io = av_gettime_relative();
+     if (err < 0)
+         goto done;
+ 
+@@ -1843,6 +1851,8 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
+         if (s->off == target_end && target_end < file_end)
+             return AVERROR(EAGAIN); /* reached end of content range */
+         len = ffurl_read(s->hd, buf, size);
++        if (len > 0)
++            s->last_io = av_gettime_relative();
+         if ((!len || len == AVERROR_EOF) &&
+             (!s->willclose || s->chunksize == UINT64_MAX) && s->off < target_end) {
+             av_log(h, AV_LOG_ERROR,
+@@ -1912,6 +1922,44 @@ static int http_end_of_resource(HTTPContext *s, int err)
+ 
+ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int force_reconnect);
+ 
++static int http_idle(HTTPContext *s)
++{
++    return av_gettime_relative() - s->last_io >= MAX_REUSE_IDLE_US;
++}
++
++/* Read and drop the rest of the reply in progress, so that the connection can
++ * take the next request. Gives up, for the caller to connect anew, once the
++ * connection has delivered nothing for about two round trips: waiting longer
++ * for a stalled or dead peer costs more than the connection it would save. */
++static int http_drain(URLContext *h, uint64_t remaining)
++{
++    HTTPContext *s = h->priv_data;
++    uint8_t discard[4096];
++    int stall_ms = av_clip64(2 * s->max_latency / 1000, 50, 500);
++    int fd = ffurl_get_file_handle(s->hd);
++    int waited = 0, ret = 0;
++
++    s->hd->flags |= AVIO_FLAG_NONBLOCK;
++    while (remaining) {
++        ret = ffurl_read(s->hd, discard, FFMIN(remaining, sizeof(discard)));
++        if (ret > 0) {
++            remaining -= ret;
++            waited = 0;
++        } else if (ret == AVERROR(EAGAIN) && fd >= 0 && waited < stall_ms &&
++                   !ff_check_interrupt(&h->interrupt_callback)) {
++            struct pollfd p = { .fd = fd, .events = POLLIN };
++            int slice = FFMIN(stall_ms - waited, 100);
++            if (poll(&p, 1, slice) == 0)
++                waited += slice;
++        } else {
++            break; /* closed, failed, stalled or interrupted */
++        }
++    }
++    s->hd->flags &= ~AVIO_FLAG_NONBLOCK;
++
++    return remaining ? AVERROR(EIO) : 0;
++}
++
+ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+ {
+     HTTPContext *s = h->priv_data;
+@@ -1950,7 +1998,7 @@ retry:
+         else if (read_ret == AVERROR(EAGAIN)) {
+             /* send new request for more data on existing connection */
+             AVDictionary *options = NULL;
+-            if (s->willclose)
++            if (s->willclose || http_idle(s))
+                 ffurl_closep(&s->hd);
+             s->initial_requests = 0; /* continue streaming uninterrupted from now on */
+             read_ret = http_open_cnx(h, &options, 1);
+@@ -2215,7 +2263,7 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+     uint8_t old_buf[BUFFER_SIZE];
+     int old_buf_size, ret;
+     AVDictionary *options = NULL;
+-    uint8_t discard[4096];
++    int same_server = 1;
+ 
+     if (whence == AVSEEK_SIZE)
+         return s->filesize == UINT64_MAX ? AVERROR(ENOSYS) : s->filesize;
+@@ -2247,12 +2295,17 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+ 
+     /* if the location changed (redirect), revert to the original uri */
+     if (strcmp(s->uri, s->location)) {
+-        char *new_uri;
++        char *new_uri, *target = s->location, *cached;
+         new_uri = av_strdup(s->uri);
+         if (!new_uri)
+             return AVERROR(ENOMEM);
+-        av_free(s->location);
+         s->location = new_uri;
++        /* The connection is one to the redirect's target. The request for the
++         * original uri may only go out on it if the redirect is remembered
++         * and leads there again. */
++        cached = redirect_cache_get(s);
++        same_server = cached && !strcmp(cached, target);
++        av_free(target);
+     }
+ 
+     /* we save the old context in case the seek fails */
+@@ -2262,8 +2315,13 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+     /* try to reuse existing connection for small seeks */
+     int short_seek = ffurl_get_short_seek(h);
+     uint64_t old_read_pos = old_off + old_buf_size;
++    /* The bytes left are counted as body bytes, which the chunks of a chunked
++     * reply are not: such a reply is only left behind once it has ended. */
++    int framed = s->chunksize == UINT64_MAX ||
++                 (s->chunkend && old_read_pos == s->range_end);
+     if (s->hd && !s->willclose && s->range_end && short_seek > 0 &&
+-        old_read_pos + short_seek >= s->range_end)
++        old_read_pos + short_seek >= s->range_end &&
++        framed && same_server && !http_idle(s))
+     {
+         uint64_t remaining = s->range_end - old_read_pos;
+         av_assert1(remaining <= short_seek);
+@@ -2271,14 +2329,9 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
+         /* drain remaining data left on the wire from previous request */
+         av_log(h, AV_LOG_DEBUG, "Soft-seeking to offset %"PRIu64" by draining "
+                "%"PRIu64" remaining byte(s)\n", s->off, remaining);
+-        while (remaining) {
+-            ret = ffurl_read(s->hd, discard, FFMIN(remaining, sizeof(discard)));
+-            if (ret < 0 || ret == AVERROR_EOF || (ret == 0 && remaining)) {
+-                /* connection broken or stuck, need to reopen */
+-                ffurl_closep(&s->hd);
+-                break;
+-            }
+-            remaining -= ret;
++        if (http_drain(h, remaining) < 0) {
++            /* connection broken or stuck, need to reopen */
++            ffurl_closep(&s->hd);
+         }
+ 
+         ret = http_open_cnx(h, &options, 1);
