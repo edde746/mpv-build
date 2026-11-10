@@ -1,0 +1,529 @@
+ass: blur in scratch memory, straight from the cached bitmap
+
+A gaussian blur allocated its stripe buffers (eight bytes per pixel of the
+padded bitmap) and freed them again for every bitmap, and before it the
+glyphs of a run were added up in a bitmap that was allocated zeroed, read
+once by the blur and freed; a single glyph or drawing was copied for the
+same purpose. Each of these is large enough for the allocator to map and
+unmap it: on Android, jemalloc purges at once, so every blur paid for an
+mmap, a page fault per page and a munmap, three times over. In the profile
+of a typeset episode on a Fire TV Stick 4K Max malloc and free were a
+tenth of all rendering time.
+
+Each render thread now keeps the stripe buffers and the blur's input
+between bitmaps, and a single cached bitmap is blurred as it is, without
+the copy. The result is allocated as before, since it is what the cache
+keeps. Without a gaussian blur nothing changes.
+
+What a thread keeps is bounded twice: a buffer over 8 MB is released right
+after use, and every 256 frames each thread releases what it has not used
+since the sweep before, so a scene of large blurs costs its memory for ten
+to twenty seconds after it, not for as long as the renderer lives.
+
+diff --git a/libass/ass_bitmap.c b/libass/ass_bitmap.c
+index f8c7cb5..fbad654 100644
+--- a/libass/ass_bitmap.c
++++ b/libass/ass_bitmap.c
+@@ -65,23 +65,69 @@ static void be_blur_post(uint8_t *buf, intptr_t stride, intptr_t width, intptr_t
+     }
+ }
+ 
+-void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
++// What a thread may keep for its next bitmap. A larger buffer is released
++// right after use: a full-frame blur must not pin that much in every thread.
++#define SCRATCH_KEEP_MAX (8 * 1024 * 1024)
++#define SCRATCH_ALIGNMENT 32
++#define SCRATCH_GRANULARITY (64 * 1024)
++
++void *ass_scratch_get(BitmapScratch *scratch, int slot, size_t size)
++{
++    scratch->used = true;
++    if (scratch->size[slot] < size) {
++        ass_aligned_free(scratch->buf[slot]);
++        scratch->buf[slot] = NULL;
++        scratch->size[slot] = 0;
++        if (size > SIZE_MAX - SCRATCH_GRANULARITY)
++            return NULL;
++        size = ass_align(SCRATCH_GRANULARITY, size);
++        scratch->buf[slot] = ass_aligned_alloc(SCRATCH_ALIGNMENT, size, false);
++        if (scratch->buf[slot])
++            scratch->size[slot] = size;
++    }
++    return scratch->buf[slot];
++}
++
++void ass_scratch_put(BitmapScratch *scratch, int slot)
++{
++    if (scratch->size[slot] > SCRATCH_KEEP_MAX) {
++        ass_aligned_free(scratch->buf[slot]);
++        scratch->buf[slot] = NULL;
++        scratch->size[slot] = 0;
++    }
++}
++
++void ass_scratch_done(BitmapScratch *scratch)
++{
++    for (int slot = 0; slot < 2; slot++)
++        ass_aligned_free(scratch->buf[slot]);
++    memset(scratch, 0, sizeof(*scratch));
++}
++
++void ass_scratch_sweep(BitmapScratch *scratch, unsigned sweeps)
++{
++    if (!scratch->used || sweeps > 1)
++        ass_scratch_done(scratch);
++    scratch->used = false;
++}
++
++void ass_synth_blur(const BitmapEngine *engine, BitmapScratch *scratch, Bitmap *bm,
+                     int be, bool fast_blur, double blur_r2x, double blur_r2y)
+ {
+     if (!bm->buffer)
+         return;
+ 
+     // Apply gaussian blur
+-    if (blur_r2x > 0.001 || blur_r2y > 0.001)
+-        ass_gaussian_blur(engine, bm, fast_blur, blur_r2x, blur_r2y);
++    if (ass_blur_is_gaussian(blur_r2x, blur_r2y))
++        ass_gaussian_blur(engine, scratch, bm, false, fast_blur, blur_r2x, blur_r2y);
+ 
+     if (!be)
+         return;
+ 
+     // Apply box blur (multiple passes, if requested)
+-    unsigned align = 1 << engine->align_order;
++    assert((1 << engine->align_order) <= SCRATCH_ALIGNMENT);
+     size_t size = sizeof(uint16_t) * bm->stride * 2;
+-    uint16_t *tmp = ass_aligned_alloc(align, size, false);
++    uint16_t *tmp = ass_scratch_get(scratch, SCRATCH_STRIPES, size);
+     if (!tmp)
+         return;
+ 
+@@ -97,7 +143,7 @@ void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
+         be_blur_post(buf, stride, w, h);
+     }
+     engine->be_blur(buf, stride, w, h, tmp);
+-    ass_aligned_free(tmp);
++    ass_scratch_put(scratch, SCRATCH_STRIPES);
+ }
+ 
+ bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm,
+@@ -118,15 +164,6 @@ bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm,
+     return true;
+ }
+ 
+-bool ass_realloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h)
+-{
+-    uint8_t *old = bm->buffer;
+-    if (!ass_alloc_bitmap(engine, bm, w, h, false))
+-        return false;
+-    ass_aligned_free(old);
+-    return true;
+-}
+-
+ void ass_free_bitmap(Bitmap *bm)
+ {
+     ass_aligned_free(bm->buffer);
+diff --git a/libass/ass_bitmap.h b/libass/ass_bitmap.h
+index ae7017e..079733d 100644
+--- a/libass/ass_bitmap.h
++++ b/libass/ass_bitmap.h
+@@ -34,8 +34,39 @@ typedef struct {
+     uint8_t *buffer;      // h * stride buffer
+ } Bitmap;
+ 
++// Working memory a thread keeps from one bitmap it filters to the next. A blur
++// needs eight bytes of stripes per pixel and, for a run of glyphs, the bitmap
++// they are combined in before it; allocated per blur, that is megabytes
++// mapped, faulted in (zeroed, on Android) and unmapped again for every run.
++typedef struct {
++    void *buf[2];
++    size_t size[2];
++    bool used;  // since the last ass_scratch_sweep()
++} BitmapScratch;
++
++enum {
++    SCRATCH_STRIPES,    // the blur's stripe buffers, and \be's line buffer
++    SCRATCH_SOURCE,     // the bitmap a gaussian blur reads
++};
++
++/**
++ * \brief A buffer of at least `size` bytes aligned for any engine, with
++ * undefined contents, valid until the slot's next ass_scratch_get().
++ * Pair with ass_scratch_put().
++ */
++void *ass_scratch_get(BitmapScratch *scratch, int slot, size_t size);
++void ass_scratch_put(BitmapScratch *scratch, int slot);
++void ass_scratch_done(BitmapScratch *scratch);
++/**
++ * \brief Release the buffers unless they were used since the last sweep.
++ * Each thread sweeps its own every so many frames, so that what one scene's
++ * blurs needed does not stay with every thread for as long as it lives.
++ * \param sweeps sweeps due since the last one; a thread that slept through
++ * one has not used its scratch since
++ */
++void ass_scratch_sweep(BitmapScratch *scratch, unsigned sweeps);
++
+ bool ass_alloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h, bool zero);
+-bool ass_realloc_bitmap(const BitmapEngine *engine, Bitmap *bm, int32_t w, int32_t h);
+ bool ass_copy_bitmap(const BitmapEngine *engine, Bitmap *dst, const Bitmap *src);
+ void ass_free_bitmap(Bitmap *bm);
+ 
+@@ -44,11 +75,23 @@ struct render_context;
+ bool ass_outline_to_bitmap(struct render_context *state, Bitmap *bm,
+                            ASS_Outline *outline1, ASS_Outline *outline2);
+ 
+-void ass_synth_blur(const BitmapEngine *engine, Bitmap *bm,
++void ass_synth_blur(const BitmapEngine *engine, BitmapScratch *scratch, Bitmap *bm,
+                     int be, bool fast_blur, double blur_r2x, double blur_r2y);
+ 
+-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
+-                       bool fast_blur, double r2x, double r2y);
++/**
++ * \brief Whether ass_synth_blur() applies the gaussian blur for these values.
++ */
++static inline bool ass_blur_is_gaussian(double r2x, double r2y)
++{
++    return r2x > 0.001 || r2y > 0.001;
++}
++
++/**
++ * \param keep_input bm's buffer is someone else's: it is only read, and bm
++ * gets a buffer of its own for the result. Otherwise the buffer is freed.
++ */
++bool ass_gaussian_blur(const BitmapEngine *engine, BitmapScratch *scratch, Bitmap *bm,
++                       bool keep_input, bool fast_blur, double r2x, double r2y);
+ void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
+ void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
+ 
+diff --git a/libass/ass_blur.c b/libass/ass_blur.c
+index 8af6138..c663802 100644
+--- a/libass/ass_blur.c
++++ b/libass/ass_blur.c
+@@ -196,8 +196,8 @@ static void find_best_method(BlurMethod *blur, double r2, bool fast)
+  * \param r2x in: desired standard deviation along X axis squared
+  * \param r2y in: desired standard deviation along Y axis squared
+  */
+-bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
+-                       bool fast_blur, double r2x, double r2y)
++bool ass_gaussian_blur(const BitmapEngine *engine, BitmapScratch *scratch, Bitmap *bm,
++                       bool keep_input, bool fast_blur, double r2x, double r2y)
+ {
+     BlurMethod blur_x, blur_y;
+     find_best_method(&blur_x, r2x, fast_blur);
+@@ -216,7 +216,7 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
+     if (size > INT_MAX / 4)
+         return false;
+ 
+-    int16_t *tmp = ass_aligned_alloc(2 * stripe_width, 4 * size, false);
++    int16_t *tmp = ass_scratch_get(scratch, SCRATCH_STRIPES, 4 * size);
+     if (!tmp)
+         return false;
+ 
+@@ -254,15 +254,18 @@ bool ass_gaussian_blur(const BitmapEngine *engine, Bitmap *bm,
+     }
+     assert(w == end_w && h == end_h);
+ 
+-    if (!ass_realloc_bitmap(engine, bm, w, h)) {
+-        ass_aligned_free(tmp);
++    uint8_t *input = bm->buffer;
++    if (!ass_alloc_bitmap(engine, bm, w, h, false)) {
++        ass_scratch_put(scratch, SCRATCH_STRIPES);
+         return false;
+     }
++    if (!keep_input)
++        ass_aligned_free(input);
+     bm->left -= ((blur_x.radius + 4) << blur_x.level) - 4;
+     bm->top  -= ((blur_y.radius + 4) << blur_y.level) - 4;
+ 
+     engine->stripe_pack(bm->buffer, bm->stride, buf[index], w, h);
+-    ass_aligned_free(tmp);
++    ass_scratch_put(scratch, SCRATCH_STRIPES);
+     return true;
+ }
+ 
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index c3a82c5..ee34854 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -52,6 +52,7 @@
+ #define MAX_PERSP_SCALE 16.0
+ #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
+ #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
++#define SCRATCH_SWEEP_FRAMES 256  // how often a thread's scratch memory is swept
+ 
+ 
+ static bool text_info_init(TextInfo* text_info)
+@@ -133,6 +134,7 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
+ static void render_context_done(RenderContext *state)
+ {
+     ass_rasterizer_done(&state->rasterizer);
++    ass_scratch_done(&state->scratch);
+ 
+     if (state->shaper)
+         ass_shaper_free(state->shaper);
+@@ -2909,7 +2911,7 @@ static void render_and_combine_glyphs(RenderContext *state,
+         bool owned_bitmaps = !info->reuse_bitmaps;
+         key.owns_bitmaps = owned_bitmaps;
+         CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache,
+-                state->cache_client, &key, render_priv);
++                state->cache_client, &key, state);
+         if (owned_bitmaps)
+             info->reuse_bitmaps = val != NULL;
+         else if (!key.bitmaps)
+@@ -2971,92 +2973,113 @@ int ass_be_padding(int be)
+ }
+ 
+ 
+-size_t ass_composite_construct(void *key, void *value, void *priv)
++// One of a composite's two bitmaps (the glyphs or their outlines): the key's
++// bitmaps of that kind added up, then blurred if `blur` is set.
++//
++// A gaussian blur reads its input once and writes a bitmap of another size, so
++// what it reads need not be a bitmap of its own: a single cached bitmap is
++// blurred as it is, and several are added up in the thread's scratch memory.
++// Without one, the result is what is added up (or a copy), as it has to be.
++static void composite_bitmaps(RenderContext *state, CompositeHashKey *k,
++                              Bitmap *dst, bool outline, bool blur)
+ {
+-    ASS_Renderer *render_priv = priv;
+-    CompositeHashKey *k = key;
+-    CompositeHashValue *v = value;
+-    memset(v, 0, sizeof(*v));
++    const BitmapEngine *engine = &state->renderer->engine;
+ 
+-    ASS_Rect rect, rect_o;
++    ASS_Rect rect;
+     rectangle_reset(&rect);
+-    rectangle_reset(&rect_o);
+-
+-    size_t n_bm = 0, n_bm_o = 0;
+-    BitmapRef *last = NULL, *last_o = NULL;
++    size_t n_bm = 0;
++    BitmapRef *last = NULL;
+     for (int i = 0; i < k->bitmap_count; i++) {
+         BitmapRef *ref = &k->bitmaps[i];
+-        if (ref->bm) {
+-            rectangle_combine(&rect, ref->bm, ref->pos);
+-            last = ref;
+-            n_bm++;
+-        }
+-        if (ref->bm_o) {
+-            rectangle_combine(&rect_o, ref->bm_o, ref->pos_o);
+-            last_o = ref;
+-            n_bm_o++;
+-        }
++        Bitmap *src = outline ? ref->bm_o : ref->bm;
++        if (!src)
++            continue;
++        rectangle_combine(&rect, src, outline ? ref->pos_o : ref->pos);
++        last = ref;
++        n_bm++;
+     }
++    if (!n_bm)
++        return;
++
++    bool fast_blur = k->filter.flags & FILTER_FAST_BLUR;
++    double r2x = restore_blur(k->filter.blur_x);
++    double r2y = restore_blur(k->filter.blur_y);
++    bool gaussian = blur && ass_blur_is_gaussian(r2x, r2y);
+ 
+     int bord = ass_be_padding(k->filter.be);
+     if (!bord && n_bm == 1) {
+-        ass_copy_bitmap(&render_priv->engine, &v->bm, last->bm);
+-        v->bm.left += last->pos.x;
+-        v->bm.top  += last->pos.y;
+-    } else if (n_bm && ass_alloc_bitmap(&render_priv->engine, &v->bm,
+-                                        rect.x_max - rect.x_min + 2 * bord,
+-                                        rect.y_max - rect.y_min + 2 * bord,
+-                                        true)) {
+-        Bitmap *dst = &v->bm;
+-        dst->left = rect.x_min - bord;
+-        dst->top  = rect.y_min - bord;
+-        for (int i = 0; i < k->bitmap_count; i++) {
+-            Bitmap *src = k->bitmaps[i].bm;
+-            if (!src)
+-                continue;
+-            int x = k->bitmaps[i].pos.x + src->left - dst->left;
+-            int y = k->bitmaps[i].pos.y + src->top  - dst->top;
+-            assert(x >= 0 && x + src->w <= dst->w);
+-            assert(y >= 0 && y + src->h <= dst->h);
+-            unsigned char *buf = dst->buffer + y * dst->stride + x;
+-            render_priv->engine.add_bitmaps(buf, dst->stride,
+-                                            src->buffer, src->stride,
+-                                            src->w, src->h);
++        Bitmap *src = outline ? last->bm_o : last->bm;
++        ASS_Vector pos = outline ? last->pos_o : last->pos;
++        *dst = *src;
++        if (!gaussian || !src->buffer ||
++                !ass_gaussian_blur(engine, &state->scratch, dst, true, fast_blur, r2x, r2y)) {
++            memset(dst, 0, sizeof(*dst));
++            ass_copy_bitmap(engine, dst, src);
+         }
++        dst->left += pos.x;
++        dst->top  += pos.y;
++        return;
+     }
+-    if (!bord && n_bm_o == 1) {
+-        ass_copy_bitmap(&render_priv->engine, &v->bm_o, last_o->bm_o);
+-        v->bm_o.left += last_o->pos_o.x;
+-        v->bm_o.top  += last_o->pos_o.y;
+-    } else if (n_bm_o && ass_alloc_bitmap(&render_priv->engine, &v->bm_o,
+-                                          rect_o.x_max - rect_o.x_min + 2 * bord,
+-                                          rect_o.y_max - rect_o.y_min + 2 * bord,
+-                                          true)) {
+-        Bitmap *dst = &v->bm_o;
+-        dst->left = rect_o.x_min - bord;
+-        dst->top  = rect_o.y_min - bord;
+-        for (int i = 0; i < k->bitmap_count; i++) {
+-            Bitmap *src = k->bitmaps[i].bm_o;
+-            if (!src)
+-                continue;
+-            int x = k->bitmaps[i].pos_o.x + src->left - dst->left;
+-            int y = k->bitmaps[i].pos_o.y + src->top  - dst->top;
+-            assert(x >= 0 && x + src->w <= dst->w);
+-            assert(y >= 0 && y + src->h <= dst->h);
+-            unsigned char *buf = dst->buffer + y * dst->stride + x;
+-            render_priv->engine.add_bitmaps(buf, dst->stride,
+-                                            src->buffer, src->stride,
+-                                            src->w, src->h);
++
++    unsigned align = 1 << engine->align_order;
++    int32_t w = rect.x_max - rect.x_min + 2 * bord;
++    int32_t h = rect.y_max - rect.y_min + 2 * bord;
++    size_t stride = ass_align(align, w);
++    Bitmap sum = {0};
++    // the checks and the size of ass_alloc_bitmap()
++    if (gaussian && stride <= (INT_MAX - align) / FFMAX(h, 1))
++        sum.buffer = ass_scratch_get(&state->scratch, SCRATCH_SOURCE, stride * h + align);
++    if (sum.buffer) {
++        sum.w = w;
++        sum.h = h;
++        sum.stride = stride;
++        memset(sum.buffer, 0, stride * h + align);
++    } else {
++        gaussian = false;
++        if (!ass_alloc_bitmap(engine, &sum, w, h, true))
++            return;
++    }
++    sum.left = rect.x_min - bord;
++    sum.top  = rect.y_min - bord;
++    for (int i = 0; i < k->bitmap_count; i++) {
++        Bitmap *src = outline ? k->bitmaps[i].bm_o : k->bitmaps[i].bm;
++        if (!src)
++            continue;
++        ASS_Vector pos = outline ? k->bitmaps[i].pos_o : k->bitmaps[i].pos;
++        int x = pos.x + src->left - sum.left;
++        int y = pos.y + src->top  - sum.top;
++        assert(x >= 0 && x + src->w <= sum.w);
++        assert(y >= 0 && y + src->h <= sum.h);
++        unsigned char *buf = sum.buffer + y * sum.stride + x;
++        engine->add_bitmaps(buf, sum.stride, src->buffer, src->stride, src->w, src->h);
++    }
++
++    *dst = sum;
++    if (gaussian) {
++        if (!ass_gaussian_blur(engine, &state->scratch, dst, true, fast_blur, r2x, r2y)) {
++            memset(dst, 0, sizeof(*dst));
++            ass_copy_bitmap(engine, dst, &sum);
+         }
++        ass_scratch_put(&state->scratch, SCRATCH_SOURCE);
++        r2x = r2y = 0;
+     }
++    // \be, after the gaussian blur
++    if (blur)
++        ass_synth_blur(engine, &state->scratch, dst, k->filter.be, fast_blur, r2x, r2y);
++}
++
++size_t ass_composite_construct(void *key, void *value, void *priv)
++{
++    RenderContext *state = priv;
++    ASS_Renderer *render_priv = state->renderer;
++    CompositeHashKey *k = key;
++    CompositeHashValue *v = value;
++    memset(v, 0, sizeof(*v));
+ 
+     int flags = k->filter.flags;
+-    bool fast_blur = flags & FILTER_FAST_BLUR;
+-    double r2x = restore_blur(k->filter.blur_x);
+-    double r2y = restore_blur(k->filter.blur_y);
+-    if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
+-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, fast_blur, r2x, r2y);
+-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, fast_blur, r2x, r2y);
++    composite_bitmaps(state, k, &v->bm, false,
++                      !(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3));
++    composite_bitmaps(state, k, &v->bm_o, true, true);
+ 
+     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
+         ass_fix_outline(&v->bm, &v->bm_o);
+@@ -4026,11 +4049,18 @@ static void *run_thread(void *ptr)
+ 
+     pthread_cond_broadcast(&priv->main_cond);
+ 
++    unsigned scratch_sweep = priv->scratch_sweep;
++
+     for (;;) {
+         while (!priv->shutting_down &&
+                (atomic_load_explicit(&priv->next_eimg, memory_order_relaxed) >=
+-                atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)))
++                atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed))) {
++            if (scratch_sweep != priv->scratch_sweep) {
++                ass_scratch_sweep(&state.scratch, priv->scratch_sweep - scratch_sweep);
++                scratch_sweep = priv->scratch_sweep;
++            }
+             pthread_cond_wait(&priv->pool_cond, &priv->mutex);
++        }
+ 
+         if (priv->shutting_down)
+             break;
+@@ -4543,6 +4573,22 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
+         return NULL;
+     }
+ 
++    // Scratch memory goes back to the system once a thread has not blurred
++    // anything for SCRATCH_SWEEP_FRAMES frames, or twice that. Every thread
++    // sweeps its own: the workers are woken for it, between two frames.
++    if (++priv->scratch_sweep_frames >= SCRATCH_SWEEP_FRAMES) {
++        priv->scratch_sweep_frames = 0;
++        ass_scratch_sweep(&priv->state.scratch, 1);
++#if ENABLE_THREADS
++        if (priv->n_threads) {
++            pthread_mutex_lock(&priv->mutex);
++            priv->scratch_sweep++;
++            pthread_cond_broadcast(&priv->pool_cond);
++            pthread_mutex_unlock(&priv->mutex);
++        }
++#endif
++    }
++
+     // render events separately
+     const EventBlock *blocks = ass_event_blocks(track);
+     int cnt = 0;
+diff --git a/libass/ass_render.h b/libass/ass_render.h
+index 63731ab..ebac755 100644
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -245,6 +245,7 @@ struct render_context {
+     TextInfo text_info;
+     ASS_Shaper *shaper;
+     RasterizerData rasterizer;
++    BitmapScratch scratch;
+     CacheClient *cache_client;
+     ImagePool *image_pool;
+ 
+@@ -489,6 +490,7 @@ struct ass_renderer {
+ 
+     RenderContext state;
+     CacheStore cache;
++    unsigned scratch_sweep_frames;  // frames since the threads' scratch was swept
+ 
+     BitmapEngine engine;
+ 
+@@ -506,6 +508,7 @@ struct ass_renderer {
+     int thread_start_failed;
+ 
+     int shutting_down;
++    unsigned scratch_sweep;     // under mutex: bumped for the workers to sweep theirs
+     _Atomic AtomicInt processing_eimgs, sent_eimgs, next_eimg;
+ #endif
+ };
