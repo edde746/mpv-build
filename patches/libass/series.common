@@ -40,6 +40,9 @@
 #                      the C ones by libass' checkasm
 #   transparent runs   no bitmaps for a run every layer of which is fully
 #                      transparent (spacers, particles that have faded out)
+#   clipped layers     no composite for a run its clip hides whole, no shadow
+#                      for one whose shadow it hides (text that has left the
+#                      screen, a shadow thrown off it)
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
@@ -54,3 +57,4 @@
 0012-ass-parse-drawings-and-numbers-faster.patch
 0013-ass-neon-bitmap-engine-for-32-bit-arm.patch
 0014-ass-no-bitmaps-for-transparent-runs.patch
+0015-ass-spare-a-run-the-layers-its-clip-hides.patch

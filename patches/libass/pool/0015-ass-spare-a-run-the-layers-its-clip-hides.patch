@@ -1,0 +1,181 @@
+ass: spare a run the layers its clip hides whole
+
+No image is made of a bitmap that lies outside the clip rectangle, but by
+then the run has been combined and blurred and its shadow copied and
+shifted. That is paid for every frame by text that has left the screen
+under a \move, and by an effect that draws a line as its shadow alone
+(fill and border at alpha FE) and throws the shadow off the screen with
+\t(\yshad-4500): a second later nothing is left to see, and for the three
+seconds the event still lasts the shadow's place in the key makes every
+frame a new composite of nineteen lines of text.
+
+Before a run's composite is looked up, its glyphs' bitmaps are now held
+against the clip rectangle as render_glyph applies it, widened by what \be
+and the blur can add around them (ass_blur_reach: the widest kernel at the
+blur's level, an upper bound). A run that is outside with all of that gets
+no composite. One whose shadow alone is outside gets none of that, and so
+a key without it: fill and border are the same bitmaps with a shadow and
+without. The opaque box of BorderStyle 3, which is drawn as its own shadow,
+and \iclip are left alone. The images of a frame are the same. That
+episode, one thread on a Fire TV Stick 4K Max, with this patch and the
+one before it: 54.1 s of rendering instead of 60.4 s, 172 frames later
+than their duration instead of 272, the longest 464 ms instead of 799 ms.
+
+scripts/test_libass_clipped_layers.c: what a blur brings into a clip from
+a box beside it is the open clip's image, cut, for every blur and
+distance; a line whose shadow is off the screen is the line without one;
+a line off the screen still casts its shadow onto it.
+
+diff --git a/libass/ass_bitmap.h b/libass/ass_bitmap.h
+index 079733d..f14ad8b 100644
+--- a/libass/ass_bitmap.h
++++ b/libass/ass_bitmap.h
+@@ -92,6 +92,11 @@ static inline bool ass_blur_is_gaussian(double r2x, double r2y)
+  */
+ bool ass_gaussian_blur(const BitmapEngine *engine, BitmapScratch *scratch, Bitmap *bm,
+                        bool keep_input, bool fast_blur, double r2x, double r2y);
++
++/**
++ * \brief How far ass_gaussian_blur() can spread a bitmap, in pixels a side
++ */
++int ass_blur_reach(double r2);
+ void ass_shift_bitmap(Bitmap *bm, int shift_x, int shift_y);
+ void ass_fix_outline(Bitmap *bm_g, Bitmap *bm_o);
+ 
+diff --git a/libass/ass_blur.c b/libass/ass_blur.c
+index c663802..e649646 100644
+--- a/libass/ass_blur.c
++++ b/libass/ass_blur.c
+@@ -191,6 +191,23 @@ static void find_best_method(BlurMethod *blur, double r2, bool fast)
+             blur->radius--;
+ }
+ 
++/**
++ * \brief How far ass_gaussian_blur() can spread a bitmap, in pixels a side
++ * \param r2 in: desired standard deviation squared
++ *
++ * An upper bound, without the cost of the method itself: that of the widest
++ * kernel at the level find_best_method() picks.
++ */
++int ass_blur_reach(double r2)
++{
++    int level = 0;
++    if (r2 >= 0.5)
++        frexp(sqrt(0.11569 * r2 + 0.20591047), &level);
++    // (radius + 4 << level) - 4 before the bitmap, no more than
++    // (radius + 5 << level) - 5 after
++    return (8 + 5) << level;
++}
++
+ /**
+  * \brief Perform approximate gaussian blur
+  * \param r2x in: desired standard deviation along X axis squared
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 4a66204..0b5b79d 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -2761,6 +2761,8 @@ static double restore_blur(int qblur)
+     return sigma * sigma;
+ }
+ 
++static void drop_clipped_layers(RenderContext *state, CombinedBitmapInfo *info);
++
+ // Convert glyphs to bitmaps, combine them, apply blur, generate shadows.
+ static void render_and_combine_glyphs(RenderContext *state,
+                                       double device_x, double device_y)
+@@ -2928,6 +2930,10 @@ static void render_and_combine_glyphs(RenderContext *state,
+             info->bitmaps[j].pos_o.y -= info->y;
+         }
+ 
++        drop_clipped_layers(state, info);
++        if (!info->bitmap_count)
++            continue;
++
+         CompositeHashKey key;
+         key.filter = info->filter;
+         key.bitmap_count = info->bitmap_count;
+@@ -2997,6 +3003,84 @@ int ass_be_padding(int be)
+ }
+ 
+ 
++static inline bool rect_in_clip(const ASS_Rect *rect, const ASS_Rect *clip)
++{
++    return rect->x_min < clip->x_max && rect->x_max > clip->x_min &&
++           rect->y_min < clip->y_max && rect->y_max > clip->y_min;
++}
++
++/**
++ * \brief Spare a run the layers its clip hides whole
++ *
++ * render_glyph() makes no image of a bitmap that lies outside the clip
++ * rectangle, but by then the run has been combined and blurred, and its shadow
++ * copied and shifted. Text that has left the screen under a \move, and a
++ * shadow that an effect throws far off (\t(\yshad-4500)) to leave the next
++ * three seconds to a fill of alpha FE, cost that for every frame.
++ *
++ * With all of the run outside the clip it gets no composite (the run's
++ * bitmap_count is set to 0), with only its shadow outside none of that:
++ * fill and border are the same bitmaps with a shadow and without.
++ */
++static void drop_clipped_layers(RenderContext *state, CombinedBitmapInfo *info)
++{
++    ASS_Renderer *render_priv = state->renderer;
++    FilterDesc *filter = &info->filter;
++    if (state->clip_mode)   // \iclip: what is outside the rectangle is what shows
++        return;
++
++    // the clip as render_glyph() applies it
++    ASS_Rect clip = {
++        FFMINMAX(state->clip_x0, 0, render_priv->width),
++        FFMINMAX(state->clip_y0, 0, render_priv->height),
++        FFMINMAX(state->clip_x1, 0, render_priv->width),
++        FFMINMAX(state->clip_y1, 0, render_priv->height),
++    };
++    ASS_Rect rect;
++    rectangle_reset(&rect);
++    for (int i = 0; i < info->bitmap_count; i++) {
++        BitmapRef *ref = &info->bitmaps[i];
++        if (ref->bm)
++            rectangle_combine(&rect, ref->bm, ref->pos);
++        if (ref->bm_o)
++            rectangle_combine(&rect, ref->bm_o, ref->pos_o);
++    }
++    rect.x_min += info->x;  rect.x_max += info->x;
++    rect.y_min += info->y;  rect.y_max += info->y;
++
++    bool shadow = filter->flags & FILTER_NONZERO_SHADOW;
++    // the shift by the fraction of a pixel stays inside the bitmap
++    int shadow_x = filter->shadow.x >> 6, shadow_y = filter->shadow.y >> 6;
++    ASS_Rect rect_s = {
++        rect.x_min + shadow_x, rect.y_min + shadow_y,
++        rect.x_max + shadow_x, rect.y_max + shadow_y,
++    };
++    if (rect_in_clip(&rect, &clip) && (!shadow || rect_in_clip(&rect_s, &clip)))
++        return;
++
++    // Outside as they are: and with what \be and the blur add around them?
++    double r2x = restore_blur(filter->blur_x), r2y = restore_blur(filter->blur_y);
++    int pad_x = ass_be_padding(filter->be), pad_y = pad_x;
++    if (ass_blur_is_gaussian(r2x, r2y)) {
++        pad_x += ass_blur_reach(r2x);
++        pad_y += ass_blur_reach(r2y);
++    }
++    rect.x_min -= pad_x;  rect.x_max += pad_x;
++    rect.y_min -= pad_y;  rect.y_max += pad_y;
++    rect_s.x_min -= pad_x;  rect_s.x_max += pad_x;
++    rect_s.y_min -= pad_y;  rect_s.y_max += pad_y;
++
++    bool seen = rect_in_clip(&rect, &clip);
++    bool shadow_seen = shadow && rect_in_clip(&rect_s, &clip);
++    if (!seen && !shadow_seen) {
++        info->bitmap_count = 0;
++    } else if (shadow && !shadow_seen && !(filter->flags & FILTER_BORDER_STYLE_3)) {
++        // (an opaque box without a border is drawn as its own shadow)
++        filter->flags &= ~(FILTER_NONZERO_SHADOW | FILTER_FILL_IN_SHADOW);
++        filter->shadow.x = filter->shadow.y = 0;
++    }
++}
++
+ // One of a composite's two bitmaps (the glyphs or their outlines): the key's
+ // bitmaps of that kind added up, then blurred if `blur` is set.
+ //
