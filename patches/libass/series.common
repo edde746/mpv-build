@@ -38,6 +38,8 @@
 #   ARM NEON           NEON blur, rasterizer tile and blend functions for
 #                      32-bit ARM (libass/arm/, intrinsics), checked against
 #                      the C ones by libass' checkasm
+#   transparent runs   no bitmaps for a run every layer of which is fully
+#                      transparent (spacers, particles that have faded out)
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
@@ -51,3 +53,4 @@
 0011-ass-wake-workers-only-for-events-to-render.patch
 0012-ass-parse-drawings-and-numbers-faster.patch
 0013-ass-neon-bitmap-engine-for-32-bit-arm.patch
+0014-ass-no-bitmaps-for-transparent-runs.patch

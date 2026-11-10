@@ -1,0 +1,53 @@
+ass: no bitmaps for runs that are fully transparent
+
+A run of text whose fill, karaoke fill, border and shadow are all fully
+transparent leaves no image: render_glyph makes none of a transparent
+color. Its glyphs were rasterized, combined and blurred all the same.
+
+Such runs are common. Typesetting holds a line's layout with invisible
+spacers ({\alpha&HFF&}), and an effect that fades its particles out with
+\t(\alpha&HFF&) keeps each of them for the rest of its event: of the 600
+events on screen at once in the opening of one episode, most are invisible
+for the second half of their time.
+
+The run is now laid out as before (the glyphs after it stand where they
+stood) and gets no bitmaps. The images of a frame are the same; one
+thread of a Fire TV Stick 4K Max renders that episode in 13.1 s instead
+of 14.5 s.
+
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 8522136..4a66204 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -2772,6 +2772,7 @@ static void render_and_combine_glyphs(RenderContext *state,
+     state->alloc_error = false;
+     unsigned nb_bitmaps = 0;
+     bool new_run = true;
++    bool invisible = false;
+     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
+     CombinedBitmapInfo *current_info = NULL;
+     ASS_DVector offset;
+@@ -2868,12 +2869,23 @@ static void render_and_combine_glyphs(RenderContext *state,
+ 
+                 nb_bitmaps++;
+                 new_run = false;
++
++                // A run whose fill, karaoke fill, border and shadow are all
++                // fully transparent leaves no image: render_glyph() makes
++                // none of a transparent color. It needs no bitmaps then.
++                // Such runs are common: the spacers that hold a line's
++                // layout ({\alpha&HFF&}), and whatever a \t or \fad has
++                // faded out before its event ends.
++                invisible = _a(current_info->c[0]) == 0xFF && _a(current_info->c[1]) == 0xFF &&
++                            _a(current_info->c[2]) == 0xFF && _a(current_info->c[3]) == 0xFF;
+             }
+             assert(current_info);
+ 
+             ASS_Vector pos, pos_o;
+             info->pos.x = double_to_d6(device_x + d6_to_double(info->pos.x) * render_priv->par_scale_x);
+             info->pos.y = double_to_d6(device_y) + info->pos.y;
++            if (invisible)
++                continue;
+             get_bitmap_glyph(state, info, &current_info->leftmost_x, &pos, &pos_o,
+                              &offset, !current_info->bitmap_count, flags);
+ 
