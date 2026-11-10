@@ -1,0 +1,63 @@
+ass: never hash the padding of a cache key
+
+The series hashes a key's fixed-width members as one byte run, from the
+first member to the end of the last, on the premise that no key struct has
+padding between two members. That holds where a pointer is as wide as a
+double. On ARM EABI a double is aligned to 8 bytes in a struct of 4-byte
+pointers, so every key that starts with a font pointer and a size (glyph
+outlines, glyph and face metrics, shaping results) has four bytes of
+padding after the pointer, and the run covered them. They hold whatever
+the stack held before, so two equal keys hashed differently whenever that
+differed: the lookup went to another bucket, missed, and the glyph's
+outline was made again, and with a new outline its bitmap and the blurred
+composite of the whole run, since those keys hold the outline's address.
+The frame came out the same, late, and was reported as changed, which
+makes mpv pack and upload its atlas again. Another thread's stack always
+differs, so with four render threads a glyph was cached once per thread.
+
+A run now ends where the next member does not start right after the
+previous one. Where the members are contiguous the compiler folds the test
+and the hash is the same value as before; on ARMv7 the padding is skipped.
+
+On a Fire TV Stick 4K Max (4 Cortex-A55, armeabi-v7a), 3836 frames of a
+typeset anime episode, 1252 of them different from the one before: 1288
+reported as changed with four threads and 1262 with one, 1252 now.
+scripts/test_libass_key_padding.c fills the stack with another byte before
+each render of the same frame and fails on that device without this patch.
+
+diff --git a/libass/ass_cache_template.h b/libass/ass_cache_template.h
+index 39186c7..ed177fa 100644
+--- a/libass/ass_cache_template.h
++++ b/libass/ass_cache_template.h
+@@ -38,11 +38,14 @@
+ // mixes. A STRING member (variable length, indirect storage) flushes the
+ // pending run; END flushes any trailing run.
+ //
+-// SAFETY: the coalesced range spans exactly [first_member, last_member_end);
+-// it never extends to sizeof(struct), so trailing padding is never hashed.
+-// All key structs are verified to have NO internal padding between adjacent
+-// fixed-width members (every adjacent pair is byte-contiguous), so no
+-// uninitialized padding bytes are ever included -> equal keys still hash equal.
++// A run ends where the next member does not start right after the previous
++// one, so padding is never hashed, between members or after the last. With an
++// ABI that aligns a double or a 64-bit integer to 8 bytes in a 32-bit struct
++// (ARM EABI), a pointer followed by a double has four bytes of padding after
++// it; hashed, whatever the stack held there made equal keys hash differently,
++// and a lookup of a cached glyph missed whenever that changed (always, for
++// another thread's lookups). Where members are contiguous the compiler folds
++// the test away and one run covers them all.
+ #define START(funcname, structname) \
+     static ass_hashcode funcname##_hash(void *buf, ass_hashcode hval) \
+     { \
+@@ -54,7 +57,10 @@
+             run_beg = run_end = NULL; \
+         }
+ #define ASS_HASH_ADD_RANGE(beg, end) \
+-        if (!run_beg) run_beg = (const char *) (beg); \
++        if (run_end != (const char *) (beg)) { \
++            ASS_HASH_FLUSH_RUN \
++            run_beg = (const char *) (beg); \
++        } \
+         run_end = (const char *) (end);
+ #define GENERIC(type, member) \
+         ASS_HASH_ADD_RANGE(&p->member, (&p->member) + 1)
