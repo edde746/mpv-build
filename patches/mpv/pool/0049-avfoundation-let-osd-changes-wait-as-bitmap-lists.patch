@@ -1,0 +1,342 @@
+vo_avfoundation: let OSD changes wait as bitmap lists
+
+A subtitle change was drawn and enqueued with its frame's video sample,
+queue-lead-ms (128) ahead: at 24 fps the OSD layer's queue holds 2.5-3
+canvases for later frames, 13.8 MB each on a 2736x1260 layer and 33 MB on a
+3840x2160 one. Of the 5 canvases alive on a typeset track those are half.
+
+--avfoundation-osd-queue-lead-ms=<ms> (default 0: as before) keeps a
+change as its frame's bitmap list (the items and a reference on their
+atlas) and draws and enqueues it only at the last flip that still leaves
+that lead before its frame: when waiting for the next flip, one frame
+spacing later, would leave less (avf_osd_change_due). A pause sends
+whatever waits; a seek, a canvas change and an option change drop it with
+the rest of the OSD state; if no flip comes (the last frames of a file) a
+timer, pushed on by every flip, looks again a frame spacing later. Off by
+default because it trades margin for memory: a VO thread stalled for longer
+than the lead shows that change late, which a 128 ms queue hides.
+
+iPhone Air, 40 ms, interleaved with 0048 alone, n = 3 (taken while 0048
+still cleared a buffer of unknown contents band by band, hence its 9.63 and
+12.67 %; not repeated since): anime-ass.mkv footprint 201 / 207 MB (mean /
+peak) -> 188 / 198 MB and 9.63 -> 9.11 % of a core; a real opening 312 /
+370 -> 296 / 356 MB, 12.67 -> 12.28 %; no dropped frame. In step with the
+video: screenshots of a file that carries its frame number in the picture
+and in the subtitles show the same number in 83 of 83 shots (82 of 82
+without the option, 83 of 83 unpatched); a prototype with 20, 40 and 60 ms:
+74 of 74, 73 of 73, 75 of 75. With the VO thread held once a second (one
+launch per cell): held 60 ms, 78 of 79 shots in step and one a frame late
+with 40 ms, 81 of 81 without the option; held 100 ms, 75 of 79 with 40 ms
+(three a frame late, one two), 67 of 75 with 80 ms, 75 of 77 without. Not
+measured at 60 fps. Pause, exact and keyframe seeks, a seek while paused,
+the end of the file with keep-open and loadfile replace behave and time as
+before (n = 2). scripts/test_avf_osd_ahead.sh covers when a change is due.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 2226a2f..ad1416e 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -260,6 +260,22 @@ static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
+     return until > now ? until : 0;
+ }
+ 
++// With --avfoundation-osd-queue-lead-ms a subtitle change does not go to the
++// OSD layer with its frame's video sample (queue-lead-ms ahead) but only when
++// its frame is near: until then it is the frame's bitmap list, a fraction of
++// the display-sized canvas the layer's queue would hold for it. flip_page
++// runs once per frame, so a change is drawn and enqueued at the last flip
++// that still leaves the lead before its frame: when waiting for the next
++// one, a frame spacing later, would leave less. Should no flip come (the
++// last frames of a file), a timer looks again that much later.
++#define AVF_OSD_PENDING_SLACK_NS INT64_C(10000000)
++
++static bool avf_osd_change_due(int64_t now, int64_t frame_host_ns,
++                               int64_t frame_spacing_ns, int64_t lead_ns)
++{
++    return frame_host_ns - (now + frame_spacing_ns) < lead_ns;
++}
++
+ // --- end avf osd ahead policy
+ 
+ // --- avf shader target (host-testable; keep freestanding) ---
+@@ -354,6 +370,7 @@ struct avfoundation_opts {
+     int presentation;
+     int osd_max_height;
+     bool osd_video_res;
++    int osd_queue_lead_ms;
+ };
+ 
+ // --- avf sync servo core (host-testable; keep freestanding) ---
+@@ -646,6 +663,24 @@ struct priv {
+     CVPixelBufferRef osd_sig_prev_buf;  // compared, never dereferenced
+     uint64_t osd_sig_salt;
+ 
++    // Subtitle changes not drawn yet (--avfoundation-osd-queue-lead-ms,
++    // avf_osd_change_due): each waits as its frame's bitmap list. osd_filed_*
++    // is the newest change filed, what the next frame's list is compared with
++    // the way a drawn one is compared with osd_change_id.
++    struct osd_pending {
++        struct sub_bitmap_list *list;   // owned; NULL: show nothing
++        struct avf_osd_canvas canvas;
++        int64_t pts_ns;                 // of its sample
++        int64_t host_ns;                // when its frame is shown
++    } osd_pending[16];
++    int osd_pending_count;
++    int64_t osd_filed_change_id;
++    bool osd_filed_subtitle;
++    struct avf_osd_canvas osd_filed_canvas;
++    int64_t osd_frame_spacing_ns, osd_last_host_ns;
++    dispatch_source_t osd_pending_timer;
++    atomic_bool osd_pending_timer_fired;
++
+     // OSD performance counters; accumulation is unconditional (cheap),
+     // formatted output is gated on -v.
+     struct {
+@@ -3960,6 +3995,157 @@ static void apply_osd_list(struct vo *vo, const struct avf_osd_canvas *canvas,
+         drop_displayed_subtitle(p);
+ }
+ 
++// --- deferred subtitle changes (--avfoundation-osd-queue-lead-ms)
++
++static bool osd_changes_deferred(struct priv *p)
++{
++    return p->opts->osd_queue_lead_ms > 0 && p->ahead.started &&
++           should_use_inline_osd_layer(p);
++}
++
++static void drop_pending_osd(struct priv *p)
++{
++    for (int i = 0; i < p->osd_pending_count; i++)
++        talloc_free(p->osd_pending[i].list);
++    p->osd_pending_count = 0;
++    p->osd_filed_subtitle = false;
++    p->osd_filed_change_id = 0;
++}
++
++// Draw and enqueue the pending changes that are due, oldest first; all of
++// them when flush (a pause: no later flip will come for them).
++static void present_pending_osd(struct vo *vo, bool flush)
++{
++    struct priv *p = vo->priv;
++    if (!p->osd_pending_count)
++        return;
++
++    int64_t lead = MP_TIME_MS_TO_NS(p->opts->osd_queue_lead_ms);
++    int64_t spacing = p->osd_frame_spacing_ns ? p->osd_frame_spacing_ns
++                                              : MP_TIME_MS_TO_NS(42);
++    int done = 0;
++    while (done < p->osd_pending_count) {
++        struct osd_pending *e = &p->osd_pending[done];
++        if (!flush && !avf_osd_change_due(mp_time_ns(), e->host_ns, spacing, lead))
++            break;
++        // A layer that takes nothing right now gets it at the next look.
++        if (!p->osdLayer || !sample_buffer_renderer_is_ready(p->osdLayer))
++            break;
++        if (e->list) {
++            apply_osd_list(vo, &e->canvas, e->list);
++        } else if (p->has_subtitle || p->cachedSubtitleBuffer) {
++            p->perf.empty++;
++            drop_displayed_subtitle(p);
++        }
++        bool needed = false;
++        CMSampleBufferRef buf = create_osd_sample_buffer(vo, e->pts_ns, &needed);
++        if (buf) {
++            bool has_subtitle = p->has_subtitle && p->cachedSubtitleBuffer;
++            int64_t t = mp_time_ns();
++            bool enqueued = enqueue_osd_sample(vo, buf);
++            p->perf.enqueue_ns += mp_time_ns() - t;
++            CFRelease(buf);
++            if (!enqueued) {
++                // Drawn but not taken: it stays pending, and stays drawn.
++                p->perf.enq_drops++;
++                break;
++            }
++            p->osd_needs_enqueue = false;
++            if (has_subtitle)
++                p->osd_layer_dirty = true;
++            int64_t margin = e->host_ns - mp_time_ns();
++            if (!p->perf.enq_count || margin < p->perf.lead_min_ns)
++                p->perf.lead_min_ns = margin;
++            p->perf.lead_sum_ns += margin;
++            p->perf.enq_count++;
++        }
++        talloc_free(e->list);
++        done++;
++    }
++    if (done) {
++        p->osd_pending_count -= done;
++        memmove(&p->osd_pending[0], &p->osd_pending[done],
++                sizeof(p->osd_pending[0]) * p->osd_pending_count);
++    }
++    // Each flip pushes the timer on, so it only fires when flips stop.
++    if (p->osd_pending_timer) {
++        dispatch_source_set_timer(p->osd_pending_timer,
++            p->osd_pending_count
++                ? dispatch_time(DISPATCH_TIME_NOW, spacing + AVF_OSD_PENDING_SLACK_NS)
++                : DISPATCH_TIME_FOREVER,
++            DISPATCH_TIME_FOREVER, NSEC_PER_MSEC);
++    }
++}
++
++// What list, rendered on canvas for the frame about to be flipped, changes
++// against the newest change filed waits until that frame is near.
++static void file_osd_list(struct vo *vo, const struct avf_osd_canvas *canvas,
++                          struct sub_bitmap_list *list)
++{
++    struct priv *p = vo->priv;
++
++    int parts = 0;
++    for (int n = 0; n < list->num_items; n++)
++        parts += list->items[n]->num_parts;
++    if (!parts) {
++        if (!p->osd_filed_subtitle)
++            return;
++        p->osd_filed_subtitle = false;
++        p->osd_filed_change_id = 0;
++    } else if (list->change_id && list->change_id == p->osd_filed_change_id &&
++               p->osd_filed_subtitle && osd_canvas_equal(canvas, &p->osd_filed_canvas))
++    {
++        p->perf.skipped++;
++        return;
++    } else {
++        p->osd_filed_subtitle = true;
++        p->osd_filed_change_id = list->change_id;
++        p->osd_filed_canvas = *canvas;
++    }
++
++    // More waiting than there is room for: the oldest go to the layer early.
++    if (p->osd_pending_count == (int)MP_ARRAY_SIZE(p->osd_pending))
++        present_pending_osd(vo, true);
++    if (p->osd_pending_count == (int)MP_ARRAY_SIZE(p->osd_pending)) {
++        talloc_free(p->osd_pending[0].list);
++        memmove(&p->osd_pending[0], &p->osd_pending[1],
++                sizeof(p->osd_pending[0]) * --p->osd_pending_count);
++    }
++
++    // The slot the list comes from is rendered into again before then: keep
++    // the items (their layout and a reference on their atlas).
++    struct sub_bitmap_list *copy = NULL;
++    if (parts) {
++        copy = talloc_zero(NULL, struct sub_bitmap_list);
++        copy->change_id = list->change_id;
++        copy->w = list->w;
++        copy->h = list->h;
++        for (int n = 0; n < list->num_items; n++) {
++            struct sub_bitmaps *item = osd_clone_item(list->items[n]);
++            talloc_steal(copy, item);
++            MP_TARRAY_APPEND(copy, copy->items, copy->num_items, item);
++        }
++    }
++    p->osd_pending[p->osd_pending_count++] = (struct osd_pending){
++        .list = copy,
++        .canvas = *canvas,
++        .pts_ns = sample_presentation_pts_ns(p),
++        .host_ns = p->next_present_host_ns,
++    };
++
++    if (!p->osd_pending_timer) {
++        p->osd_pending_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
++            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
++        dispatch_source_set_timer(p->osd_pending_timer, DISPATCH_TIME_FOREVER,
++                                  DISPATCH_TIME_FOREVER, NSEC_PER_MSEC);
++        dispatch_source_set_event_handler(p->osd_pending_timer, ^{
++            atomic_store(&p->osd_pending_timer_fired, true);
++            vo_wakeup(vo);
++        });
++        dispatch_resume(p->osd_pending_timer);
++    }
++}
++
+ // Render OSD/subtitles synchronously so timed clear samples are never
+ // skipped. Only used when the render-ahead thread is unavailable.
+ static void render_osd(struct vo *vo, double pts)
+@@ -4138,7 +4324,11 @@ static void ahead_present(struct vo *vo)
+         p->ahead_perf.late++;
+         p->ahead_perf.max_late = MPMAX(p->ahead_perf.max_late, late);
+     }
+-    apply_osd_list(vo, &p->ahead_canvas, list);
++    if (osd_changes_deferred(p)) {
++        file_osd_list(vo, &p->ahead_canvas, list);
++    } else {
++        apply_osd_list(vo, &p->ahead_canvas, list);
++    }
+ }
+ 
+ // Nothing the render thread has rendered or is rendering counts as shown any
+@@ -5122,7 +5312,16 @@ static void flip_page(struct vo *vo)
+         }
+ 
+         int64_t osd_pts_ns = sample_presentation_pts_ns(p);
+-        osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
++        if (osd_changes_deferred(p)) {
++            int64_t spacing = p->next_present_host_ns - p->osd_last_host_ns;
++            if (spacing >= MP_TIME_MS_TO_NS(4) && spacing <= MP_TIME_MS_TO_NS(200))
++                p->osd_frame_spacing_ns = spacing;
++            p->osd_last_host_ns = p->next_present_host_ns;
++            present_pending_osd(vo, false);
++        }
++        // While a change waits, the frame's OSD comes with that change.
++        if (!p->osd_pending_count)
++            osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
+         bool osd_buf_has_subtitle = osd_buf && p->has_subtitle && p->cachedSubtitleBuffer;
+ 
+         int64_t t = mp_time_ns();
+@@ -5280,6 +5479,7 @@ static void clear_subtitle_cache(struct priv *p)
+     p->osd_callback_invoked = false;
+     p->subtitle_x0 = p->subtitle_y0 = p->subtitle_x1 = p->subtitle_y1 = 0;
+     ahead_invalidate(p, p->ahead_last_pts);
++    drop_pending_osd(p);
+ }
+ 
+ // Helper to clear all subtitle state (called on video change/stop)
+@@ -5310,6 +5510,12 @@ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+ 
++    drop_pending_osd(p);
++    if (p->osd_pending_timer) {
++        dispatch_source_cancel(p->osd_pending_timer);
++        dispatch_release(p->osd_pending_timer);
++        p->osd_pending_timer = NULL;
++    }
+     report_osd_perf(vo);
+     report_ahead_perf(vo);
+     if (p->ahead.started)
+@@ -5432,6 +5638,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+ 
+     switch (request) {
+     case VOCTRL_CHECK_EVENTS:
++        if (atomic_exchange(&p->osd_pending_timer_fired, false))
++            present_pending_osd(vo, false);
+         if (atomic_exchange(&p->pending_presentation_resync, false))
+             recover_display_layer(vo, "presentation resume", true);
+         if (atomic_exchange(&p->pending_layer_geometry_sync, false))
+@@ -5496,6 +5704,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, true);
+         ahead_set_paused(p, true);
++        // No flip will come for the changes that wait.
++        present_pending_osd(vo, true);
+         return VO_TRUE;
+     case VOCTRL_RESUME:
+         if (!p->presentation_host)
+@@ -5507,6 +5717,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         return VO_TRUE;
+     case VOCTRL_REDRAW:
+         p->osd_change_id = 0;
++        p->osd_filed_change_id = 0;
+         return VO_TRUE;
+     case VOCTRL_UPDATE_WINDOW_TITLE:
+         return VO_TRUE;
+@@ -5539,6 +5750,11 @@ static const struct m_option avfoundation_options[] = {
+     // Rasterize the OSD at the video's pixel density instead of the
+     // display's (1:1 over the on-screen video rect).
+     {"osd-video-res", OPT_BOOL(osd_video_res)},
++    // Send a subtitle change to the OSD layer only this long before its
++    // frame, at least (0: with the frame's video sample, queue-lead-ms
++    // ahead). Until then it waits as a bitmap list instead of as a
++    // display-sized canvas in the layer's queue.
++    {"osd-queue-lead-ms", OPT_INT(osd_queue_lead_ms), M_RANGE(0, 1000)},
+     {0},
+ };
+ 

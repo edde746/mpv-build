@@ -55,6 +55,41 @@ int main(void)
     int64_t composite = avf_osd_wait_until(now, now + lead, lead, true, true, true);
     check(composite > now + lead, "a composite frame waits for its subtitles");
 
+    // --avfoundation-osd-queue-lead-ms: a change waits as a bitmap list and
+    // goes to the layer at the last flip that leaves the lead before its
+    // frame. Flips come one frame spacing apart, a queue lead before their
+    // own frame: walk them and see when a change for frame 0 is sent.
+    static const int64_t spacings[] = {41708333, 40000000, 33366666, 16683333, 8341666};
+    static const int64_t leads[] = {20 * MS, 40 * MS, 60 * MS, 100 * MS};
+    bool margin_ok = true, last_ok = true, early_ok = true;
+    for (size_t si = 0; si < sizeof(spacings) / sizeof(spacings[0]); si++) {
+        for (size_t li = 0; li < sizeof(leads) / sizeof(leads[0]); li++) {
+            int64_t spacing = spacings[si], want = leads[li], frame = 5000 * MS;
+            int64_t sent = -1;
+            for (int k = 0; sent < 0 && k < 100; k++) {
+                int64_t flip = frame - lead + k * spacing;  // flip of frame k
+                if (avf_osd_change_due(flip, frame, spacing, want))
+                    sent = flip;
+            }
+            // Sent with at least the lead left (or at the frame's own flip,
+            // when the lead asked for is longer than the queue lead) ...
+            margin_ok &= sent >= 0 && (frame - sent >= want || sent == frame - lead);
+            // ... and at the last such flip: the next would be too late.
+            last_ok &= sent >= 0 && frame - (sent + spacing) < want;
+            // Never before the frame's own flip.
+            early_ok &= sent >= frame - lead;
+        }
+    }
+    check(margin_ok, "a deferred change is sent with at least its lead left");
+    check(last_ok, "a deferred change is sent at the last flip that leaves its lead");
+    check(early_ok, "a deferred change is not sent before its frame is flipped");
+    // A frame shown at once (a redraw, a seek while paused) is due at once.
+    check(avf_osd_change_due(now, now, 41 * MS, 40 * MS), "an untimed frame's change is due at once");
+    // The timer that looks again when no flip comes fires a frame spacing
+    // and a slack later: late enough that a flip on time always comes first.
+    check(AVF_OSD_PENDING_SLACK_NS > 0 && AVF_OSD_PENDING_SLACK_NS < 20 * MS,
+          "the fallback timer's slack is a few milliseconds");
+
     if (failures)
         return 1;
     printf("avfoundation subtitle wait policy: all checks passed\n");

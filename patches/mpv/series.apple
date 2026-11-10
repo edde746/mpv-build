@@ -40,3 +40,7 @@
 # that it changes, and copies from the previous canvas what that one already
 # holds (common 0234's pixel ids; test_avf_osd_damage.sh).
 0048-avfoundation-redraw-only-the-canvas-tiles-a-frame-changes.patch
+# Off by default: a subtitle change waits as a bitmap list until its frame is
+# near instead of as a canvas in the layer's queue
+# (--avfoundation-osd-queue-lead-ms; test_avf_osd_ahead.sh).
+0049-avfoundation-let-osd-changes-wait-as-bitmap-lists.patch
