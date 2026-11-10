@@ -32,3 +32,8 @@
 # release/9.1); drop it once the pin carries them. Other architectures, and
 # the Apple slices built without asm (Catalyst), keep the C transform.
 0042-lavu-tx-aarch64-neon-inverse-mdct.patch
+# HTTP can keep its connection across seeks instead of opening one per seek:
+# upstream's persistent range requests (on release/9.1; drop 0080 once the pin
+# carries them). Nothing changes on the wire until the options are set. After
+# 0023, which it builds on.
+0080-http-persistent-range-requests.patch
