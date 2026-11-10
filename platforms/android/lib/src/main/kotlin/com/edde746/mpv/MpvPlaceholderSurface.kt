@@ -9,6 +9,7 @@ import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -30,46 +31,74 @@ import java.util.concurrent.FutureTask
  */
 class MpvPlaceholderSurface private constructor(
     private val handler: Handler,
-    private val gl: Gl,
+    private val consumer: Consumer,
 ) : AutoCloseable {
 
     /** The Surface to give mpv; valid until [close]. */
-    val surface: Surface get() = gl.surface
+    val surface: Surface get() = consumer.surface
 
-    /** What the GL thread built; [released] and [latchFailureLogged] are read and written on that thread only. */
-    private class Gl(
-        val display: EGLDisplay,
-        val context: EGLContext,
-        val pbuffer: EGLSurface,
-        val texture: Int,
-        val surfaceTexture: SurfaceTexture,
-        val surface: Surface,
-    ) {
+    /**
+     * The queue's two ends, and what its GL thread latches with. [egl], [released] and [latchFailureLogged] are read
+     * and written on that thread only; [egl] is null until the thread has built it.
+     */
+    private class Consumer(val surfaceTexture: SurfaceTexture, val surface: Surface) {
+        var egl: Egl? = null
         var released = false
         var latchFailureLogged = false
     }
+
+    private class Egl(val display: EGLDisplay, val context: EGLContext, val pbuffer: EGLSurface, val texture: Int)
 
     companion object {
         private const val TAG = "MpvPlaceholderSurface"
 
         /**
-         * Starts the GL thread and blocks until its consumer is up; call it off the main thread. Throws
-         * [IllegalStateException] when EGL refuses a step or the wait is interrupted (the interrupt status is kept);
-         * either way the thread stops and nothing it built is left behind.
+         * Makes the Surface and starts the GL thread that takes its frames; call it off the main thread.
+         *
+         * From API 26 this returns as soon as the Surface exists, and the thread builds its EGL context behind it:
+         * that build is the slow part (10 ms on a Pixel 7, 17-28 ms on MT8696 and Amlogic TV boxes, 70-90 ms on a
+         * SHIELD TV), and a player is usually created right after, which need not wait for it. The SurfaceTexture
+         * starts detached, as a TextureView's does, and frames posted meanwhile are taken once the context is up. An
+         * EGL that refuses is logged and the Surface released, so a producer pointed at it fails instead of stalling.
+         *
+         * On API 25, where a SurfaceTexture cannot start detached, this blocks until the consumer is up and throws
+         * [IllegalStateException] when EGL refuses a step or the wait is interrupted (the interrupt status is kept).
+         * Either way the thread stops and nothing it built is left behind.
          */
         fun create(): MpvPlaceholderSurface {
             val thread = HandlerThread("MpvPlaceholder").apply { start() }
             val handler = Handler(thread.looper)
-            val task = FutureTask(Callable { initGl(handler) })
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val surfaceTexture = SurfaceTexture(false)
+                val consumer = Consumer(surfaceTexture, Surface(surfaceTexture))
+                // Posted first, so every frame callback finds the context built or the consumer released.
+                handler.post { attach(consumer, thread) }
+                surfaceTexture.setOnFrameAvailableListener({ latchAndDrop(consumer) }, handler)
+                return MpvPlaceholderSurface(handler, consumer)
+            }
+            val task = FutureTask(
+                Callable {
+                    val egl = initEgl()
+                    try {
+                        val surfaceTexture = SurfaceTexture(egl.texture)
+                        val consumer = Consumer(surfaceTexture, Surface(surfaceTexture)).also { it.egl = egl }
+                        surfaceTexture.setOnFrameAvailableListener({ latchAndDrop(consumer) }, handler)
+                        consumer
+                    } catch (e: Throwable) {
+                        releaseEgl(egl)
+                        throw e
+                    }
+                },
+            )
             handler.post(task)
-            val gl = try {
+            val consumer = try {
                 task.get()
             } catch (e: ExecutionException) {
-                // initGl released what it had built before throwing.
+                // The task released what it had built before throwing.
                 thread.quitSafely()
                 throw IllegalStateException("Placeholder surface initialization failed", e.cause ?: e)
             } catch (e: InterruptedException) {
-                // initGl may still finish. It runs first on its thread, so this teardown finds it done.
+                // The task may still finish. It runs first on its thread, so this teardown finds it done.
                 handler.post {
                     try {
                         runCatching { task.get() }.getOrNull()?.let(::release)
@@ -80,18 +109,46 @@ class MpvPlaceholderSurface private constructor(
                 Thread.currentThread().interrupt()
                 throw IllegalStateException("Placeholder surface initialization interrupted", e)
             }
-            return MpvPlaceholderSurface(handler, gl)
+            return MpvPlaceholderSurface(handler, consumer)
         }
 
-        private fun initGl(handler: Handler): Gl {
+        /** Builds the context and attaches the detached SurfaceTexture to it; on the GL thread, before any frame. */
+        private fun attach(consumer: Consumer, thread: HandlerThread) {
+            val egl = try {
+                initEgl()
+            } catch (e: Throwable) {
+                fail(consumer, thread, e)
+                return
+            }
+            try {
+                consumer.surfaceTexture.attachToGLContext(egl.texture)
+                consumer.egl = egl
+            } catch (e: Throwable) {
+                releaseEgl(egl)
+                fail(consumer, thread, e)
+            }
+        }
+
+        /**
+         * No consumer can be built: nothing would ever take a frame, so the Surface goes too. Whoever holds it gets
+         * an invalid Surface (mpv then refuses the handoff or fails the output), not a producer blocked for good.
+         */
+        private fun fail(consumer: Consumer, thread: HandlerThread, error: Throwable) {
+            Log.e(TAG, "Placeholder surface initialization failed; releasing its Surface", error)
+            consumer.released = true
+            consumer.surface.release()
+            consumer.surfaceTexture.release()
+            thread.quitSafely()
+        }
+
+        /** A current ES2 context on a 1x1 pbuffer and one texture name; throws after undoing what it had built. */
+        private fun initEgl(): Egl {
             val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
             check(display != EGL14.EGL_NO_DISPLAY) { "eglGetDisplay failed" }
             val version = IntArray(2)
             check(EGL14.eglInitialize(display, version, 0, version, 1)) { "eglInitialize failed: ${EGL14.eglGetError()}" }
             var context = EGL14.EGL_NO_CONTEXT
             var pbuffer = EGL14.EGL_NO_SURFACE
-            var texture = 0
-            var surfaceTexture: SurfaceTexture? = null
             try {
                 val configs = arrayOfNulls<EGLConfig>(1)
                 val count = IntArray(1)
@@ -114,41 +171,39 @@ class MpvPlaceholderSurface private constructor(
                 check(EGL14.eglMakeCurrent(display, pbuffer, pbuffer, context)) { "eglMakeCurrent failed: ${EGL14.eglGetError()}" }
                 val textures = IntArray(1)
                 GLES20.glGenTextures(1, textures, 0)
-                texture = textures[0]
-                surfaceTexture = SurfaceTexture(texture)
-                val gl = Gl(display, context, pbuffer, texture, surfaceTexture, Surface(surfaceTexture))
-                surfaceTexture.setOnFrameAvailableListener({ latchAndDrop(gl) }, handler)
-                return gl
+                return Egl(display, context, pbuffer, textures[0])
             } catch (e: Throwable) {
-                surfaceTexture?.release()
-                if (texture != 0) GLES20.glDeleteTextures(1, intArrayOf(texture), 0)
                 releaseEgl(display, context, pbuffer)
                 throw e
             }
         }
 
         /** Latches the newest frame so the producer gets its buffer back; nothing ever reads it. */
-        private fun latchAndDrop(gl: Gl) {
-            if (gl.released) return
+        private fun latchAndDrop(consumer: Consumer) {
+            if (consumer.released) return
             try {
-                gl.surfaceTexture.updateTexImage()
+                consumer.surfaceTexture.updateTexImage()
             } catch (e: RuntimeException) {
                 // A frame the driver cannot latch is dropped like the rest; the next one is latched afresh.
-                if (!gl.latchFailureLogged) {
-                    gl.latchFailureLogged = true
+                if (!consumer.latchFailureLogged) {
+                    consumer.latchFailureLogged = true
                     Log.w(TAG, "Dropped a frame that failed to latch", e)
                 }
             }
         }
 
-        /** Tears down what [initGl] built, once; on the GL thread. */
-        private fun release(gl: Gl) {
-            if (gl.released) return
-            gl.released = true
-            gl.surface.release()
-            gl.surfaceTexture.release()
-            GLES20.glDeleteTextures(1, intArrayOf(gl.texture), 0)
-            releaseEgl(gl.display, gl.context, gl.pbuffer)
+        /** Tears down the consumer, once; on the GL thread. */
+        private fun release(consumer: Consumer) {
+            if (consumer.released) return
+            consumer.released = true
+            consumer.surface.release()
+            consumer.surfaceTexture.release()
+            consumer.egl?.let(::releaseEgl)
+        }
+
+        private fun releaseEgl(egl: Egl) {
+            GLES20.glDeleteTextures(1, intArrayOf(egl.texture), 0)
+            releaseEgl(egl.display, egl.context, egl.pbuffer)
         }
 
         private fun releaseEgl(display: EGLDisplay, context: EGLContext, pbuffer: EGLSurface) {
@@ -165,7 +220,7 @@ class MpvPlaceholderSurface private constructor(
     override fun close() {
         handler.post {
             try {
-                release(gl)
+                release(consumer)
             } finally {
                 handler.looper.quitSafely()
             }
