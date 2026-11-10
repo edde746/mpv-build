@@ -32,5 +32,7 @@
 0044-vo-queue-slack-for-vos-that-present-by-timestamp.patch
 # --hwdec-threads defaults to 1: VideoToolbox decodes one frame at a time.
 0045-vd-lavc-one-hwdec-thread-by-default-on-apple-platforms.patch
-# Startup: a file's first frame is on screen before the audio output opens.
+# Startup: a file's first frame is on screen before the audio output opens,
+# and vo_avfoundation waits for the main thread once, not seven times.
 0046-player-first-video-frame-before-the-audio-output-opens.patch
+0047-avfoundation-one-main-thread-trip-to-set-up.patch

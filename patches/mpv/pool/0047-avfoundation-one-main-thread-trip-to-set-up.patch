@@ -1,0 +1,354 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0100
+Subject: [PATCH] vo_avfoundation: one trip to the main thread to set up, none for a first frame
+
+The display layer may only be touched on the main thread, and the VO
+went there synchronously seven times between loadfile and a file's
+first frame: five in preinit (the control timebase, the layer's
+geometry, the OSD layer, the application state and its observers, the
+KVO registration), once in reconfig and once more for the first frame's
+render geometry. Each trip waits for whatever the main thread is in the
+middle of. With an idle main thread that is a millisecond or two in
+all; with one that is busy in pieces, as a player screen that is just
+opening keeps it, every trip waits for the piece in progress.
+
+preinit now does all of its main-thread work in one block, and
+registers the KVO observer before it reads the geometry. That reading
+stays valid until the layer's owner changes its bounds, contentsScale or
+videoGravity, which MPVLayerGeometryObserver already sees:
+update_avfoundation_geometry() goes to the main thread only after the
+observer flagged a change. This also takes a synchronous main-thread
+read out of every frame rendered with video zoom or pan
+(should_apply_video_geometry() re-read the layer each time).
+
+iPhone Air, H.264 1080p MP4, ms from loadfile to PLAYBACK_RESTART,
+medians of 3 interleaved runs, Plezy's / Tortuga's option set, before
+-> after (with the rest of this series' startup patches):
+  main thread idle                      48.5 -> 46.9 / 49.6 -> 48.2
+  busy in 30 ms pieces, back to back   194.5 -> 41.3 / 194.1 -> 35.6
+  busy in 100 ms pieces, back to back  656.7 -> 75.9 / 652.1 -> 75.8
+The VO exists 47.6 ms after loadfile instead of 454 ms in the last row.
+A main thread that is free between pieces (4 ms busy, 4 ms free, or
+12 / 4) never delayed the VO.
+
+The core sets vo->dwidth/dheight to the video's size on every reconfig,
+so update_avfoundation_geometry() applies the size it last read on every
+call, as its unconditional read did. (The build the numbers above were
+taken with skipped that and laid the OSD out at the video's size; the
+main-thread trips, which is what they measure, are the same.)
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index a3d3e19..b541510 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -667,6 +667,13 @@ struct priv {
+     // VOCTRL_CHECK_EVENTS resyncs the cached OSD geometry.
+     id layer_geometry_observer;
+     atomic_bool pending_layer_geometry_sync;
++    // The layer's size, scale or gravity changed since they were last read
++    // (MPVLayerGeometryObserver). Reading them takes the main thread, so
++    // update_avfoundation_geometry reads only then.
++    atomic_bool layer_geometry_dirty;
++    // What was last read: the layer's size in pixels. The core resets
++    // vo->dwidth/dheight on a reconfig, so every update applies it again.
++    int layer_w, layer_h;
+     // The layer's videoGravity, read with its size by
+     // update_avfoundation_geometry; it decides the user shaders' output size.
+     enum avf_gravity layer_gravity;
+@@ -739,6 +746,7 @@ static const struct m_sub_options avfoundation_conf;
+     struct priv *p = target->priv;
+     // The user shaders' output follows the layer's size and gravity; the OSD
+     // only its size.
++    atomic_store(&p->layer_geometry_dirty, true);
+     atomic_store(&p->shader_layer_stale, true);
+     if (![keyPath isEqualToString:@"videoGravity"])
+         atomic_store(&p->pending_layer_geometry_sync, true);
+@@ -1229,6 +1237,44 @@ static void record_not_ready_drop(struct vo *vo)
+         recover_display_layer(vo, "repeated not-ready drops", false);
+ }
+ 
++// The display layer's size in pixels and its gravity. On the main thread.
++static void read_layer_geometry(AVSampleBufferDisplayLayer *displayLayer,
++                                int *width, int *height,
++                                enum avf_gravity *gravity)
++{
++    CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
++    CGSize size = displayLayer.bounds.size;
++    if (size.width <= 0 || size.height <= 0)
++        size = displayLayer.frame.size;
++
++    *width = MPMAX(1, (int)(size.width * scale + 0.5));
++    *height = MPMAX(1, (int)(size.height * scale + 0.5));
++
++    *gravity = AVF_GRAVITY_ASPECT;
++    AVLayerVideoGravity layerGravity = displayLayer.videoGravity;
++    if ([layerGravity isEqualToString:AVLayerVideoGravityResizeAspectFill])
++        *gravity = AVF_GRAVITY_ASPECT_FILL;
++    else if ([layerGravity isEqualToString:AVLayerVideoGravityResize])
++        *gravity = AVF_GRAVITY_RESIZE;
++}
++
++static void set_layer_geometry(struct vo *vo, int width, int height,
++                               enum avf_gravity gravity)
++{
++    struct priv *p = vo->priv;
++
++    p->layer_w = width;
++    p->layer_h = height;
++    p->layer_gravity = gravity;
++    vo->dwidth = width;
++    vo->dheight = height;
++    vo->monitor_par = 1.0;
++}
++
++// What preinit read stays right until the layer's owner changes it, which
++// MPVLayerGeometryObserver flags. Only then is there something to ask the
++// main thread for: a wait for it that a file's first frame, and with video
++// zoom or pan every frame, would otherwise make.
+ static void update_avfoundation_geometry(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -1236,31 +1282,23 @@ static void update_avfoundation_geometry(struct vo *vo)
+     if (!p->displayLayer)
+         return;
+ 
++    if (!atomic_exchange(&p->layer_geometry_dirty, false)) {
++        // Unchanged, but the core sets the VO's size to the video's on a
++        // reconfig.
++        set_layer_geometry(vo, p->layer_w, p->layer_h, p->layer_gravity);
++        return;
++    }
++
+     __block int width = 0;
+     __block int height = 0;
+     __block enum avf_gravity gravity = AVF_GRAVITY_ASPECT;
+     AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
+     dispatch_main_sync_safe(^{
+-        CGFloat scale = displayLayer.contentsScale > 0 ? displayLayer.contentsScale : get_screen_scale();
+-        CGSize size = displayLayer.bounds.size;
+-        if (size.width <= 0 || size.height <= 0)
+-            size = displayLayer.frame.size;
+-
+-        width = MPMAX(1, (int)(size.width * scale + 0.5));
+-        height = MPMAX(1, (int)(size.height * scale + 0.5));
+-
+-        AVLayerVideoGravity layerGravity = displayLayer.videoGravity;
+-        if ([layerGravity isEqualToString:AVLayerVideoGravityResizeAspectFill])
+-            gravity = AVF_GRAVITY_ASPECT_FILL;
+-        else if ([layerGravity isEqualToString:AVLayerVideoGravityResize])
+-            gravity = AVF_GRAVITY_RESIZE;
++        read_layer_geometry(displayLayer, &width, &height, &gravity);
+     });
+     [displayLayer release];
+ 
+-    vo->dwidth = width;
+-    vo->dheight = height;
+-    vo->monitor_par = 1.0;
+-    p->layer_gravity = gravity;
++    set_layer_geometry(vo, width, height, gravity);
+ }
+ 
+ // --- avf frame-space osd core ---
+@@ -1448,6 +1486,37 @@ static CGRect layer_untransformed_frame(CALayer *layer)
+ // Create the timed OSD sample-buffer layer, in inline mode only. Its lifetime
+ // follows the composite_osd/pip_composite_osd options, so sync_osd_layer_frame
+ // can call this again after the user turns compositing back off.
++// On the main thread.
++static void create_osd_layer(struct vo *vo,
++                             AVSampleBufferDisplayLayer *osdDisplayLayer,
++                             CMTimebaseRef osdTimebase)
++{
++    struct priv *p = vo->priv;
++
++    AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
++    osdLayer.frame = layer_untransformed_frame(osdDisplayLayer);
++    osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
++#if !TARGET_OS_IPHONE
++    osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++#endif
++    osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
++    osdLayer.backgroundColor = NULL;
++    osdLayer.opaque = NO;
++    osdLayer.videoGravity = AVLayerVideoGravityResize;
++    osdLayer.controlTimebase = osdTimebase;
++
++    CALayer *parent = osdDisplayLayer.superlayer;
++    if (parent) {
++        [parent addSublayer:osdLayer];
++        osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
++    } else {
++        [osdDisplayLayer addSublayer:osdLayer];
++        osdLayer.frame = osdDisplayLayer.bounds;
++        MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
++    }
++    p->osdLayer = osdLayer;
++}
++
+ static void ensure_osd_layer(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
+@@ -1458,28 +1527,7 @@ static void ensure_osd_layer(struct vo *vo)
+     AVSampleBufferDisplayLayer *osdDisplayLayer = [p->displayLayer retain];
+     CMTimebaseRef osdTimebase = p->timebase;
+     dispatch_main_sync_safe(^{
+-        AVSampleBufferDisplayLayer *osdLayer = [[AVSampleBufferDisplayLayer alloc] init];
+-        osdLayer.frame = layer_untransformed_frame(osdDisplayLayer);
+-        osdLayer.anchorPoint = CGPointMake(0.5, 0.5);
+-#if !TARGET_OS_IPHONE
+-        osdLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+-#endif
+-        osdLayer.contentsScale = osdDisplayLayer.contentsScale > 0 ? osdDisplayLayer.contentsScale : get_screen_scale();
+-        osdLayer.backgroundColor = NULL;
+-        osdLayer.opaque = NO;
+-        osdLayer.videoGravity = AVLayerVideoGravityResize;
+-        osdLayer.controlTimebase = osdTimebase;
+-
+-        CALayer *parent = osdDisplayLayer.superlayer;
+-        if (parent) {
+-            [parent addSublayer:osdLayer];
+-            osdLayer.zPosition = osdDisplayLayer.zPosition + 1;
+-        } else {
+-            [osdDisplayLayer addSublayer:osdLayer];
+-            osdLayer.frame = osdDisplayLayer.bounds;
+-            MP_WARN(vo, "displayLayer has no superlayer; OSD will degrade direct scanout\n");
+-        }
+-        p->osdLayer = osdLayer;
++        create_osd_layer(vo, osdDisplayLayer, osdTimebase);
+     });
+     [osdDisplayLayer release];
+ }
+@@ -4363,39 +4411,50 @@ static int preinit(struct vo *vo)
+         CMTimebaseSetTime(p->timebase, cm_time_from_ns(0));
+         CMTimebaseSetRate(p->timebase, 0.0);
+     }
++    atomic_init(&p->pending_presentation_resync, false);
++    atomic_init(&p->app_inactive, false);
++    atomic_init(&p->pending_layer_geometry_sync, false);
++    atomic_init(&p->layer_geometry_dirty, false);
++    atomic_init(&p->shader_layer_stale, false);
++
++    // Everything the main thread has to do for a new VO, in one trip to it:
++    // each trip waits for whatever the main thread is in the middle of, and
++    // a player screen that is just opening keeps it busy.
+     AVSampleBufferDisplayLayer *displayLayer = [p->displayLayer retain];
+     CMTimebaseRef timebase = p->timebase;
+-    dispatch_main_sync_safe(^{
+-        displayLayer.controlTimebase = timebase;
+-    });
+-    [displayLayer release];
+-    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
+-    vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+-    p->ready_queue = dispatch_queue_create("avfoundation ready",
+-        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+-                                                QOS_CLASS_USER_INTERACTIVE, 0));
+-    update_avfoundation_geometry(vo);
+-
+-    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
+-        MP_WARN(vo, "Core Image fallback compositor unavailable\n");
+-
++    MPVLayerGeometryObserver *observer = [[MPVLayerGeometryObserver alloc] init];
++    observer->vo = vo;
+     // The OSD layer's lifetime follows the option: created here, kept in step
+     // by sync_osd_layer_frame.
+-    ensure_osd_layer(vo);
+-    ahead_start(vo);
++    bool inline_osd = should_use_inline_osd_layer(p);
++    __block int width = 0;
++    __block int height = 0;
++    __block enum avf_gravity gravity = AVF_GRAVITY_ASPECT;
++    dispatch_main_sync_safe(^{
++        displayLayer.controlTimebase = timebase;
+ 
+-    vo->hwdec_devs = hwdec_devices_create();
+-    p->hwctx = (struct mp_hwdec_ctx){
+-        .driver_name = "avfoundation",
+-        .av_device_ref = create_videotoolbox_device_ref(vo),
+-        .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
+-    };
+-    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
++        // Observed before it is read, so that no change goes unseen.
++        [displayLayer addObserver:observer
++                       forKeyPath:@"bounds"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        [displayLayer addObserver:observer
++                       forKeyPath:@"contentsScale"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        [displayLayer addObserver:observer
++                       forKeyPath:@"videoGravity"
++                          options:NSKeyValueObservingOptionOld |
++                                  NSKeyValueObservingOptionNew
++                          context:NULL];
++        read_layer_geometry(displayLayer, &width, &height, &gravity);
++
++        if (inline_osd)
++            create_osd_layer(vo, displayLayer, timebase);
+ 
+-    atomic_init(&p->pending_presentation_resync, false);
+-    atomic_init(&p->app_inactive, false);
+ #if TARGET_OS_IPHONE
+-    dispatch_main_sync_safe(^{
+         atomic_store(&p->app_inactive, UIApplication.sharedApplication.applicationState !=
+                                        UIApplicationStateActive);
+         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+@@ -4419,35 +4478,30 @@ static int preinit(struct vo *vo)
+                 vo_wakeup(vo);
+             }
+         }] retain];
+-    });
+ #endif
++    });
++    [displayLayer release];
++    p->layer_geometry_observer = observer;
++    set_layer_geometry(vo, width, height, gravity);
+ 
+-    atomic_init(&p->pending_layer_geometry_sync, false);
+-    atomic_init(&p->shader_layer_stale, false);
+-    {
+-        MPVLayerGeometryObserver *observer = [[MPVLayerGeometryObserver alloc] init];
+-        observer->vo = vo;
+-        AVSampleBufferDisplayLayer *observedLayer = [p->displayLayer retain];
+-        dispatch_main_sync_safe(^{
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"bounds"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"contentsScale"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-            [observedLayer addObserver:observer
+-                            forKeyPath:@"videoGravity"
+-                               options:NSKeyValueObservingOptionOld |
+-                                       NSKeyValueObservingOptionNew
+-                               context:NULL];
+-        });
+-        [observedLayer release];
+-        p->layer_geometry_observer = observer;
+-    }
++    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
++    p->ready_queue = dispatch_queue_create("avfoundation ready",
++        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
++                                                QOS_CLASS_USER_INTERACTIVE, 0));
++
++    if (p->opts->composite_osd && !ensure_ci_compositor(vo))
++        MP_WARN(vo, "Core Image fallback compositor unavailable\n");
++
++    ahead_start(vo);
++
++    vo->hwdec_devs = hwdec_devices_create();
++    p->hwctx = (struct mp_hwdec_ctx){
++        .driver_name = "avfoundation",
++        .av_device_ref = create_videotoolbox_device_ref(vo),
++        .hw_imgfmt = IMGFMT_VIDEOTOOLBOX,
++    };
++    hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
+ 
+     return 0;
+ }
