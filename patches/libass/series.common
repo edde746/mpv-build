@@ -33,6 +33,8 @@
 #   thread wakeups     workers woken only for events that need rendering;
 #                      the default thread count is the cores near the
 #                      fastest (cpu_capacity), not every core
+#   drawings           drawing tokens in one array, plain decimals parsed in
+#                      one pass, one tag walk per event text
 0001-ass-fast-blur-kernels.patch
 0002-ass-parse-and-rasterize-faster.patch
 0003-ass-threaded-rendering-image-pool-and-layout-cache.patch
@@ -44,3 +46,4 @@
 0009-ass-blur-in-scratch-memory.patch
 0010-ass-shift-shadows-a-row-at-a-time.patch
 0011-ass-wake-workers-only-for-events-to-render.patch
+0012-ass-parse-drawings-and-numbers-faster.patch

@@ -1,0 +1,695 @@
+ass: parse drawings and plain numbers faster
+
+A vector clip traced around a sign is tens of thousands of points, 500 KB
+of text, and motion tracking gives every frame its own. Parsing it was the
+largest part of the frames that take longest (130 ms on a Fire TV Stick 4K
+Max): a malloc and a free per point for a doubly linked token list, and
+ass_strtod's general path, two passes and a loop over powers of ten, for
+numbers like "1137.66".
+
+- The tokens of a drawing live in one array, sized from the length of the
+  text, and the outline is allocated for as many points. Same tokens, same
+  order.
+- ass_strtod takes a plain decimal of up to 15 significant digits in one
+  pass and one division. The mantissa and the power of ten are both exact
+  doubles, as they are in the general path for such a number, so the
+  quotient is the same double; anything else (more digits, an exponent, no
+  digits) falls through to the code as it was. The first nine digits are
+  gathered in 32 bits, which a 32-bit ARM multiplies and converts without
+  a library call. 300 million random strings give the same value, end
+  pointer and errno with and without it.
+- The two questions asked of an event's text before it is rendered (does
+  it position itself, does it change over time) are answered by one walk
+  over it, not one each.
+- The rasterizer takes the bounding box of an outline as it adds the
+  segments, not in a second pass over them.
+
+diff --git a/libass/ass_drawing.c b/libass/ass_drawing.c
+index b4c3233..549db32 100644
+--- a/libass/ass_drawing.c
++++ b/libass/ass_drawing.c
+@@ -30,31 +30,25 @@
+ #define DRAWING_INITIAL_POINTS 100
+ #define DRAWING_INITIAL_SEGMENTS 100
+ 
+-/*
+- * \brief Free a list of tokens
+- */
+-static void drawing_free_tokens(ASS_DrawingToken *token)
++// The tokens of one drawing, in order. A vector clip of a motion-tracked sign
++// is tens of thousands of points, parsed anew for every frame: one array, not
++// one allocation per point.
++typedef struct {
++    ASS_DrawingToken *tokens;
++    size_t count, capacity;
++} TokenList;
++
++static inline bool add_node(TokenList *list, ASS_TokenType type, ASS_Vector point)
+ {
+-    while (token) {
+-        ASS_DrawingToken *at = token;
+-        token = token->next;
+-        free(at);
++    if (list->count == list->capacity) {
++        size_t capacity = 2 * list->capacity;
++        if (!ASS_REALLOC_ARRAY(list->tokens, capacity))
++            return false;
++        list->capacity = capacity;
+     }
+-}
+-
+-static inline bool add_node(ASS_DrawingToken **tail, ASS_TokenType type, ASS_Vector point)
+-{
+-    assert(tail && *tail);
+-
+-    ASS_DrawingToken *new_tail = malloc(sizeof(**tail));
+-    if (!new_tail)
+-        return false;
+-    (*tail)->next = new_tail;
+-    new_tail->prev = *tail;
+-    new_tail->next = NULL;
+-    new_tail->type = type;
+-    new_tail->point = point;
+-    *tail = new_tail;
++    list->tokens[list->count].type = type;
++    list->tokens[list->count].point = point;
++    list->count++;
+     return true;
+ }
+ 
+@@ -75,7 +69,7 @@ static inline bool get_point(const char **str, ASS_Vector *point)
+  * If an allocation fails, error will be set to true.
+  * \return whether three valid points were added
+  */
+-static bool add_3_points(const char **str, ASS_DrawingToken **tail, ASS_TokenType type, bool *error)
++static bool add_3_points(const char **str, TokenList *list, ASS_TokenType type, bool *error)
+ {
+     ASS_Vector buf[3];
+ 
+@@ -89,9 +83,9 @@ static bool add_3_points(const char **str, ASS_DrawingToken **tail, ASS_TokenTyp
+     if (!valid)
+         return false;
+ 
+-    valid = add_node(tail, type, buf[0]);
+-    valid = valid && add_node(tail, type, buf[1]);
+-    valid = valid && add_node(tail, type, buf[2]);
++    valid = add_node(list, type, buf[0]);
++    valid = valid && add_node(list, type, buf[1]);
++    valid = valid && add_node(list, type, buf[2]);
+     if (!valid) {
+         *error = true;
+         return false;
+@@ -102,12 +96,12 @@ static bool add_3_points(const char **str, ASS_DrawingToken **tail, ASS_TokenTyp
+ 
+ /*
+  * Parses and advances the string while it matches points.
+- * Each set of batch_size points will be turned into tokens and appended to tail.
++ * Each set of batch_size points will be turned into tokens and appended to the list.
+  * Partial matches (i.e. an insufficient amount of coordinates) are still consumed.
+  * If an allocation fails, error will be set to true.
+  * \return count of added points
+  */
+-static size_t add_many_points(const char **str, ASS_DrawingToken **tail,
++static size_t add_many_points(const char **str, TokenList *list,
+                               ASS_TokenType type, size_t batch_size, bool *error)
+ {
+     ASS_Vector buf[3];
+@@ -130,7 +124,7 @@ static size_t add_many_points(const char **str, ASS_DrawingToken **tail,
+             continue;
+ 
+         for (size_t i = 0; i < count_batch; i++)
+-            if (!add_node(tail, type, buf[i])) {
++            if (!add_node(list, type, buf[i])) {
+                 *error = true;
+                 return count_total - count_batch + i;
+             }
+@@ -140,26 +134,17 @@ static size_t add_many_points(const char **str, ASS_DrawingToken **tail,
+     return count_total - count_batch;
+ }
+ 
+-static inline bool add_root_node(ASS_DrawingToken **root, ASS_DrawingToken **tail,
+-                                 size_t *points, ASS_Vector point, ASS_TokenType type)
+-{
+-    *root = *tail = calloc(1, sizeof(ASS_DrawingToken));
+-    if (!*root)
+-        return false;
+-    (*root)->point = point;
+-    (*root)->type = type;
+-    *points = 1;
+-    return true;
+-}
+-
+ /*
+  * \brief Tokenize a drawing string into a list of ASS_DrawingToken
+  * This also expands points for closing b-splines
++ * \return false if the drawing is rejected or memory ran out; the list is
++ * empty then
+  */
+-static ASS_DrawingToken *drawing_tokenize(const char *str)
++static bool drawing_tokenize(const char *str, TokenList *list)
+ {
+     const char *p = str;
+-    ASS_DrawingToken *root = NULL, *tail = NULL, *spline_start = NULL;
++    // index of the token before a b-spline's first point
++    size_t spline_start = SIZE_MAX;
+     size_t points = 0;
+     bool m_seen = false;
+     bool error = false;
+@@ -181,45 +166,47 @@ static ASS_DrawingToken *drawing_tokenize(const char *str)
+         switch (cmd) {
+         case 'm':
+             m_seen = true;
+-            if (!root) {
++            if (!list->count) {
+                 ASS_Vector point;
+                 if (!get_point(&p, &point))
+                     continue;
+-                if (!add_root_node(&root, &tail, &points, point, TOKEN_MOVE))
+-                    return NULL;
++                if (!add_node(list, TOKEN_MOVE, point))
++                    goto fail;
++                points = 1;
+             }
+-            points += add_many_points(&p, &tail, TOKEN_MOVE, 1, &error);
++            points += add_many_points(&p, list, TOKEN_MOVE, 1, &error);
+             break;
+         case 'n':
+-            if (!root) {
++            if (!list->count) {
+                 ASS_Vector point;
+                 if (!get_point(&p, &point))
+                     continue;
+                 if (!m_seen)
+-                    return NULL;
+-                if (!add_root_node(&root, &tail, &points, point, TOKEN_MOVE_NC))
+-                    return NULL;
++                    goto fail;
++                if (!add_node(list, TOKEN_MOVE_NC, point))
++                    goto fail;
++                points = 1;
+             }
+-            points += add_many_points(&p, &tail, TOKEN_MOVE_NC, 1, &error);
++            points += add_many_points(&p, list, TOKEN_MOVE_NC, 1, &error);
+             break;
+         case 'l':
+-            if (!root)
++            if (!list->count)
+                 continue;
+-            points += add_many_points(&p, &tail, TOKEN_LINE, 1, &error);
++            points += add_many_points(&p, list, TOKEN_LINE, 1, &error);
+             break;
+         case 'b':
+-            if (!root)
++            if (!list->count)
+                 continue;
+-            points += add_many_points(&p, &tail, TOKEN_CUBIC_BEZIER, 3, &error);
++            points += add_many_points(&p, list, TOKEN_CUBIC_BEZIER, 3, &error);
+             break;
+         case 's':
+-            if (!root)
++            if (!list->count)
+                 continue;
+             // Only the initial 3 points are TOKEN_B_SPLINE,
+             // all following ones are TOKEN_EXTEND_SPLINE
+-            spline_start = tail;
+-            if (!add_3_points(&p, &tail, TOKEN_B_SPLINE, &error)) {
+-                spline_start = NULL;
++            spline_start = list->count - 1;
++            if (!add_3_points(&p, list, TOKEN_B_SPLINE, &error)) {
++                spline_start = SIZE_MAX;
+                 break;
+             }
+             points += 3;
+@@ -227,20 +214,19 @@ static ASS_DrawingToken *drawing_tokenize(const char *str)
+         case 'p':
+             if (points < 3)
+                 continue;
+-            points += add_many_points(&p, &tail, TOKEN_EXTEND_SPLINE, 1, &error);
++            points += add_many_points(&p, list, TOKEN_EXTEND_SPLINE, 1, &error);
+             break;
+         case 'c':
+-            if (!spline_start)
++            if (spline_start == SIZE_MAX)
+                 continue;
+             // Close b-splines: add the first three points of the b-spline back to the end
+             for (int i = 0; i < 3; i++) {
+-                if (!add_node(&tail, TOKEN_EXTEND_SPLINE, spline_start->point)) {
++                if (!add_node(list, TOKEN_EXTEND_SPLINE, list->tokens[spline_start + i].point)) {
+                     error = true;
+                     break;
+                 }
+-                spline_start = spline_start->next;
+             }
+-            spline_start = NULL;
++            spline_start = SIZE_MAX;
+             break;
+         default:
+             // Ignore, just search for next valid command
+@@ -250,24 +236,25 @@ static ASS_DrawingToken *drawing_tokenize(const char *str)
+             goto fail;
+     }
+ 
+-    return root;
++    return true;
+ 
+ fail:
+-    drawing_free_tokens(root);
+-    return NULL;
++    free(list->tokens);
++    *list = (TokenList) {0};
++    return false;
+ }
+ 
+ /*
+  * \brief Add curve to drawing
++ * \param token the first of the curve's four tokens
+  */
+ static bool drawing_add_curve(ASS_Outline *outline, ASS_Rect *cbox,
+-                              ASS_DrawingToken *token, bool spline, int started)
++                              const ASS_DrawingToken *token, bool spline, int started)
+ {
+     ASS_Vector p[4];
+     for (int i = 0; i < 4; ++i) {
+-        p[i] = token->point;
++        p[i] = token[i].point;
+         rectangle_update(cbox, p[i].x, p[i].y, p[i].x, p[i].y);
+-        token = token->next;
+     }
+ 
+     if (spline) {
+@@ -294,45 +281,45 @@ static bool drawing_add_curve(ASS_Outline *outline, ASS_Rect *cbox,
+         ass_outline_add_point(outline, p[3], OUTLINE_CUBIC_SPLINE);
+ }
+ 
+-/*
+- * Anything produced by our tokenizer is already supposed to fulfill these requirements
+- * where relevant, but let's check with an assert in builds without NDEBUG
+- */
+-static inline void assert_3_forward(ASS_DrawingToken *token)
+-{
+-    assert(token && token->prev && token->next && token->next->next);
+-}
+-
+-static inline void assert_4_back(ASS_DrawingToken *token)
+-{
+-    assert(token && token->prev && token->prev->prev && token->prev->prev->prev);
+-}
+-
+ /*
+  * \brief Convert token list to outline.  Calls the line and curve evaluators.
+  */
+ bool ass_drawing_parse(ASS_Outline *outline, ASS_Rect *cbox,
+                        const char *text, ASS_Library *lib)
+ {
+-    if (!ass_outline_alloc(outline, DRAWING_INITIAL_POINTS, DRAWING_INITIAL_SEGMENTS))
+-        return false;
+     rectangle_reset(cbox);
+ 
+-    ASS_DrawingToken *tokens = drawing_tokenize(text);
++    // A point takes four characters at least ("0 0 "), so this holds every
++    // token but those a closed b-spline repeats, and those grow it. Grown
++    // from a hundred by doubling, the array of a traced clip was copied a
++    // dozen times, and the outline's points after it.
++    TokenList list = {0};
++    list.capacity = strlen(text) / 4 + 8;
++    list.tokens = ass_realloc_array(NULL, list.capacity, sizeof(*list.tokens));
++    if (!list.tokens)
++        return false;
++    drawing_tokenize(text, &list);
++    const ASS_DrawingToken *tokens = list.tokens;
++
++    // one point and one segment per token, but for splines; those still grow it
++    if (!ass_outline_alloc(outline, FFMAX(list.count + 1, DRAWING_INITIAL_POINTS),
++                           FFMAX(list.count + 1, DRAWING_INITIAL_SEGMENTS))) {
++        free(list.tokens);
++        return false;
++    }
+ 
+     bool started = false;
+     ASS_Vector pen = {0, 0};
+-    ASS_DrawingToken *token = tokens;
+-    while (token) {
++    for (size_t i = 0; i < list.count;) {
+         // Draw something according to current command
+-        switch (token->type) {
++        switch (tokens[i].type) {
+         case TOKEN_MOVE_NC:
+-            pen = token->point;
++            pen = tokens[i].point;
+             rectangle_update(cbox, pen.x, pen.y, pen.x, pen.y);
+-            token = token->next;
++            i++;
+             break;
+         case TOKEN_MOVE:
+-            pen = token->point;
++            pen = tokens[i].point;
+             rectangle_update(cbox, pen.x, pen.y, pen.x, pen.y);
+             if (started) {
+                 if (!ass_outline_add_segment(outline, OUTLINE_LINE_SEGMENT))
+@@ -340,42 +327,41 @@ bool ass_drawing_parse(ASS_Outline *outline, ASS_Rect *cbox,
+                 ass_outline_close_contour(outline);
+                 started = false;
+             }
+-            token = token->next;
++            i++;
+             break;
+         case TOKEN_LINE: {
+-            ASS_Vector to = token->point;
++            ASS_Vector to = tokens[i].point;
+             rectangle_update(cbox, to.x, to.y, to.x, to.y);
+             if (!started && !ass_outline_add_point(outline, pen, 0))
+                 goto error;
+             if (!ass_outline_add_point(outline, to, OUTLINE_LINE_SEGMENT))
+                 goto error;
+             started = true;
+-            token = token->next;
++            i++;
+             break;
+         }
++        // Anything produced by our tokenizer is already supposed to have the
++        // tokens a curve needs around it, but let's check with an assert in
++        // builds without NDEBUG
+         case TOKEN_CUBIC_BEZIER:
+-            assert_3_forward(token);
+-            if (!drawing_add_curve(outline, cbox, token->prev, false, started))
++            assert(i >= 1 && i + 2 < list.count);
++            if (!drawing_add_curve(outline, cbox, tokens + i - 1, false, started))
+                 goto error;
+-            token = token->next;
+-            token = token->next;
+-            token = token->next;
++            i += 3;
+             started = true;
+             break;
+         case TOKEN_B_SPLINE:
+-            assert_3_forward(token);
+-            if (!drawing_add_curve(outline, cbox, token->prev, true, started))
++            assert(i >= 1 && i + 2 < list.count);
++            if (!drawing_add_curve(outline, cbox, tokens + i - 1, true, started))
+                 goto error;
+-            token = token->next;
+-            token = token->next;
+-            token = token->next;
++            i += 3;
+             started = true;
+             break;
+         case TOKEN_EXTEND_SPLINE:
+-            assert_4_back(token);
+-            if (!drawing_add_curve(outline, cbox, token->prev->prev->prev, true, started))
++            assert(i >= 3);
++            if (!drawing_add_curve(outline, cbox, tokens + i - 3, true, started))
+                 goto error;
+-            token = token->next;
++            i++;
+             started = true;
+             break;
+         }
+@@ -393,11 +379,11 @@ bool ass_drawing_parse(ASS_Outline *outline, ASS_Rect *cbox,
+                 "Parsed drawing with %zu points and %zu segments",
+                 outline->n_points, outline->n_segments);
+ 
+-    drawing_free_tokens(tokens);
++    free(list.tokens);
+     return true;
+ 
+ error:
+-    drawing_free_tokens(tokens);
++    free(list.tokens);
+     ass_outline_free(outline);
+     return false;
+ }
+diff --git a/libass/ass_drawing.h b/libass/ass_drawing.h
+index 0aed169..79c4bb8 100644
+--- a/libass/ass_drawing.h
++++ b/libass/ass_drawing.h
+@@ -35,8 +35,6 @@ typedef enum {
+ typedef struct ass_drawing_token {
+     ASS_TokenType type;
+     ASS_Vector point;
+-    struct ass_drawing_token *next;
+-    struct ass_drawing_token *prev;
+ } ASS_DrawingToken;
+ 
+ bool ass_drawing_parse(ASS_Outline *outline, ASS_Rect *cbox,
+diff --git a/libass/ass_parse.c b/libass/ass_parse.c
+index 008ea22..0b66fdd 100644
+--- a/libass/ass_parse.c
++++ b/libass/ass_parse.c
+@@ -1235,18 +1235,12 @@ unsigned ass_get_next_char(RenderContext *state, char **str)
+     return chr;
+ }
+ 
+-// Tag classes event_tag_flags() reports.
+-enum {
+-    HAS_HARD_OVERRIDES = 1 << 0,
+-    HAS_TIME_DEPENDENT_TAGS = 1 << 1,
+-};
+-
+-// Return the tag classes present in an event's text. The walk (brace skipping,
+-// the "\<char>" escape, the "\\" escape outside braces) is shared by both
+-// callers; they differ in token set and in where the tag name starts:
+-// ass_parse_tags skips spaces/tabs after the backslash before the name,
+-// ass_get_next_char (which the hard-override scan mirrors) does not.
+-static int event_tag_flags(char *str)
++// Return the tag classes (EVENT_*, ass_parse.h) present in an event's text.
++// The walk (brace skipping, the "\<char>" escape, the "\\" escape outside
++// braces) is the same for both; they differ in token set and in where the tag
++// name starts: ass_parse_tags skips spaces/tabs after the backslash before the
++// name, ass_get_next_char (which the hard-override scan mirrors) does not.
++int ass_event_tag_flags(char *str)
+ {
+     int flags = 0;
+     // mirrors ass_get_next_char, but is faster and doesn't change any global state
+@@ -1264,7 +1258,7 @@ static int event_tag_flags(char *str)
+                         mystrcmp(&tag, "clip") || mystrcmp(&tag, "iclip") ||
+                         mystrcmp(&tag, "org") || mystrcmp(&tag, "pbo") ||
+                         mystrcmp(&tag, "p"))
+-                        flags |= HAS_HARD_OVERRIDES;
++                        flags |= EVENT_HARD_OVERRIDES;
+                     // \t, \move, \fad/\fade, karaoke (\k, \K, \kf, \ko). An
+                     // event with any of these (or a scrolling/banner
+                     // transition effect, handled separately) cannot be served
+@@ -1277,7 +1271,7 @@ static int event_tag_flags(char *str)
+                     if (mystrcmp(&tag, "move") || mystrcmp(&tag, "fad") ||
+                         mystrcmp(&tag, "t") || mystrcmp(&tag, "k") ||
+                         mystrcmp(&tag, "K"))
+-                        flags |= HAS_TIME_DEPENDENT_TAGS;
++                        flags |= EVENT_TIME_DEPENDENT_TAGS;
+                 }
+                 str++;
+             }
+@@ -1287,15 +1281,3 @@ static int event_tag_flags(char *str)
+     }
+     return flags;
+ }
+-
+-// Return 1 if the event contains tags that will apply overrides the selective
+-// style override code should not touch. Return 0 otherwise.
+-int ass_event_has_hard_overrides(char *str)
+-{
+-    return event_tag_flags(str) & HAS_HARD_OVERRIDES;
+-}
+-
+-int ass_event_has_time_dependent_tags(char *str)
+-{
+-    return event_tag_flags(str) & HAS_TIME_DEPENDENT_TAGS;
+-}
+diff --git a/libass/ass_parse.h b/libass/ass_parse.h
+index bc2580d..b26538f 100644
+--- a/libass/ass_parse.h
++++ b/libass/ass_parse.h
+@@ -34,8 +34,16 @@ void ass_process_karaoke_effects(RenderContext *state);
+ unsigned ass_get_next_char(RenderContext *state, char **str);
+ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
+                      bool nested);
+-int ass_event_has_hard_overrides(char *str);
+-int ass_event_has_time_dependent_tags(char *str);
++
++// Tag classes of an event's text
++enum {
++    // tags that apply overrides the selective style override code should not
++    // touch: \pos, \move, \clip, \iclip, \org, \pbo, \p
++    EVENT_HARD_OVERRIDES = 1 << 0,
++    // \t, \move, \fad, \fade, karaoke: the event looks different over time
++    EVENT_TIME_DEPENDENT_TAGS = 1 << 1,
++};
++int ass_event_tag_flags(char *str);
+ void ass_apply_fade(uint32_t *clr, int fade);
+ 
+ 
+diff --git a/libass/ass_rasterizer.c b/libass/ass_rasterizer.c
+index c023836..77c8341 100644
+--- a/libass/ass_rasterizer.c
++++ b/libass/ass_rasterizer.c
+@@ -177,6 +177,8 @@ static bool add_line(RasterizerData *rst, ASS_Vector pt0, ASS_Vector pt1)
+     line->x_max = FFMAX(pt0.x, pt1.x);
+     line->y_min = FFMIN(pt0.y, pt1.y);
+     line->y_max = FFMAX(pt0.y, pt1.y);
++    // here rather than in a second pass over the segments once they are all in
++    rectangle_update(&rst->bbox, line->x_min, line->y_min, line->x_max, line->y_max);
+ 
+     line->a = y;
+     line->b = -x;
+@@ -316,12 +318,6 @@ bool ass_rasterizer_set_outline(RasterizerData *rst,
+     }
+     assert(start == cur && (!cur || cur == path->points + path->n_points));
+ 
+-    for (size_t k = rst->n_first; k < rst->size[0]; k++) {
+-        struct segment *line = &rst->linebuf[0][k];
+-        rectangle_update(&rst->bbox,
+-                         line->x_min, line->y_min,
+-                         line->x_max, line->y_max);
+-    }
+     if (!extra)
+         rst->n_first = rst->size[0];
+     return true;
+diff --git a/libass/ass_render.c b/libass/ass_render.c
+index 53b0956..8522136 100644
+--- a/libass/ass_render.c
++++ b/libass/ass_render.c
+@@ -79,6 +79,17 @@ static void image_pool_renderer_done(ImagePool *pool);
+ static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                      ASS_Event *event);
+ 
++static int event_tag_flags(RenderPriv *rp, ASS_Event *event)
++{
++    if (!rp)
++        return ass_event_tag_flags(event->Text);
++    if (rp->tag_flags_text != event->Text) {
++        rp->tag_flags = ass_event_tag_flags(event->Text);
++        rp->tag_flags_text = event->Text;
++    }
++    return rp->tag_flags;
++}
++
+ // Static-event layout cache — see ass_render.h:LayoutSnapshot.
+ static void layout_cache_prune(ASS_Renderer *priv, uint64_t oldest_frame);
+ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv, ASS_Event *event);
+@@ -3322,13 +3333,7 @@ void ass_render_priv_done(RenderPriv *priv)
+ // layout-cache eligibility gate.
+ static bool event_has_time_dependent_tags(RenderPriv *rp, ASS_Event *event)
+ {
+-    if (!rp)
+-        return ass_event_has_time_dependent_tags(event->Text);
+-    if (rp->time_dep_text != event->Text) {
+-        rp->has_time_dep_tags = ass_event_has_time_dependent_tags(event->Text);
+-        rp->time_dep_text = event->Text;
+-    }
+-    return rp->has_time_dep_tags;
++    return event_tag_flags(rp, event) & EVENT_TIME_DEPENDENT_TAGS;
+ }
+ 
+ // Build a snapshot of the fully laid-out event (called on a cacheable miss,
+@@ -4272,15 +4277,8 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
+ static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                      ASS_Event *event)
+ {
+-    ASS_RenderPriv *priv = get_render_priv(render_priv, event);
+-    if (!priv)
+-        return ass_event_has_hard_overrides(event->Text);
+-
+-    if (priv->hard_overrides_text != event->Text) {
+-        priv->has_hard_overrides = ass_event_has_hard_overrides(event->Text);
+-        priv->hard_overrides_text = event->Text;
+-    }
+-    return priv->has_hard_overrides;
++    return event_tag_flags(get_render_priv(render_priv, event), event) &
++        EVENT_HARD_OVERRIDES;
+ }
+ 
+ static int overlap(Rect *s1, Rect *s2)
+diff --git a/libass/ass_render.h b/libass/ass_render.h
+index 6a7648c..b056b8e 100644
+--- a/libass/ass_render.h
++++ b/libass/ass_render.h
+@@ -518,12 +518,12 @@ struct ass_renderer {
+ typedef struct render_priv {
+     int top, height, left, width;
+     int render_id;
+-    char *hard_overrides_text;
+-    bool has_hard_overrides;
+-    // Static-layout cache: memoized time-dependent-tag scan (keyed on the event's
+-    // Text pointer, like hard_overrides) and the cached layout snapshot.
+-    char *time_dep_text;
+-    bool has_time_dep_tags;
++    // ass_event_tag_flags() of the event's text, for as long as it is this
++    // string: one walk for every question asked of it (a traced vector clip
++    // is half a megabyte of text, per event and frame)
++    char *tag_flags_text;
++    int tag_flags;
++    // Static-layout cache: the cached layout snapshot.
+     LayoutSnapshot *layout;
+ } RenderPriv;
+ 
+diff --git a/libass/ass_strtod.c b/libass/ass_strtod.c
+index 47302a8..a12403c 100644
+--- a/libass/ass_strtod.c
++++ b/libass/ass_strtod.c
+@@ -16,6 +16,7 @@
+ #include "config.h"
+ #include "ass_compat.h"
+ 
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <float.h>
+ #include <errno.h>
+@@ -133,6 +134,59 @@ ass_strtod(
+         sign = 0;
+     }
+ 
++    /*
++     * A plain decimal of up to 15 significant digits, which is nearly every
++     * number a script holds (and each of the tens of thousands of
++     * coordinates of a traced clip): one pass and one division. Both
++     * operands are exact, as below, where the same digits make up fraction
++     * and the same power of ten dblExp, so the quotient is the same double.
++     * Anything else (more digits, an exponent, no digit at all) is left to
++     * the code below.
++     */
++    {
++        static const double tens[] = {
++            1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
++            1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
++        };
++        const char *q = p;
++        // nine digits fit 32 bits, which is all most numbers have and all a
++        // 32-bit CPU multiplies and converts without a library call
++        uint32_t mant32 = 0;
++        uint64_t mant = 0;
++        unsigned digits = 0, significant = 0, fracDigits = 0;
++        int point = 0;
++        for (;; q++) {
++            unsigned digit = (unsigned char) *q - '0';
++            if (digit <= 9) {
++                digits++;
++                if (significant || digit)
++                    significant++;
++                if (significant > 15)
++                    break;
++                if (significant <= 9) {
++                    mant32 = 10 * mant32 + digit;
++                } else {
++                    if (significant == 10)
++                        mant = mant32;
++                    mant = 10 * mant + digit;
++                }
++                fracDigits += point;
++            } else if (*q == '.' && !point) {
++                point = 1;
++            } else {
++                break;
++            }
++        }
++        if (digits && significant <= 15 && fracDigits <= 22 &&
++                *q != 'e' && *q != 'E') {
++            fraction = significant <= 9 ? (double) mant32 : (double) mant;
++            if (fracDigits)
++                fraction /= tens[fracDigits];
++            p = q;
++            goto done;
++        }
++    }
++
+     /*
+      * Count the number of digits in the mantissa (including the decimal
+      * point), and also locate the decimal point.
