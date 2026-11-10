@@ -1,0 +1,47 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0100
+Subject: [PATCH] vd_lavc: do not decode the first H.264 packet twice with a hardware decoder
+
+demux_mkv hands the decoder the first packet of an H.264 track
+(probe_x264_garbage, sh->codec->first_packet), and init_avctx() decodes
+and flushes it right after avcodec_open2(): the x264 build number in its
+SEI turns on libavcodec's workaround for the 4:4:4 streams of old x264
+builds. That workaround is libavcodec's own reconstruction, which a
+hardware decoder never runs, but the decode ran all the same: get_format,
+a VideoToolbox session (or a MediaCodec), one frame decoded and thrown
+away, and then all of it again for the first real packet. An iPhone's log
+of an H.264 Matroska file has "Requesting pixfmt 'videotoolbox_vld'" and
+"Reinit context" twice, 15 and 10 ms apart, and FILE_LOADED comes 12 ms later
+than for the same streams in MP4, which has no first_packet.
+
+Skip that decode while a hardware decoder is being tried. One that fails
+falls back through init_avctx() with use_hwdec unset, so software
+decoding gets the packet as before.
+
+iPhone Air, H.264 1080p in Matroska, ms after loadfile, medians of 3
+interleaved runs, Plezy's / Tortuga's option set, before -> after:
+FILE_LOADED 23.7 -> 7.5 / 24.4 -> 6.8 with the audio session active and
+34.8 -> 11.9 / 34.6 -> 11.6 when the audio output activates it;
+PLAYBACK_RESTART 55.1 -> 48.4 / 51.3 -> 44.6 and 103.5 -> 97.1 /
+100.4 -> 89.7; a second player in the process 88.8 -> 79.2 / 85.1 -> 73.4.
+The same streams in MP4 do not change (48.9 -> 46.1 / 47.1 -> 46.8 with
+the rest of this series' startup patches).
+
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 202f726..c89ae22 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -870,7 +870,12 @@ static void init_avctx(struct mp_filter *vd)
+     // decoding of the rest of the stream. The only currently known case is the
+     // x264 build number (encoded in a SEI element), needed to enable a
+     // workaround for broken 4:4:4 streams produced by older x264 versions.
+-    if (lavc_codec->id == AV_CODEC_ID_H264 && c->first_packet) {
++    // That workaround is libavcodec's own reconstruction, which a hardware
++    // decoder does not use; with one, decoding the packet here would open the
++    // hardware decoder, decode the frame and flush it, only for the first real
++    // packet to open it again. A hardware decoder that fails falls back
++    // through this function with use_hwdec unset, and takes the packet then.
++    if (lavc_codec->id == AV_CODEC_ID_H264 && c->first_packet && !ctx->use_hwdec) {
+         mp_set_av_packet(ctx->avpkt, c->first_packet, &ctx->codec_timebase);
+         avcodec_send_packet(avctx, ctx->avpkt);
+         avcodec_receive_frame(avctx, ctx->pic);

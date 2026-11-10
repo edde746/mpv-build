@@ -49,3 +49,6 @@
 # keeps its packed atlas (and atlas_id), and new atlases come from a small
 # pool of free ones (--sub-ass-atlas-reuse, --sub-ass-atlas-pool).
 0215-sub-keep-the-ass-atlas-when-only-positions-or-colors-change.patch
+# Startup: a hardware decoder is not opened twice for a file's first H.264
+# packet (demux_mkv's first_packet).
+0232-vd-lavc-no-first-packet-probe-with-a-hardware-decoder.patch
