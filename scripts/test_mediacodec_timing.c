@@ -553,7 +553,7 @@ struct vo_frame {
 
 struct osd_request {
     double pts, delta;
-    uint64_t seq, epoch;
+    uint64_t seq, epoch, static_id;
 };
 
 struct osd_release {
@@ -578,6 +578,7 @@ struct priv {
     uint64_t prepared_frame_id, prepared_seq, prepared_epoch;
     double cur_duration, osd_pts;
     bool cur_synthetic, osd_threads_created, osd_missing_logged;
+    bool prepared_filed, cur_filed;
     bool vsync_attached;
     int64_t vsync_sample, queue_period, queue_mode, queue_period_changed, queue_offset;
     struct mediacodec_phase vsync_phase;
@@ -644,7 +645,11 @@ static int64_t clock_ns;
 static int64_t clock_offset_ns;
 static struct osd_request requested;
 static struct osd_release published;
-static unsigned requests;
+static unsigned requests, releases_published;
+// The OSD's static id (0: it may change with every frame) and whether the
+// pipeline has settled on it; test_mediacodec_osd.sh drives the real answer.
+static uint64_t osd_static;
+static bool osd_settled;
 
 static int64_t monotonic_now_ns(void) { return clock_ns + clock_offset_ns; }
 static int64_t mp_time_ns(void) { return clock_ns; }
@@ -758,6 +763,19 @@ static void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release re
 {
     (void)s;
     published = release;
+    releases_published++;
+}
+
+static uint64_t osd_static_id(struct vo *vo)
+{
+    (void)vo;
+    return osd_static;
+}
+
+static bool osd_ahead_is_settled(const struct osd_ahead *s, uint64_t static_id)
+{
+    (void)s;
+    return static_id && osd_settled;
 }
 
 static void osd_ahead_invalidate(struct osd_ahead *s, double pts)
@@ -829,6 +847,86 @@ static void test_preparation_does_not_submit_early(void)
              "the codec gets media3's 50 ms of notice, not two display periods");
     CHECK_EQ(published.seq, requested.seq, "OSD gets its matching video release");
     CHECK_EQ(image.refs, 1, "balanced image ownership");
+}
+
+// With no subtitle track and nothing new on the OSD, a frame files no render
+// request and publishes no release: the OSD threads stay asleep. The video
+// itself is prepared, admitted and released as always.
+static void test_a_settled_osd_is_left_asleep(void)
+{
+    struct priv p = {.osd_threads_created = true, .vsync_attached = true};
+    struct vo_internal in = {0};
+    struct vo vo = {&p, &in, &driver, 40 * MS, 0};
+    AVMediaCodecBuffer buffers[3] = {0};
+    struct mp_image images[3];
+    struct vo_frame frames[3];
+    for (int n = 0; n < 3; n++) {
+        images[n] = (struct mp_image){.pts = 12.5 + n * 0.04, .planes[3] = &buffers[n], .refs = 1};
+        frames[n] = (struct vo_frame){.current = &images[n], .frame_id = n + 1,
+                                      .pts = EPOCH + (1000 + n * 40) * MS, .duration = 40 * MS};
+    }
+    p.vsync_sample = frames[0].pts - 2 * 40 * MS;
+
+    // The first frame of a static OSD still asks for its render.
+    osd_static = 7;
+    osd_settled = false;
+    unsigned filed = requests, released = releases_published;
+    in.frame_queued = &frames[0];
+    clock_ns = frames[0].pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "preparation waits for the codec window");
+    CHECK_EQ(requests, filed + 1, "an unsettled static OSD files its request");
+    CHECK_EQ(requested.static_id, 7, "the request carries the static id");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the first frame is released");
+    CHECK_EQ(releases_published, released + 1, "a frame that filed publishes its release");
+    CHECK_EQ(published.seq, requested.seq, "under its own sequence");
+
+    // Settled: nothing is filed, nothing is published, the buffer goes out.
+    osd_settled = true;
+    filed = requests;
+    released = releases_published;
+    in.frame_queued = &frames[1];
+    clock_ns = frames[1].pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "the second frame is prepared early all the same");
+    uint64_t prepared_seq = p.prepared_seq;
+    CHECK_EQ(prepared_seq != 0, true, "a settled frame still has its sequence");
+    CHECK_EQ(present_queued(&vo), false, "a second wake before admission");
+    CHECK_EQ(p.prepared_seq, prepared_seq, "does not prepare the frame again");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the second frame is released");
+    CHECK_EQ(buffers[1].releases, 1, "to the codec, once");
+    CHECK_EQ(buffers[1].timestamp != 0, true, "with its timestamp");
+    CHECK_EQ(requests, filed, "a settled OSD files no request");
+    CHECK_EQ(releases_published, released, "and waits for no release");
+
+    // The OSD changed (another id, not settled): the next frame files again.
+    osd_static = 8;
+    osd_settled = false;
+    in.frame_queued = &frames[2];
+    clock_ns = frames[2].pts - 120 * MS;
+    CHECK_EQ(present_queued(&vo), false, "the third frame waits for its window");
+    CHECK_EQ(requests, filed + 1, "a changed OSD files a request with the next frame");
+    CHECK_EQ(requested.static_id, 8, "for its new id");
+    clock_ns = in.wakeup_pts;
+    CHECK_EQ(present_queued(&vo), true, "the third frame is released");
+    CHECK_EQ(releases_published, released + 1, "and publishes its release");
+    CHECK_EQ(published.seq, requested.seq, "under its own sequence");
+
+    // A frame that reaches draw_frame unprepared decides there.
+    osd_settled = true;
+    filed = requests;
+    released = releases_published;
+    AVMediaCodecBuffer late = {0};
+    struct mp_image late_image = {.pts = 12.62, .planes[3] = &late, .refs = 1};
+    struct vo_frame late_frame = {.current = &late_image, .frame_id = 4,
+                                  .pts = frames[2].pts + 40 * MS, .duration = 40 * MS};
+    draw_frame(&vo, &late_frame);
+    flip_page(&vo);
+    CHECK_EQ(late.releases, 1, "an unprepared frame is released");
+    CHECK_EQ(requests, filed, "without a request while the OSD is settled");
+    CHECK_EQ(releases_published, released, "and without a release");
+    osd_static = 0;
+    osd_settled = false;
 }
 
 static void test_flip_records_intents_and_drains_reports(void)
@@ -1576,6 +1674,7 @@ int main(void)
     test_late_frames_keep_cadence();
     test_release_discontinuities();
     test_preparation_does_not_submit_early();
+    test_a_settled_osd_is_left_asleep();
     test_driver_refresh_and_cadence();
     test_refresh_transition_and_late_frame();
     test_choreographer_period_and_cadence_across_a_switch();

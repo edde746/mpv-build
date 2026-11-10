@@ -31,3 +31,4 @@
 0150-ao-audiotrack-wait-instead-of-writing-nothing.patch
 0151-ao-audiotrack-read-a-raw-passthrough-carrier-a-burst-at-a-time.patch
 0152-builtin-conf-libmpv-leaves-the-builtin-scripts-unloaded.patch
+0153-vo-mediacodec-leave-the-osd-pipeline-asleep-while-nothing-can-change.patch

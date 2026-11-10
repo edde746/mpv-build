@@ -1,0 +1,458 @@
+Subject: [PATCH] vo_mediacodec: leave the OSD pipeline asleep while nothing can change
+
+vo_mediacodec files an OSD request for every video frame. The render
+thread wakes, serves it from the pre-render of the frame before, asks
+how far the subtitle decoders can render, renders the next frame ahead
+with osd_render() and looks for an event to warm; the flip then
+publishes the frame's release on the pipeline's condition, which wakes
+the render and the present thread once more. With no subtitle track and
+nothing on the OSD, all of it finds 24 times a second that nothing
+changed: on a file without subtitles the two threads make 62 wakeups a
+second for 3.5 Mcycles/s on a Pixel 7 and 5.1 on a SEI box.
+
+Without a subtitle decoder, what the OSD shows only changes when
+something tells osd_state so: text, the bar, an overlay, an option.
+osd_state now counts those changes (osd_note_change), and
+osd_get_static_id() gives a VO a value that stays the same exactly
+while every pts renders the same, 0 while a subtitle decoder is
+attached. vo_mediacodec combines it with the OSD window's size and
+sends it along with the frame's request. Once a render made for a
+request with that id is queued or on screen, osd_ahead holds the id
+settled (osd_ahead_is_settled), and vo_mediacodec files no request and
+publishes no release until the id, the window's size or the epoch moves:
+an OSD change, a subtitle track, a seek, a pause, a new geometry and a
+repaint each move one of them. Only a render on demand settles an id: a
+pre-render may be older than the change the id stands for, a result
+that was not queued leaves a repaint owed, and a static OSD is not
+rendered ahead at all. With a subtitle decoder attached every frame is
+requested, pre-rendered and prefetched as before, and so is a plane
+presented on every frame (--vo-mediacodec-osd-vsync-delay): for those
+two the VO passes no id and does not ask the window for its size. Up to
+API 30 a SurfaceView's buffer queue lives in SurfaceFlinger, and
+ANativeWindow_getWidth() and _getHeight() are a binder call each: asked
+for every frame they cost the VO thread 42 to 63 context switches a
+second and half again its CPU time on a SHIELD (API 28) and a Fire TV
+Stick 4K (API 30), which with subtitles on, where there is nothing to
+save, made playback dearer than before (SHIELD: 12.1 -> 12.4 % of a
+core). While the OSD is static the VO still asks, where the render
+thread did before: that is how a resized window is noticed.
+
+H.264 1080p without subtitles, Tortuga's options, interleaved, n = 5,
+median (range), app cycles and wakeups:
+  Pixel 7      197 (194-200) -> 189 (188-189) Mcycles/s, 735 -> 673 /s
+  SEI Box R    383 (381-387) -> 377 (377-382) Mcycles/s, 750 -> 688 /s
+vo/osd-render and vo/osd-present leave the per-thread tables on both.
+A scripted playback on the Pixel (no track; show-text at 6 s for 3 s;
+sid=1 at 12 s; sid=no at 22 s) files 252 requests instead of 687 and
+presents the text, its removal and every cue at the same pts as the
+unpatched build (17 against 16 swaps); screenshots show the text, a cue
+and the empty plane.
+
+--- a/sub/osd.c
++++ b/sub/osd.c
+@@ -221,7 +221,7 @@ void osd_set_text(struct osd_state *osd, const char *text)
+         talloc_free(osd_obj->text);
+         osd_obj->text = talloc_strdup(osd_obj, text);
+         osd_obj->osd_changed = true;
+-        osd->want_redraw_notification = true;
++        osd_note_change(osd);
+     }
+     mp_mutex_unlock(&osd->lock);
+ }
+@@ -237,7 +237,7 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub)
+         obj->sub = dec_sub;
+         obj->vo_change_id += 1;
+     }
+-    osd->want_redraw_notification = true;
++    osd_note_change(osd);
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
+@@ -328,6 +328,20 @@ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
++// For a VO that renders the OSD per video frame: nonzero while osd_render()
++// returns the same for every pts, and the same value for as long as it does,
++// so one render per value is enough. 0 while a subtitle decoder is attached:
++// what it draws moves with the video pts. The other objects only change
++// through osd_note_change().
++uint64_t osd_get_static_id(struct osd_state *osd)
++{
++    mp_mutex_lock(&osd->lock);
++    bool subs = osd->objs[OSDTYPE_SUB]->sub || osd->objs[OSDTYPE_SUB2]->sub;
++    uint64_t id = subs ? 0 : osd->change_count + 1;
++    mp_mutex_unlock(&osd->lock);
++    return id;
++}
++
+ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
+ {
+     mp_mutex_lock(&osd->lock);
+@@ -341,7 +355,7 @@ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
+                sizeof(osd_obj->progbar_state.stops[0]) * s->num_stops);
+     }
+     osd_obj->osd_changed = true;
+-    osd->want_redraw_notification = true;
++    osd_note_change(osd);
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
+@@ -352,7 +366,7 @@ void osd_set_external2(struct osd_state *osd, struct sub_bitmaps *imgs)
+     talloc_free(obj->external2);
+     obj->external2 = sub_bitmaps_copy(NULL, imgs);
+     obj->vo_change_id += 1;
+-    osd->want_redraw_notification = true;
++    osd_note_change(osd);
+     mp_mutex_unlock(&osd->lock);
+ }
+ 
+@@ -597,7 +611,7 @@ void osd_changed(struct osd_state *osd)
+ {
+     mp_mutex_lock(&osd->lock);
+     osd->objs[OSDTYPE_OSD]->osd_changed = true;
+-    osd->want_redraw_notification = true;
++    osd_note_change(osd);
+     // Done here for a lack of a better place.
+     m_config_cache_update(osd->opts_cache);
+     mp_mutex_unlock(&osd->lock);
+--- a/sub/osd.h
++++ b/sub/osd.h
+@@ -201,6 +201,7 @@ double osd_get_sub_render_horizon(struct osd_state *osd);
+ void osd_get_sub_schedule(struct osd_state *osd, double pts, double after,
+                           double *next_start, int *next_events,
+                           double *visible_end);
++uint64_t osd_get_static_id(struct osd_state *osd);
+ 
+ struct osd_progbar_state {
+     int type;           // <0: disabled, 1-255: symbol, else: no symbol
+--- a/sub/osd_libass.c
++++ b/sub/osd_libass.c
+@@ -587,7 +587,7 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
+     if (!ov->format) {
+         if (!entry->ov.hidden) {
+             obj->changed = true;
+-            osd->want_redraw_notification = true;
++            osd_note_change(osd);
+         }
+         destroy_external(entry);
+         MP_TARRAY_REMOVE_AT(obj->externals, obj->num_externals, index);
+@@ -596,7 +596,7 @@ void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov)
+ 
+     if (!entry->ov.hidden || !ov->hidden) {
+         obj->changed = true;
+-        osd->want_redraw_notification = true;
++        osd_note_change(osd);
+     }
+ 
+     entry->ov.format = ov->format;
+@@ -653,7 +653,7 @@ void osd_set_external_remove_owner(struct osd_state *osd, void *owner)
+             destroy_external(e);
+             MP_TARRAY_REMOVE_AT(obj->externals, obj->num_externals, n);
+             obj->changed = true;
+-            osd->want_redraw_notification = true;
++            osd_note_change(osd);
+         }
+     }
+     mp_mutex_unlock(&osd->lock);
+--- a/sub/osd_state.h
++++ b/sub/osd_state.h
+@@ -80,6 +80,8 @@ struct osd_state {
+ 
+     bool want_redraw;
+     bool want_redraw_notification;
++    // How often osd_note_change() ran: see osd_get_static_id().
++    uint64_t change_count;
+ 
+     struct m_config_cache *opts_cache;
+     struct mp_osd_render_opts *opts;
+@@ -90,6 +92,14 @@ struct osd_state {
+     struct mp_draw_sub_cache *draw_cache;
+ };
+ 
++// Called locked, by whatever changes what the next osd_render() returns for
++// the objects that are not subtitles, or which subtitle decoder is attached.
++static inline void osd_note_change(struct osd_state *osd)
++{
++    osd->want_redraw_notification = true;
++    osd->change_count++;
++}
++
+ // defined in osd_libass.c
+ struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
+                                            struct osd_object *obj, int format);
+--- a/video/out/osd_ahead.c
++++ b/video/out/osd_ahead.c
+@@ -300,6 +300,7 @@ static struct osd_release osd_find_release(struct osd_ahead *s, uint64_t seq)
+ struct osd_render_state {
+     int last_w, last_h;
+     bool force_full;
++    bool rendered;            // the last render pass had a canvas to render on
+     int64_t posted_change_id; // sub_bitmap_list.change_id of the last result
+     int posted_slot;          // that result's slot; valid while !force_full
+     struct osd_request last;  // last serviced request
+@@ -478,6 +479,7 @@ static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
+                             double pts, int slot)
+ {
+     int w = 0, h = 0;
++    rs->rendered = false;
+     s->cb.canvas_size(s->cb.ctx, &w, &h);
+     if (w <= 0 || h <= 0)
+         return false;
+@@ -493,6 +495,7 @@ static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
+     struct sub_bitmap_list *sbs = osd_slot_render(s, rs, pts, res, 0, &render_ns);
+     if (!sbs)
+         return false;
++    rs->rendered = true;
+ 
+     bool changed = rs->force_full || sbs->change_id != rs->posted_change_id;
+     if (render_ns > MP_TIME_MS_TO_NS(100)) {
+@@ -571,6 +574,20 @@ static void osd_mark_served(struct osd_ahead *s, const struct osd_request *req)
+         mp_cond_broadcast(&s->wakeup);
+ }
+ 
++// Locked. A static OSD (osd_request.static_id) is settled once a render made
++// for a request that carried its id is queued or on screen: until the id or
++// the epoch moves, another render returns the same and posts nothing. Only a
++// render on demand settles it. A pre-render may be older than the change the
++// id stands for, and a result that was not queued leaves a repaint owed.
++static void osd_settle(struct osd_ahead *s, const struct osd_render_state *rs,
++                       const struct osd_request *req, bool rendered)
++{
++    bool settled = rendered && req->static_id && !rs->force_full &&
++                   req->epoch == s->epoch;
++    s->settled_id = settled ? req->static_id : 0;
++    s->settled_epoch = req->epoch;
++}
++
+ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs,
+                                 struct osd_request req)
+ {
+@@ -579,6 +596,7 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+     mp_mutex_lock(&s->lock);
+     if (req.epoch != s->epoch) {
+         rs->force_full = true;
++        osd_settle(s, rs, &req, false);
+         mp_mutex_unlock(&s->lock);
+         return;
+     }
+@@ -595,6 +613,7 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+             spec_slot = osd_repeat_slot(s, rs, &req);
+         bool queued = spec_slot >= 0 && osd_post_result(s, rs, spec_slot, &req);
+         osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++        osd_settle(s, rs, &req, false);
+         osd_mark_served(s, &req);
+         mp_mutex_unlock(&s->lock);
+         rs->last = req;
+@@ -604,8 +623,10 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+     // Admission reserves queue capacity and consuming speculation frees its
+     // slot; an active frame and event prefetch cannot exhaust the working slots.
+     int slot = osd_free_slot(s);
+-    if (slot < 0)
++    if (slot < 0) {
++        osd_settle(s, rs, &req, false);
+         osd_mark_served(s, &req);
++    }
+     mp_mutex_unlock(&s->lock);
+     if (slot < 0) {
+         rs->last = req;
+@@ -618,6 +639,7 @@ static void osd_service_request(struct osd_ahead *s, struct osd_render_state *rs
+     int post_slot = posted ? slot : osd_repeat_slot(s, rs, &req);
+     bool queued = post_slot >= 0 && osd_post_result(s, rs, post_slot, &req);
+     osd_prefetch_retire(&s->prefetch, req.pts, req.epoch);
++    osd_settle(s, rs, &req, rs->rendered);
+     osd_mark_served(s, &req);
+     mp_mutex_unlock(&s->lock);
+     rs->last = req;
+@@ -701,6 +723,10 @@ static MP_THREAD_VOID osd_render_thread(void *arg)
+             continue;
+         }
+         rs.planned_seq = rs.last.seq;
++        // A static OSD has no next frame to render ahead and no event to
++        // warm; its next request renders on demand, which settles it.
++        if (rs.last.static_id)
++            continue;
+         int spec_slot = osd_free_slot(s);
+         bool eligible = !s->paused && rs.last.seq && rs.last.epoch == s->epoch &&
+                         spec_slot >= 0 && !s->spec.valid;
+@@ -796,6 +822,13 @@ void osd_ahead_invalidate(struct osd_ahead *s, double pts)
+     });
+ }
+ 
++// Locked.
++bool osd_ahead_is_settled(const struct osd_ahead *s, uint64_t static_id)
++{
++    return static_id && !s->requested && !s->repeat_unchanged &&
++           s->settled_id == static_id && s->settled_epoch == s->epoch;
++}
++
+ // Locked.
+ void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release)
+ {
+--- a/video/out/osd_ahead.h
++++ b/video/out/osd_ahead.h
+@@ -138,6 +138,10 @@ struct osd_request {
+     uint64_t seq;    // frame sequence, 0 for an unpinned repaint
+     uint64_t epoch;
+     bool full;
++    // osd_get_static_id() read before filing, or anything else that stays the
++    // same exactly while every pts renders the same; 0 when the OSD may
++    // change from one frame to the next.
++    uint64_t static_id;
+ };
+ 
+ // --- end osd ahead types
+@@ -204,6 +208,10 @@ struct osd_ahead {
+     // repeat_unchanged).
+     uint64_t served_seq, served_epoch;
+     bool served_waiter;         // broadcast wakeup when a request is served
++    // render -> VO: the static_id of the last request, once a render made
++    // for it is queued or on screen, else 0; and that request's epoch. See
++    // osd_ahead_is_settled.
++    uint64_t settled_id, settled_epoch;
+ 
+     struct osd_ahead_stats stats;
+     struct osd_spec spec;       // render (counters read by the VO thread)
+@@ -234,6 +242,11 @@ void osd_ahead_destroy(struct osd_ahead *s);
+ void osd_ahead_file_request(struct osd_ahead *s, struct osd_request req);
+ // Locked. Discard everything in flight and repaint at pts.
+ void osd_ahead_invalidate(struct osd_ahead *s, double pts);
++// Locked. Whether a request with this static_id would render what the last
++// one did and post nothing: the VO can leave it unfiled, and need not publish
++// that frame's release. False for 0, and while the pipeline repeats
++// unchanged frames.
++bool osd_ahead_is_settled(const struct osd_ahead *s, uint64_t static_id);
+ // Locked. Publish when the frame with release.seq is shown.
+ void osd_ahead_publish_release(struct osd_ahead *s, struct osd_release release);
+ 
+--- a/video/out/vo_mediacodec.c
++++ b/video/out/vo_mediacodec.c
+@@ -813,6 +813,11 @@ struct priv {
+     // VO thread only
+     struct osd_cadence cadence;
+     uint64_t frame_seq;
++    // Whether the prepared and the current frame filed an OSD request, and
++    // the OSD window's size with the count of its changes (osd_static_id).
++    bool prepared_filed, cur_filed;
++    int osd_static_w, osd_static_h;
++    uint32_t osd_static_sizes;
+     uint32_t stats_frames;
+     struct stats_cadence osd_stats;
+     struct present_stats present;
+@@ -3092,9 +3097,39 @@ static void update_opts(struct vo *vo)
+         vo->want_redraw = true;
+ }
+ 
++// What the OSD plane shows for as long as this stays the same, or 0 when it
++// can change from one frame to the next: osd_get_static_id() for the window's
++// size, since a canvas of another size is another render. Both counts fit:
++// the size changes with the surface, the OSD with an option or a command.
++// The window is only asked while the answer can settle the pipeline: up to
++// API 30 a SurfaceView's buffer queue lives in SurfaceFlinger and each of the
++// two getters is a binder call. With a subtitle decoder attached, or a plane
++// presented on every frame (--vo-mediacodec-osd-vsync-delay), every frame is
++// requested whatever the id, the render pass reads the size itself, and a
++// request without an id is rendered ahead as it always was.
++static uint64_t osd_static_id(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    uint64_t id = p->osd_vsync_delay > 0 ? 0 : osd_get_static_id(vo->osd);
++    if (!id)
++        return 0;
++    int w = ANativeWindow_getWidth(p->osd_window);
++    int h = ANativeWindow_getHeight(p->osd_window);
++    if (w != p->osd_static_w || h != p->osd_static_h) {
++        p->osd_static_w = w;
++        p->osd_static_h = h;
++        p->osd_static_sizes++;
++    }
++    return w > 0 && h > 0 ? id << 24 | (p->osd_static_sizes & 0xFFFFFF) : 0;
++}
++
+ // Preparation does not own or submit the decoder image. The core can discard
+ // a queued frame on seek/drop while this bounded OSD request is in flight.
+-static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool synthetic)
++// *filed: whether a request went to the OSD pipeline. With no subtitle track
++// and nothing new on the OSD, a render returns what the last one did, so the
++// frame leaves the render and present threads asleep.
++static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool synthetic,
++                            bool *filed)
+ {
+     struct priv *p = vo->priv;
+     uint64_t seq = ++p->frame_seq;
+@@ -3105,15 +3140,21 @@ static uint64_t prepare_osd(struct vo *vo, struct vo_frame *frame, bool syntheti
+         else
+             osd_cadence_observe(&p->cadence, frame->frame_id, pts);
+     }
++    *filed = false;
+     if (p->osd_threads_created) {
++        uint64_t static_id = osd_static_id(vo);
+         mp_mutex_lock(&p->osd.lock);
+-        osd_ahead_file_request(&p->osd, (struct osd_request){
+-            .pts = pts,
+-            .delta = synthetic ? 0 : osd_cadence_delta(&p->cadence),
+-            .seq = seq,
+-            .epoch = p->osd.epoch,
+-        });
+-        p->osd.stats.frames++;
++        if (!osd_ahead_is_settled(&p->osd, static_id)) {
++            osd_ahead_file_request(&p->osd, (struct osd_request){
++                .pts = pts,
++                .delta = synthetic ? 0 : osd_cadence_delta(&p->cadence),
++                .seq = seq,
++                .epoch = p->osd.epoch,
++                .static_id = static_id,
++            });
++            p->osd.stats.frames++;
++            *filed = true;
++        }
+         mp_mutex_unlock(&p->osd.lock);
+     }
+     return seq;
+@@ -3179,7 +3220,7 @@ static int64_t prepare_frame(struct vo *vo, struct vo_frame *frame)
+     if (!p->prepared_seq || p->prepared_frame_id != frame->frame_id ||
+         p->prepared_epoch != p->osd.epoch)
+     {
+-        p->prepared_seq = prepare_osd(vo, frame, false);
++        p->prepared_seq = prepare_osd(vo, frame, false, &p->prepared_filed);
+         p->prepared_frame_id = frame->frame_id;
+         p->prepared_epoch = p->osd.epoch;
+     }
+@@ -3220,11 +3261,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         p->prepared_frame_id == frame->frame_id)
+     {
+         p->cur_seq = p->prepared_seq;
++        p->cur_filed = p->prepared_filed;
+         p->cur_seen_ns = p->prepared_seen_ns;
+     } else {
+         if (!synthetic)
+             update_queue_timing(vo, frame->duration);
+-        p->cur_seq = prepare_osd(vo, frame, synthetic);
++        p->cur_seq = prepare_osd(vo, frame, synthetic, &p->cur_filed);
+         p->cur_seen_ns = monotonic_now_ns();
+     }
+     return VO_TRUE;
+@@ -3392,13 +3434,16 @@ static void flip_page(struct vo *vo)
+         return;
+ 
+     // The release timestamp is what keeps the OSD in step with the video;
+-    // the present stage waits for it before it schedules the swap.
+-    mp_mutex_lock(&p->osd.lock);
+-    osd_ahead_publish_release(&p->osd, (struct osd_release){
+-        .seq = p->cur_seq, .timestamp = target.timestamp, .vsync = target.vsync,
+-        .period = p->queue_period,
+-    });
+-    mp_mutex_unlock(&p->osd.lock);
++    // the present stage waits for it before it schedules the swap. A frame
++    // that filed no request has no result waiting for one.
++    if (p->cur_filed) {
++        mp_mutex_lock(&p->osd.lock);
++        osd_ahead_publish_release(&p->osd, (struct osd_release){
++            .seq = p->cur_seq, .timestamp = target.timestamp, .vsync = target.vsync,
++            .period = p->queue_period,
++        });
++        mp_mutex_unlock(&p->osd.lock);
++    }
+ 
+     stats_tick(vo);
+ }

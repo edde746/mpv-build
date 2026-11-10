@@ -33,7 +33,8 @@ python3 "$E" region "$module" "$workdir/mediacodec_osd_core.inc" --append \
 
 python3 "$E" symbol "$module" "$workdir/mediacodec_osd_request.inc" \
     --fn osd_find_release --fn osd_free_slot --fn osd_post_result \
-    --fn osd_notify_posted --fn osd_repeat_slot --fn osd_mark_served --fn osd_service_request --fn osd_ahead_file_request \
+    --fn osd_notify_posted --fn osd_repeat_slot --fn osd_mark_served --fn osd_settle --fn osd_service_request \
+    --fn osd_ahead_file_request --fn osd_ahead_is_settled \
     --fn osd_ahead_invalidate --fn osd_ahead_publish_release \
     --fn osd_ahead_take_newest
 
@@ -44,3 +45,12 @@ cc -O2 -std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$workdir" \
 cc -O2 -std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$workdir" \
     -o "$workdir/request-test" "$root/scripts/test_mediacodec_osd_request.c" -lm
 "$workdir/request-test"
+
+# The id vo_mediacodec gives a frame's request while the OSD is static (patch
+# 0153): made with the window's size, which is not asked for while a subtitle
+# decoder or a delayed plane keeps every frame requested anyway.
+python3 "$E" symbol "$source_dir/video/out/vo_mediacodec.c" "$workdir/mediacodec_osd_static.inc" \
+    --fn osd_static_id
+cc -O2 -std=c11 -Wall -Wextra -Werror -Wno-unused-function -I"$workdir" \
+    -o "$workdir/static-test" "$root/scripts/test_mediacodec_osd_static.c"
+"$workdir/static-test"

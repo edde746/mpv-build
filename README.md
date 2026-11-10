@@ -242,14 +242,14 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_mediacodec_geometry.sh` | vo_mediacodec geometry (patch 0100) | main |
 | `test_mediacodec_input.sh` | an access unit too large for its input buffer is dropped whole | PR, main |
 | `test_mediacodec_letterbox.sh` | the OSD plane's letterbox fill | PR, main |
-| `test_mediacodec_osd.sh` | the shared subtitle render-ahead pipeline (patch 0031), and a delayed plane repeating an unchanged frame (0214) | main |
+| `test_mediacodec_osd.sh` | the shared subtitle render-ahead pipeline (patch 0031), a delayed plane repeating an unchanged frame (0214), and when a static OSD is settled (0153) | main |
 | `test_mediacodec_paused.sh` | a paused decoder is not polled and never holds the decode thread | PR, main |
 | `test_mediacodec_rate.sh` | the `media3_rate` operating-rate option | PR, main |
 | `test_mediacodec_rebind.sh` | OSD surface retirement without rebuilding the decoder; a letterbox-fill change repaints (patch 0143) | PR, main |
 | `test_mediacodec_rendered.sh` | the rendered-frame feedback ring | PR, main |
 | `test_mediacodec_reorder.sh` | presentation-order recovery (patch 0026) | PR, main |
 | `test_mediacodec_shed.sh` | pre-decode frame shedding for H.264, HEVC, VP9 and AV1 | PR, main |
-| `test_mediacodec_timing.sh` | vo_mediacodec cadence, vsync snapping, release timing, present stats | PR, main |
+| `test_mediacodec_timing.sh` | vo_mediacodec cadence, vsync snapping, release timing, present stats, and a settled OSD left without requests (0153) | PR, main |
 | `test_mediacodec_vsync.sh` | the Choreographer vsync sampler against Android 11's behaviour | PR, main |
 | `test_pgs_palette.sh` | PGS palettes start transparent after an epoch boundary | PR, main |
 | `test_player_queue_frames.sh` | frame queueing and durations under vo_mediacodec | PR, main |

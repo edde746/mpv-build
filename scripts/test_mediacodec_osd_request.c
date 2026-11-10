@@ -25,6 +25,7 @@ struct osd_ahead {
     struct osd_request request;
     uint64_t served_seq, served_epoch;
     bool served_waiter;
+    uint64_t settled_id, settled_epoch;
     struct osd_ahead_stats stats;
     struct osd_slot slots[OSD_SLOTS];
     int lock, wakeup;
@@ -35,7 +36,7 @@ struct osd_ahead {
 };
 struct sub_bitmap_list { int change_id; };
 struct osd_render_state {
-    bool force_full;
+    bool force_full, rendered;
     int64_t posted_change_id;
     int posted_slot;
     struct osd_request last;
@@ -65,6 +66,7 @@ static bool osd_render_pass(struct osd_ahead *s, struct osd_render_state *rs,
                             double pts, int slot)
 {
     struct priv *p = (struct priv *)s;
+    rs->rendered = !p->no_canvas;
     if (p->no_canvas)
         return false;
     struct sub_bitmap_list *image = &blank;
@@ -124,6 +126,17 @@ static void request(struct priv *p, double pts, uint64_t seq, bool full)
     osd_ahead_file_request(&p->osd, (struct osd_request){
         .pts = pts, .delta = 1001.0 / 24000.0, .seq = seq,
         .epoch = p->osd.epoch, .full = full,
+    });
+    service_pending(p);
+}
+
+// A request from a VO that knows the OSD cannot change between frames (no
+// subtitle track, nothing new on the OSD): it carries that state's id.
+static void static_request(struct priv *p, double pts, uint64_t seq, uint64_t id)
+{
+    osd_ahead_file_request(&p->osd, (struct osd_request){
+        .pts = pts, .delta = 1001.0 / 24000.0, .seq = seq,
+        .epoch = p->osd.epoch, .static_id = id,
     });
     service_pending(p);
 }
@@ -411,6 +424,81 @@ static void test_delayed_plane_repeats_the_slot_on_screen(void)
     check(!osd_result_head(&p.osd.results), "without the delay an unchanged OSD posts nothing");
 }
 
+// A static OSD is settled, and the VO stops filing requests for it, only
+// once a render made for a request with its id is queued or on screen.
+static void test_a_static_osd_settles_on_a_render_made_for_it(void)
+{
+    struct priv p = warmed();
+    check(!osd_ahead_is_settled(&p.osd, 5), "nothing is settled before a render");
+    static_request(&p, 9.0, 101, 5);
+    check(head_image(&p) == &blank, "the first render of a static OSD is posted");
+    check(osd_ahead_is_settled(&p.osd, 5), "a render made for the id settles it");
+    check(!osd_ahead_is_settled(&p.osd, 6), "another id is another render");
+    check(!osd_ahead_is_settled(&p.osd, 0), "an OSD that may change is never settled");
+    take(&p, &blank, publish(&p, 101));
+
+    static_request(&p, 9.04, 102, 5);
+    check(!osd_result_head(&p.osd.results) && osd_ahead_is_settled(&p.osd, 5),
+          "an unchanged render keeps it settled and posts nothing");
+
+    p.osd.repeat_unchanged = true;
+    check(!osd_ahead_is_settled(&p.osd, 5), "a plane presented on every frame is never settled");
+    p.osd.repeat_unchanged = false;
+
+    osd_ahead_file_request(&p.osd, (struct osd_request){
+        .pts = 9.08, .seq = 103, .epoch = p.osd.epoch, .static_id = 5,
+    });
+    check(!osd_ahead_is_settled(&p.osd, 5), "a pending request is not skipped past");
+    service_pending(&p);
+    check(osd_ahead_is_settled(&p.osd, 5), "served, it is settled again");
+
+    // A request without the id (subtitles came on) ends it.
+    request(&p, 9.12, 104, false);
+    check(!osd_ahead_is_settled(&p.osd, 5), "a render that was not for the id unsettles it");
+
+    // A pre-render may be older than the change the id stands for.
+    osd_spec_store(&p.osd.spec, 9.16, p.osd.epoch, -1);
+    static_request(&p, 9.16, 105, 6);
+    check(!osd_ahead_is_settled(&p.osd, 6), "a pre-render does not settle a static OSD");
+    static_request(&p, 9.2, 106, 6);
+    check(osd_ahead_is_settled(&p.osd, 6), "the render on demand after it does");
+
+    // A repaint replaces the timeline: what was settled belongs to the old one.
+    p.osd_pts = 9.2;
+    invalidate(&p);
+    check(!osd_ahead_is_settled(&p.osd, 6), "an invalidation unsettles it");
+    service_pending(&p);
+    check(!osd_ahead_is_settled(&p.osd, 6), "the repaint carries no id");
+    take(&p, &blank, (struct osd_release){0});
+    static_request(&p, 9.24, 107, 6);
+    check(osd_ahead_is_settled(&p.osd, 6), "the next frame's render settles the new timeline");
+
+    // No canvas, no render: nothing is known about what the screen shows.
+    p.no_canvas = true;
+    static_request(&p, 9.28, 108, 7);
+    check(!osd_ahead_is_settled(&p.osd, 7), "a render that could not run settles nothing");
+    p.no_canvas = false;
+    static_request(&p, 9.32, 109, 7);
+    check(osd_ahead_is_settled(&p.osd, 7), "the first one that runs does");
+
+    // A changed result that could not be queued leaves a repaint owed.
+    for (uint64_t seq = 110; seq <= 110 + OSD_RELEASE_HISTORY; seq++)
+        publish(&p, seq);
+    static_request(&p, 10.02, 110, 8); // the sign, its release long gone
+    check(!osd_result_head(&p.osd.results) && !osd_ahead_is_settled(&p.osd, 8),
+          "a result that was not queued settles nothing");
+    static_request(&p, 10.02, 200, 8);
+    check(head_image(&p) == &sign && osd_ahead_is_settled(&p.osd, 8),
+          "the render that is queued does");
+
+    // A render the epoch moved under is rejected, and so is its settling.
+    take(&p, &sign, publish(&p, 200));
+    p.osd_pts = 10.03;
+    p.after_render = invalidate;
+    static_request(&p, 10.06, 201, 9);
+    check(!osd_ahead_is_settled(&p.osd, 9), "a render cancelled in flight settles nothing");
+}
+
 int main(void)
 {
     test_flip_thread_presenter_takes_the_newest_flipped_result();
@@ -421,6 +509,7 @@ int main(void)
     test_expired_release_does_not_authorize_or_suppress_a_clear();
     test_queued_results_notify_the_presenter();
     test_delayed_plane_repeats_the_slot_on_screen();
+    test_a_static_osd_settles_on_a_render_made_for_it();
     printf("mediacodec osd requests: all content scenarios passed\n");
     return 0;
 }
