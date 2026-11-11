@@ -1,0 +1,282 @@
+Subject: [PATCH] ao_audiotrack: read a passthrough head once per clock sample
+
+A passthrough track's clock is the smoothed playback head
+(AudioTrack_smoothPlayhead): it averages (head - clock) samples, takes
+one every 30 ms, and runs on the system clock in between. The worker
+nevertheless read the head on every pass, and its passes come in runs:
+as many back to back as fit in the space a blocking write waited for.
+On a direct track getPlaybackHeadPosition is a binder call into
+AudioFlinger, which asks the HAL for its render position under the
+output thread's lock (AudioSystem::getRenderPosition). A Swisscom
+IP1800 logged 47 of them a second on a DTS track, in runs of 4-5 within
+2 ms, and the monitor's own read came on top from a second thread.
+media3's AudioTrackPositionTracker reads the head once per sample.
+
+The worker now reads the head when a sample is due and reuses it until
+the next one; the estimate it returns is unchanged, since the reads in
+between fed nothing. With no sample to reuse it reads on every pass as
+before: until the head first moves, and after each reset of the
+smoothing (a flush, a pause, a resume, a restarted counter), so the
+pass that sees the device start is still the first one after it did.
+The resume wait (AudioTrack_awaitResumedHead) and PCM tracks, whose
+clock is the head itself, are untouched.
+
+The monitor takes the worker's latest read as its sample and asks the
+track only when the worker has read nothing since the previous poll,
+which is when it is held in a write.
+
+The "playhead step" line gains reads=, the polls since the anchor that
+read the head, and measures the head against the clock of its own read:
+a reused head has aged, not moved. A pause logs the read and reuse
+counts so far. --audiotrack-head-reuse=no restores a read per pass.
+
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -230,6 +230,16 @@
+ 
+     The following global options are supported by this audio output:
+ 
++    ``--audiotrack-head-reuse=<yes|no>``
++        A passthrough (bitstream) track's clock averages samples of the
++        track's playback head, one every 30 ms, and runs on the system clock
++        in between. With ``yes`` (default) the head is read once per sample;
++        on a direct track each read is a call into the audio server, which
++        asks the HAL under the output's lock. ``no`` reads it on every pass of
++        the output's writer, several times per sample, as before the option
++        existed. The clock is the same either way. Read when the audio output
++        opens.
++
+     ``--audiotrack-stream-silence-limit=<0-86400>``
+         With ``--audio-stream-silence=yes``, a passthrough (bitstream) track is
+         kept running while the player has no audio for it - across pauses,
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -66,6 +66,11 @@
+ // HAL restarts the bitstream first; 55-72 ms on a DTS track in the wild.
+ #define RESUME_HEAD_WAIT_NS MP_TIME_MS_TO_NS(250)
+ #define RESUME_HEAD_POLL_NS MP_TIME_MS_TO_NS(2)
++// How often a passthrough track's clock samples the playback head; it runs
++// on the system clock in between (AudioTrack_smoothPlayhead), and the worker
++// reads the head no more often than that (--audiotrack-head-reuse). media3's
++// AudioTrackPositionTracker samples at the same interval.
++#define HEAD_SAMPLE_NS MP_TIME_MS_TO_NS(30)
+ 
+ // android.os.Process.THREAD_PRIORITY_AUDIO: the niceness of the platform's
+ // own audio client threads.
+@@ -290,6 +295,16 @@
+     int64_t smooth_head;      // smooth_last_head, unwrapped
+     int64_t smooth_reported;  // last returned estimate, unwrapped
+     int64_t smooth_reported_ns;
++    double smooth_head_offset; // smooth_head - clock at the head's read, frames
++    // The head this pass handed to the smoother was read for it, not reused
++    // (AudioTrack_getPlaybackHeadPosition).
++    bool head_fresh;
++    // The worker's reads of the head: the latest one and their count, which
++    // the monitor takes its sample from (monitor_thread), and the passes that
++    // reused one instead.
++    atomic_uint head_read_raw;
++    atomic_uint head_read_seq;
++    unsigned head_reuses;
+ 
+     // Playhead-step diagnostic (see AudioTrack_observePlayheadStep). The
+     // anchor is where the clock last was; the counters describe the polls
+@@ -299,6 +314,7 @@
+     double step_est_offset;   // smoothed estimate - clock, frames, at the anchor
+     double step_head_offset;  // unwrapped raw head - clock, frames, at the anchor
+     unsigned step_polls;
++    unsigned step_read_seq;   // head_read_seq at the anchor
+     unsigned step_limited;    // polls the drift limiter clamped
+     unsigned step_resets;     // times the smoothing window was reset
+     int64_t step_logged_ns;   // rate limit
+@@ -317,6 +333,7 @@
+     bool cfg_pcm_float;
+     bool cfg_raw_passthrough;
+     bool cfg_route_reload;
++    bool cfg_head_reuse;
+     int cfg_session_id;
+     bool cfg_normalize;
+     int cfg_silence_limit;      // seconds of silence per pause; 0 for no limit
+@@ -1222,9 +1239,10 @@
+ 
+ // A direct/offload track's playback head advances in HAL-period steps (8192
+ // frames at 192 kHz), larger than a 24p frame. Like media3's
+-// AudioTrackPositionTracker: average the last (head - clock) offsets, bound
+-// the estimate by what was written, and limit drift between reports to 10%
+-// of elapsed time.
++// AudioTrackPositionTracker: average the last (head - clock) offsets, one
++// taken every HEAD_SAMPLE_NS, bound the estimate by what was written, and
++// limit drift between reports to 10% of elapsed time. A head the worker
++// reused (AudioTrack_getPlaybackHeadPosition) is not a sample.
+ static uint32_t AudioTrack_smoothPlayhead(struct ao *ao, uint32_t head,
+                                         int64_t *sample_time)
+ {
+@@ -1238,9 +1256,11 @@
+ 
+     p->smooth_head += (int32_t)(head - p->smooth_last_head);
+     p->smooth_last_head = head;
++    if (p->head_fresh)
++        p->smooth_head_offset = p->smooth_head - clock;
+ 
+-    if (!p->smooth_count ||
+-        now - p->smooth_sampled >= MP_TIME_MS_TO_NS(30))
++    if (p->head_fresh &&
++        (!p->smooth_count || now - p->smooth_sampled >= HEAD_SAMPLE_NS))
+     {
+         p->smooth_offset[p->smooth_next] = p->smooth_head - clock;
+         p->smooth_next = (p->smooth_next + 1) % MP_ARRAY_SIZE(p->smooth_offset);
+@@ -1385,8 +1405,32 @@
+         //MP_VERBOSE(ao, "position = %u via getTimestamp (state = %d / time= %"PRId64")\n", pos, state, time);
+     }
+     if (!use_timestamp) {
+-        uint32_t raw =
+-            0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++        // The passthrough clock samples the head every HEAD_SAMPLE_NS and
++        // runs on the system clock in between (AudioTrack_smoothPlayhead), so
++        // a read between two samples feeds nothing. It is not free: on a
++        // direct track the head is a binder call into AudioFlinger, which
++        // asks the HAL for its render position under the output thread's
++        // lock (AudioSystem::getRenderPosition), and the worker's passes
++        // come in runs, as many back to back as fit in the space a blocking
++        // write waited for (4-5 on a DTS track, 47 reads a second, on a
++        // Swisscom IP1800; media3 reads once per sample). Until the next
++        // sample is due the worker keeps the head it has. With no sample to
++        // keep it reads on every pass, as it always did: before the first
++        // one, and after each reset of the smoothing - a flush, a pause, a
++        // resume, a counter that restarted.
++        const bool passthrough = p->format == AudioFormat.ENCODING_IEC61937 ||
++                                 p->raw_passthrough;
++        p->head_fresh = !(p->cfg_head_reuse && passthrough &&
++                          !p->head_reset_pending && p->smooth_count &&
++                          mp_time_ns() - p->smooth_sampled < HEAD_SAMPLE_NS);
++        uint32_t raw = p->last_head_raw;
++        if (p->head_fresh) {
++            raw = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++            atomic_store(&p->head_read_raw, raw);
++            atomic_fetch_add(&p->head_read_seq, 1);
++        } else {
++            p->head_reuses++;
++        }
+         *sample_time = mp_time_ns();
+         if (p->head_reset_pending) {
+             // First read of this epoch: after a flush() the counter may not
+@@ -1432,9 +1476,11 @@
+ //
+ // A line names the raw getPlaybackHeadPosition, written_frames and the
+ // smoothed estimate, how far the estimate and the raw head moved against the
+-// clock since the anchor, how many of the polls since then the drift limiter
+-// clamped and how often the smoothing window was reset, and a getTimestamp
+-// probe (framePosition, nanoTime, whether framePosition advanced since the
++// clock since the anchor (the head against the clock of its own read: a
++// reused head has aged, not moved), how many polls there were since then
++// and how many of them read the head, how many the drift limiter clamped
++// and how often the smoothing window was reset, and a getTimestamp probe
++// (framePosition, nanoTime, whether framePosition advanced since the
+ // previous probe). The probe is observation only: the passthrough clock
+ // never reads p->timestamp, so filling it here feeds nothing.
+ //
+@@ -1455,13 +1501,14 @@
+     int64_t now = mp_time_ns();
+     double clock = MP_TIME_NS_TO_S(now) * ao->samplerate;
+     double est_offset = (double)p->smooth_reported - clock;
+-    double head_offset = (double)p->smooth_head - clock;
++    double head_offset = p->smooth_head_offset;
+     if (!p->step_anchored) {
+         p->step_anchored = true;
+         p->step_anchor_ns = now;
+         p->step_est_offset = est_offset;
+         p->step_head_offset = head_offset;
+         p->step_polls = p->step_limited = p->step_resets = 0;
++        p->step_read_seq = atomic_load(&p->head_read_seq);
+         return;
+     }
+     p->step_polls++;
+@@ -1488,13 +1535,14 @@
+     }
+     double ms = 1000.0 / ao->samplerate;
+     MP_VERBOSE(ao, "playhead step: est=%+dms head=%+dms over %dms; raw=%u written=%u "
+-               "smoothed=%u polls=%u limited=%u resets=%u ts=%d fpos=%u nano=%lld "
++               "smoothed=%u polls=%u reads=%u limited=%u resets=%u ts=%d fpos=%u nano=%lld "
+                "tsAgeMs=%d tsAdvancing=%d\n",
+                (int)lround(est_step * ms),
+                (int)lround((head_offset - p->step_head_offset) * ms),
+                (int)((now - p->step_anchor_ns) / 1000000),
+                p->last_head_raw, p->written_frames, estimate,
+-               p->step_polls, p->step_limited, p->step_resets,
++               p->step_polls, atomic_load(&p->head_read_seq) - p->step_read_seq,
++               p->step_limited, p->step_resets,
+                ts_ok, fpos, (long long)nano,
+                ts_ok && nano ? (int)((mp_raw_time_ns() - nano) / 1000000) : -1,
+                advancing);
+@@ -3765,7 +3813,10 @@
+ // pull the worker out of AudioTrack.write and have it rebuild the track, or
+ // once that has been tried, tell the core to end playback. Head samples
+ // also refresh the progress clock, so a slow device that still drains keeps
+-// a long write out of the stall verdict.
++// a long write out of the stall verdict. A head the worker read since the
++// previous poll is this poll's sample: the monitor asks the track itself
++// only when the worker has not, which is when it is held in a write, so
++// that in steady playback one thread queries the track, not two at once.
+ static MP_THREAD_VOID monitor_thread(void *arg)
+ {
+     struct ao *ao = arg;
+@@ -3782,11 +3833,15 @@
+     int underruns = 0;
+     int underrun_generation = -1;
+     int64_t underrun_logged_ns = 0;
++    unsigned head_seq = 0;
+     mp_mutex_lock(&p->monitor_lock);
+     while (!atomic_load(&p->monitor_terminate)) {
+         mp_cond_timedwait(&p->monitor_wakeup, &p->monitor_lock, STALL_POLL_NS);
+         if (atomic_load(&p->monitor_terminate))
+             break;
++        const unsigned seq = atomic_load(&p->head_read_seq);
++        const bool worker_read = p->cfg_head_reuse && seq != head_seq;
++        head_seq = seq;
+         if (atomic_load(&p->failed) || !atomic_load(&p->play_requested)) {
+             have_head = false;
+             continue;
+@@ -3797,8 +3852,13 @@
+         bool sampled = false;
+         int underrun_delta = 0;
+         if (p->audiotrack) {
+-            head = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
+-            sampled = MP_JNI_EXCEPTION_LOG(ao) >= 0;
++            if (worker_read) {
++                head = atomic_load(&p->head_read_raw);
++                sampled = true;
++            } else {
++                head = 0xFFFFFFFFL & MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlaybackHeadPosition);
++                sampled = MP_JNI_EXCEPTION_LOG(ao) >= 0;
++            }
+             if (sampled && AudioTrack.getUnderrunCount) {
+                 if (p->track_generation != underrun_generation) {
+                     underrun_generation = p->track_generation;
+@@ -4461,6 +4521,10 @@
+     p->timestamp_stable = 0;
+     AudioTrack_resetPlayheadSmoothing(p);
+     p->step_anchored = false;
++    if (p->head_reuses) {
++        MP_VERBOSE(ao, "playback head: read on %u passes so far, reused on %u\n",
++                   atomic_load(&p->head_read_seq), p->head_reuses);
++    }
+     mp_mutex_unlock(&p->lock);
+     return true;
+ }
+@@ -4480,12 +4544,17 @@
+         .cfg_pcm_float = 1,
+         .cfg_raw_passthrough = 1,
+         .cfg_route_reload = 1,
++        .cfg_head_reuse = 1,
+         .cfg_silence_limit = 60,
+     },
+     .options   = (const struct m_option[]) {
+         {"pcm-float", OPT_BOOL(cfg_pcm_float)},
+         {"raw-passthrough", OPT_BOOL(cfg_raw_passthrough)},
+         {"route-reload", OPT_BOOL(cfg_route_reload)},
++        // A passthrough track's worker reads the playback head once per
++        // sample its clock takes and reuses it in between
++        // (AudioTrack_getPlaybackHeadPosition); "no" reads it on every pass.
++        {"head-reuse", OPT_BOOL(cfg_head_reuse)},
+         {"session-id", OPT_INT(cfg_session_id)},
+         // With --audio-stream-silence on a passthrough track: seconds of
+         // silence in one feed before the track is stood down; 0 feeds for

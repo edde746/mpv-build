@@ -33,7 +33,7 @@ E="$root/scripts/extract.py"
 python3 "$E" type "$src" "$workdir/audiotrack_clock.inc" --name priv
 python3 "$E" define "$src" "$workdir/audiotrack_clock.inc" --append \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES \
-    --name KA_HEAD_STILL_NS --name KA_QUEUE_NS
+    --name KA_HEAD_STILL_NS --name KA_QUEUE_NS --name HEAD_SAMPLE_NS
 python3 "$E" symbol "$src" "$workdir/audiotrack_clock.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_smoothPlayhead \
     --fn head_rate --fn head_jump_is_wrap \
@@ -60,7 +60,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_write.inc" --append \
     --name THREAD_PRIORITY_AUDIO \
     --name PLAYHEAD_STEP_MS --name PLAYHEAD_STEP_MIN_NS --name PLAYHEAD_STEP_MAX_LINES \
     --name KA_AHEAD_NS --name KA_HEAD_STILL_NS --name KA_POLL_NS --name KA_STALL_LOG_NS \
-    --name KA_IDLE_NS --name KA_QUEUE_NS
+    --name KA_IDLE_NS --name KA_QUEUE_NS --name HEAD_SAMPLE_NS
 # The silent frames and the IEC preamble the stream-silence path writes.
 python3 "$E" region "$src" "$workdir/audiotrack_write.inc" --append --start stream-silence-data
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \

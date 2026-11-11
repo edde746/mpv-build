@@ -506,6 +506,7 @@ static void setup(struct fixture *f, bool raw, int format, bool direct)
     f->p.raw_passthrough = raw;
     f->p.raw_rate_mult = 1;
     f->p.format = format;
+    f->p.cfg_head_reuse = true; // the AO's default
     f->p.chunksize = sizeof(f->chunk);
     f->p.size = sizeof(f->chunk);
     f->p.chunk = f->chunk;
@@ -2997,7 +2998,7 @@ static void stall_polls(struct fixture *f, int polls)
 }
 
 #define STEP_LINE_FORMAT "playhead step: est=%dms head=%dms over %dms; " \
-    "raw=%u written=%u smoothed=%u polls=%u limited=%u resets=%u " \
+    "raw=%u written=%u smoothed=%u polls=%u reads=%u limited=%u resets=%u " \
     "ts=%d fpos=%u nano=%lld tsAgeMs=%d tsAdvancing=%d"
 
 // The passthrough clock's step diagnostic: a HAL head that stops advancing
@@ -3038,18 +3039,19 @@ static void check_iec_playhead_step_line(void)
     stall_polls(&f, 1);
     assert(step_lines == 1);
     int est_ms, head_ms, over_ms, ts_ok, ts_age, ts_adv;
-    unsigned raw, written, smoothed, polls, limited, resets, fpos;
+    unsigned raw, written, smoothed, polls, reads, limited, resets, fpos;
     long long nano;
     assert(sscanf(last_step_line, STEP_LINE_FORMAT, &est_ms, &head_ms, &over_ms,
-                  &raw, &written, &smoothed, &polls, &limited, &resets, &ts_ok,
-                  &fpos, &nano, &ts_age, &ts_adv) == 14);
+                  &raw, &written, &smoothed, &polls, &reads, &limited, &resets, &ts_ok,
+                  &fpos, &nano, &ts_age, &ts_adv) == 15);
     assert(est_ms == -21);        // seven limited polls of 3 ms
     assert(head_ms == -210);      // the raw head stood still for seven polls
     assert(over_ms == 3 * 40 + 7 * 30); // three steady polls, then seven stalled
     assert(raw == 4000 + 1920 * 4);
     assert(written == 50000);
     assert(smoothed == 7680 + 7 * (1440 - 144));
-    assert(polls == 10 && limited == 7 && resets == 0);
+    // Polls a sample apart each read the head.
+    assert(polls == 10 && reads == 10 && limited == 7 && resets == 0);
     assert(ts_ok == 0 && ts_adv == -1 && ts_age == -1);
 
     // The next poll re-anchors; another 21 ms of movement inside the 5 s
@@ -3071,10 +3073,10 @@ static void check_iec_playhead_step_line(void)
     poll_clock(&f);
     assert(step_lines == 2);
     assert(sscanf(last_step_line, STEP_LINE_FORMAT, &est_ms, &head_ms, &over_ms,
-                  &raw, &written, &smoothed, &polls, &limited, &resets, &ts_ok,
-                  &fpos, &nano, &ts_age, &ts_adv) == 14);
+                  &raw, &written, &smoothed, &polls, &reads, &limited, &resets, &ts_ok,
+                  &fpos, &nano, &ts_age, &ts_adv) == 15);
     assert(est_ms == -(7 * 3 + 500) && head_ms == -(7 * 30 + 5000));
-    assert(over_ms == 7 * 30 + 5000 && polls == 8 && limited == 8 && resets == 0);
+    assert(over_ms == 7 * 30 + 5000 && polls == 8 && reads == 8 && limited == 8 && resets == 0);
     assert(ts_ok == 1 && fpos == 123 && ts_adv == -1);
     assert(ts_age == 7 + 8 * 30 + 5000);
     // The probe fed nothing: the clock is still the head, untouched.
@@ -3097,6 +3099,203 @@ static void check_iec_playhead_step_line(void)
     teardown(&f);
     puts("PASS: a stalled passthrough head logs one rate-limited step line with a "
          "getTimestamp probe that feeds nothing");
+}
+
+// 10000 frames written and three 40 ms polls of a head that plays them, so
+// the passthrough smoother has a window to carry.
+static void run_passthrough_clock(struct fixture *f)
+{
+    mp_mutex_lock(&f->p.lock);
+    f->p.written_frames = 10000;
+    mp_mutex_unlock(&f->p.lock);
+    for (int n = 1; n <= 3; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 1920 * n;
+        mp_mutex_unlock(&gate);
+        expect_delay_played(f, 10000, 1920 * n);
+    }
+}
+
+static int head_query_count(void)
+{
+    mp_mutex_lock(&gate);
+    const int n = head_queries;
+    mp_mutex_unlock(&gate);
+    return n;
+}
+
+// One clock poll `ms` after the previous one, the device having played up to
+// `head` of the 10000 frames written.
+static void pass_played(struct fixture *f, int ms, uint32_t head)
+{
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(ms));
+    mp_mutex_lock(&gate);
+    tracks[0].head = head;
+    mp_mutex_unlock(&gate);
+    expect_delay_played(f, 10000, head);
+}
+
+// The passthrough clock takes one head sample every 30 ms and runs on the
+// system clock in between, so the worker's passes inside a sample do not ask
+// the track for its head again: on a direct track each query is a call into
+// the audio server. The clock reads the same with the reuse on and off.
+static void check_passthrough_head_is_read_once_per_sample(bool raw)
+{
+    struct fixture f;
+    setup(&f, raw, raw ? 5 : AudioFormat.ENCODING_IEC61937, true);
+    run_passthrough_clock(&f); // its last poll took a sample
+    uint32_t played = 1920 * 3;
+
+    for (int reuse = 1; reuse >= 0; reuse--) {
+        mp_mutex_lock(&f.p.lock);
+        f.p.cfg_head_reuse = reuse;
+        mp_mutex_unlock(&f.p.lock);
+        const int before = head_query_count();
+        // Five passes inside the sample, the device playing on meanwhile.
+        for (int n = 0; n < 5; n++)
+            pass_played(&f, 5, played += 240);
+        assert(head_query_count() - before == (reuse ? 0 : 5));
+        // The sixth comes a sample after the last one taken.
+        pass_played(&f, 5, played += 240);
+        assert(head_query_count() - before == (reuse ? 1 : 6));
+    }
+    teardown(&f);
+}
+
+// With no sample to run on, every pass reads the head, so the pass that first
+// sees the device play is the first one after it did: at the start, and
+// again once a flush has reset the smoothing.
+static void check_passthrough_head_is_read_until_sampled(void)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+    for (int epoch = 0; epoch < 2; epoch++) {
+        mp_mutex_lock(&f.p.lock);
+        f.p.written_frames = 10000;
+        mp_mutex_unlock(&f.p.lock);
+        const int before = head_query_count();
+        for (int n = 0; n < 3; n++)
+            pass_played(&f, 5, 0); // not playing yet
+        assert(head_query_count() - before == 3);
+        // It starts: this pass sees it and takes the first sample...
+        pass_played(&f, 5, 480);
+        assert(head_query_count() - before == 4);
+        // ...which the next pass runs on.
+        pass_played(&f, 5, 720);
+        assert(head_query_count() - before == 4);
+        stop(&f.ao);
+    }
+    teardown(&f);
+    puts("PASS: a passthrough track's head is read once per clock sample, and on "
+         "every pass until there is one");
+}
+
+// A PCM track's clock is the head itself: nothing runs between two reads.
+static void check_pcm_head_is_read_on_every_pass(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = 10000;
+    mp_mutex_unlock(&f.p.lock);
+    const int before = head_query_count();
+    for (int n = 1; n <= 5; n++)
+        pass_played(&f, 5, 240 * n);
+    assert(head_query_count() - before == 5);
+    teardown(&f);
+    puts("PASS: a PCM track's head is read on every pass");
+}
+
+// The step diagnostic with a worker that passes twice per sample. A head
+// that stops moves the estimate at the limiter's pace whether the passes in
+// between read it or not, so the line fires on the same pass either way;
+// what it says of the head comes from the reads alone.
+static void check_playhead_step_between_samples(bool reuse)
+{
+    struct fixture f;
+    setup(&f, false, AudioFormat.ENCODING_IEC61937, true);
+    mp_mutex_lock(&f.p.lock);
+    f.p.cfg_head_reuse = reuse;
+    mp_mutex_unlock(&f.p.lock);
+    run_passthrough_clock(&f);
+    mp_mutex_lock(&f.p.lock);
+    f.p.written_frames = 50000; // the clock runs on past the stalled head
+    mp_mutex_unlock(&f.p.lock);
+
+    // The head stands at 5760. The pass 15 ms after the last sample has no
+    // news of it; the next one samples it, and from then on each pass may
+    // fall 1.5 ms (10 %) behind the clock: 19.5 ms after thirteen of them is
+    // not yet a step, 21 ms after the fourteenth is.
+    for (int n = 0; n < 14; n++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(15));
+        poll_clock(&f);
+    }
+    assert(step_lines == 0);
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(15));
+    poll_clock(&f);
+    assert(step_lines == 1);
+    int est_ms, head_ms, over_ms, ts_ok, ts_age, ts_adv;
+    unsigned raw, written, smoothed, polls, reads, limited, resets, fpos;
+    long long nano;
+    assert(sscanf(last_step_line, STEP_LINE_FORMAT, &est_ms, &head_ms, &over_ms,
+                  &raw, &written, &smoothed, &polls, &reads, &limited, &resets, &ts_ok,
+                  &fpos, &nano, &ts_age, &ts_adv) == 15);
+    assert(est_ms == -21 && limited == 14 && resets == 0 && raw == 5760);
+    assert(over_ms == 2 * 40 + 15 * 15 && polls == 2 + 15);
+    if (reuse) {
+        // Seven samples saw the head stand still, the last of them 15 ms ago.
+        assert(reads == 2 + 7 && head_ms == -210);
+    } else {
+        assert(reads == 2 + 15 && head_ms == -225);
+    }
+    teardown(&f);
+}
+
+// One monitor poll, after a pass of the worker's or without one; returns how
+// often the monitor asked the track for its head. The monitor cannot leave
+// its wait without monitor_lock, so no poll comes between the worker's pass
+// and the one counted.
+static int monitor_poll_head_queries(struct fixture *f, bool worker_pass)
+{
+    mp_mutex_lock(&f->p.monitor_lock);
+    if (worker_pass)
+        poll_clock(f);
+    mp_mutex_lock(&gate);
+    const int before = head_queries;
+    const int target = underrun_queries + 1;
+    mp_mutex_unlock(&gate);
+    mp_cond_signal(&f->p.monitor_wakeup);
+    mp_mutex_unlock(&f->p.monitor_lock);
+    wait_counter(&underrun_queries, target);
+    return head_query_count() - before;
+}
+
+// In steady playback the worker reads the head several times per monitor
+// poll. The monitor takes the worker's latest read as its sample and asks
+// the track itself only when the worker has read nothing since the previous
+// poll -- held in a write, which is when the monitor's verdict is wanted.
+static void check_monitor_takes_the_workers_head(void)
+{
+    struct fixture f;
+    setup(&f, true, 5, true);
+    atomic_store(&f.p.play_requested, true); // the core wants audio; no write in flight
+    assert(!pthread_create(&f.p.monitor, NULL, monitor_thread, &f.ao));
+    f.p.monitor_created = true;
+
+    assert(monitor_poll_head_queries(&f, false) == 1);
+    assert(monitor_poll_head_queries(&f, true) == 0);
+    assert(monitor_poll_head_queries(&f, false) == 1);
+
+    mp_mutex_lock(&f.p.monitor_lock);
+    f.p.cfg_head_reuse = false;
+    mp_mutex_unlock(&f.p.monitor_lock);
+    assert(monitor_poll_head_queries(&f, true) == 1);
+
+    atomic_store(&f.p.play_requested, false);
+    teardown(&f);
+    puts("PASS: the monitor samples the head the worker read, and the track when "
+         "the worker read none");
 }
 
 // A recreated track arms the same anchors: its first read cannot trip the
@@ -3278,22 +3477,6 @@ static void check_pause_requalifies_the_timestamp(void)
     park_worker(&f);
     teardown(&f);
     puts("PASS: a pause requalifies the timestamp instead of extrapolating it across the pause");
-}
-
-// 10000 frames written and three 40 ms polls of a head that plays them, so
-// the passthrough smoother has a window to carry.
-static void run_passthrough_clock(struct fixture *f)
-{
-    mp_mutex_lock(&f->p.lock);
-    f->p.written_frames = 10000;
-    mp_mutex_unlock(&f->p.lock);
-    for (int n = 1; n <= 3; n++) {
-        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(40));
-        mp_mutex_lock(&gate);
-        tracks[0].head = 1920 * n;
-        mp_mutex_unlock(&gate);
-        expect_delay_played(f, 10000, 1920 * n);
-    }
 }
 
 // The passthrough clock is the smoothed head. A pause stands the head still
@@ -3480,6 +3663,15 @@ int main(void)
     check_pcm_healthy_counters_after_flush();
     check_iec_delayed_reset_smoothing();
     check_iec_playhead_step_line();
+    check_passthrough_head_is_read_once_per_sample(false);
+    check_passthrough_head_is_read_once_per_sample(true);
+    check_passthrough_head_is_read_until_sampled();
+    check_pcm_head_is_read_on_every_pass();
+    check_playhead_step_between_samples(true);
+    check_playhead_step_between_samples(false);
+    puts("PASS: a head that stops between two reads logs its step on the same "
+         "pass, counting the reads");
+    check_monitor_takes_the_workers_head();
     check_recreate_anchors_fresh_track();
     check_pause_keeps_the_rest(1, true, 1);
     check_pause_keeps_the_rest(1, false, 1);
