@@ -1,0 +1,93 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:00:00 +0100
+Subject: [PATCH] sd_ass: tell a packet without a position by its payload
+
+sd_ass keeps the events it decoded across a seek (unless
+--sub-clear-on-seek) and drops a packet the demuxer delivers again by its
+file position and pts. A text subtitle that goes through the lavc converter
+(WebVTT, SRT, mov_text) was checked only when the packet has a position, and
+lavf's hls demuxer gives none: every seek back over a line of an HLS stream's
+WebVTT rendition, and the exact seek that redraws a paused frame on a new
+Surface, added the line once more, and libass stacked the copies on screen
+(plezy: "Subtitles: Bip!" three times after Home and back on Apple's
+bipbop_adv example).
+
+A packet without a position is now keyed by a hash of its duration and
+payload, negative so it never equals a position; with its pts that tells a
+line read again from one read for the first time, while two different lines
+at the same time stay two. Packets with a position are keyed as before.
+--sub-clear-on-seek, the other way out, loses a line a seek lands inside.
+---
+  sub/sd_ass.c | 34 +++++++++++++++++++++++++---------
+  1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/sub/sd_ass.c b/sub/sd_ass.c
+index e16ab9d..3a57a1f 100644
+--- a/sub/sd_ass.c
++++ b/sub/sd_ass.c
+@@ -514,23 +514,40 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
+         talloc_free(pkt);
+ }
+ 
+-// Test if the packet with the given file position and pts was already consumed.
+-// Return false if the packet is new (and add it to the internal list), and
+-// return true if it was already seen.
++// A packet's place among the packets this track decoded: its file position,
++// or, from a demuxer that gives none (the segments of an HLS stream), a hash
++// of its duration and payload, negative so it never equals a position.
++static int64_t packet_key(struct demux_packet *packet)
++{
++    if (packet->pos >= 0)
++        return packet->pos;
++    uint64_t h = 14695981039346656037ULL;
++    const unsigned char *duration = (const unsigned char *)&packet->duration;
++    for (size_t n = 0; n < sizeof(packet->duration); n++)
++        h = (h ^ duration[n]) * 1099511628211ULL;
++    for (size_t n = 0; n < packet->len; n++)
++        h = (h ^ packet->buffer[n]) * 1099511628211ULL;
++    return -(int64_t)(h >> 1) - 1;
++}
++
++// Test if the packet with the given key (packet_key) and pts was already
++// consumed. Return false if the packet is new (and add it to the internal
++// list), and return true if it was already seen.
+ static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
+ {
+     struct sd_ass_priv *priv = sd->priv;
++    int64_t key = packet_key(packet);
+     int a = 0;
+     int b = priv->num_seen_packets;
+     while (a < b) {
+         int mid = a + (b - a) / 2;
+         struct seen_packet *seen_packet = &priv->seen_packets[mid];
+-        if (packet->pos == seen_packet->pos && packet->pts == seen_packet->pts) {
++        if (key == seen_packet->pos && packet->pts == seen_packet->pts) {
+             packet->seen_pos = mid;
+             return true;
+         }
+-        if (packet->pos > seen_packet->pos ||
+-            (packet->pos == seen_packet->pos && packet->pts > seen_packet->pts)) {
++        if (key > seen_packet->pos ||
++            (key == seen_packet->pos && packet->pts > seen_packet->pts)) {
+             a = mid + 1;
+         } else {
+             b = mid;
+@@ -538,7 +555,7 @@ static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
+     }
+     packet->seen_pos = a;
+     MP_TARRAY_INSERT_AT(priv, priv->seen_packets, priv->num_seen_packets, a,
+-                        (struct seen_packet){packet->pos, packet->pts});
++                        (struct seen_packet){key, packet->pts});
+     return false;
+ }
+ 
+@@ -552,8 +569,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
+     packet->sub_duration = packet->duration;
+ 
+     if (ctx->converter) {
+-        if (!sd->opts->sub_clear_on_seek && packet->pos >= 0 &&
+-            check_packet_seen(sd, packet))
++        if (!sd->opts->sub_clear_on_seek && check_packet_seen(sd, packet))
+             return;
+ 
+         double sub_pts = 0;

@@ -67,3 +67,7 @@
 # connection across the seeks of an open (FFmpeg patches 0080 and 0081).
 0240-demux-mkv-let-trailing-tags-wait-for-the-cues.patch
 0241-stream-lavf-keep-the-http-connection-across-seeks.patch
+# A text subtitle packet the demuxer delivers again after a seek is dropped by
+# its payload where it has no file position (HLS), so a line seen twice shows
+# once.
+0242-sd-ass-tell-a-packet-without-a-position-by-its-payload.patch

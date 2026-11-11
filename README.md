@@ -225,6 +225,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_audiotrack_timing.sh` | AudioTrack clock, writes, passthrough, recreate retry, stream silence, pause, the passthrough resume and the core's resume clock (patch 0144), and a track whose core has no audio waiting instead of writing nothing (0150) | PR, main |
 | `test_audiotrack_truehd.sh [media]` | raw TrueHD reassembly from IEC 61937 MAT bursts (needs host ffmpeg) | PR |
 | `test_ass_pixel_ids.sh` | the ids mp_ass_packer gives libass bitmaps: one id means one unchanged bitmap of a list that stayed held (patch 0234) | PR, main |
+| `test_sd_ass_seen_packets.sh` | a subtitle packet sd_ass decoded before is seen again with or without a file position (HLS), and a different one is new (patch 0242) | PR, main |
 | `test_av_log_routing.sh` | FFmpeg log lines reach the mpv instance that logged them (patch 0209), and one that no instance takes is turned away before the lock (0233) | PR, main |
 | `test_demux_codec_profile.sh` | demuxer-published codec profile matches the decoder's (patch 0204) | PR, main |
 | `test_demux_mkv_defer_tags.sh` | Matroska Tags behind the clusters wait for the Cues on network streams and nowhere else; tags read after opening reach only the file's metadata (patch 0240) | PR, main |
