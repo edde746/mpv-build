@@ -71,3 +71,6 @@
 # its payload where it has no file position (HLS), so a line seen twice shows
 # once.
 0242-sd-ass-tell-a-packet-without-a-position-by-its-payload.patch
+# Software screenshots download a hardware frame again (upstream b7b9ec2):
+# with VA-API under the render API on GLES every screenshot failed.
+0243-screenshot-correctly-detect-hardware-frame.patch

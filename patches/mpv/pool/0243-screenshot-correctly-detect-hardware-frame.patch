@@ -1,0 +1,31 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 20:00:00 +0100
+Subject: [PATCH] screenshot: correctly detect hardware frame
+
+Backport of upstream mpv b7b9ec2 (PR #17186, fixes #17185), which is not
+in a release yet. Since mpv 9b1d47e an mp_image of a hardware format
+describes its software subformat in image->fmt, so the software
+screenshot's "is this a hardware frame" check (image->fmt.flags &
+MP_IMGFLAG_HWACCEL) is false for one: the VA-API frame went to libswscale
+undownloaded and every screenshot failed with "Input image format vaapi
+not supported by libswscale". That is the path whenever the VO cannot take
+the screenshot itself, as with the render API on GLES (no tex_download):
+Plezy's Linux player on the Steam Deck. The check now asks the image's
+format.
+---
+  player/screenshot.c | 2 +-
+  1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/player/screenshot.c b/player/screenshot.c
+index c733a2b..32d10a0 100644
+--- a/player/screenshot.c
++++ b/player/screenshot.c
+@@ -377,7 +377,7 @@ static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
+     }
+ 
+     // vo_get_current_frame() can return a hardware frame, which we have to download first.
+-    if (image && image->fmt.flags & MP_IMGFLAG_HWACCEL) {
++    if (image && IMGFMT_IS_HWACCEL(image->imgfmt)) {
+         struct mp_image *nimage = mp_image_hw_download(image, NULL);
+         talloc_free(image);
+         if (!nimage)
