@@ -282,7 +282,11 @@ main() {
   # is FFmpeg's default as before, and --disable-stripping still keeps the
   # install from stripping anything: package.sh copies the DWARF into the
   # symbols zip, and the tarball's libmpv.so stays unstripped.
-  echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoder-only)..."
+  #
+  # The only encoders are mjpeg and png, which mpv's screenshot commands
+  # (screenshot, screenshot-to-file) encode JPEG and PNG files with; without
+  # them every screenshot fails. The Windows group's FFmpeg has them already.
+  echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoders and image encoders)..."
   checkout_verified_ref \
     "$FFMPEG_URL" "$FFMPEG_REF" "$FFMPEG_COMMIT" \
     "$srcdir/ffmpeg-${FFMPEG_VERSION}"
@@ -299,6 +303,7 @@ main() {
     --disable-programs \
     --disable-doc \
     --disable-encoders \
+    --enable-encoder=mjpeg,png \
     --disable-muxers \
     --enable-muxer=spdif \
     --disable-devices \
