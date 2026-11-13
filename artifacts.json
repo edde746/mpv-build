@@ -166,36 +166,36 @@
         "libmpv": {
           "frameworks": {
             "Libmpv": {
-              "asset": "Libmpv-c2bf59f57966.xcframework.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a",
-              "checksum": "1ac7385b4d091efc21caea14e8c482f1ae8b568eebc3e130c0d872ada08fb6c2"
+              "asset": "Libmpv-7747eff8a851.xcframework.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda",
+              "checksum": "83e36f601d87dafd4bb061a76b29295c3cfac96edbb7dc1fba6196e7ea65ea56"
             }
           },
-          "key": "c2bf59f57966",
+          "key": "7747eff8a851",
           "prebuilt": {
             "ios": {
-              "asset": "libmpv-all-c2bf59f57966-ios.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-ios.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             },
             "isimulator": {
-              "asset": "libmpv-all-c2bf59f57966-isimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-isimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             },
             "maccatalyst": {
-              "asset": "libmpv-all-c2bf59f57966-maccatalyst.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-maccatalyst.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             },
             "macos": {
-              "asset": "libmpv-all-c2bf59f57966-macos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-macos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             },
             "tvos": {
-              "asset": "libmpv-all-c2bf59f57966-tvos.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-tvos.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             },
             "tvsimulator": {
-              "asset": "libmpv-all-c2bf59f57966-tvsimulator.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a"
+              "asset": "libmpv-all-7747eff8a851-tvsimulator.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-48129ba79fda"
             }
           }
         }
