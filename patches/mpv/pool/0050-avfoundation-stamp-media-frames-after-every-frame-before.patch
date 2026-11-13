@@ -1,0 +1,96 @@
+vo_avfoundation: stamp a media-time frame after every frame before it
+
+On media time (iOS and iPadOS, picture in picture's clock) each frame's
+sample is stamped with its timestamp. VOCTRL_RESET's flush drops the
+samples the display layer still holds, but not the ones CoreMedia already
+took for display, up to queue-lead-ms ahead of where the old file was; a
+seek's timebase jump never showed them, but the next file's timestamps
+start over. Skip from an episode a second in, and a second into the next
+one the frame of the skipped episode at that timestamp flashed in place of
+the new one, or stayed up if the pause landed on it.
+
+Media stamps now never go back either (avf_media_stamp_offset): a frame
+whose stamp would be at or before the last one moves an offset added to
+every later timestamp, so it is stamped just after the old frames and they
+show before it, as the old file's last frames, never after. A redraw keeps
+the stamp of the frame it shows again. The layers' clock runs on the stamps:
+picture in picture's time range is the clock less the position, which the
+offset does not change. Host mode (tvOS, macOS hosts that ask for it) keeps
+its own rule.
+
+A libmpv program on macOS 27.2 that loads A, B (played 1 s) and C with
+loadfile replace, holds each first frame 100 ms as a player's start gate
+does, and reads the frame the display layer shows every 2 ms
+(copyDisplayedPixelBuffer): with --avfoundation-presentation=media, a frame
+of B showed in C's playback in 3 of 8 runs with VideoToolbox and 1 of 8 in
+software, each at its own timestamp's slot; host mode 0 of 8. The same on
+the iPhone 17 simulator under Plezy: a frame of the skipped episode at
+1.208 s and at 3.833 s, between the next one's frames. scripts/
+test_avf_media_stamp.sh checks the rule.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index ad1416e..5d666d2 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -594,6 +594,10 @@ struct priv {
+     // Latest host stamp given to a video frame; see avf_host_present_ns().
+     int64_t last_host_present_ns;
+     int64_t next_media_pts_ns;
++    // Media mode: what is added to a frame's media timestamp to stamp it, and
++    // the latest stamp given to a video frame; see avf_media_stamp_offset().
++    int64_t media_stamp_offset_ns;
++    int64_t last_media_stamp_ns;
+     bool next_media_pts_valid;
+     double next_timebase_rate;
+     bool next_timebase_rate_valid;
+@@ -1143,6 +1147,29 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+ }
+ // --- end avf host present stamp ---
+ 
++// --- avf media stamp (host-testable; keep freestanding) ---
++// Media stamps never go back either. On media time a frame's sample is
++// stamped with its timestamp, and a reset's flush leaves the samples
++// CoreMedia already took for display, up to queue-lead-ms ahead of where the
++// old file or position was. The next file's timestamps start over (at 0, or
++// at a resume point), so when its clock reached those stamps a frame of the
++// file before showed in the middle of the new one (skip an episode a second
++// in, and a second into the next its frame flashes). A frame whose timestamp
++// plus offset_ns is at or before the last stamp moves the offset so that the
++// frame is stamped just after it; the frames after it keep the offset, and
++// their spacing. No old frame can then come after a new one. The layers'
++// clock runs on the stamps, not the media timestamps: whoever reads it (a
++// picture in picture time range) takes the position relative to it.
++static int64_t avf_media_stamp_offset(int64_t offset_ns, int64_t last_stamp_ns,
++                                      int64_t media_pts_ns)
++{
++    int64_t stamp = media_pts_ns + offset_ns;
++    if (stamp <= last_stamp_ns)
++        return offset_ns + (last_stamp_ns - stamp) + 1;
++    return offset_ns;
++}
++// --- end avf media stamp ---
++
+ // Slack over queue-lead-ms for avf_host_present_ns()'s window: how far ahead
+ // of a new frame's target an already queued frame can be stamped.
+ #define AVF_HOST_PRESENT_SLACK_NS MP_TIME_MS_TO_NS(50)
+@@ -5429,9 +5456,19 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         p->last_host_present_ns = p->next_present_host_ns;
+     }
+     p->next_media_pts_valid = media_pts_is_valid(pts);
++    // A redraw shows the frame already up again, whose stamp it keeps.
++    bool restamp = p->next_media_pts_valid && !p->presentation_host &&
++                   !frame->redraw;
++    if (restamp) {
++        p->media_stamp_offset_ns = avf_media_stamp_offset(
++            p->media_stamp_offset_ns, p->last_media_stamp_ns,
++            media_pts_to_ns(pts));
++    }
+     p->next_media_pts_ns = p->next_media_pts_valid
+-        ? media_pts_to_ns(pts)
++        ? media_pts_to_ns(pts) + p->media_stamp_offset_ns
+         : current_media_time_ns(p);
++    if (restamp)
++        p->last_media_stamp_ns = p->next_media_pts_ns;
+     p->next_timebase_rate_valid = false;
+     if (p->next_media_pts_valid) {
+         int64_t frame_duration_ns = frame->display_synced &&

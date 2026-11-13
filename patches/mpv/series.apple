@@ -44,3 +44,7 @@
 # near instead of as a canvas in the layer's queue
 # (--avfoundation-osd-queue-lead-ms; test_avf_osd_ahead.sh).
 0049-avfoundation-let-osd-changes-wait-as-bitmap-lists.patch
+# Media-time stamps never go back: after a reset (a new file) no frame the
+# display layer already took can show after the new file's frames
+# (test_avf_media_stamp.sh).
+0050-avfoundation-stamp-media-frames-after-every-frame-before.patch
