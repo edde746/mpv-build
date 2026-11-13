@@ -113,6 +113,9 @@ jobs:
       - name: Test AVFoundation host-mode clock rules
         run: ./scripts/test_avf_host_present.sh
 
+      - name: Test AVFoundation media-time stamp rule
+        run: ./scripts/test_avf_media_stamp.sh
+
       - name: Test AVFoundation user shader output size
         run: ./scripts/test_avf_shader_target.sh
 

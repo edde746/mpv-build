@@ -213,6 +213,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_ao_spatial.sh`, `test_spatial_*.sh` | spatial audio; see [docs/apple.md](docs/apple.md#its-tests) | PR, main |
 | `test_avf_dovi_profile5_rpu.sh` | which frames vo_avfoundation uploads with their Dolby Vision RPU | main |
 | `test_avf_host_present.sh` | host-mode frame stamps after a seek, and when a reset re-seeds the timebase | main |
+| `test_avf_media_stamp.sh` | media-time frame stamps after a reset: no frame of the file before shows after the next file's (patch 0050) | main |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
 | `test_avf_osd_blend.sh` | the OSD's NEON blends, libass masks and premultiplied BGRA, match their scalar references bit for bit (patch 0043; aarch64 host) | main |
 | `test_avf_osd_damage.sh` | an overlay buffer drawn by tile, whatever it held, ends up exactly as a full clear and blend of the frame (patch 0048) | main |
