@@ -4,3 +4,7 @@
 # Every group but android: a MediaCodec that starts failing mid-stream rarely
 # recovers, and waiting out its error burst only delays the software fallback.
 0025-vd-lavc-recover-hwdec-after-decode-error-burst.patch
+# E-AC-3 through the system's Dolby decoder (Media Foundation), so that a Dolby
+# Atmos track reaches a Windows spatial sound format as objects. Adds the
+# "mediafoundation" AO after wasapi in the autoprobe order.
+0300-ao-mediafoundation-eac3-through-the-system-decoder.patch
