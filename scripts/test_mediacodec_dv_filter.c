@@ -223,6 +223,13 @@ static void slice(struct au *au, int type, size_t n)
 
 #define PIC_TIMING 0x01, 0x03, 0x12, 0x34, 0x56
 #define HDR10PLUS  0x04, 0x0A, 0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x00, 0x11, 0x22, 0x33
+// A second Samsung application-4 message, oriented code 0x0010, as plezy#3062's
+// hybrid release carries it beside standard HDR10+ on every frame.
+#define SAMSUNG_APP4_0010 0x04, 0x22, 0xB5, 0x00, 0x3C, 0x00, 0x10, 0x04, 0x01, \
+    0x00, 0x61, 0x90, 0x00, 0x08, 0x00, 0x08, 0x00, 0x0C, 0x00, 0x08, 0x00, 0x05, \
+    0x00, 0x04, 0xC0, 0x02, 0xE0, 0x01, 0xD0, 0x01, 0x20, 0x00, 0xE8, 0x00, 0x9A, 0x40
+// Samsung's provider code for another application: not ST 2094-40.
+#define SAMSUNG_APP5 0x04, 0x07, 0xB5, 0x00, 0x3C, 0x00, 0x01, 0x05, 0x00
 #define HASH       0x84, 0x03, 0xAA, 0xBB, 0xCC
 
 // --- harness
@@ -391,6 +398,26 @@ static void test_bundled_sei_keeps_other_messages(void)
     load(&all);
     filter("all messages removed");
     expect_bytes(&none, "SEI with only HDR10+ messages is removed whole");
+}
+
+static void test_every_samsung_application4_message_is_removed(void)
+{
+    // Both of plezy#3062's per-frame messages go whatever their oriented
+    // code; a Samsung message for another application and pic_timing stay.
+    struct au au = {0}, expected = {0};
+    NAL(&au, 1, PREFIX_SEI, PIC_TIMING, 0x80);
+    NAL(&expected, 1, PREFIX_SEI, PIC_TIMING, 0x80);
+    NAL(&au, 1, PREFIX_SEI, SAMSUNG_APP4_0010, 0x80);
+    NAL(&au, 1, PREFIX_SEI, HDR10PLUS, 0x80);
+    NAL(&au, 1, PREFIX_SEI, SAMSUNG_APP5, 0x80);
+    NAL(&expected, 1, PREFIX_SEI, SAMSUNG_APP5, 0x80);
+    slice(&au, IDR, 100);
+    slice(&expected, IDR, 100);
+
+    reset(DV_FILTER_NONE);
+    load(&au);
+    filter("Samsung application-4 messages");
+    expect_bytes(&expected, "every Samsung application-4 message is removed");
 }
 
 static void test_malformed_sei_is_kept_verbatim(void)
@@ -575,6 +602,7 @@ int main(void)
     test_unchanged_access_unit_is_not_copied();
     test_hdr10plus_only_sei_is_removed();
     test_bundled_sei_keeps_other_messages();
+    test_every_samsung_application4_message_is_removed();
     test_malformed_sei_is_kept_verbatim();
     test_strip_and_native_modes();
     test_convert_rewrites_rpu();
