@@ -1,0 +1,73 @@
+vo_avfoundation: decode untagged VideoToolbox frames as mpv does
+
+FFmpeg tags a VideoToolbox frame with the colour its stream specifies and
+removes what the stream leaves unspecified. Core Animation decodes a frame
+without a matrix with BT.601's and shows its values without converting
+them, so an untagged HD stream played with other hues than mpv gives it
+everywhere else, this VO's own upload path included: mpv guesses BT.709 at
+HD sizes, and an uploaded frame is tagged with that guess. Subtitles typeset
+against mpv's picture could not match it, with or without 0052.
+
+A VideoToolbox frame now gets mpv's colour for each of its primaries,
+transfer and matrix that its stream left unspecified, and the colour space
+derived from them; what the stream specified stays. Dolby Vision frames are
+left alone (restore_dolby_vision_transfer). FFmpeg removes the attachments
+again from a recycled buffer, so an untagged stream pays for them on every
+frame.
+
+The bands and boxes of 0052, an untagged H.264 stream decoded by
+VideoToolbox: the largest band/box difference 16 -> 3 on macOS and on the
+iPhone Air, the bands showing as the same file decoded in software does
+(macOS: 180,248,232 -> 183,243,235 for 176,242,233).
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 8ebb6e6..6164953 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -2191,6 +2191,38 @@ static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
+         set_colorspace_from_attachments(pixbuf);
+ }
+ 
++// FFmpeg tags a VideoToolbox frame with the colour its stream specifies and
++// removes what the stream leaves unspecified. Core Animation decodes a frame
++// without a matrix with BT.601's and shows its values without converting
++// them, so an untagged HD stream played with other hues than mpv gives it
++// everywhere else, this VO's own upload path included: mpv decodes it with
++// the colour it guesses (BT.709 at HD sizes), and subtitles are typeset
++// against that picture. Give the frame mpv's colour for what its stream left
++// unspecified; what the stream specified stays. Dolby Vision keeps its
++// unspecified primaries and matrix (restore_dolby_vision_transfer).
++static void tag_unspecified_color(CVPixelBufferRef pixbuf,
++                                  const struct mp_image_params *params)
++{
++    if (params->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        return;
++
++    const struct { CFStringRef key, value; } guess[] = {
++        {kCVImageBufferColorPrimariesKey, get_cv_color_primaries(params->color.primaries)},
++        {kCVImageBufferTransferFunctionKey, get_cv_transfer_function(params->color.transfer)},
++        {kCVImageBufferYCbCrMatrixKey, get_cv_ycbcr_matrix(params->repr.sys)},
++    };
++    bool tagged = false;
++    for (int i = 0; i < MP_ARRAY_SIZE(guess); i++) {
++        if (!guess[i].value || CVBufferGetAttachment(pixbuf, guess[i].key, NULL))
++            continue;
++        CVBufferSetAttachment(pixbuf, guess[i].key, guess[i].value,
++                              kCVAttachmentMode_ShouldPropagate);
++        tagged = true;
++    }
++    if (tagged)
++        set_colorspace_from_attachments(pixbuf);
++}
++
+ // --- avf osd color (host-testable; keep freestanding) ---
+ // Subtitle colours are the video's RGB: VSFilter blends subtitles into the
+ // picture before it is converted for the display, typesetters match signs
+@@ -5216,6 +5248,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+         if (mpi->imgfmt == IMGFMT_VIDEOTOOLBOX) {
+             // Hardware decoded: zero-copy passthrough
+             pixbuf = (CVPixelBufferRef)mpi->planes[3];
++            tag_unspecified_color(pixbuf, &mpi->params);
+         } else {
+             // Software decoded: upload to CVPixelBuffer
+             pixbuf = upload_software_frame(vo, mpi);

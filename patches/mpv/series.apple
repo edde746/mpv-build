@@ -53,5 +53,7 @@
 0051-avfoundation-prime-the-osd-layer-before-its-first-subtitle.patch
 # Overlay samples carry the colour of the SDR video under them, so a sign or
 # mask matched to the picture keeps its colour on screen
-# (test_avf_osd_color.sh).
+# (test_avf_osd_color.sh); a VideoToolbox frame gets mpv's colour for what its
+# stream leaves unspecified, as an uploaded frame does.
 0052-avfoundation-show-subtitles-in-the-colour-of-their-video.patch
+0053-avfoundation-decode-untagged-videotoolbox-frames-as-mpv-does.patch
