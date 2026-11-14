@@ -48,3 +48,6 @@
 # display layer already took can show after the new file's frames
 # (test_avf_media_stamp.sh).
 0050-avfoundation-stamp-media-frames-after-every-frame-before.patch
+# The first subtitle on the OSD layer waits for its frame: a layer that never
+# showed an image shows the first sample it gets at once.
+0051-avfoundation-prime-the-osd-layer-before-its-first-subtitle.patch
