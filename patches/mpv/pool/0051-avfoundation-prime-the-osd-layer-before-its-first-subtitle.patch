@@ -1,0 +1,83 @@
+vo_avfoundation: prime the OSD layer before its first subtitle
+
+An AVSampleBufferDisplayLayer that has never shown an image shows the first
+sample it is handed at once, whatever its timestamp; every later sample
+waits for its time on the layer's timebase. The OSD layer gets no sample
+until the first subtitle (osd_layer_dirty keeps a subtitle-less layer
+without an image), and flip_page enqueues that subtitle with its frame,
+queue-lead-ms ahead. So the first subtitle a VO showed came a queue lead
+early: a sign that starts on a cut sat over the last frames of the shot
+before it (about 100 ms, 6 display frames at 60 Hz, in an iPhone screen
+recording; 117 ms on the iPhone Air simulator). Later subtitles, and the
+first after a seek of a layer that had shown one, were on time: the layer
+had an image by then.
+
+Before a subtitle goes to a layer that never had one, a transparent sample
+marked to display at once goes first (as clear_osd_layer does after a
+seek), so the subtitle is not the layer's first sample and waits for its
+frame. A file without subtitles still never gives the layer an image. The
+transparent sample is stamped with the layers' clock as it is, like
+clear_osd_layer's, so it never comes after a stamp of 0050's.
+
+iPhone Air simulator, iOS 27.0, an episode whose first subtitle is a sign
+starting on a cut, the time the subtitle layer first shows the sign less
+the time the video layer shows the cut, read every display refresh
+(displayedPixelBuffer of both layers): opened at a point before the sign
+-117 ms in each of 3 runs -> 0 ms in each of 4 (with and without 0050);
+opened earlier, playing through other subtitles and seeking to the same
+point: 0 ms before and after.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 5d666d2..f7b32f9 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -3727,6 +3727,31 @@ static int64_t layer_time_ns(struct priv *p)
+     return p->timebase ? cm_time_to_ns(CMTimebaseGetTime(p->timebase)) : 0;
+ }
+ 
++// A sample buffer layer that has never shown an image shows the first sample
++// it is handed at once, whatever its timestamp, while every later one waits
++// for its time on the layer's timebase. The OSD layer gets nothing until the
++// first subtitle (osd_layer_dirty), and that subtitle is enqueued a queue
++// lead (~120 ms) ahead of its frame, so it showed that much early: a sign
++// over the last frames of the shot before it. Hand such a layer a
++// transparent sample to show at once first; the subtitle then waits for its
++// frame. A layer that never shows a subtitle still never gets an image.
++static void prime_osd_layer(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++
++    if (p->osd_layer_dirty || !p->osdLayer)
++        return;
++    CVPixelBufferRef pixbuf = create_empty_osd_pixel_buffer(vo);
++    if (!pixbuf)
++        return;
++    CMSampleBufferRef buf = create_image_sample_buffer(vo, pixbuf, layer_time_ns(p), true);
++    CVPixelBufferRelease(pixbuf);
++    if (!buf)
++        return;
++    enqueue_osd_sample(vo, buf);
++    CFRelease(buf);
++}
++
+ // Make the OSD layer show nothing, dropping what is queued for it, without
+ // removing its image. Removing the displayed image (flush with removal)
+ // hands the layer's video receiver an empty configuration on every seek,
+@@ -4068,6 +4093,8 @@ static void present_pending_osd(struct vo *vo, bool flush)
+         CMSampleBufferRef buf = create_osd_sample_buffer(vo, e->pts_ns, &needed);
+         if (buf) {
+             bool has_subtitle = p->has_subtitle && p->cachedSubtitleBuffer;
++            if (has_subtitle)
++                prime_osd_layer(vo);
+             int64_t t = mp_time_ns();
+             bool enqueued = enqueue_osd_sample(vo, buf);
+             p->perf.enqueue_ns += mp_time_ns() - t;
+@@ -5362,6 +5389,8 @@ static void flip_page(struct vo *vo)
+                 update_media_timebase_for_frame(vo);
+ 
+             if (osd_buf) {
++                if (osd_buf_has_subtitle)
++                    prime_osd_layer(vo);
+                 t = mp_time_ns();
+                 osd_enqueued = enqueue_osd_sample(vo, osd_buf);
+                 p->perf.enqueue_ns += mp_time_ns() - t;
