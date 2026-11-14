@@ -51,3 +51,7 @@
 # The first subtitle on the OSD layer waits for its frame: a layer that never
 # showed an image shows the first sample it gets at once.
 0051-avfoundation-prime-the-osd-layer-before-its-first-subtitle.patch
+# Overlay samples carry the colour of the SDR video under them, so a sign or
+# mask matched to the picture keeps its colour on screen
+# (test_avf_osd_color.sh).
+0052-avfoundation-show-subtitles-in-the-colour-of-their-video.patch

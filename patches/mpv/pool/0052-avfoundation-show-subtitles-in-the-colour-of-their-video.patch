@@ -1,0 +1,232 @@
+vo_avfoundation: show subtitles in the colour of their video
+
+Subtitle colours are the video's RGB: VSFilter blends subtitles into the
+picture before it is converted for the display, and typesetters match signs
+and masks to the picture in that RGB. Overlay samples carried no colour,
+and macOS's compositor shows an untagged buffer as it is while it converts
+the video from the colour the video carries: Apple's BT.709 transfer lifts
+the picture's midtones (grey 128 shows as 139 on an sRGB display) and not
+the subtitle's, and a wide gamut display takes the subtitle's sRGB values
+as its own primaries. A mask matched to the picture showed as a patch over it
+(plezy#3072, a MacBook Pro's P3 display: a mask over a cyan sketch book
+showed as P3 176,242,233, its own values, the book around it as
+196,242,237).
+
+Every overlay sample now carries the colour of the video it is shown over:
+the colour space, primaries, transfer, gamma and ICC profile of the frame's
+buffer as decoded or uploaded, taken again whenever the frame's params
+change. flip_page makes the video sample before the OSD's samples so they
+have it; the order they are enqueued in is unchanged. The Core Image
+composite (video geometry in a composite mode) takes the subtitle image in
+the same colour. PQ, HLG and Dolby Vision video keep an untagged overlay:
+their transfer would put subtitle white at the signal's peak. The Y'CbCr
+composite already blends subtitle RGB with the video's matrix.
+
+macOS 27, a 1080p sRGB display, libmpv drawing into a display layer set up
+as Plezy's macOS player sets it up, paused on six colour bands with an ASS
+box of each band's RGB over half of it; the largest difference between a
+band and its box in displayed 8-bit values, before -> after:
+
+  H.264 BT.709, VideoToolbox                      11 -> 3
+  H.264 BT.709, software decoding                 11 -> 3
+  HEVC Main 10 BT.709, VideoToolbox               10 -> 3
+  composite-osd with video-zoom (Core Image)      11 -> 3
+  composite-osd (Y'CbCr blend, unchanged)          3 -> 3
+  H.264 untagged, software decoding               11 -> 3
+
+The 3 left is the test file's: its bands decode 2-3 below the RGB they were
+made from (grey to 125), the boxes are exact.
+
+iOS 27, an iPhone Air (P3 display), the same bands in a layer set up as
+Plezy's iOS player sets it up: iOS shows BT.709 video without macOS's lift,
+so the inline overlay matched already (3), and its screenshots are the same
+pixel for pixel after; composite-osd with video-zoom 11 -> 3.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index f7b32f9..8ebb6e6 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -715,6 +715,11 @@ struct priv {
+     CVPixelBufferRef cachedSubtitleBuffer;
+     int subtitle_x0, subtitle_y0, subtitle_x1, subtitle_y1;
+     bool has_subtitle;
++    // The colour attachments every overlay sample carries: the video's
++    // (update_osd_color), or none. osd_color_params are the params of the
++    // frame they were taken from.
++    CFDictionaryRef osd_color;
++    struct mp_image_params osd_color_params;
+ 
+     // Software frame upload support
+     CVPixelBufferPoolRef swUploadPool;
+@@ -2186,6 +2191,88 @@ static void tag_pixel_buffer_color_metadata(CVPixelBufferRef pixbuf,
+         set_colorspace_from_attachments(pixbuf);
+ }
+ 
++// --- avf osd color (host-testable; keep freestanding) ---
++// Subtitle colours are the video's RGB: VSFilter blends subtitles into the
++// picture before it is converted for the display, typesetters match signs
++// and masks to the picture in that RGB, and sd_ass's colour compat converts
++// a script's colours to the video's matrix. The compositor converts each
++// sample from the colour it carries and shows an untagged overlay buffer as
++// it is: Apple's BT.709 transfer lifted the video's midtones and not the
++// subtitle's (128 shows as 139 on an sRGB display), and a wide gamut display
++// took the subtitle's values as its own primaries, so a mask matched to the
++// picture showed as a patch over it. Overlay samples carry the colour of the
++// video under them instead.
++
++// The attachments that say which colour an RGB buffer's values are in. The
++// YCbCr matrix stays the video's: an overlay buffer is RGB.
++#define AVF_OSD_COLOR_KEYS {            \
++    kCVImageBufferCGColorSpaceKey,      \
++    kCVImageBufferICCProfileKey,        \
++    kCVImageBufferColorPrimariesKey,    \
++    kCVImageBufferTransferFunctionKey,  \
++    kCVImageBufferGammaLevelKey,        \
++}
++
++// The colour an overlay buffer takes from video, the buffer of the frame it
++// is shown over: video's colour attachments, or NULL (untagged) when it has
++// none or is hdr (PQ, HLG, Dolby Vision), whose transfer would put subtitle
++// white at the signal's peak.
++static CFDictionaryRef avf_osd_color_create(CVPixelBufferRef video, bool hdr)
++{
++    if (hdr)
++        return NULL;
++    const CFStringRef keys[] = AVF_OSD_COLOR_KEYS;
++    CFMutableDictionaryRef color = NULL;
++    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++        CFTypeRef value = CVBufferGetAttachment(video, keys[i], NULL);
++        if (!value)
++            continue;
++        if (!color) {
++            color = CFDictionaryCreateMutable(NULL, sizeof(keys) / sizeof(keys[0]),
++                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        }
++        CFDictionarySetValue(color, keys[i], value);
++    }
++    return color;
++}
++
++// Give the overlay buffer pixbuf color (avf_osd_color_create's; NULL: none),
++// dropping any other colour it was given before. Only attachments that differ
++// are touched: a pool buffer keeps what it was given, and setting or
++// removing one on an IOSurface-backed buffer is a kernel round trip.
++static void avf_osd_color_apply(CFDictionaryRef color, CVPixelBufferRef pixbuf)
++{
++    const CFStringRef keys[] = AVF_OSD_COLOR_KEYS;
++    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++        CFTypeRef want = color ? CFDictionaryGetValue(color, keys[i]) : NULL;
++        CFTypeRef have = CVBufferGetAttachment(pixbuf, keys[i], NULL);
++        if (want == have || (want && have && CFEqual(want, have)))
++            continue;
++        if (want) {
++            CVBufferSetAttachment(pixbuf, keys[i], want,
++                                  kCVAttachmentMode_ShouldPropagate);
++        } else {
++            CVBufferRemoveAttachment(pixbuf, keys[i]);
++        }
++    }
++}
++// --- end avf osd color ---
++
++// The OSD's colour (osd_color) for the frame mpi, whose buffer as decoded or
++// uploaded is pixbuf. Taken again only when mpi's params change.
++static void update_osd_color(struct priv *p, struct mp_image *mpi,
++                             CVPixelBufferRef pixbuf)
++{
++    if (mp_image_params_static_equal(&mpi->params, &p->osd_color_params))
++        return;
++    p->osd_color_params = mpi->params;
++    if (p->osd_color)
++        CFRelease(p->osd_color);
++    p->osd_color = avf_osd_color_create(pixbuf,
++        pl_color_transfer_is_hdr(mpi->params.color.transfer) ||
++        mpi->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION);
++}
++
+ static void restore_dolby_vision_transfer(CVPixelBufferRef pixbuf,
+                                           const struct mp_image_params *params)
+ {
+@@ -3629,8 +3716,9 @@ static CVPixelBufferRef render_subtitle_list_pixel_buffer(struct vo *vo,
+     return draw_osd_pixel_buffer(vo, list->items, list->num_items);
+ }
+ 
+-// Wrap pixbuf (not consumed) in a sample buffer. An immediate sample is shown
+-// as soon as it arrives instead of at pts on the layer's timebase.
++// Wrap the overlay buffer pixbuf (not consumed) in a sample buffer, in the
++// OSD's colour (osd_color). An immediate sample is shown as soon as it
++// arrives instead of at pts on the layer's timebase.
+ static CMSampleBufferRef create_image_sample_buffer(struct vo *vo,
+                                                     CVPixelBufferRef pixbuf,
+                                                     int64_t pts_ns,
+@@ -3642,6 +3730,9 @@ static CMSampleBufferRef create_image_sample_buffer(struct vo *vo,
+         .decodeTimeStamp = kCMTimeInvalid
+     };
+ 
++    struct priv *p = vo->priv;
++    avf_osd_color_apply(p->osd_color, pixbuf);
++
+     CMFormatDescriptionRef format = NULL;
+     CMSampleBufferRef buf = NULL;
+     OSStatus err = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixbuf, &format);
+@@ -4752,7 +4843,15 @@ static CVPixelBufferRef render_video_geometry_frame(struct vo *vo,
+         CIImage *outputImage = [videoImage imageByCompositingOverImage:background];
+ 
+         if (include_subtitle && p->cachedSubtitleImage) {
+-            CIImage *subtitleImage = [CIImage imageWithCGImage:p->cachedSubtitleImage];
++            // In the OSD's colour (update_osd_color): the video's colour
++            // space, or sRGB, as Core Image takes an untagged image.
++            CGColorSpaceRef subColorSpace = p->osd_color
++                ? (CGColorSpaceRef)CFDictionaryGetValue(p->osd_color, kCVImageBufferCGColorSpaceKey)
++                : NULL;
++            CIImage *subtitleImage = subColorSpace
++                ? [CIImage imageWithCGImage:p->cachedSubtitleImage
++                                    options:@{kCIImageColorSpace: (__bridge id)subColorSpace}]
++                : [CIImage imageWithCGImage:p->cachedSubtitleImage];
+             if (subtitleImage) {
+                 CGSize subSize = subtitleImage.extent.size;
+                 if (subSize.width != (CGFloat)outW || subSize.height != (CGFloat)outH) {
+@@ -5126,6 +5225,7 @@ static CMSampleBufferRef create_video_sample_buffer(struct vo *vo, mp_image_t *m
+             }
+             pixbufNeedsRelease = true;
+         }
++        update_osd_color(p, mpi, pixbuf);
+ 
+         CVPixelBufferRef finalBuffer = pixbuf;
+         bool needsRelease = false;
+@@ -5365,6 +5465,12 @@ static void flip_page(struct vo *vo)
+             render_osd(vo, p->next_pts);
+         }
+ 
++        // Made before the OSD's samples, which take its colour
++        // (update_osd_color); still enqueued after them.
++        int64_t t = mp_time_ns();
++        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
++        p->perf.video_sample_ns += mp_time_ns() - t;
++
+         int64_t osd_pts_ns = sample_presentation_pts_ns(p);
+         if (osd_changes_deferred(p)) {
+             int64_t spacing = p->next_present_host_ns - p->osd_last_host_ns;
+@@ -5378,10 +5484,6 @@ static void flip_page(struct vo *vo)
+             osd_buf = create_osd_sample_buffer(vo, osd_pts_ns, &osd_needed);
+         bool osd_buf_has_subtitle = osd_buf && p->has_subtitle && p->cachedSubtitleBuffer;
+ 
+-        int64_t t = mp_time_ns();
+-        CMSampleBufferRef video_buf = create_video_sample_buffer(vo, p->next_image);
+-        p->perf.video_sample_ns += mp_time_ns() - t;
+-
+         bool osd_enqueued = !osd_needed;
+ 
+         if (video_buf && wait_until_ready_for_more_media_data(vo, p->next_present_host_ns)) {
+@@ -5671,6 +5773,11 @@ static void uninit(struct vo *vo)
+         p->video_format_desc = NULL;
+     }
+ 
++    if (p->osd_color) {
++        CFRelease(p->osd_color);
++        p->osd_color = NULL;
++    }
++
+     release_osd_layer(vo);
+ 
+     avf_shaders_destroy(&p->shaders);

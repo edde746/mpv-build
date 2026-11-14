@@ -216,6 +216,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_media_stamp.sh` | media-time frame stamps after a reset: no frame of the file before shows after the next file's (patch 0050) | main |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
 | `test_avf_osd_blend.sh` | the OSD's NEON blends, libass masks and premultiplied BGRA, match their scalar references bit for bit (patch 0043; aarch64 host) | main |
+| `test_avf_osd_color.sh` | an overlay buffer carries the colour of the SDR video under it, and none over HDR or untagged video, whatever a pool buffer held (patch 0052; macOS) | main |
 | `test_avf_osd_damage.sh` | an overlay buffer drawn by tile, whatever it held, ends up exactly as a full clear and blend of the frame (patch 0048) | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
