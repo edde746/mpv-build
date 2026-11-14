@@ -57,3 +57,6 @@
 # stream leaves unspecified, as an uploaded frame does.
 0052-avfoundation-show-subtitles-in-the-colour-of-their-video.patch
 0053-avfoundation-decode-untagged-videotoolbox-frames-as-mpv-does.patch
+# On tvOS a host stamp sits 30% into a refresh interval, where the video and
+# OSD layers agree on the refresh that shows it (test_avf_host_present.sh).
+0054-avfoundation-stamp-tvos-host-frames-where-both-layers-pick-one-refresh.patch

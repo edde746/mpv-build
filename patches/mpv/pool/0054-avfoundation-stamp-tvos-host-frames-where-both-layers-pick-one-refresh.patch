@@ -1,0 +1,172 @@
+vo_avfoundation: stamp tvOS host frames where both layers pick one refresh
+
+The video layer and the OSD layer each pick the refresh that shows a
+sample from its stamp. With the Apple TV's refresh matched to the frame
+rate their cut-offs differ and wander: frames stamped 73-89% of the way
+from one vsync to the next showed their subtitles a refresh before or
+after the picture, for a whole stretch of playback or every few frames. A
+host stamp is mpv's target time, so where it falls in the refresh is set
+anew at every pause and seek and kept until the next: whether playback
+desynced, and which way, looked random, and a pause or seek changed it
+(plezy#3073).
+
+On tvOS a display link now follows the display's vsyncs, and a host stamp
+moves to the nearest point 30% of the way through a refresh interval, the
+farthest from those cut-offs, by at most half a refresh either way; on
+average a frame shows on the refresh it showed on before. Android's
+ExoPlayer places frames the same way (VideoFrameReleaseHelper: the
+nearest vsync, released 80% of a refresh before it). iOS and macOS track
+no vsync and keep their stamps.
+
+Apple TV 4K at 2160p 23.976 Hz, Plezy's options, the mode switch made
+after the first frame as Plezy makes it; a 23.976 fps clip whose frames
+and per-frame ASS events carry the same code in both halves of the
+picture, captured over HDMI, a pause or a seek every 3 s. Of 143
+stretches at the stamps mpv gave, every mismatched frame came from the
+37 at 70-90% of the interval: 354 of 9576 frames, 5 stretches mismatched
+for most of their length (the worst 66 of 67 frames, subtitles a refresh
+late). Stamps forced to 80%: 11 of 40 stretches mismatched, 3 of them
+throughout. At 30% (105 stretches, this patch and the same stamps
+forced): 28 of 6615 frames, none of a stretch's for long (the worst 10
+of 69), each a single refresh where one layer, mostly the video, kept a
+frame a refresh longer.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 6164953..513774f 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -593,6 +593,14 @@ struct priv {
+     int64_t next_present_host_ns;
+     // Latest host stamp given to a video frame; see avf_host_present_ns().
+     int64_t last_host_present_ns;
++    // The display's refresh for avf_host_refresh_stamp_ns(): its latest vsync
++    // on mp_time_ns() and its period, both 0 until refresh_link has seen a
++    // vsync. Written on the main thread.
++    _Atomic int64_t refresh_vsync_ns;
++    _Atomic int64_t refresh_period_ns;
++#if TARGET_OS_TV
++    CADisplayLink *refresh_link;
++#endif
+     int64_t next_media_pts_ns;
+     // Media mode: what is added to a frame's media timestamp to stamp it, and
+     // the latest stamp given to a video frame; see avf_media_stamp_offset().
+@@ -892,6 +900,28 @@ static const struct m_sub_options avfoundation_conf;
+ }
+ @end
+ 
++#if TARGET_OS_TV
++// Keeps priv's refresh fields on the display's vsyncs, on the main thread. A
++// display link's timestamp is its last vsync in CACurrentMediaTime(), which
++// is mach_absolute_time() as mp_time_ns() is.
++@interface MPVRefreshClock : NSObject {
++@public
++    struct priv *p;
++}
++@end
++
++@implementation MPVRefreshClock
++- (void)tick:(CADisplayLink *)link
++{
++    int64_t vsync_ns = mp_time_ns() +
++        (int64_t)((link.timestamp - CACurrentMediaTime()) * 1e9);
++    atomic_store(&p->refresh_period_ns,
++                 (int64_t)((link.targetTimestamp - link.timestamp) * 1e9));
++    atomic_store(&p->refresh_vsync_ns, vsync_ns);
++}
++@end
++#endif
++
+ static bool should_composite_into_video(struct priv *p)
+ {
+     return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
+@@ -1152,6 +1182,35 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+ }
+ // --- end avf host present stamp ---
+ 
++// --- avf host refresh stamp (host-testable; keep freestanding) ---
++// Where in a refresh interval a host stamp goes (plezy#3073). The video layer
++// and the OSD layer each pick the refresh that shows a sample from its stamp,
++// and on tvOS with the refresh matched to the frame rate their cut-offs
++// differ and wander: stamps 73-89% of the way from one vsync to the next put
++// the subtitles a refresh before or after the picture, steadily or every few
++// frames, and at 24p a stamp keeps its place in the interval until a pause
++// or seek. A stamp moves to the nearest point 30% of the way through an
++// interval, the farthest from those cut-offs, by at most half a refresh
++// either way. A period of 0 (no vsync seen) leaves the target as it is.
++static int64_t avf_host_refresh_stamp_ns(int64_t target_ns, int64_t vsync_ns,
++                                         int64_t period_ns)
++{
++    if (period_ns <= 0)
++        return target_ns;
++    int64_t base_ns = vsync_ns + period_ns * 3 / 10;
++    int64_t offset_ns = target_ns - base_ns;
++    int64_t n = offset_ns / period_ns;
++    int64_t rest_ns = offset_ns % period_ns;
++    if (rest_ns < 0) {
++        rest_ns += period_ns;
++        n--;
++    }
++    if (rest_ns >= period_ns - rest_ns)
++        n++;
++    return base_ns + n * period_ns;
++}
++// --- end avf host refresh stamp ---
++
+ // --- avf media stamp (host-testable; keep freestanding) ---
+ // Media stamps never go back either. On media time a frame's sample is
+ // stamped with its timestamp, and a reset's flush leaves the samples
+@@ -4985,6 +5044,8 @@ static int preinit(struct vo *vo)
+     atomic_init(&p->pending_layer_geometry_sync, false);
+     atomic_init(&p->layer_geometry_dirty, false);
+     atomic_init(&p->shader_layer_stale, false);
++    atomic_init(&p->refresh_vsync_ns, 0);
++    atomic_init(&p->refresh_period_ns, 0);
+ 
+     // Everything the main thread has to do for a new VO, in one trip to it:
+     // each trip waits for whatever the main thread is in the middle of, and
+@@ -5047,6 +5108,17 @@ static int preinit(struct vo *vo)
+                 vo_wakeup(vo);
+             }
+         }] retain];
++#endif
++#if TARGET_OS_TV
++        if (p->presentation_host) {
++            MPVRefreshClock *clock = [[MPVRefreshClock alloc] init];
++            clock->p = p;
++            p->refresh_link = [[CADisplayLink displayLinkWithTarget:clock
++                                                           selector:@selector(tick:)] retain];
++            [clock release];
++            [p->refresh_link addToRunLoop:[NSRunLoop mainRunLoop]
++                                  forMode:NSRunLoopCommonModes];
++        }
+ #endif
+     });
+     [displayLayer release];
+@@ -5612,6 +5684,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     p->next_pts = pts;
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
+     if (p->presentation_host) {
++        p->next_present_host_ns = avf_host_refresh_stamp_ns(
++            p->next_present_host_ns, atomic_load(&p->refresh_vsync_ns),
++            atomic_load(&p->refresh_period_ns));
+         // Queue slack lets a frame be stamped that much further ahead.
+         p->next_present_host_ns = avf_host_present_ns(
+             p->last_host_present_ns, p->next_present_host_ns,
+@@ -5740,6 +5815,17 @@ static void uninit(struct vo *vo)
+         });
+     }
+ #endif
++#if TARGET_OS_TV
++    if (p->refresh_link) {
++        // Invalidated on the main thread, so no tick is left to touch p.
++        CADisplayLink *link = p->refresh_link;
++        p->refresh_link = nil;
++        dispatch_main_sync_safe(^{
++            [link invalidate];
++        });
++        [link release];
++    }
++#endif
+ 
+     if (p->layer_geometry_observer) {
+         MPVLayerGeometryObserver *observer = p->layer_geometry_observer;
