@@ -119,6 +119,9 @@ jobs:
       - name: Test AVFoundation media-time stamp rule
         run: ./scripts/test_avf_media_stamp.sh
 
+      - name: Test AVFoundation queue lead
+        run: ./scripts/test_avf_queue_lead.sh
+
       - name: Test AVFoundation user shader output size
         run: ./scripts/test_avf_shader_target.sh
 

@@ -1,0 +1,202 @@
+vo_avfoundation: queue tvOS frames four refreshes ahead
+
+On tvOS a layer shows a sample on the refresh its stamp asks for only when
+it has the sample about three refreshes before that refresh, and a refresh
+later otherwise. The video layer's limit and the OSD layer's differ: a
+frame that reached them between 2.9 and 3.3 refreshes ahead showed its
+subtitles a refresh before or after its picture. At 24 Hz queue-lead-ms's
+128 ms is 3.1 refreshes, and frames reached the layers 2.8 to 3.9
+refreshes ahead, depending on where mpv's target for them fell in the
+refresh, which is set anew at every pause and seek: whether playback
+desynced, and which way, looked random, and a pause or seek changed it
+(plezy#3073).
+
+On tvOS a display link now follows the display's refresh, and the queue
+lead is at least four refreshes: 167 ms at 23.976 Hz, 160 ms at 25 Hz,
+133 ms at 30 Hz. At 50 Hz and up queue-lead-ms (128 ms) is more and
+stays, and so does the time a pause takes to show.
+
+Apple TV 4K at 2160p 23.976 Hz, Plezy's options, the mode switch made
+after the first frame as Plezy makes it; a 23.976 fps clip whose frames
+and per-frame ASS events carry the same code in both halves of the
+picture, captured over HDMI, a pause or a seek every 3 s. Stretches of
+playback by the median time from enqueue to the refresh after the stamp:
+below 2.9 refreshes 2 stretches, no frame mismatched; 2.9-3.1 refreshes
+50 stretches, 15 of them mismatched, 363 of 3237 frames, some throughout
+(66 of 67, the subtitles a refresh late); 3.2-3.9 refreshes 100
+stretches, 2 frames. With stamps forced to other places in the refresh
+the mismatches followed the same band. With a 170 ms lead: 40 stretches
+4.0-4.8 refreshes ahead, no frame mismatched; with this patch: 77
+stretches 3.8-4.7 refreshes ahead, none of 4429 frames mismatched. Left
+as before: a frame or two around a seek, an unpause or a pause.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 6164953..9c8d6fa 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -593,6 +593,14 @@ struct priv {
+     int64_t next_present_host_ns;
+     // Latest host stamp given to a video frame; see avf_host_present_ns().
+     int64_t last_host_present_ns;
++    // The queue lead in effect; see update_queue_lead().
++    int64_t queue_lead_ns;
++    // The display's refresh period from refresh_link (tvOS); 0 until its
++    // first vsync, and elsewhere. Written on the main thread.
++    _Atomic int64_t refresh_period_ns;
++#if TARGET_OS_TV
++    CADisplayLink *refresh_link;
++#endif
+     int64_t next_media_pts_ns;
+     // Media mode: what is added to a frame's media timestamp to stamp it, and
+     // the latest stamp given to a video frame; see avf_media_stamp_offset().
+@@ -892,6 +900,22 @@ static const struct m_sub_options avfoundation_conf;
+ }
+ @end
+ 
++#if TARGET_OS_TV
++// Keeps priv's refresh period on the display's, on the main thread.
++@interface MPVRefreshClock : NSObject {
++@public
++    struct priv *p;
++}
++@end
++
++@implementation MPVRefreshClock
++- (void)tick:(CADisplayLink *)link
++{
++    atomic_store(&p->refresh_period_ns, (int64_t)(link.duration * 1e9));
++}
++@end
++#endif
++
+ static bool should_composite_into_video(struct priv *p)
+ {
+     return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
+@@ -1097,6 +1121,42 @@ static void reset_media_timing(struct priv *p)
+ // within microseconds; only CoreMedia clamping or stopping it crosses this.
+ #define AVF_HOST_TIMEBASE_TOLERANCE_NS MP_TIME_MS_TO_NS(5)
+ 
++// --- avf queue lead (host-testable; keep freestanding) ---
++// How far ahead of their frame's time samples go to the layers. On tvOS a
++// layer shows a sample on the refresh its stamp asks for only when it has
++// the sample about three refreshes before that refresh, and a refresh later
++// otherwise. The video layer's limit and the OSD layer's differ, between 2.9
++// and 3.3 refreshes, and a frame enqueued in between showed its subtitles a
++// refresh before or after its picture (plezy#3073). At 24 Hz queue-lead-ms's
++// 128 ms is 3.1 refreshes, frames reached the layers 2.8 to 3.9 refreshes
++// ahead depending on where their stamps fell in the refresh, and that was
++// set anew at every pause and seek. The lead is at least
++// AVF_QUEUE_LEAD_REFRESHES refreshes, past both limits with a flip some
++// milliseconds late; a period of 0 (refresh unknown) keeps option_ns.
++#define AVF_QUEUE_LEAD_REFRESHES 4
++static int64_t avf_queue_lead_ns(int64_t option_ns, int64_t period_ns)
++{
++    int64_t refreshes_ns = AVF_QUEUE_LEAD_REFRESHES * period_ns;
++    return refreshes_ns > option_ns ? refreshes_ns : option_ns;
++}
++// --- end avf queue lead ---
++
++// Apply the queue lead for queue-lead-ms and the display's refresh, which a
++// display mode switch changes during playback. The display link's period
++// wobbles by nanoseconds from one vsync to the next, a mode switch moves it
++// by milliseconds, and queue-lead-ms moves in milliseconds.
++static void update_queue_lead(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    int64_t lead_ns = avf_queue_lead_ns(MP_TIME_MS_TO_NS(p->opts->queue_lead_ms),
++                                        atomic_load(&p->refresh_period_ns));
++    if (llabs(lead_ns - p->queue_lead_ns) < MP_TIME_MS_TO_NS(1))
++        return;
++    p->queue_lead_ns = lead_ns;
++    vo_set_queue_params(vo, lead_ns, 1);
++    MP_VERBOSE(vo, "Queue lead %.1f ms\n", lead_ns / 1e6);
++}
++
+ // --- avf host timebase drift (host-testable; keep freestanding) ---
+ // Whether a host-mode timebase has left mp_time_ns(). before_ns and after_ns
+ // are mp_time_ns() read either side of the timebase read: a timebase still on
+@@ -1791,7 +1851,7 @@ static void update_avfoundation_options(struct vo *vo)
+         return;
+ 
+     if (old_queue_lead_ms != p->opts->queue_lead_ms)
+-        vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++        update_queue_lead(vo);
+     if (old_queue_slack_ms != p->opts->queue_slack_ms)
+         vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+ 
+@@ -4470,7 +4530,7 @@ static void ahead_present(struct vo *vo)
+         bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
+                       s->served_seq + 1 < p->ahead_req.seq;
+         int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
+-            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), p->ahead_req.timed,
++            p->queue_lead_ns, p->ahead_req.timed,
+             composite, behind);
+         if (behind)
+             p->ahead_perf.behind++;
+@@ -4985,6 +5045,7 @@ static int preinit(struct vo *vo)
+     atomic_init(&p->pending_layer_geometry_sync, false);
+     atomic_init(&p->layer_geometry_dirty, false);
+     atomic_init(&p->shader_layer_stale, false);
++    atomic_init(&p->refresh_period_ns, 0);
+ 
+     // Everything the main thread has to do for a new VO, in one trip to it:
+     // each trip waits for whatever the main thread is in the middle of, and
+@@ -5047,13 +5108,22 @@ static int preinit(struct vo *vo)
+                 vo_wakeup(vo);
+             }
+         }] retain];
++#endif
++#if TARGET_OS_TV
++        MPVRefreshClock *clock = [[MPVRefreshClock alloc] init];
++        clock->p = p;
++        p->refresh_link = [[CADisplayLink displayLinkWithTarget:clock
++                                                       selector:@selector(tick:)] retain];
++        [clock release];
++        [p->refresh_link addToRunLoop:[NSRunLoop mainRunLoop]
++                              forMode:NSRunLoopCommonModes];
+ #endif
+     });
+     [displayLayer release];
+     p->layer_geometry_observer = observer;
+     set_layer_geometry(vo, width, height, gravity);
+ 
+-    vo_set_queue_params(vo, MP_TIME_MS_TO_NS(p->opts->queue_lead_ms), 1);
++    update_queue_lead(vo);
+     vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+     p->ready_queue = dispatch_queue_create("avfoundation ready",
+         dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+@@ -5592,6 +5662,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     struct priv *p = vo->priv;
+ 
+     mp_image_unrefp(&p->next_image);
++    update_queue_lead(vo);
+ 
+     if (!frame->current || (frame->repeat && !frame->redraw)) {
+         p->next_pts = MP_NOPTS_VALUE;
+@@ -5615,7 +5686,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         // Queue slack lets a frame be stamped that much further ahead.
+         p->next_present_host_ns = avf_host_present_ns(
+             p->last_host_present_ns, p->next_present_host_ns,
+-            MP_TIME_MS_TO_NS(p->opts->queue_lead_ms + p->opts->queue_slack_ms) +
++            p->queue_lead_ns + MP_TIME_MS_TO_NS(p->opts->queue_slack_ms) +
+             AVF_HOST_PRESENT_SLACK_NS);
+         p->last_host_present_ns = p->next_present_host_ns;
+     }
+@@ -5740,6 +5811,17 @@ static void uninit(struct vo *vo)
+         });
+     }
+ #endif
++#if TARGET_OS_TV
++    if (p->refresh_link) {
++        // Invalidated on the main thread, so no tick is left to touch p.
++        CADisplayLink *link = p->refresh_link;
++        p->refresh_link = nil;
++        dispatch_main_sync_safe(^{
++            [link invalidate];
++        });
++        [link release];
++    }
++#endif
+ 
+     if (p->layer_geometry_observer) {
+         MPVLayerGeometryObserver *observer = p->layer_geometry_observer;

@@ -212,7 +212,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_ao_probe_refusal.sh` | the compressed-audio loader refuses reads past the write head | main |
 | `test_ao_spatial.sh`, `test_spatial_*.sh` | spatial audio; see [docs/apple.md](docs/apple.md#its-tests) | PR, main |
 | `test_avf_dovi_profile5_rpu.sh` | which frames vo_avfoundation uploads with their Dolby Vision RPU | main |
-| `test_avf_host_present.sh` | host-mode frame stamps after a seek, when a reset re-seeds the timebase, and where in a refresh interval a tvOS stamp sits so the video and OSD layers show it on the same refresh (patch 0054) | main |
+| `test_avf_host_present.sh` | host-mode frame stamps after a seek, and when a reset re-seeds the timebase | main |
 | `test_avf_media_stamp.sh` | media-time frame stamps after a reset: no frame of the file before shows after the next file's (patch 0050) | main |
 | `test_avf_osd_ahead.sh` | how long flip_page may hold video for its subtitles | main |
 | `test_avf_osd_blend.sh` | the OSD's NEON blends, libass masks and premultiplied BGRA, match their scalar references bit for bit (patch 0043; aarch64 host) | main |
@@ -220,6 +220,7 @@ header says what it covers. "PR" is `ci.yml`, "main" is `publish.yml`.
 | `test_avf_osd_damage.sh` | an overlay buffer drawn by tile, whatever it held, ends up exactly as a full clear and blend of the frame (patch 0048) | main |
 | `test_avf_osd_layer_geometry.sh` | the inline OSD layer's placement (macOS) | main |
 | `test_avf_pip_frame_space_osd.sh` | frame-space OSD geometry for PiP | main |
+| `test_avf_queue_lead.sh` | how far ahead vo_avfoundation enqueues frames: on tvOS past where the video and OSD layers disagree on a frame's refresh, unchanged at 50 Hz and up (patch 0054) | main |
 | `test_avf_shader_target.sh` | the size vo_avfoundation renders `--glsl-shaders` at, and the part of the frame that fills it, per display-layer gravity | main |
 | `test_avf_timebase_servo.sh` | the timebase servo and rate decisions | main |
 | `test_audio_passthrough_fallback.sh` | the player's AO failure handling and PCM fallback (patch 0040) | PR |
