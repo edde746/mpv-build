@@ -205,29 +205,29 @@
       "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-linux",
       "libraries": {
         "libmpv-linux": {
-          "key": "9c5c433e5e91",
+          "key": "a1d0b397f5c4",
           "prebuilt": {
             "aarch64": {
-              "asset": "libmpv-linux-9c5c433e5e91-aarch64.tar.zst",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a",
-              "checksum": "8103644c84cc490d221979f61e868c691a279de25a5bb59a65c9877b2c66e68b"
+              "asset": "libmpv-linux-a1d0b397f5c4-aarch64.tar.zst",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-275cbf0bc20a",
+              "checksum": "486504d326b7d53717e1d3147857c6696c19be315847640af8ed1bd73a38d9f1"
             },
             "x86_64": {
-              "asset": "libmpv-linux-9c5c433e5e91-x86_64.tar.zst",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a",
-              "checksum": "75e4c4480bdf2ed38b1398f8ec8c38ff68f29244e5a5b37229a2929587ea6bf7"
+              "asset": "libmpv-linux-a1d0b397f5c4-x86_64.tar.zst",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-275cbf0bc20a",
+              "checksum": "8d89b2cf900fb6ba607bbdf7160f03a4324edd79139549365ab085bbd142642f"
             }
           },
           "symbols": {
             "aarch64": {
-              "asset": "libmpv-linux-9c5c433e5e91-aarch64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a",
-              "checksum": "f8f50fd7bdc32d0c0bef69b1024c4c2bf194b14cac74497612e13f2aa7c3ff70"
+              "asset": "libmpv-linux-a1d0b397f5c4-aarch64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-275cbf0bc20a",
+              "checksum": "2cb6dfb89e60f842a2d43f722c550dbcb28b34a5e762a1cb1fd49e0c7b06d077"
             },
             "x86_64": {
-              "asset": "libmpv-linux-9c5c433e5e91-x86_64-symbols.zip",
-              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-124d02ab943a",
-              "checksum": "06bd584b0fb5a9839a4bd2ffbfe1186f76ece030e0c76136c1c3eddd1de7b36b"
+              "asset": "libmpv-linux-a1d0b397f5c4-x86_64-symbols.zip",
+              "assetBase": "https://github.com/edde746/mpv-build/releases/download/binaries-275cbf0bc20a",
+              "checksum": "5c68293445b005a6fe0ccc283349d569073ebbfdc5351ae0bc1051f6e3c79778"
             }
           }
         }
