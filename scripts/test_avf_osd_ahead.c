@@ -27,32 +27,51 @@ int main(void)
 
     // A frame drawn a full queue lead early may wait until half of it is
     // left, and no longer: the video keeps 64 ms to be enqueued in.
-    int64_t until = avf_osd_wait_until(now, now + lead, lead, true, false, false);
+    int64_t until = avf_osd_wait_until(now, now + lead, lead, true, false, false, false);
     check(until == now + 64 * MS, "a timed frame waits until half its lead is left");
 
     // Once half the lead is gone the video is not held at all.
-    check(avf_osd_wait_until(now, now + 60 * MS, lead, true, false, false) == 0,
+    check(avf_osd_wait_until(now, now + 60 * MS, lead, true, false, false, false) == 0,
           "a frame already inside half its lead does not wait");
-    check(avf_osd_wait_until(now, now - 5 * MS, lead, true, false, false) == 0,
+    check(avf_osd_wait_until(now, now - 5 * MS, lead, true, false, false, false) == 0,
           "a late frame does not wait");
 
     // With the render thread still on an older frame, waiting buys only part
     // of that render: the frame shows what is ready instead.
-    check(avf_osd_wait_until(now, now + lead, lead, true, false, true) == 0,
+    check(avf_osd_wait_until(now, now + lead, lead, true, false, true, false) == 0,
           "a frame does not wait while the render thread is behind");
 
     // A shorter queue lead shrinks the wait with it.
-    check(avf_osd_wait_until(now, now + 50 * MS, 50 * MS, true, false, false) ==
+    check(avf_osd_wait_until(now, now + 50 * MS, 50 * MS, true, false, false, false) ==
           now + 25 * MS, "the wait scales with the configured queue lead");
 
+    // The first frames after a seek or a resume come faster than the render
+    // thread renders: each waits a bounded time for its own subtitles, behind
+    // or not and with its deadline gone (its stamp moves on afterwards).
+    int64_t restart = avf_osd_wait_until(now, now + 10 * MS, lead, true, false, true, true);
+    check(restart > now && restart <= now + 50 * MS,
+          "a restart frame waits a bounded time for its subtitles, behind or not");
+    // A frame after a resume, a lead ahead, keeps its ordinary deadline: the
+    // first render after a pause is the slow one. While the render thread is
+    // behind, a frame a lead ahead still waits only the bounded time.
+    check(avf_osd_wait_until(now, now + lead, lead, true, false, false, true) >=
+              avf_osd_wait_until(now, now + lead, lead, true, false, false, false),
+          "a restart frame waits at least as long as its deadline allows");
+    int64_t behind_restart = avf_osd_wait_until(now, now + lead, lead, true, false, true, true);
+    check(behind_restart > now && behind_restart <= now + 50 * MS,
+          "a restart frame behind the render thread waits only a bounded time");
+    check(avf_osd_wait_until(now, now, lead, false, false, false, true) ==
+              avf_osd_wait_until(now, now, lead, false, false, false, false),
+          "an untimed frame waits as before in the restart window");
+
     // Untimed frames (redraws) have no deadline, only a bound.
-    int64_t redraw = avf_osd_wait_until(now, now, lead, false, false, false);
+    int64_t redraw = avf_osd_wait_until(now, now, lead, false, false, false, false);
     check(redraw > now && redraw <= now + 1000 * MS,
           "an untimed frame waits a bounded time");
 
     // The composite modes draw the subtitle into the video sample and keep
     // the synchronous path's ordering, behind or not.
-    int64_t composite = avf_osd_wait_until(now, now + lead, lead, true, true, true);
+    int64_t composite = avf_osd_wait_until(now, now + lead, lead, true, true, true, false);
     check(composite > now + lead, "a composite frame waits for its subtitles");
 
     // --avfoundation-osd-queue-lead-ms: a change waits as a bitmap list and

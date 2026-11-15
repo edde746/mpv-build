@@ -14,7 +14,8 @@ desynced, and which way, looked random, and a pause or seek changed it
 On tvOS a display link now follows the display's refresh, and the queue
 lead is at least four refreshes: 167 ms at 23.976 Hz, 160 ms at 25 Hz,
 133 ms at 30 Hz. At 50 Hz and up queue-lead-ms (128 ms) is more and
-stays, and so does the time a pause takes to show.
+stays, and so does the time a pause takes to show. A link period outside
+4-50 ms counts as no refresh seen, which leaves queue-lead-ms.
 
 Apple TV 4K at 2160p 23.976 Hz, Plezy's options, the mode switch made
 after the first frame as Plezy makes it; a 23.976 fps clip whose frames
@@ -35,7 +36,7 @@ the 74 in the band, not counted above, stamped 74-85% of the way
 through it; patch 0055).
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 6164953..9c8d6fa 100644
+index 6164953..e340cf9 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -593,6 +593,14 @@ struct priv {
@@ -53,7 +54,7 @@ index 6164953..9c8d6fa 100644
      int64_t next_media_pts_ns;
      // Media mode: what is added to a frame's media timestamp to stamp it, and
      // the latest stamp given to a video frame; see avf_media_stamp_offset().
-@@ -892,6 +900,22 @@ static const struct m_sub_options avfoundation_conf;
+@@ -892,6 +900,27 @@ static const struct m_sub_options avfoundation_conf;
  }
  @end
  
@@ -68,7 +69,12 @@ index 6164953..9c8d6fa 100644
 +@implementation MPVRefreshClock
 +- (void)tick:(CADisplayLink *)link
 +{
-+    atomic_store(&p->refresh_period_ns, (int64_t)(link.duration * 1e9));
++    // A period outside 4-50 ms (250 to 20 Hz) is no refresh a display runs
++    // at; it counts as unknown, as before the first vsync.
++    double period = link.duration;
++    if (!isfinite(period) || period < 0.004 || period > 0.05)
++        period = 0;
++    atomic_store(&p->refresh_period_ns, (int64_t)(period * 1e9));
 +}
 +@end
 +#endif
@@ -76,7 +82,7 @@ index 6164953..9c8d6fa 100644
  static bool should_composite_into_video(struct priv *p)
  {
      return p->opts && (p->opts->composite_osd || p->opts->pip_composite_osd);
-@@ -1097,6 +1121,42 @@ static void reset_media_timing(struct priv *p)
+@@ -1097,6 +1126,42 @@ static void reset_media_timing(struct priv *p)
  // within microseconds; only CoreMedia clamping or stopping it crosses this.
  #define AVF_HOST_TIMEBASE_TOLERANCE_NS MP_TIME_MS_TO_NS(5)
  
@@ -119,7 +125,7 @@ index 6164953..9c8d6fa 100644
  // --- avf host timebase drift (host-testable; keep freestanding) ---
  // Whether a host-mode timebase has left mp_time_ns(). before_ns and after_ns
  // are mp_time_ns() read either side of the timebase read: a timebase still on
-@@ -1791,7 +1851,7 @@ static void update_avfoundation_options(struct vo *vo)
+@@ -1791,7 +1856,7 @@ static void update_avfoundation_options(struct vo *vo)
          return;
  
      if (old_queue_lead_ms != p->opts->queue_lead_ms)
@@ -128,7 +134,7 @@ index 6164953..9c8d6fa 100644
      if (old_queue_slack_ms != p->opts->queue_slack_ms)
          vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
  
-@@ -4470,7 +4530,7 @@ static void ahead_present(struct vo *vo)
+@@ -4470,7 +4535,7 @@ static void ahead_present(struct vo *vo)
          bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
                        s->served_seq + 1 < p->ahead_req.seq;
          int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
@@ -137,7 +143,7 @@ index 6164953..9c8d6fa 100644
              composite, behind);
          if (behind)
              p->ahead_perf.behind++;
-@@ -4985,6 +5045,7 @@ static int preinit(struct vo *vo)
+@@ -4985,6 +5050,7 @@ static int preinit(struct vo *vo)
      atomic_init(&p->pending_layer_geometry_sync, false);
      atomic_init(&p->layer_geometry_dirty, false);
      atomic_init(&p->shader_layer_stale, false);
@@ -145,7 +151,7 @@ index 6164953..9c8d6fa 100644
  
      // Everything the main thread has to do for a new VO, in one trip to it:
      // each trip waits for whatever the main thread is in the middle of, and
-@@ -5047,13 +5108,22 @@ static int preinit(struct vo *vo)
+@@ -5047,13 +5113,22 @@ static int preinit(struct vo *vo)
                  vo_wakeup(vo);
              }
          }] retain];
@@ -169,7 +175,7 @@ index 6164953..9c8d6fa 100644
      vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
      p->ready_queue = dispatch_queue_create("avfoundation ready",
          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
-@@ -5592,6 +5662,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5592,6 +5667,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      struct priv *p = vo->priv;
  
      mp_image_unrefp(&p->next_image);
@@ -177,7 +183,7 @@ index 6164953..9c8d6fa 100644
  
      if (!frame->current || (frame->repeat && !frame->redraw)) {
          p->next_pts = MP_NOPTS_VALUE;
-@@ -5615,7 +5686,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5615,7 +5691,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
          // Queue slack lets a frame be stamped that much further ahead.
          p->next_present_host_ns = avf_host_present_ns(
              p->last_host_present_ns, p->next_present_host_ns,
@@ -186,7 +192,7 @@ index 6164953..9c8d6fa 100644
              AVF_HOST_PRESENT_SLACK_NS);
          p->last_host_present_ns = p->next_present_host_ns;
      }
-@@ -5740,6 +5811,17 @@ static void uninit(struct vo *vo)
+@@ -5740,6 +5816,17 @@ static void uninit(struct vo *vo)
          });
      }
  #endif

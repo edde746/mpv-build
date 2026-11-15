@@ -65,3 +65,7 @@
 # video and OSD layers can settle a refresh apart after a seek
 # (test_avf_host_present.sh).
 0055-avfoundation-stamp-tvos-host-frames-30-percent-into-a-refresh.patch
+# On tvOS the first frames after a seek or a resume wait for their own
+# subtitles and reach the layers at least 3.5 refreshes ahead
+# (test_avf_osd_ahead.sh, test_avf_host_present.sh).
+0056-avfoundation-give-tvos-restart-frames-their-subtitles-and-lead.patch

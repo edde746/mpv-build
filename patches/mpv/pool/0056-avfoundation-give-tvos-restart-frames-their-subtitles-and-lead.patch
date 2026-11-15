@@ -1,0 +1,334 @@
+vo_avfoundation: give tvOS frames after a seek or resume their subtitles and lead
+
+After a seek mpv flips the first frames back to back as they decode, and
+the render thread falls behind them. The third and fourth frames after a
+seek then went to the layers without their subtitles: the third's wait
+deadline (half its queue lead) had passed, and the fourth did not wait
+because the render thread was still on an older frame. Their picture
+showed with the subtitle of two frames before, for about 170 ms
+(plezy#3073). At a resume the first frame reached the layers 2.9-3.0
+refreshes before its refresh, where the video layer shows it a refresh
+late and the OSD layer does not: its subtitle showed a refresh before its
+picture.
+
+On tvOS, each of the first eight timed frames after the start, a seek or
+a resume waits for its own subtitles whether or not the render thread is
+behind, as long as its deadline allows and at least 25 ms, until one such
+wait runs out. A frame whose refresh is then less than 3.5 refreshes away
+is stamped whole refreshes later until it is not, before its stamp is
+first used: when a deferred subtitle change is filed with it
+(osd-queue-lead-ms), or else right before its samples are made. The
+frames after it follow it as any frame does (avf_host_present_ns), so a
+moved frame can share a refresh with the next one, which then shows in
+its place. Steady playback is not moved. Where no refresh is known
+(elsewhere than tvOS) nothing changes.
+
+vo.c told the driver of a pause or a resume after the frame it drew in
+the same iteration, so the first frame after an unpause could be drawn
+before the resume, as if still paused. The driver is now told under the
+lock that picks the frame, before drawing it. In media mode (iOS, macOS)
+the first frame after a resume now always anchors the timebase at its own
+time, as it already did when the resume came first. The other drivers
+only ask for a redraw at a pause, which they now get an iteration sooner.
+
+Apple TV 4K (3rd generation), Plezy's options, the mode switch made after
+the first frame; clips whose frames and per-frame ASS events carry the
+same code, read from an HDMI capture; 24 Hz unless said. Before this patch
+(0054 and 0055), and with it:
+
+- After a seek, a subtitle other than the picture's on 2 or more
+  captures: 12 of 136 seeks before, none of 136 with it; the third and
+  fourth frames both without their subtitles: 18 before, none.
+- After an unpause, any capture with a subtitle other than the picture's:
+  2 of 39 before, none of 190; at playback start 7 of 9, none of 15.
+- Steady playback: none of 8964 captures mismatched before, none of 13243.
+- With 120 blurred signs on screen (renders 16 ms, p99 35-58 ms): after a
+  seek 50 of 58 before, none of 96; after an unpause 4 of 45, none of 70.
+- 25p at 50 Hz (40 seeks), 23.976 and 29.97 at 60 Hz (40 seeks), HDR10
+  (38 seeks, 20 unpauses) and Dolby Vision 8.1 shown as HDR10 (20 seeks):
+  no mismatched steady capture, seek or unpause; 80 frame steps, none.
+- Of 4904 frames after a seek or a resume, 3 (with the 120 signs) reached
+  the layers less than 3.5 refreshes before their refresh, the least 3.41.
+  At a resume about one frame was moved, mostly by one refresh.
+
+Left as they were: the first picture after a seek can show for a refresh
+before its subtitle (53 of 136 seeks; 89 before), and with heavy
+typesetting the first frames of a file can go without their subtitles
+while the first render runs.
+
+diff --git a/video/out/vo.c b/video/out/vo.c
+index b109ee1..d9a9641 100644
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -142,6 +142,7 @@ struct vo_internal {
+     bool want_redraw;               // redraw request from VO to player
+     bool send_reset;                // send VOCTRL_RESET
+     bool paused;
++    bool driver_paused;             // what the driver was told last (VO thread)
+     bool visible;
+     bool wakeup_on_done;
+     int queued_events;              // event mask for the user
+@@ -935,6 +936,17 @@ static bool render_frame(struct vo *vo)
+ 
+     mp_mutex_lock(&in->lock);
+ 
++    // A pause or a resume reaches the driver before the frame picked under
++    // the same lock. The first frame after an unpause can be queued before
++    // the VO thread wakes, and was drawn ahead of the resume, as if still
++    // paused (vo_avfoundation's restart window, plezy#3073).
++    while (in->driver_paused != in->paused) {
++        in->driver_paused = in->paused;
++        mp_mutex_unlock(&in->lock);
++        vo->driver->control(vo, in->driver_paused ? VOCTRL_PAUSE : VOCTRL_RESUME, NULL);
++        mp_mutex_lock(&in->lock);
++    }
++
+     if (in->frame_queued) {
+         talloc_free(in->current_frame);
+         in->current_frame = in->frame_queued;
+@@ -1134,7 +1146,6 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+ {
+     struct vo *vo = ptr;
+     struct vo_internal *in = vo->in;
+-    bool vo_paused = false;
+ 
+     mp_thread_set_name("vo");
+     mp_av_log_set_thread(vo->global);
+@@ -1190,14 +1201,10 @@ static MP_THREAD_VOID vo_thread(void *ptr)
+         bool redraw = in->request_redraw;
+         bool send_reset = in->send_reset;
+         in->send_reset = false;
+-        bool send_pause = in->paused != vo_paused;
+-        vo_paused = in->paused;
+         mp_mutex_unlock(&in->lock);
+ 
+         if (send_reset)
+             vo->driver->control(vo, VOCTRL_RESET, NULL);
+-        if (send_pause)
+-            vo->driver->control(vo, vo_paused ? VOCTRL_PAUSE : VOCTRL_RESUME, NULL);
+         if (wait_until > now && redraw) {
+             // Allow manual redraws at most at slightly over display fps.
+             int64_t max_interval = (MP_TIME_S_TO_NS(1) / MPMAX(in->display_fps, 10)) / 1.1;
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 74c57f7..87d2aa4 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -238,25 +238,39 @@ static void avf_damage_apply(const uint64_t *have, const uint64_t *prev,
+ // A timed frame keeps at least half its queue lead for the video: a slow
+ // render costs the subtitle a frame, never the video. While the render
+ // thread is still busy with an older frame, waiting would only buy part of
+-// that render, so the frame does not wait and shows what is ready. An
++// that render, so the frame does not wait and shows what is ready. After a
++// seek or a resume mpv's first frames are due at once and come faster than
++// the render thread: each of the first AVF_RESTART_FRAMES waits for its own
++// subtitles at least AVF_OSD_RESTART_WAIT_NS, behind or not, and as long as
++// its deadline allows while the render thread is not behind, until one such
++// wait runs out; avf_host_restart_stamp_ns() then gives its video the
++// refreshes back. Without that the third and fourth frames after a seek went
++// out without theirs, and the picture that showed came with a subtitle two
++// frames old for about 170 ms (plezy#3073); the first render after a pause,
++// slower than the others, is what the deadline covers at a resume. An
+ // untimed frame (a redraw, or any frame while paused) has no deadline to
+ // keep and waits a bounded time; a result later than that is shown on its
+ // own while paused (ahead_present_late). The composite modes draw the subtitle into the
+ // video sample itself, so they wait as the synchronous path did.
+ #define AVF_OSD_UNTIMED_WAIT_NS INT64_C(250000000)
+ #define AVF_OSD_COMPOSITE_WAIT_NS INT64_C(1000000000)
++#define AVF_OSD_RESTART_WAIT_NS INT64_C(25000000)
+ 
+ static int64_t avf_osd_wait_until(int64_t now, int64_t present_ns,
+                                   int64_t queue_lead_ns, bool timed,
+-                                  bool composite, bool behind)
++                                  bool composite, bool behind, bool restart)
+ {
+     if (composite)
+         return now + AVF_OSD_COMPOSITE_WAIT_NS;
++    int64_t until = present_ns - queue_lead_ns / 2;
++    if (timed && restart) {
++        int64_t least = now + AVF_OSD_RESTART_WAIT_NS;
++        return !behind && until > least ? until : least;
++    }
+     if (behind)
+         return 0;
+     if (!timed)
+         return now + AVF_OSD_UNTIMED_WAIT_NS;
+-    int64_t until = present_ns - queue_lead_ns / 2;
+     return until > now ? until : 0;
+ }
+ 
+@@ -595,6 +609,14 @@ struct priv {
+     int64_t last_host_present_ns;
+     // The queue lead in effect; see update_queue_lead().
+     int64_t queue_lead_ns;
++    // Timed frames left in the restart window after the start, a seek or a
++    // resume, whether the frame being drawn is one, and whether restart
++    // frames still wait for their subtitles; see AVF_RESTART_FRAMES.
++    int restart_frames;
++    bool next_restart;
++    bool restart_wait;
++    // Between VOCTRL_PAUSE and VOCTRL_RESUME.
++    bool paused;
+     // The display's refresh from refresh_link (tvOS): its latest vsync on
+     // mp_time_ns() and its period, both 0 until its first vsync, and
+     // elsewhere. Written on the main thread.
+@@ -1257,6 +1279,34 @@ static int64_t avf_host_refresh_stamp_ns(int64_t target_ns, int64_t vsync_ns,
+         n++;
+     return base_ns + n * period_ns;
+ }
++
++// The first frames after the start, a seek or a resume are due at once: vo.c
++// flips them as soon as they are decoded, short of the queue lead. A sample
++// that reaches the layers less than about three refreshes before the refresh
++// its stamp asks for (the first vsync at or after it) can show a refresh
++// late in the video layer and not in the OSD layer: at a resume the first
++// frame's subtitle showed a refresh before its picture (plezy#3073). For
++// the first AVF_RESTART_FRAMES timed frames from then, a stamp whose refresh
++// comes less than 3.5 refreshes after now moves on by whole refreshes until
++// it does not; the frames after it then follow it, by avf_host_present_ns().
++// Steady playback reaches the layers at least 3.6 refreshes ahead. A period
++// of 0 (no vsync seen) leaves the stamp as it is.
++#define AVF_RESTART_FRAMES 8
++
++static int64_t avf_host_restart_stamp_ns(int64_t stamp_ns, int64_t now_ns,
++                                         int64_t vsync_ns, int64_t period_ns)
++{
++    if (period_ns <= 0)
++        return stamp_ns;
++    int64_t rest_ns = (stamp_ns - vsync_ns) % period_ns;
++    if (rest_ns < 0)
++        rest_ns += period_ns;
++    int64_t refresh_ns = rest_ns ? stamp_ns + period_ns - rest_ns : stamp_ns;
++    int64_t min_ns = now_ns + period_ns * 7 / 2;
++    if (refresh_ns >= min_ns)
++        return stamp_ns;
++    return stamp_ns + (min_ns - refresh_ns + period_ns - 1) / period_ns * period_ns;
++}
+ // --- end avf host refresh stamp ---
+ 
+ // --- avf media stamp (host-testable; keep freestanding) ---
+@@ -4556,6 +4606,28 @@ static void ahead_file_frame(struct vo *vo, struct vo_frame *frame)
+     p->ahead_last_pts = pts;
+ }
+ 
++static void restart_window(struct priv *p)
++{
++    p->restart_frames = AVF_RESTART_FRAMES;
++    p->restart_wait = true;
++}
++
++// A restart frame, which may have waited for its subtitles, gets its
++// refreshes back (avf_host_restart_stamp_ns), once and as late as it can:
++// when its subtitle change is filed with its stamp, or else just before its
++// samples are made, after the subtitles are drawn.
++static void restart_stamp(struct priv *p)
++{
++    if (!p->next_restart)
++        return;
++    p->next_restart = false;
++    p->next_present_host_ns = avf_host_restart_stamp_ns(
++        p->next_present_host_ns, mp_time_ns(),
++        atomic_load(&p->refresh_vsync_ns),
++        atomic_load(&p->refresh_period_ns));
++    p->last_host_present_ns = p->next_present_host_ns;
++}
++
+ // Present what the render thread has for this frame, waiting only as long
+ // as avf_osd_wait_until allows. A result that arrives later is shown with a
+ // later frame; of several ready ones only the newest is drawn.
+@@ -4576,9 +4648,10 @@ static void ahead_present(struct vo *vo)
+         int64_t now = mp_time_ns();
+         bool behind = p->ahead_req.seq && s->served_epoch == p->ahead_req.epoch &&
+                       s->served_seq + 1 < p->ahead_req.seq;
++        bool restart_wait = p->next_restart && p->restart_wait;
+         int64_t until = avf_osd_wait_until(now, p->next_present_host_ns,
+             p->queue_lead_ns, p->ahead_req.timed,
+-            composite, behind);
++            composite, behind, restart_wait);
+         if (behind)
+             p->ahead_perf.behind++;
+         if (until > now) {
+@@ -4590,6 +4663,11 @@ static void ahead_present(struct vo *vo)
+             p->ahead_perf.wait_max_ns = MPMAX(p->ahead_perf.wait_max_ns, waited);
+             if (!served)
+                 p->ahead_perf.gave_up++;
++            // The render thread is slower than the restart: the rest of the
++            // window waits as any frame does, and still gets its refreshes
++            // back.
++            if (!served && restart_wait)
++                p->restart_wait = false;
+         }
+     }
+     int dropped;
+@@ -4609,6 +4687,7 @@ static void ahead_present(struct vo *vo)
+         p->ahead_perf.max_late = MPMAX(p->ahead_perf.max_late, late);
+     }
+     if (osd_changes_deferred(p)) {
++        restart_stamp(p);
+         file_osd_list(vo, &p->ahead_canvas, list);
+     } else {
+         apply_osd_list(vo, &p->ahead_canvas, list);
+@@ -5172,6 +5251,7 @@ static int preinit(struct vo *vo)
+     set_layer_geometry(vo, width, height, gravity);
+ 
+     update_queue_lead(vo);
++    restart_window(p);
+     vo_set_queue_slack(vo, MP_TIME_MS_TO_NS(p->opts->queue_slack_ms));
+     p->ready_queue = dispatch_queue_create("avfoundation ready",
+         dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+@@ -5615,6 +5695,7 @@ static void flip_page(struct vo *vo)
+         } else {
+             render_osd(vo, p->next_pts);
+         }
++        restart_stamp(p);
+ 
+         // Made before the OSD's samples, which take its colour
+         // (update_osd_color); still enqueued after them.
+@@ -5712,6 +5793,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     mp_image_unrefp(&p->next_image);
+     update_queue_lead(vo);
+ 
++    p->next_restart = false;
+     if (!frame->current || (frame->repeat && !frame->redraw)) {
+         p->next_pts = MP_NOPTS_VALUE;
+         p->next_present_host_ns = mp_time_ns();
+@@ -5729,6 +5811,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         pts = frame->current->pts;
+ 
+     p->next_pts = pts;
++    // Only timed frames count against the restart window, and only where the
++    // refresh is known for avf_host_restart_stamp_ns().
++    if (p->restart_frames > 0 && frame->pts > 0 && !frame->redraw &&
++        !p->paused && p->presentation_host &&
++        atomic_load(&p->refresh_period_ns) > 0)
++    {
++        p->next_restart = true;
++        p->restart_frames--;
++    }
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
+     if (p->presentation_host) {
+         p->next_present_host_ns = avf_host_refresh_stamp_ns(
+@@ -6016,6 +6107,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         // seeks; the OSD layer is still cleared so stale subtitles don't
+         // linger over the held frame.
+         p->ahead_last_pts = MP_NOPTS_VALUE;
++        restart_window(p);
+         osd_cadence_reset(&p->ahead_cadence);
+         clear_subtitle_cache(p);
+         p->not_ready_drop_count = 0;
+@@ -6043,6 +6135,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, true);
+         ahead_set_paused(p, true);
++        p->paused = true;
+         // No flip will come for the changes that wait.
+         present_pending_osd(vo, true);
+         return VO_TRUE;
+@@ -6050,6 +6143,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
+         if (!p->presentation_host)
+             set_media_timebase_paused(vo, false);
+         ahead_set_paused(p, false);
++        p->paused = false;
++        restart_window(p);
+         return VO_TRUE;
+     case VOCTRL_UPDATE_RENDER_OPTS:
+         update_shader_options(vo);

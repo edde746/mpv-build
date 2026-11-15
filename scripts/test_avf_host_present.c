@@ -11,6 +11,9 @@
 //   seek (plezy#3073), moves by at most half a refresh, keeps the frames'
 //   order, and content at the display's rate gets a refresh of its own for
 //   every frame.
+// - avf_host_restart_stamp_ns: a frame after a seek or a resume reaches the
+//   layers at least 3.5 refreshes before the refresh that shows it, moved on
+//   by whole refreshes and no further than that takes (plezy#3073).
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +33,13 @@ static void check(bool ok, const char *what)
         fprintf(stderr, "FAIL: %s\n", what);
         failures++;
     }
+}
+
+// The refresh that shows a stamp: the first vsync at or after it.
+static int64_t refresh_of(int64_t t, int64_t vsync, int64_t period)
+{
+    int64_t rest = ((t - vsync) % period + period) % period;
+    return rest ? t + period - rest : t;
 }
 
 int main(void)
@@ -147,6 +157,31 @@ int main(void)
 
     check(avf_host_refresh_stamp_ns(now + 5 * MS, 0, 0) == now + 5 * MS,
           "without a refresh seen the target is kept");
+
+    // Restart stamps: stamps 30% into a refresh, flipped from 8 refreshes
+    // before them to 2 after (late), every 1 ms.
+    bool later = true, whole = true, enough = true, no_further = true,
+         far_kept = true;
+    for (int64_t k = -2; k < 12; k++) {
+        int64_t stamp = vsync + k * period + phase;
+        for (int64_t flip = stamp - 8 * period; flip <= stamp + 2 * period; flip += MS) {
+            int64_t moved = avf_host_restart_stamp_ns(stamp, flip, vsync, period);
+            int64_t lead = refresh_of(moved, vsync, period) - flip;
+            later = later && moved >= stamp;
+            whole = whole && (moved - stamp) % period == 0;
+            enough = enough && lead * 2 >= 7 * period;
+            if (moved != stamp)
+                no_further = no_further && (lead - period) * 2 < 7 * period;
+            if ((refresh_of(stamp, vsync, period) - flip) * 2 >= 7 * period)
+                far_kept = far_kept && moved == stamp;
+        }
+    }
+    check(later && whole, "a restart stamp only moves later, by whole refreshes");
+    check(enough, "a restart frame's refresh is at least 3.5 refreshes after its flip");
+    check(no_further, "a restart stamp moves no further than that takes");
+    check(far_kept, "a restart stamp already that far ahead is kept");
+    check(avf_host_restart_stamp_ns(now + 5 * MS, now, 0, 0) == now + 5 * MS,
+          "without a refresh seen a restart stamp is kept");
 
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

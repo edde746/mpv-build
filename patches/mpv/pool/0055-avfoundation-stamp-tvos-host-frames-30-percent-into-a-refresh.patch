@@ -37,7 +37,7 @@ after a seek, where the subtitles can trail the burst of frames a seek
 starts with by up to two frames for about 170 ms.
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
-index 9c8d6fa..fc015a9 100644
+index e340cf9..74c57f7 100644
 --- a/video/out/vo_avfoundation.m
 +++ b/video/out/vo_avfoundation.m
 @@ -595,8 +595,10 @@ struct priv {
@@ -64,18 +64,26 @@ index 9c8d6fa..fc015a9 100644
  @interface MPVRefreshClock : NSObject {
  @public
      struct priv *p;
-@@ -911,7 +915,10 @@ static const struct m_sub_options avfoundation_conf;
- @implementation MPVRefreshClock
- - (void)tick:(CADisplayLink *)link
- {
+@@ -914,9 +918,16 @@ static const struct m_sub_options avfoundation_conf;
+     // A period outside 4-50 ms (250 to 20 Hz) is no refresh a display runs
+     // at; it counts as unknown, as before the first vsync.
+     double period = link.duration;
+-    if (!isfinite(period) || period < 0.004 || period > 0.05)
+-        period = 0;
++    if (!isfinite(link.timestamp) || !isfinite(period) || period < 0.004 ||
++        period > 0.05)
++    {
++        atomic_store(&p->refresh_period_ns, 0);
++        return;
++    }
 +    int64_t vsync_ns = mp_time_ns() +
 +        (int64_t)((link.timestamp - CACurrentMediaTime()) * 1e9);
-     atomic_store(&p->refresh_period_ns, (int64_t)(link.duration * 1e9));
+     atomic_store(&p->refresh_period_ns, (int64_t)(period * 1e9));
 +    atomic_store(&p->refresh_vsync_ns, vsync_ns);
  }
  @end
  #endif
-@@ -1212,6 +1219,37 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+@@ -1217,6 +1228,37 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
  }
  // --- end avf host present stamp ---
  
@@ -113,7 +121,7 @@ index 9c8d6fa..fc015a9 100644
  // --- avf media stamp (host-testable; keep freestanding) ---
  // Media stamps never go back either. On media time a frame's sample is
  // stamped with its timestamp, and a reset's flush leaves the samples
-@@ -5045,6 +5083,7 @@ static int preinit(struct vo *vo)
+@@ -5050,6 +5092,7 @@ static int preinit(struct vo *vo)
      atomic_init(&p->pending_layer_geometry_sync, false);
      atomic_init(&p->layer_geometry_dirty, false);
      atomic_init(&p->shader_layer_stale, false);
@@ -121,7 +129,7 @@ index 9c8d6fa..fc015a9 100644
      atomic_init(&p->refresh_period_ns, 0);
  
      // Everything the main thread has to do for a new VO, in one trip to it:
-@@ -5683,6 +5722,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+@@ -5688,6 +5731,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
      p->next_pts = pts;
      p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
      if (p->presentation_host) {
