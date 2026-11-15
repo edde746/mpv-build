@@ -396,6 +396,14 @@ assert_argument "$ffmpeg_configure" "--enable-libdav1d" "ffmpeg's configure"
 assert_argument "$ffmpeg_configure" "--enable-ffnvcodec" "ffmpeg's configure"
 assert_argument "$ffmpeg_configure" "--enable-nvdec" "ffmpeg's configure"
 
+# scale_vaapi is how mpv converts a VAAPI frame its interop cannot map (HEVC
+# 4:4:4 10-bit decodes to xv30). Every other source still plays without it, so
+# only this catches a filter list trimmed back. The list is one argument, which
+# assert_argument cannot look inside.
+tail -n +3 "$ffmpeg_configure" | sed -n 's/^--enable-filter=//p' | tr ',' '\n' |
+  grep -Fxq scale_vaapi ||
+  fail "ffmpeg's configure does not enable the scale_vaapi filter"
+
 # FFmpeg's DWARF is what names its frames in libmpv crash reports, and losing
 # it fails as quietly as a lost hwdec: the build still plays, the symbols zip
 # just cannot place a crash inside FFmpeg. configure honours the last debug

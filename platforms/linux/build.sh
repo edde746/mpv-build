@@ -286,6 +286,14 @@ main() {
   # The only encoders are mjpeg and png, which mpv's screenshot commands
   # (screenshot, screenshot-to-file) encode JPEG and PNG files with; without
   # them every screenshot fails. The Windows group's FFmpeg has them already.
+  #
+  # scale_vaapi is mpv's hardware format conversion for VAAPI: when the decoder
+  # outputs a format the GL interop cannot map - xv30 from HEVC 4:4:4 10-bit,
+  # for one - mpv converts it on the GPU with this filter. Without it mpv does
+  # not fall back to copying back to the CPU; the VO fails to map every frame
+  # of the file. mpv deinterlaces VAAPI frames with its own vavpp and moves
+  # frames between GPU and CPU with its own hwupload/hwdownload, so no other
+  # VAAPI filter is needed.
   echo "==> Building ffmpeg $FFMPEG_VERSION (static, decoders and image encoders)..."
   checkout_verified_ref \
     "$FFMPEG_URL" "$FFMPEG_REF" "$FFMPEG_COMMIT" \
@@ -310,7 +318,7 @@ main() {
     --disable-bsfs \
     --enable-bsf=aac_adtstoasc,av1_metadata,extract_extradata,h264_metadata,h264_mp4toannexb,hevc_metadata,hevc_mp4toannexb,vp9_metadata \
     --disable-filters \
-    --enable-filter=aformat,aresample,bwdif,decimate,fieldmatch,format,loudnorm,null,scale \
+    --enable-filter=aformat,aresample,bwdif,decimate,fieldmatch,format,loudnorm,null,scale,scale_vaapi \
     --enable-gnutls \
     --enable-vaapi \
     --enable-ffnvcodec \
