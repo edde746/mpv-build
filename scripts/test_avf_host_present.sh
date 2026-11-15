@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Compile vo_avfoundation's host-mode clock rules (the marked "avf host
-# present stamp" and "avf host timebase drift" regions, patch 0004) VERBATIM
+# present stamp", "avf host timebase drift" and "avf host refresh stamp"
+# regions, patches 0004 and 0055) VERBATIM
 # from the final Apple series. Pass an already-patched mpv tree for offline
 # use; otherwise fetch and patch the pinned source.
 set -euo pipefail
@@ -22,6 +23,9 @@ python3 "$root/scripts/extract.py" region "$source_dir/video/out/vo_avfoundation
 python3 "$root/scripts/extract.py" region "$source_dir/video/out/vo_avfoundation.m" \
     "$workdir/avf_host_timebase_drift.inc" --start "avf host timebase drift" \
     --require "avf_host_timebase_drifted"
+python3 "$root/scripts/extract.py" region "$source_dir/video/out/vo_avfoundation.m" \
+    "$workdir/avf_host_refresh_stamp.inc" --start "avf host refresh stamp" \
+    --require "avf_host_refresh_stamp_ns"
 
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
     -o "$workdir/test" "$root/scripts/test_avf_host_present.c"

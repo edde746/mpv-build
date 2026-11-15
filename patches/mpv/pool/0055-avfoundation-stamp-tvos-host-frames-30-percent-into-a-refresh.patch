@@ -1,0 +1,133 @@
+vo_avfoundation: stamp tvOS host frames 30% into a refresh
+
+After a seek the video layer and the OSD layer can settle on different
+refreshes for samples stamped late in a refresh interval, and stay a
+refresh apart until the next pause or seek. A host stamp is mpv's target
+time, so where it falls in the interval is set anew at every pause and
+seek: after some seeks the subtitles ran a refresh late for the whole
+stretch of playback, at any queue lead (plezy#3073).
+
+The display link of patch 0054 now also gives the latest vsync, and a
+host stamp moves to the nearest point 30% of the way through a refresh
+interval, by at most half a refresh either way; on average a frame shows
+on the refresh it showed on before. Android's ExoPlayer places frames the
+same way (VideoFrameReleaseHelper: the nearest vsync, released 80% of a
+refresh before it). iOS and macOS track no vsync and keep their stamps.
+
+Apple TV 4K, Plezy's options, a clip whose frames and per-frame ASS
+events carry the same code in both halves of the picture, captured over
+HDMI. Patch 0054 alone, as published: in 9 runs at 23.976 Hz, a pause or
+a seek every 3 s, 5 stretches after a seek had the subtitles a refresh
+late throughout, with the same 154-158 ms of lead as the rest. Stamps
+held at one place in the interval, 20 seeks a run and 2.5 s of playback
+after each: at 23.976 Hz 18 of 38 stretches so at 75%, none of 27 at 30%;
+at 50 Hz (25 fps) 6 of 20 at 75%, 3 of 20 at 90%, none of 20 at each of
+10%, 30% and 50%.
+
+With this patch, stamps where mpv's targets put them: every stamp of
+steady playback sat at 30% (1st to 99th percentile) in every run, frames
+went to the layers at least 3.6 refreshes ahead, and no capture of steady
+playback mismatched. At 23.976 Hz 222 stretches, 136 of them after a seek
+(20 seeks a run, a pause or a seek every 3 s, heavy subtitles, the switch
+made before the first frame, an 11-minute session of pauses and seeks);
+at 50 Hz 147 (25 and 23.976 fps); at 59.94 Hz 84 (29.97 and 23.976 fps).
+In 15 minutes of uninterrupted playback every stamp came one refresh after
+the last. Left: the frame a pause stops on, and the first five frames
+after a seek, where the subtitles can trail the burst of frames a seek
+starts with by up to two frames for about 170 ms.
+
+diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
+index 9c8d6fa..fc015a9 100644
+--- a/video/out/vo_avfoundation.m
++++ b/video/out/vo_avfoundation.m
+@@ -595,8 +595,10 @@ struct priv {
+     int64_t last_host_present_ns;
+     // The queue lead in effect; see update_queue_lead().
+     int64_t queue_lead_ns;
+-    // The display's refresh period from refresh_link (tvOS); 0 until its
+-    // first vsync, and elsewhere. Written on the main thread.
++    // The display's refresh from refresh_link (tvOS): its latest vsync on
++    // mp_time_ns() and its period, both 0 until its first vsync, and
++    // elsewhere. Written on the main thread.
++    _Atomic int64_t refresh_vsync_ns;
+     _Atomic int64_t refresh_period_ns;
+ #if TARGET_OS_TV
+     CADisplayLink *refresh_link;
+@@ -901,7 +903,9 @@ static const struct m_sub_options avfoundation_conf;
+ @end
+ 
+ #if TARGET_OS_TV
+-// Keeps priv's refresh period on the display's, on the main thread.
++// Keeps priv's refresh fields on the display's vsyncs, on the main thread. A
++// display link's timestamp is its last vsync in CACurrentMediaTime(), which
++// is mach_absolute_time() as mp_time_ns() is.
+ @interface MPVRefreshClock : NSObject {
+ @public
+     struct priv *p;
+@@ -911,7 +915,10 @@ static const struct m_sub_options avfoundation_conf;
+ @implementation MPVRefreshClock
+ - (void)tick:(CADisplayLink *)link
+ {
++    int64_t vsync_ns = mp_time_ns() +
++        (int64_t)((link.timestamp - CACurrentMediaTime()) * 1e9);
+     atomic_store(&p->refresh_period_ns, (int64_t)(link.duration * 1e9));
++    atomic_store(&p->refresh_vsync_ns, vsync_ns);
+ }
+ @end
+ #endif
+@@ -1212,6 +1219,37 @@ static int64_t avf_host_present_ns(int64_t last_ns, int64_t target_ns,
+ }
+ // --- end avf host present stamp ---
+ 
++// --- avf host refresh stamp (host-testable; keep freestanding) ---
++// Where in a refresh interval a host stamp goes (plezy#3073). After a flush
++// (a seek) the video layer and the OSD layer can settle on different
++// refreshes for samples stamped late in a refresh interval, and stay a
++// refresh apart until the next pause or seek. On tvOS with the stamps held
++// at one place in the interval, the subtitles were a refresh late for a
++// whole stretch after a seek in 18 of 38 stretches at 75% (24 Hz), 6 and 3
++// of 20 at 75% and 90% (50 Hz), and in none of 27 at 30% (24 Hz) or of 60
++// at 10-50% (50 Hz). A stamp is mpv's target time, so where it falls in the
++// interval is set anew at every pause and seek. A stamp moves to the nearest
++// point 30% of the way through an interval, by at most half a refresh
++// either way. A period of 0 (no vsync seen) leaves the target as it is.
++static int64_t avf_host_refresh_stamp_ns(int64_t target_ns, int64_t vsync_ns,
++                                         int64_t period_ns)
++{
++    if (period_ns <= 0)
++        return target_ns;
++    int64_t base_ns = vsync_ns + period_ns * 3 / 10;
++    int64_t offset_ns = target_ns - base_ns;
++    int64_t n = offset_ns / period_ns;
++    int64_t rest_ns = offset_ns % period_ns;
++    if (rest_ns < 0) {
++        rest_ns += period_ns;
++        n--;
++    }
++    if (rest_ns >= period_ns - rest_ns)
++        n++;
++    return base_ns + n * period_ns;
++}
++// --- end avf host refresh stamp ---
++
+ // --- avf media stamp (host-testable; keep freestanding) ---
+ // Media stamps never go back either. On media time a frame's sample is
+ // stamped with its timestamp, and a reset's flush leaves the samples
+@@ -5045,6 +5083,7 @@ static int preinit(struct vo *vo)
+     atomic_init(&p->pending_layer_geometry_sync, false);
+     atomic_init(&p->layer_geometry_dirty, false);
+     atomic_init(&p->shader_layer_stale, false);
++    atomic_init(&p->refresh_vsync_ns, 0);
+     atomic_init(&p->refresh_period_ns, 0);
+ 
+     // Everything the main thread has to do for a new VO, in one trip to it:
+@@ -5683,6 +5722,9 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     p->next_pts = pts;
+     p->next_present_host_ns = frame->pts > 0 ? frame->pts : mp_time_ns();
+     if (p->presentation_host) {
++        p->next_present_host_ns = avf_host_refresh_stamp_ns(
++            p->next_present_host_ns, atomic_load(&p->refresh_vsync_ns),
++            atomic_load(&p->refresh_period_ns));
+         // Queue slack lets a frame be stamped that much further ahead.
+         p->next_present_host_ns = avf_host_present_ns(
+             p->last_host_present_ns, p->next_present_host_ns,

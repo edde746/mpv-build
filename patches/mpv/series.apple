@@ -61,3 +61,7 @@
 # the video and OSD layers disagree on the refresh that shows them
 # (test_avf_queue_lead.sh).
 0054-avfoundation-queue-tvos-frames-four-refreshes-ahead.patch
+# On tvOS host stamps sit 30% into a refresh interval, away from where the
+# video and OSD layers can settle a refresh apart after a seek
+# (test_avf_host_present.sh).
+0055-avfoundation-stamp-tvos-host-frames-30-percent-into-a-refresh.patch

@@ -6,6 +6,11 @@
 // - avf_host_timebase_drifted: a reset re-seeds the timebase, a clock write
 //   that retimes the display layers, only when it has really left
 //   mp_time_ns(); a thread descheduled between the clock reads must not count.
+// - avf_host_refresh_stamp_ns: a stamp sits 30% into a refresh interval, away
+//   from where the video and OSD layers can settle a refresh apart after a
+//   seek (plezy#3073), moves by at most half a refresh, keeps the frames'
+//   order, and content at the display's rate gets a refresh of its own for
+//   every frame.
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +18,7 @@
 
 #include "avf_host_present.inc"
 #include "avf_host_timebase_drift.inc"
+#include "avf_host_refresh_stamp.inc"
 
 #define MS INT64_C(1000000)
 
@@ -101,6 +107,46 @@ int main(void)
           "a timebase clamped far back is drifted even across a long read");
     check(avf_host_timebase_drifted(now, now, now, 0.0, tol),
           "a stopped timebase is drifted");
+
+    // Refresh stamps. A 24 Hz display (the refresh matched to 23.976 fps)
+    // with a vsync at an arbitrary time; targets every 0.1 ms over three
+    // refreshes either side of it, so before it too.
+    const int64_t period = 41708333, vsync = now + 7 * MS;
+    const int64_t phase = period * 3 / 10;
+    bool on_phase = true, near = true, in_order = true;
+    int64_t prev_stamp = INT64_MIN;
+    for (int64_t t = vsync - 3 * period; t <= vsync + 3 * period; t += MS / 10) {
+        int64_t stamp = avf_host_refresh_stamp_ns(t, vsync, period);
+        int64_t into = ((stamp - vsync) % period + period) % period;
+        on_phase = on_phase && into == phase;
+        near = near && (stamp > t ? stamp - t : t - stamp) * 2 <= period;
+        in_order = in_order && stamp >= prev_stamp;
+        prev_stamp = stamp;
+    }
+    check(on_phase, "every stamp sits 30% of the way through a refresh");
+    check(near, "no stamp moves by more than half a refresh");
+    check(in_order, "a later target never gets an earlier stamp");
+    check(avf_host_refresh_stamp_ns(vsync + 2 * period + phase, vsync, period) ==
+              vsync + 2 * period + phase,
+          "a target already 30% into a refresh keeps its stamp");
+
+    // Content at the display's rate, from every start within a refresh (late
+    // in the interval, where the layers can settle a refresh apart, among
+    // them): one refresh per frame, none shared and none skipped.
+    bool one_each = true;
+    for (int64_t start = 0; start < period; start += period / 50) {
+        int64_t prev = avf_host_refresh_stamp_ns(vsync + start, vsync, period);
+        for (int i = 1; i < 48; i++) {
+            int64_t stamp = avf_host_refresh_stamp_ns(vsync + start + i * period,
+                                                      vsync, period);
+            one_each = one_each && stamp - prev == period;
+            prev = stamp;
+        }
+    }
+    check(one_each, "frames at the display's rate get one refresh each");
+
+    check(avf_host_refresh_stamp_ns(now + 5 * MS, 0, 0) == now + 5 * MS,
+          "without a refresh seen the target is kept");
 
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);

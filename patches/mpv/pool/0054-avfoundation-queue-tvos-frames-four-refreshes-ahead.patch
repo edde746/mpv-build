@@ -21,14 +21,18 @@ after the first frame as Plezy makes it; a 23.976 fps clip whose frames
 and per-frame ASS events carry the same code in both halves of the
 picture, captured over HDMI, a pause or a seek every 3 s. Stretches of
 playback by the median time from enqueue to the refresh after the stamp:
-below 2.9 refreshes 2 stretches, no frame mismatched; 2.9-3.1 refreshes
-50 stretches, 15 of them mismatched, 363 of 3237 frames, some throughout
-(66 of 67, the subtitles a refresh late); 3.2-3.9 refreshes 100
+below 2.9 refreshes 6 stretches, no frame mismatched; 2.9-3.35 refreshes
+74 stretches, 72 frames mismatched a few at a time (49 with the
+subtitles a refresh ahead, 23 behind); 3.35 refreshes and more 72
 stretches, 2 frames. With stamps forced to other places in the refresh
 the mismatches followed the same band. With a 170 ms lead: 40 stretches
 4.0-4.8 refreshes ahead, no frame mismatched; with this patch: 77
 stretches 3.8-4.7 refreshes ahead, none of 4429 frames mismatched. Left
-as before: a frame or two around a seek, an unpause or a pause.
+as before: a frame or two around a seek, an unpause or a pause, and
+stretches after a seek with the subtitles a refresh late throughout,
+which come from where the stamps sit in the refresh at any lead (5 of
+the 74 in the band, not counted above, stamped 74-85% of the way
+through it; patch 0055).
 
 diff --git a/video/out/vo_avfoundation.m b/video/out/vo_avfoundation.m
 index 6164953..9c8d6fa 100644
