@@ -1,0 +1,1811 @@
+Subject: [PATCH] ao_mediafoundation: play E-AC-3 through the system decoder
+
+FFmpeg decodes only the 5.1/7.1 bed of a Dolby Atmos (JOC) E-AC-3 track, and
+ao_wasapi can pass the bitstream on only in exclusive mode, to a device that
+decodes it. Headphones and built-in speakers with a Windows spatial sound
+format (Dolby Atmos for Headphones, ...) therefore never get the objects.
+
+This AO takes the E-AC-3 access units back out of the IEC 61937 stream
+ad_spdif produces and serves them to a Media Foundation session from a media
+source of its own. The topology loader inserts the Dolby decoder MFT, which
+negotiates MFAudioFormat_Float_SpatialObjects with the audio renderer. The
+session's presentation clock is the audio clock.
+
+ao_wasapi redirects E-AC-3 to it when the device refuses the bitstream
+(ao->redirect, as ao_coreaudio does for coreaudio_exclusive), together with the
+device it was opened for, which the AO resolves as ao_wasapi does. So a device
+that takes the bitstream keeps getting it, a device picked with
+--audio-device=wasapi/... is used, and the AO is neither probed on its own nor
+listed in audio-device-list. It refuses to initialize when the decoder would not
+output objects (no spatial format on the endpoint, no decoder), and mpv decodes
+the track as before.
+
+Once playing, a failure asks the player to decode the track instead
+(ao_request_pcm_fallback(), 0244): an error from the session, a Start or resume
+the session refuses, no MESessionStarted within 3 s, or a clock that stands
+still for 3 s while the renderer has everything it asked for. A reload would
+reopen the same stream and could fail the same way without end. Device changes
+are followed as ao_wasapi_changenotify.c follows them (another eMultimedia
+default when none was picked, the device removed or disabled, a new
+PKEY_AudioEngine_DeviceFormat), and so are the renderer's own device events
+when the session passes them on: those ask for a reload, which tries
+passthrough again on whatever device is current.
+
+mf.dll and mfplat.dll are loaded at runtime, so libmpv does not import them.
+
+The IEC 61937 parser is plain C between "// --- bursts" markers, and
+scripts/test_ao_mediafoundation_bursts.sh runs it on the host against FFmpeg's
+spdif muxer.
+
+---
+  DOCS/man/ao.rst                |   26 +
+  audio/out/ao.c                 |    5 +
+  audio/out/ao_mediafoundation.c | 1652 ++++++++++++++++++++++++++++++++
+  audio/out/ao_wasapi.c          |   11 +-
+  meson.build                    |    9 +
+  5 files changed, 1702 insertions(+), 1 deletion(-)
+
+diff --git a/DOCS/man/ao.rst b/DOCS/man/ao.rst
+index 7eb7c97..30d9e32 100644
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -321,3 +321,29 @@ Available audio output drivers are:
+         cases, but reportedly on some devices there are glitches following
+         stream resets under the default setting. In such cases, specifying a
+         shorter duration might help.
++
++``mediafoundation``
++    Dolby Digital Plus through the decoder Windows ships (Media Foundation).
++
++    Used for E-AC-3 that mpv passes through (``--audio-spdif=eac3``) to a
++    device that refuses the bitstream: ``wasapi`` hands the stream over to it,
++    together with the device it was opened for (the default one, or the one
++    selected with ``--audio-device=wasapi/...``). Instead of sending the
++    bitstream to the device, it hands the access units to the system's Dolby
++    decoder. With a spatial sound format active on the device (Dolby Atmos for
++    Headphones, for home theater, for built-in speakers) the decoder renders a
++    Dolby Atmos track as objects, which mpv's own decoder cannot do. It is not
++    probed on its own and has no entries in ``--audio-device=help``;
++    ``--ao=mediafoundation`` selects it directly.
++
++    The output refuses to initialize, and mpv decodes the track itself, when no
++    decoder on the system offers spatial objects for the device. If the stream
++    fails while playing, mpv decodes the rest of the track itself. When the
++    device changes (another default device, the device removed, a new device
++    format), the output is reopened, which tries passthrough again.
++
++    The following global options are supported by this audio output:
++
++    ``--ao-mediafoundation-require-spatial=<yes|no>``
++        Whether to refuse when the decoder would output plain PCM (default:
++        yes).
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index e1007f4..ebde2c6 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -51,6 +51,7 @@ extern const struct ao_driver audio_out_opensles;
+ extern const struct ao_driver audio_out_null;
+ extern const struct ao_driver audio_out_alsa;
+ extern const struct ao_driver audio_out_wasapi;
++extern const struct ao_driver audio_out_mediafoundation;
+ extern const struct ao_driver audio_out_pcm;
+ extern const struct ao_driver audio_out_lavc;
+ extern const struct ao_driver audio_out_sdl;
+@@ -107,6 +108,10 @@ static const struct ao_driver * const audio_out_drivers[] = {
+     &audio_out_null,
+ #if HAVE_COREAUDIO
+     &audio_out_coreaudio_exclusive,
++#endif
++#if HAVE_AO_MEDIAFOUNDATION
++    // Reached through ao_wasapi's redirect for E-AC-3, not probed or listed.
++    &audio_out_mediafoundation,
+ #endif
+     &audio_out_pcm,
+     &audio_out_lavc,
+diff --git a/audio/out/ao_mediafoundation.c b/audio/out/ao_mediafoundation.c
+new file mode 100644
+index 0000000..a48abbd
+--- /dev/null
++++ b/audio/out/ao_mediafoundation.c
+@@ -0,0 +1,1652 @@
++/*
++ * Dolby Digital Plus through the system decoder (Media Foundation)
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Plays E-AC-3 with the decoder Windows ships instead of FFmpeg's, which is
++ * the only way a Dolby Atmos (JOC) track reaches the system as objects.
++ *
++ * ao_wasapi hands E-AC-3 passthrough to this AO (ao->redirect) when the device
++ * refuses the bitstream, together with the device it was opened for. The AO
++ * gets the IEC 61937 stream mpv would send to a receiver (--audio-spdif=eac3),
++ * takes the access units back out of the bursts and serves them to a Media
++ * Foundation session from a media source of its own:
++ *
++ *     this source -> decoder the topology loader picks -> audio renderer
++ *
++ * With a spatial sound format active on the endpoint (Dolby Atmos for
++ * Headphones, for home theater, for built-in speakers) the Dolby decoder MFT
++ * negotiates MFAudioFormat_Float_SpatialObjects with the renderer. A decoder
++ * driven by hand cannot do that: the spatial samples come from an allocator
++ * the pipeline provides. Where no decoder offers that type, init fails and
++ * mpv decodes the track itself.
++ *
++ * Once playing, a failure (an error from the session, a Start or resume that
++ * fails, a session that never starts, a renderer that stops taking audio)
++ * asks the player to decode the track instead (ao_request_pcm_fallback()): a
++ * reload would reopen the same stream, and a failure that only shows after
++ * init() would repeat without end. A change of device (another default, the
++ * device gone, a new device format) asks for a reload, which tries passthrough
++ * again on whatever device is current.
++ *
++ * The session's presentation clock is the audio clock: timestamps restart at
++ * zero with every start after a reset.
++ */
++
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wchar.h>
++
++#include <windows.h>
++#include <mfapi.h>
++#include <mfidl.h>
++#include <mfobjects.h>
++#include <mferror.h>
++#include <mftransform.h>
++
++#include "audio/format.h"
++#include "common/common.h"
++#include "common/msg.h"
++#include "options/m_option.h"
++#include "osdep/threads.h"
++#include "osdep/timer.h"
++#include "osdep/windows_utils.h"
++#include "ao.h"
++#include "ao_wasapi.h"
++#include "internal.h"
++
++// --- bursts
++// IEC 61937 E-AC-3 bursts as libavformat's spdif muxer writes them, for
++// --audio-spdif=eac3: stereo 16 bit frames, little-endian. A burst starts
++// with Pa Pb Pc Pd = 0xF872 0x4E1F <data type> <payload length in bytes>,
++// carries the payload as big-endian words in little-endian ones, and is
++// zero-padded to BURST_FRAMES frames. Plain C, so that the host harness
++// (scripts/test_ao_mediafoundation_bursts.sh) compiles this region alone.
++
++#define BURST_FRAMES 6144
++#define BURST_HEADER 8
++#define BURST_TYPE_EAC3 0x15
++
++struct bursts {
++    uint8_t *pending;                   // bytes of a burst that is not complete yet
++    size_t len, cap;
++    int64_t offset;                     // where pending[0] is in the stream, bytes
++    uint8_t *payload;                   // one payload, unswapped
++    size_t payload_cap;
++    bool skipped_other;                 // passed over a burst that is not E-AC-3
++};
++
++// Called with each complete E-AC-3 payload and the stream offset (bytes) of
++// its burst. Returns false to stop (out of memory).
++typedef bool (*burst_cb)(void *ctx, const uint8_t *payload, size_t size,
++                         int64_t offset);
++
++static void bursts_reset(struct bursts *b)
++{
++    b->len = 0;
++    b->offset = 0;
++}
++
++static void bursts_free(struct bursts *b)
++{
++    free(b->pending);
++    free(b->payload);
++    *b = (struct bursts){0};
++}
++
++// Append size bytes and hand every burst they complete to cb. max_payload is
++// the most a burst can carry (its frames minus the preamble, in bytes).
++static bool bursts_feed(struct bursts *b, const uint8_t *data, size_t size,
++                        size_t max_payload, burst_cb cb, void *ctx)
++{
++    if (b->len + size > b->cap) {
++        size_t cap = b->cap * 2 > b->len + size ? b->cap * 2 : b->len + size;
++        uint8_t *grown = realloc(b->pending, cap);
++        if (!grown)
++            return false;
++        b->pending = grown;
++        b->cap = cap;
++    }
++    if (b->payload_cap < max_payload + 1) {
++        uint8_t *grown = realloc(b->payload, max_payload + 1);
++        if (!grown)
++            return false;
++        b->payload = grown;
++        b->payload_cap = max_payload + 1;
++    }
++    memcpy(b->pending + b->len, data, size);
++    b->len += size;
++
++    const uint8_t *buf = b->pending;
++    size_t len = b->len, pos = 0;
++    bool ok = true;
++    while (pos + BURST_HEADER <= len) {
++        // Pa Pb as little-endian words; in between bursts the carrier is zero.
++        if (buf[pos] != 0x72 || buf[pos + 1] != 0xF8 ||
++            buf[pos + 2] != 0x1F || buf[pos + 3] != 0x4E)
++        {
++            pos += 2;
++            continue;
++        }
++        unsigned type = buf[pos + 4] & 0x7F;
++        size_t length = buf[pos + 6] | ((size_t)buf[pos + 7] << 8);
++        size_t padded = (length + 1) & ~(size_t)1;
++        if (type != BURST_TYPE_EAC3 || !length || padded > max_payload) {
++            b->skipped_other = true;
++            pos += 4;
++            continue;
++        }
++        if (pos + BURST_HEADER + padded > len)
++            break;                      // the rest comes with the next write
++
++        // The payload is a big-endian bitstream in little-endian words; an
++        // odd length still occupies a whole last word.
++        const uint8_t *src = buf + pos + BURST_HEADER;
++        for (size_t n = 0; n < padded; n += 2) {
++            b->payload[n] = src[n + 1];
++            b->payload[n + 1] = src[n];
++        }
++        if (!cb(ctx, b->payload, length, b->offset + (int64_t)pos)) {
++            ok = false;
++            break;
++        }
++        pos += BURST_HEADER + padded;
++    }
++
++    // Carrier padding cannot begin a burst: do not keep it for the next write.
++    while (ok && pos + 2 <= len && !buf[pos] && !buf[pos + 1])
++        pos += 2;
++
++    if (pos)
++        memmove(b->pending, b->pending + pos, len - pos);
++    b->len = len - pos;
++    b->offset += (int64_t)pos;
++    return ok;
++}
++// --- end bursts
++
++// Access units mpv may queue here on top of what the pipeline has pulled.
++#define QUEUE_UNITS 6
++#define MAX_UNITS 32
++
++// Waits on the player thread.
++#define TOPOLOGY_TIMEOUT_MS 2000
++#define CLOSE_TIMEOUT_MS 1000
++
++// How long the session may take to report a start, how long the clock may
++// stand still while the renderer has all it asked for, and how long it stands
++// still before a pipeline without data counts as played out.
++#define START_TIMEOUT_MS 3000
++#define STALL_TIMEOUT_MS 3000
++#define DRY_MS 40
++
++static const GUID null_guid = {0};
++
++// MEStreamSinkFormatInvalidated, which not every mingw-w64 has.
++#define ME_STREAM_SINK_FORMAT_INVALIDATED 802
++
++// Not in every mingw-w64: MFAudioFormat_Float_SpatialObjects and
++// MF_MT_SPATIAL_AUDIO_MAX_DYNAMIC_OBJECTS.
++static const GUID spatial_objects_subtype = {
++    0xfa39cd94, 0xbc64, 0x4ab1, {0x9b, 0x71, 0xdc, 0xd0, 0x9d, 0x5a, 0x7e, 0x7a}};
++static const GUID spatial_max_dynamic_objects = {
++    0xdcfba24a, 0x2609, 0x4240, {0xa7, 0x21, 0x3f, 0xae, 0xa7, 0x6a, 0x4d, 0xf9}};
++
++// mf.dll and mfplat.dll are missing on Windows editions that come without the
++// media features (the "N" editions), and a player that imports them does not
++// start there at all. So they are loaded when this output is first asked for,
++// and stay loaded: the session may still call into the source after uninit.
++static struct mf_dll {
++    HRESULT (WINAPI *MFStartup)(ULONG, DWORD);
++    HRESULT (WINAPI *MFShutdown)(void);
++    HRESULT (WINAPI *MFCreateEventQueue)(IMFMediaEventQueue **);
++    HRESULT (WINAPI *MFCreateMediaType)(IMFMediaType **);
++    HRESULT (WINAPI *MFCreateMemoryBuffer)(DWORD, IMFMediaBuffer **);
++    HRESULT (WINAPI *MFCreateSample)(IMFSample **);
++    HRESULT (WINAPI *MFCreateStreamDescriptor)(DWORD, DWORD, IMFMediaType **,
++                                               IMFStreamDescriptor **);
++    HRESULT (WINAPI *MFCreatePresentationDescriptor)(DWORD,
++                                                     IMFStreamDescriptor **,
++                                                     IMFPresentationDescriptor **);
++    HRESULT (WINAPI *MFCreateMediaSession)(IMFAttributes *, IMFMediaSession **);
++    HRESULT (WINAPI *MFCreateTopology)(IMFTopology **);
++    HRESULT (WINAPI *MFCreateTopologyNode)(MF_TOPOLOGY_TYPE, IMFTopologyNode **);
++    HRESULT (WINAPI *MFCreateAudioRendererActivate)(IMFActivate **);
++    HRESULT (WINAPI *MFGetService)(IUnknown *, REFGUID, REFIID, LPVOID *);
++    bool loaded;
++} mf;
++static mp_once mf_once = MP_STATIC_ONCE_INITIALIZER;
++
++static void load_mf(void)
++{
++    HMODULE plat = LoadLibraryExW(L"mfplat.dll", NULL,
++                                  LOAD_LIBRARY_SEARCH_SYSTEM32);
++    HMODULE core = LoadLibraryExW(L"mf.dll", NULL,
++                                  LOAD_LIBRARY_SEARCH_SYSTEM32);
++    if (!plat || !core)
++        return;
++#define MF_GET(dll, name) (mf.name = (void *)GetProcAddress(dll, #name))
++    mf.loaded = MF_GET(plat, MFStartup) &&
++                MF_GET(plat, MFShutdown) &&
++                MF_GET(plat, MFCreateEventQueue) &&
++                MF_GET(plat, MFCreateMediaType) &&
++                MF_GET(plat, MFCreateMemoryBuffer) &&
++                MF_GET(plat, MFCreateSample) &&
++                MF_GET(plat, MFCreateStreamDescriptor) &&
++                MF_GET(plat, MFCreatePresentationDescriptor) &&
++                MF_GET(core, MFCreateMediaSession) &&
++                MF_GET(core, MFCreateTopology) &&
++                MF_GET(core, MFCreateTopologyNode) &&
++                MF_GET(core, MFCreateAudioRendererActivate) &&
++                MF_GET(core, MFGetService);
++#undef MF_GET
++}
++
++struct unit {
++    uint8_t *data;
++    DWORD size;
++    LONGLONG time;                      // 100 ns, from the last reset
++};
++
++enum source_state {
++    SOURCE_STOPPED,
++    SOURCE_STARTED,
++    SOURCE_PAUSED,
++    SOURCE_SHUTDOWN,
++};
++
++// Everything Media Foundation and the device notifications call into. It can
++// outlive the AO, since the session releases its references from its own
++// threads.
++struct mf_core {
++    IMFMediaSource source;
++    IMFMediaStream stream;
++    IMFAsyncCallback callback;
++    IMMNotificationClient notify;
++    LONG refs;
++
++    SRWLOCK lock;
++    CONDITION_VARIABLE changed;
++    struct ao *ao;                      // NULL once the AO is gone
++
++    IMFMediaEventQueue *source_events;
++    IMFMediaEventQueue *stream_events;
++    IMFPresentationDescriptor *pd;
++    IMFStreamDescriptor *sd;
++    IMFMediaSession *session;
++    wchar_t *endpoint;                  // the device played on
++    bool follow_default;                // no device was asked for
++
++    enum source_state state;
++    bool flushing;                      // reset(): nothing goes out before the next Start
++    int stops_pending;                  // Stops reset() sent that the source has not seen
++    bool announced;
++    bool discontinuity;
++    LONGLONG unit_duration;
++    struct unit units[MAX_UNITS];
++    int unit_pos, num_units;
++    IUnknown **tokens;                  // RequestSample calls not answered yet
++    int num_tokens, tokens_cap;
++
++    bool live;                          // init is done: problems go to the player
++    bool played;                        // the clock ran: the stream worked here
++    bool topology_ready, failed, reload_requested;
++    bool events_done;                   // no session event will come any more
++    HRESULT error;
++    unsigned started_events;            // MESessionStarted that succeeded
++};
++
++struct priv {
++    struct mf_core *core;
++    IMFMediaSession *session;
++    IMFPresentationClock *clock;
++    IMFAudioStreamVolume *volume;
++    IMMDeviceEnumerator *enumerator;
++    bool notify_registered;
++    bool com_init, mf_started;
++
++    struct bursts bursts;
++    int64_t written;                    // frames since the last reset
++    bool warned_type;
++
++    bool started, paused;
++    bool session_running;               // Start was sent and no Stop since
++    unsigned starts_ok;                 // Start calls the session accepted
++    unsigned restart_call;              // the one that restarted the clock at zero
++    int64_t restart_time;               // when it was made
++    LONGLONG last_clock;
++    int64_t last_clock_change;
++    bool clock_moved;                   // since the clock restarted at zero
++    int64_t last_state_time;            // the previous get_state()
++    float gain;
++    bool volume_set, warned_gain, warned_volume;
++
++    bool opt_require_spatial;
++};
++
++#define CORE_OF(iface, member) \
++    ((struct mf_core *)((char *)(iface) - offsetof(struct mf_core, member)))
++
++static void drop_tokens(struct mf_core *c)
++{
++    for (int n = 0; n < c->num_tokens; n++) {
++        if (c->tokens[n])
++            IUnknown_Release(c->tokens[n]);
++    }
++    c->num_tokens = 0;
++}
++
++static bool push_token(struct mf_core *c, IUnknown *token)
++{
++    if (c->num_tokens == c->tokens_cap) {
++        int cap = c->tokens_cap ? c->tokens_cap * 2 : 16;
++        IUnknown **grown = realloc(c->tokens, cap * sizeof(*grown));
++        if (!grown)
++            return false;
++        c->tokens = grown;
++        c->tokens_cap = cap;
++    }
++    if (token)
++        IUnknown_AddRef(token);
++    c->tokens[c->num_tokens++] = token;
++    return true;
++}
++
++static void drop_units(struct mf_core *c)
++{
++    for (int n = 0; n < c->num_units; n++)
++        free(c->units[(c->unit_pos + n) % MAX_UNITS].data);
++    c->unit_pos = c->num_units = 0;
++}
++
++static ULONG core_addref(struct mf_core *c)
++{
++    return InterlockedIncrement(&c->refs);
++}
++
++static ULONG core_release(struct mf_core *c)
++{
++    ULONG refs = InterlockedDecrement(&c->refs);
++    if (!refs) {
++        drop_tokens(c);
++        drop_units(c);
++        free(c->tokens);
++        free(c->endpoint);
++        if (c->source_events)
++            IMFMediaEventQueue_Release(c->source_events);
++        if (c->stream_events)
++            IMFMediaEventQueue_Release(c->stream_events);
++        if (c->pd)
++            IMFPresentationDescriptor_Release(c->pd);
++        if (c->sd)
++            IMFStreamDescriptor_Release(c->sd);
++        free(c);
++    }
++    return refs;
++}
++
++// The stream cannot go on: the player decodes the track instead. Before init
++// is done, init() sees the flag and fails. Called with the lock held.
++static void fail_locked(struct mf_core *c, const char *what, HRESULT hr)
++{
++    if (c->failed)
++        return;
++    c->failed = true;
++    c->error = hr;
++    if (c->ao && c->live) {
++        MP_WARN(c->ao, "%s: %s. Decoding the track instead.\n", what,
++                mp_HRESULT_to_str(hr));
++        ao_request_pcm_fallback(c->ao);
++        ao_wakeup(c->ao);
++    }
++}
++
++// The device changed under the session: reopen, which tries passthrough
++// again on whatever device is current. Called with the lock held.
++static void reload_locked(struct mf_core *c, const char *why)
++{
++    if (c->reload_requested || c->failed || !c->ao || !c->live)
++        return;
++    c->reload_requested = true;
++    MP_VERBOSE(c->ao, "%s: reopening the output.\n", why);
++    ao_request_reload(c->ao);
++}
++
++// The renderer reports trouble with its device. Once the stream has played,
++// that is a change to follow; before, reopening would meet the same trouble
++// again and again, so the track is decoded instead. Called with the lock held.
++static void device_trouble_locked(struct mf_core *c, const char *why)
++{
++    if (c->played) {
++        reload_locked(c, why);
++    } else {
++        fail_locked(c, why, MF_E_AUDIO_PLAYBACK_DEVICE_INVALIDATED);
++    }
++}
++
++static void fail(struct ao *ao, const char *what, HRESULT hr)
++{
++    struct mf_core *c = ((struct priv *)ao->priv)->core;
++    AcquireSRWLockExclusive(&c->lock);
++    fail_locked(c, what, hr);
++    ReleaseSRWLockExclusive(&c->lock);
++}
++
++// Answer the pipeline's sample requests with the queued access units.
++// Called with the lock held.
++static void deliver(struct mf_core *c)
++{
++    while (c->num_tokens && c->num_units && c->state == SOURCE_STARTED &&
++           !c->flushing && !c->failed)
++    {
++        struct unit *u = &c->units[c->unit_pos];
++        IMFSample *sample = NULL;
++        IMFMediaBuffer *buffer = NULL;
++        BYTE *dst = NULL;
++        HRESULT hr = mf.MFCreateSample(&sample);
++        if (SUCCEEDED(hr))
++            hr = mf.MFCreateMemoryBuffer(u->size, &buffer);
++        if (SUCCEEDED(hr))
++            hr = IMFMediaBuffer_Lock(buffer, &dst, NULL, NULL);
++        if (SUCCEEDED(hr)) {
++            memcpy(dst, u->data, u->size);
++            IMFMediaBuffer_Unlock(buffer);
++            IMFMediaBuffer_SetCurrentLength(buffer, u->size);
++            IMFSample_AddBuffer(sample, buffer);
++            IMFSample_SetSampleTime(sample, u->time);
++            IMFSample_SetSampleDuration(sample, c->unit_duration);
++            IMFSample_SetUINT32(sample, &MFSampleExtension_CleanPoint, 1);
++            if (c->discontinuity)
++                IMFSample_SetUINT32(sample, &MFSampleExtension_Discontinuity, 1);
++            c->discontinuity = false;
++            IUnknown *token = c->tokens[0];
++            if (token) {
++                IMFSample_SetUnknown(sample, &MFSampleExtension_Token, token);
++                IUnknown_Release(token);
++            }
++            c->num_tokens--;
++            memmove(c->tokens, c->tokens + 1, c->num_tokens * sizeof(c->tokens[0]));
++            hr = IMFMediaEventQueue_QueueEventParamUnk(c->stream_events, MEMediaSample,
++                                                       &null_guid, S_OK,
++                                                       (IUnknown *)sample);
++        }
++        if (buffer)
++            IMFMediaBuffer_Release(buffer);
++        if (sample)
++            IMFSample_Release(sample);
++        if (FAILED(hr)) {
++            if (hr != MF_E_SHUTDOWN)
++                fail_locked(c, "Could not hand the decoder a sample", hr);
++            break;
++        }
++        free(u->data);
++        u->data = NULL;
++        c->unit_pos = (c->unit_pos + 1) % MAX_UNITS;
++        c->num_units--;
++    }
++}
++
++// --- IMFMediaSource
++
++static HRESULT STDMETHODCALLTYPE source_QueryInterface(IMFMediaSource *iface,
++                                                       REFIID riid, void **out)
++{
++    if (!out)
++        return E_POINTER;
++    if (IsEqualGUID(riid, &IID_IUnknown) ||
++        IsEqualGUID(riid, &IID_IMFMediaEventGenerator) ||
++        IsEqualGUID(riid, &IID_IMFMediaSource))
++    {
++        *out = iface;
++        core_addref(CORE_OF(iface, source));
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE source_AddRef(IMFMediaSource *iface)
++{
++    return core_addref(CORE_OF(iface, source));
++}
++
++static ULONG STDMETHODCALLTYPE source_Release(IMFMediaSource *iface)
++{
++    return core_release(CORE_OF(iface, source));
++}
++
++static HRESULT STDMETHODCALLTYPE source_GetEvent(IMFMediaSource *iface,
++                                                 DWORD flags, IMFMediaEvent **out)
++{
++    return IMFMediaEventQueue_GetEvent(CORE_OF(iface, source)->source_events,
++                                       flags, out);
++}
++
++static HRESULT STDMETHODCALLTYPE source_BeginGetEvent(IMFMediaSource *iface,
++                                                      IMFAsyncCallback *cb,
++                                                      IUnknown *state)
++{
++    return IMFMediaEventQueue_BeginGetEvent(CORE_OF(iface, source)->source_events,
++                                            cb, state);
++}
++
++static HRESULT STDMETHODCALLTYPE source_EndGetEvent(IMFMediaSource *iface,
++                                                    IMFAsyncResult *result,
++                                                    IMFMediaEvent **out)
++{
++    return IMFMediaEventQueue_EndGetEvent(CORE_OF(iface, source)->source_events,
++                                          result, out);
++}
++
++static HRESULT STDMETHODCALLTYPE source_QueueEvent(IMFMediaSource *iface,
++                                                   MediaEventType type,
++                                                   REFGUID ext, HRESULT status,
++                                                   const PROPVARIANT *value)
++{
++    return IMFMediaEventQueue_QueueEventParamVar(
++        CORE_OF(iface, source)->source_events, type, ext, status, value);
++}
++
++static HRESULT STDMETHODCALLTYPE source_GetCharacteristics(IMFMediaSource *iface,
++                                                           DWORD *out)
++{
++    if (!out)
++        return E_POINTER;
++    *out = MFMEDIASOURCE_CAN_PAUSE;
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE source_CreatePresentationDescriptor(
++    IMFMediaSource *iface, IMFPresentationDescriptor **out)
++{
++    return IMFPresentationDescriptor_Clone(CORE_OF(iface, source)->pd, out);
++}
++
++static HRESULT STDMETHODCALLTYPE source_Start(IMFMediaSource *iface,
++                                              IMFPresentationDescriptor *pd,
++                                              const GUID *time_format,
++                                              const PROPVARIANT *position)
++{
++    struct mf_core *c = CORE_OF(iface, source);
++    PROPVARIANT empty;
++    PropVariantInit(&empty);
++    if (!position)
++        position = &empty;
++
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->state == SOURCE_SHUTDOWN) {
++        ReleaseSRWLockExclusive(&c->lock);
++        return MF_E_SHUTDOWN;
++    }
++    // A position restarts the stream with whatever is queued now. Requests
++    // from before it belong to samples the pipeline has thrown away.
++    bool restart = position->vt == VT_I8;
++    bool seek = restart && c->state != SOURCE_STOPPED;
++    if (restart) {
++        drop_tokens(c);
++        c->discontinuity = true;
++    }
++    c->state = SOURCE_STARTED;
++    // A Start the session queued before reset() sent its Stop belongs to the
++    // run that Stop ends: audio delivered into it would be thrown away with it.
++    if (!c->stops_pending)
++        c->flushing = false;
++    IMFMediaEventQueue_QueueEventParamUnk(
++        c->source_events, c->announced ? MEUpdatedStream : MENewStream,
++        &null_guid, S_OK, (IUnknown *)&c->stream);
++    c->announced = true;
++    IMFMediaEventQueue_QueueEventParamVar(
++        c->source_events, seek ? MESourceSeeked : MESourceStarted,
++        &null_guid, S_OK, position);
++    IMFMediaEventQueue_QueueEventParamVar(
++        c->stream_events, seek ? MEStreamSeeked : MEStreamStarted,
++        &null_guid, S_OK, position);
++    deliver(c);
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE source_Stop(IMFMediaSource *iface)
++{
++    struct mf_core *c = CORE_OF(iface, source);
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->state == SOURCE_SHUTDOWN) {
++        ReleaseSRWLockExclusive(&c->lock);
++        return MF_E_SHUTDOWN;
++    }
++    c->state = SOURCE_STOPPED;
++    if (c->stops_pending)
++        c->stops_pending--;
++    drop_tokens(c);
++    IMFMediaEventQueue_QueueEventParamVar(c->source_events, MESourceStopped,
++                                          &null_guid, S_OK, NULL);
++    IMFMediaEventQueue_QueueEventParamVar(c->stream_events, MEStreamStopped,
++                                          &null_guid, S_OK, NULL);
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE source_Pause(IMFMediaSource *iface)
++{
++    struct mf_core *c = CORE_OF(iface, source);
++    HRESULT hr = S_OK;
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->state == SOURCE_SHUTDOWN) {
++        hr = MF_E_SHUTDOWN;
++    } else if (c->state != SOURCE_STARTED) {
++        hr = MF_E_INVALID_STATE_TRANSITION;
++    } else {
++        c->state = SOURCE_PAUSED;
++        IMFMediaEventQueue_QueueEventParamVar(c->source_events, MESourcePaused,
++                                              &null_guid, S_OK, NULL);
++        IMFMediaEventQueue_QueueEventParamVar(c->stream_events, MEStreamPaused,
++                                              &null_guid, S_OK, NULL);
++    }
++    ReleaseSRWLockExclusive(&c->lock);
++    return hr;
++}
++
++static HRESULT STDMETHODCALLTYPE source_Shutdown(IMFMediaSource *iface)
++{
++    struct mf_core *c = CORE_OF(iface, source);
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->state != SOURCE_SHUTDOWN) {
++        c->state = SOURCE_SHUTDOWN;
++        drop_tokens(c);
++        drop_units(c);
++        IMFMediaEventQueue_Shutdown(c->source_events);
++        IMFMediaEventQueue_Shutdown(c->stream_events);
++    }
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static CONST_VTBL IMFMediaSourceVtbl source_vtbl = {
++    .QueryInterface = source_QueryInterface,
++    .AddRef = source_AddRef,
++    .Release = source_Release,
++    .GetEvent = source_GetEvent,
++    .BeginGetEvent = source_BeginGetEvent,
++    .EndGetEvent = source_EndGetEvent,
++    .QueueEvent = source_QueueEvent,
++    .GetCharacteristics = source_GetCharacteristics,
++    .CreatePresentationDescriptor = source_CreatePresentationDescriptor,
++    .Start = source_Start,
++    .Stop = source_Stop,
++    .Pause = source_Pause,
++    .Shutdown = source_Shutdown,
++};
++
++// --- IMFMediaStream
++
++static HRESULT STDMETHODCALLTYPE stream_QueryInterface(IMFMediaStream *iface,
++                                                       REFIID riid, void **out)
++{
++    if (!out)
++        return E_POINTER;
++    if (IsEqualGUID(riid, &IID_IUnknown) ||
++        IsEqualGUID(riid, &IID_IMFMediaEventGenerator) ||
++        IsEqualGUID(riid, &IID_IMFMediaStream))
++    {
++        *out = iface;
++        core_addref(CORE_OF(iface, stream));
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE stream_AddRef(IMFMediaStream *iface)
++{
++    return core_addref(CORE_OF(iface, stream));
++}
++
++static ULONG STDMETHODCALLTYPE stream_Release(IMFMediaStream *iface)
++{
++    return core_release(CORE_OF(iface, stream));
++}
++
++static HRESULT STDMETHODCALLTYPE stream_GetEvent(IMFMediaStream *iface,
++                                                 DWORD flags, IMFMediaEvent **out)
++{
++    return IMFMediaEventQueue_GetEvent(CORE_OF(iface, stream)->stream_events,
++                                       flags, out);
++}
++
++static HRESULT STDMETHODCALLTYPE stream_BeginGetEvent(IMFMediaStream *iface,
++                                                      IMFAsyncCallback *cb,
++                                                      IUnknown *state)
++{
++    return IMFMediaEventQueue_BeginGetEvent(CORE_OF(iface, stream)->stream_events,
++                                            cb, state);
++}
++
++static HRESULT STDMETHODCALLTYPE stream_EndGetEvent(IMFMediaStream *iface,
++                                                    IMFAsyncResult *result,
++                                                    IMFMediaEvent **out)
++{
++    return IMFMediaEventQueue_EndGetEvent(CORE_OF(iface, stream)->stream_events,
++                                          result, out);
++}
++
++static HRESULT STDMETHODCALLTYPE stream_QueueEvent(IMFMediaStream *iface,
++                                                   MediaEventType type,
++                                                   REFGUID ext, HRESULT status,
++                                                   const PROPVARIANT *value)
++{
++    return IMFMediaEventQueue_QueueEventParamVar(
++        CORE_OF(iface, stream)->stream_events, type, ext, status, value);
++}
++
++static HRESULT STDMETHODCALLTYPE stream_GetMediaSource(IMFMediaStream *iface,
++                                                       IMFMediaSource **out)
++{
++    struct mf_core *c = CORE_OF(iface, stream);
++    if (!out)
++        return E_POINTER;
++    *out = &c->source;
++    core_addref(c);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE stream_GetStreamDescriptor(IMFMediaStream *iface,
++                                                            IMFStreamDescriptor **out)
++{
++    struct mf_core *c = CORE_OF(iface, stream);
++    if (!out)
++        return E_POINTER;
++    *out = c->sd;
++    IMFStreamDescriptor_AddRef(c->sd);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE stream_RequestSample(IMFMediaStream *iface,
++                                                      IUnknown *token)
++{
++    struct mf_core *c = CORE_OF(iface, stream);
++    HRESULT hr = S_OK;
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->state == SOURCE_SHUTDOWN) {
++        hr = MF_E_SHUTDOWN;
++    } else if (c->state == SOURCE_STOPPED) {
++        // The one error the pipeline takes for a stopped stream: any other
++        // halts the session.
++        hr = MF_E_MEDIA_SOURCE_WRONGSTATE;
++    } else if (!push_token(c, token)) {
++        hr = E_OUTOFMEMORY;
++    } else {
++        // While paused the request waits for the next Start.
++        deliver(c);
++        // The pipeline took something, or waits for more: have mpv refill.
++        if (c->ao)
++            ao_wakeup(c->ao);
++    }
++    ReleaseSRWLockExclusive(&c->lock);
++    return hr;
++}
++
++static CONST_VTBL IMFMediaStreamVtbl stream_vtbl = {
++    .QueryInterface = stream_QueryInterface,
++    .AddRef = stream_AddRef,
++    .Release = stream_Release,
++    .GetEvent = stream_GetEvent,
++    .BeginGetEvent = stream_BeginGetEvent,
++    .EndGetEvent = stream_EndGetEvent,
++    .QueueEvent = stream_QueueEvent,
++    .GetMediaSource = stream_GetMediaSource,
++    .GetStreamDescriptor = stream_GetStreamDescriptor,
++    .RequestSample = stream_RequestSample,
++};
++
++// --- IMFAsyncCallback: the session's events
++
++static HRESULT STDMETHODCALLTYPE callback_QueryInterface(IMFAsyncCallback *iface,
++                                                         REFIID riid, void **out)
++{
++    if (!out)
++        return E_POINTER;
++    if (IsEqualGUID(riid, &IID_IUnknown) ||
++        IsEqualGUID(riid, &IID_IMFAsyncCallback))
++    {
++        *out = iface;
++        core_addref(CORE_OF(iface, callback));
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE callback_AddRef(IMFAsyncCallback *iface)
++{
++    return core_addref(CORE_OF(iface, callback));
++}
++
++static ULONG STDMETHODCALLTYPE callback_Release(IMFAsyncCallback *iface)
++{
++    return core_release(CORE_OF(iface, callback));
++}
++
++static HRESULT STDMETHODCALLTYPE callback_GetParameters(IMFAsyncCallback *iface,
++                                                        DWORD *flags, DWORD *queue)
++{
++    return E_NOTIMPL;
++}
++
++// Events the renderer raises when its device goes away or changes. Whether
++// the session passes them on is up to it; the device notifications below
++// cover the same cases.
++static bool device_event(MediaEventType type)
++{
++    switch (type) {
++    case MEAudioSessionDeviceRemoved:
++    case MEAudioSessionDisconnected:
++    case MEAudioSessionFormatChanged:
++    case MEStreamSinkDeviceChanged:
++    case MESinkInvalidated:
++    case ME_STREAM_SINK_FORMAT_INVALIDATED:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static HRESULT STDMETHODCALLTYPE callback_Invoke(IMFAsyncCallback *iface,
++                                                 IMFAsyncResult *result)
++{
++    struct mf_core *c = CORE_OF(iface, callback);
++
++    AcquireSRWLockExclusive(&c->lock);
++    IMFMediaSession *session = c->session;
++    if (session)
++        IMFMediaSession_AddRef(session);
++    ReleaseSRWLockExclusive(&c->lock);
++    if (!session)
++        return S_OK;
++
++    IMFMediaEvent *event = NULL;
++    MediaEventType type = MEUnknown;
++    HRESULT status = S_OK;
++    UINT32 topo = 0;
++    HRESULT hr = IMFMediaSession_EndGetEvent(session, result, &event);
++    if (SUCCEEDED(hr)) {
++        IMFMediaEvent_GetType(event, &type);
++        IMFMediaEvent_GetStatus(event, &status);
++        IMFMediaEvent_GetUINT32(event, &MF_EVENT_TOPOLOGY_STATUS, &topo);
++        IMFMediaEvent_Release(event);
++    }
++
++    AcquireSRWLockExclusive(&c->lock);
++    bool more = true;
++    if (FAILED(hr)) {
++        // Without the events nothing below can be told any more.
++        if (hr != MF_E_SHUTDOWN)
++            fail_locked(c, "Lost the session's events", hr);
++        more = false;
++    } else {
++        if (c->ao)
++            MP_DBG(c->ao, "Session event %d: %s\n", (int)type,
++                   mp_HRESULT_to_str(status));
++        if (type == MESessionClosed) {
++            more = false;       // whatever its status: uninit waits for it
++        } else if (type == MEAudioSessionExclusiveModeOverride ||
++                   type == MEAudioSessionServerShutdown) {
++            fail_locked(c, "The audio device was taken away",
++                        FAILED(status) ? status : E_FAIL);
++        } else if (device_event(type)) {
++            device_trouble_locked(c, "The renderer lost its device");
++        } else if (FAILED(status) || type == MEError) {
++            fail_locked(c, "The session failed", FAILED(status) ? status : E_FAIL);
++        } else if (type == MESessionTopologyStatus) {
++            if (topo == MF_TOPOSTATUS_READY)
++                c->topology_ready = true;
++        } else if (type == MESessionStarted) {
++            c->started_events++;
++            if (c->ao)
++                ao_wakeup(c->ao);
++        }
++    }
++    c->events_done = !more;
++    WakeAllConditionVariable(&c->changed);
++    ReleaseSRWLockExclusive(&c->lock);
++
++    if (more) {
++        hr = IMFMediaSession_BeginGetEvent(session, iface, NULL);
++        if (FAILED(hr)) {
++            AcquireSRWLockExclusive(&c->lock);
++            if (hr != MF_E_SHUTDOWN)
++                fail_locked(c, "Lost the session's events", hr);
++            c->events_done = true;
++            WakeAllConditionVariable(&c->changed);
++            ReleaseSRWLockExclusive(&c->lock);
++        }
++    }
++    IMFMediaSession_Release(session);
++    return S_OK;
++}
++
++static CONST_VTBL IMFAsyncCallbackVtbl callback_vtbl = {
++    .QueryInterface = callback_QueryInterface,
++    .AddRef = callback_AddRef,
++    .Release = callback_Release,
++    .GetParameters = callback_GetParameters,
++    .Invoke = callback_Invoke,
++};
++
++// --- IMMNotificationClient: the device going away, or another default.
++// The same cases ao_wasapi_changenotify.c reloads for.
++
++static HRESULT STDMETHODCALLTYPE notify_QueryInterface(IMMNotificationClient *iface,
++                                                       REFIID riid, void **out)
++{
++    if (!out)
++        return E_POINTER;
++    if (IsEqualGUID(riid, &IID_IUnknown) ||
++        IsEqualGUID(riid, &IID_IMMNotificationClient))
++    {
++        *out = iface;
++        core_addref(CORE_OF(iface, notify));
++        return S_OK;
++    }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE notify_AddRef(IMMNotificationClient *iface)
++{
++    return core_addref(CORE_OF(iface, notify));
++}
++
++static ULONG STDMETHODCALLTYPE notify_Release(IMMNotificationClient *iface)
++{
++    return core_release(CORE_OF(iface, notify));
++}
++
++static bool is_our_device(struct mf_core *c, LPCWSTR id)
++{
++    return id && c->endpoint && !wcscmp(id, c->endpoint);
++}
++
++static HRESULT STDMETHODCALLTYPE notify_OnDeviceStateChanged(IMMNotificationClient *iface,
++                                                             LPCWSTR id, DWORD state)
++{
++    struct mf_core *c = CORE_OF(iface, notify);
++    AcquireSRWLockExclusive(&c->lock);
++    if (is_our_device(c, id) && state != DEVICE_STATE_ACTIVE)
++        reload_locked(c, "The audio device went away");
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE notify_OnDeviceAdded(IMMNotificationClient *iface,
++                                                      LPCWSTR id)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE notify_OnDeviceRemoved(IMMNotificationClient *iface,
++                                                        LPCWSTR id)
++{
++    struct mf_core *c = CORE_OF(iface, notify);
++    AcquireSRWLockExclusive(&c->lock);
++    if (is_our_device(c, id))
++        reload_locked(c, "The audio device was removed");
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE notify_OnDefaultDeviceChanged(IMMNotificationClient *iface,
++                                                               EDataFlow flow, ERole role,
++                                                               LPCWSTR id)
++{
++    struct mf_core *c = CORE_OF(iface, notify);
++    // The role ao_wasapi picks the default device for.
++    if (flow != eRender || role != eMultimedia)
++        return S_OK;
++    AcquireSRWLockExclusive(&c->lock);
++    if (c->follow_default && !is_our_device(c, id))
++        reload_locked(c, "Another device is the default now");
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE notify_OnPropertyValueChanged(IMMNotificationClient *iface,
++                                                               LPCWSTR id,
++                                                               const PROPERTYKEY key)
++{
++    struct mf_core *c = CORE_OF(iface, notify);
++    AcquireSRWLockExclusive(&c->lock);
++    if (is_our_device(c, id)) {
++        if (key.pid == PKEY_AudioEngine_DeviceFormat.pid &&
++            IsEqualGUID(&key.fmtid, &PKEY_AudioEngine_DeviceFormat.fmtid))
++        {
++            reload_locked(c, "The device format changed");
++        } else if (c->ao) {
++            MP_DBG(c->ao, "Device property changed: %s\n", mp_PKEY_to_str(&key));
++        }
++    }
++    ReleaseSRWLockExclusive(&c->lock);
++    return S_OK;
++}
++
++static CONST_VTBL IMMNotificationClientVtbl notify_vtbl = {
++    .QueryInterface = notify_QueryInterface,
++    .AddRef = notify_AddRef,
++    .Release = notify_Release,
++    .OnDeviceStateChanged = notify_OnDeviceStateChanged,
++    .OnDeviceAdded = notify_OnDeviceAdded,
++    .OnDeviceRemoved = notify_OnDeviceRemoved,
++    .OnDefaultDeviceChanged = notify_OnDefaultDeviceChanged,
++    .OnPropertyValueChanged = notify_OnPropertyValueChanged,
++};
++
++// --- the AO
++
++// Whether the decoder the topology loader picked hands the renderer objects.
++static bool renders_objects(struct ao *ao, IMFMediaSession *session)
++{
++    IMFTopology *topology = NULL;
++    bool spatial = false;
++    WORD count = 0;
++    if (FAILED(IMFMediaSession_GetFullTopology(
++            session, MFSESSION_GETFULLTOPOLOGY_CURRENT, 0, &topology)))
++        return false;
++    IMFTopology_GetNodeCount(topology, &count);
++    for (WORD n = 0; n < count; n++) {
++        IMFTopologyNode *node = NULL;
++        IUnknown *object = NULL;
++        IMFTransform *transform = NULL;
++        IMFMediaType *type = NULL;
++        MF_TOPOLOGY_TYPE kind = MF_TOPOLOGY_MAX;
++        GUID subtype = {0};
++        UINT32 objects = 0;
++        if (SUCCEEDED(IMFTopology_GetNode(topology, n, &node)) &&
++            SUCCEEDED(IMFTopologyNode_GetNodeType(node, &kind)) &&
++            kind == MF_TOPOLOGY_TRANSFORM_NODE &&
++            SUCCEEDED(IMFTopologyNode_GetObject(node, &object)) &&
++            SUCCEEDED(IUnknown_QueryInterface(object, &IID_IMFTransform,
++                                              (void **)&transform)) &&
++            SUCCEEDED(IMFTransform_GetOutputCurrentType(transform, 0, &type)) &&
++            SUCCEEDED(IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype)))
++        {
++            IMFMediaType_GetUINT32(type, &spatial_max_dynamic_objects,
++                                   &objects);
++            bool is_spatial = IsEqualGUID(&subtype,
++                                          &spatial_objects_subtype);
++            MP_VERBOSE(ao, "Decoder output: %s (%u dynamic objects)\n",
++                       is_spatial ? "spatial objects" : mp_GUID_to_str(&subtype),
++                       (unsigned)objects);
++            spatial |= is_spatial;
++        }
++        if (type)
++            IMFMediaType_Release(type);
++        if (transform)
++            IMFTransform_Release(transform);
++        if (object)
++            IUnknown_Release(object);
++        if (node)
++            IMFTopologyNode_Release(node);
++    }
++    IMFTopology_Release(topology);
++    return spatial;
++}
++
++static void uninit(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    struct mf_core *c = p->core;
++
++    if (c) {
++        AcquireSRWLockExclusive(&c->lock);
++        c->ao = NULL;
++        c->live = false;
++        ReleaseSRWLockExclusive(&c->lock);
++    }
++    // Not under the lock: the notifications take it, and unregistering waits
++    // for them.
++    if (p->notify_registered) {
++        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(p->enumerator,
++                                                                   &c->notify);
++        core_release(c);
++    }
++    if (p->enumerator)
++        IMMDeviceEnumerator_Release(p->enumerator);
++    if (p->session) {
++        if (SUCCEEDED(IMFMediaSession_Close(p->session))) {
++            AcquireSRWLockExclusive(&c->lock);
++            int64_t end = mp_time_ns() + MP_TIME_MS_TO_NS(CLOSE_TIMEOUT_MS);
++            while (!c->events_done && mp_time_ns() < end)
++                SleepConditionVariableSRW(&c->changed, &c->lock, 50, 0);
++            ReleaseSRWLockExclusive(&c->lock);
++        }
++    }
++    if (c)
++        IMFMediaSource_Shutdown(&c->source);
++    if (p->session)
++        IMFMediaSession_Shutdown(p->session);
++    if (c) {
++        AcquireSRWLockExclusive(&c->lock);
++        IMFMediaSession *held = c->session;
++        c->session = NULL;
++        ReleaseSRWLockExclusive(&c->lock);
++        if (held)
++            IMFMediaSession_Release(held);
++    }
++    if (p->volume)
++        IMFAudioStreamVolume_Release(p->volume);
++    if (p->clock)
++        IMFPresentationClock_Release(p->clock);
++    if (p->session)
++        IMFMediaSession_Release(p->session);
++    if (c)
++        core_release(c);
++    if (p->mf_started)
++        mf.MFShutdown();
++    if (p->com_init)
++        CoUninitialize();
++    bursts_free(&p->bursts);
++    *p = (struct priv){.opt_require_spatial = p->opt_require_spatial};
++}
++
++static struct mf_core *create_core(struct ao *ao, int rate, const wchar_t *endpoint,
++                                   bool follow_default)
++{
++    struct mf_core *c = calloc(1, sizeof(*c));
++    if (!c)
++        return NULL;
++    c->source.lpVtbl = &source_vtbl;
++    c->stream.lpVtbl = &stream_vtbl;
++    c->callback.lpVtbl = &callback_vtbl;
++    c->notify.lpVtbl = &notify_vtbl;
++    c->refs = 1;
++    c->ao = ao;
++    c->flushing = true;
++    c->follow_default = follow_default;
++    c->unit_duration = (LONGLONG)BURST_FRAMES * 10000000 / ao->samplerate;
++    InitializeSRWLock(&c->lock);
++    InitializeConditionVariable(&c->changed);
++
++    // The decoder reads everything else out of the stream. The channel count
++    // only shapes the PCM types it offers; with objects it does not matter.
++    IMFMediaType *type = NULL;
++    IMFMediaTypeHandler *handler = NULL;
++    bool ok = (c->endpoint = _wcsdup(endpoint)) &&
++              SUCCEEDED(mf.MFCreateEventQueue(&c->source_events)) &&
++              SUCCEEDED(mf.MFCreateEventQueue(&c->stream_events)) &&
++              SUCCEEDED(mf.MFCreateMediaType(&type)) &&
++              SUCCEEDED(IMFMediaType_SetGUID(type, &MF_MT_MAJOR_TYPE,
++                                             &MFMediaType_Audio)) &&
++              SUCCEEDED(IMFMediaType_SetGUID(type, &MF_MT_SUBTYPE,
++                                             &MFAudioFormat_Dolby_DDPlus)) &&
++              SUCCEEDED(IMFMediaType_SetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, 6)) &&
++              SUCCEEDED(IMFMediaType_SetUINT32(type, &MF_MT_AUDIO_SAMPLES_PER_SECOND,
++                                               rate)) &&
++              SUCCEEDED(mf.MFCreateStreamDescriptor(1, 1, &type, &c->sd)) &&
++              SUCCEEDED(IMFStreamDescriptor_GetMediaTypeHandler(c->sd, &handler)) &&
++              SUCCEEDED(IMFMediaTypeHandler_SetCurrentMediaType(handler, type)) &&
++              SUCCEEDED(mf.MFCreatePresentationDescriptor(1, &c->sd, &c->pd)) &&
++              SUCCEEDED(IMFPresentationDescriptor_SelectStream(c->pd, 0));
++    if (handler)
++        IMFMediaTypeHandler_Release(handler);
++    if (type)
++        IMFMediaType_Release(type);
++    if (!ok) {
++        core_release(c);
++        return NULL;
++    }
++    return c;
++}
++
++static HRESULT set_topology(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    struct mf_core *c = p->core;
++    IMFTopology *topology = NULL;
++    IMFTopologyNode *source = NULL, *output = NULL;
++    IMFActivate *renderer = NULL;
++    HRESULT hr;
++
++#define TRY(call) do { hr = (call); if (FAILED(hr)) goto done; } while (0)
++    TRY(mf.MFCreateTopology(&topology));
++    TRY(mf.MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &source));
++    TRY(IMFTopologyNode_SetUnknown(source, &MF_TOPONODE_SOURCE,
++                                   (IUnknown *)&c->source));
++    TRY(IMFTopologyNode_SetUnknown(source, &MF_TOPONODE_PRESENTATION_DESCRIPTOR,
++                                   (IUnknown *)c->pd));
++    TRY(IMFTopologyNode_SetUnknown(source, &MF_TOPONODE_STREAM_DESCRIPTOR,
++                                   (IUnknown *)c->sd));
++    TRY(mf.MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE, &output));
++    TRY(mf.MFCreateAudioRendererActivate(&renderer));
++    TRY(IMFActivate_SetString(renderer, &MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ID,
++                              c->endpoint));
++    TRY(IMFTopologyNode_SetObject(output, (IUnknown *)renderer));
++    TRY(IMFTopology_AddNode(topology, source));
++    TRY(IMFTopology_AddNode(topology, output));
++    TRY(IMFTopologyNode_ConnectOutput(source, 0, output, 0));
++    TRY(IMFMediaSession_SetTopology(p->session, 0, topology));
++#undef TRY
++
++done:
++    if (renderer)
++        IMFActivate_Release(renderer);
++    if (output)
++        IMFTopologyNode_Release(output);
++    if (source)
++        IMFTopologyNode_Release(source);
++    if (topology)
++        IMFTopology_Release(topology);
++    return hr;
++}
++
++static int init(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    int level = ao->probing ? MSGL_V : MSGL_ERR;
++    HRESULT hr = E_FAIL;
++
++    if (ao->format != AF_FORMAT_S_EAC3) {
++        MP_VERBOSE(ao, "Only for Dolby Digital Plus passed through "
++                   "(--audio-spdif=eac3), not %s.\n", af_fmt_to_str(ao->format));
++        return -1;
++    }
++    mp_exec_once(&mf_once, load_mf);
++    if (!mf.loaded) {
++        MP_VERBOSE(ao, "Media Foundation is not available on this system.\n");
++        return -1;
++    }
++
++    // COM stays initialized for the AO's lifetime, as in ao_wasapi.
++    p->com_init = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
++
++    // The device ao_wasapi was opened for and passed on with the redirect
++    // (ao->device), or the default one; found the way ao_wasapi finds it.
++    wchar_t *endpoint = wasapi_find_deviceID(ao);
++    if (!endpoint)
++        goto error;
++    bool follow_default = !ao->device || !ao->device[0];
++
++    // The carrier runs at four times the track's rate.
++    int rate = ao->samplerate / 4;
++    ao->device_buffer = QUEUE_UNITS * BURST_FRAMES;
++
++    hr = mf.MFStartup(MF_VERSION, MFSTARTUP_LITE);
++    p->mf_started = SUCCEEDED(hr);
++    if (FAILED(hr)) {
++        talloc_free(endpoint);
++        goto error;
++    }
++    p->core = create_core(ao, rate, endpoint, follow_default);
++    talloc_free(endpoint);
++    if (!p->core) {
++        hr = E_OUTOFMEMORY;
++        goto error;
++    }
++    struct mf_core *c = p->core;
++
++    hr = mf.MFCreateMediaSession(NULL, &p->session);
++    if (FAILED(hr))
++        goto error;
++    c->session = p->session;
++    IMFMediaSession_AddRef(c->session);
++    hr = IMFMediaSession_BeginGetEvent(p->session, &c->callback, NULL);
++    if (FAILED(hr))
++        goto error;
++    hr = set_topology(ao);
++    if (FAILED(hr))
++        goto error;
++
++    // No decoder, no endpoint, a type the renderer refuses: all of it shows
++    // up here, as a failed topology.
++    AcquireSRWLockExclusive(&c->lock);
++    int64_t end = mp_time_ns() + MP_TIME_MS_TO_NS(TOPOLOGY_TIMEOUT_MS);
++    while (!c->topology_ready && !c->failed && mp_time_ns() < end)
++        SleepConditionVariableSRW(&c->changed, &c->lock, 50, 0);
++    bool ready = c->topology_ready && !c->failed;
++    hr = c->failed ? c->error : (ready ? S_OK : HRESULT_FROM_WIN32(ERROR_TIMEOUT));
++    ReleaseSRWLockExclusive(&c->lock);
++    if (!ready)
++        goto error;
++
++    bool spatial = renders_objects(ao, p->session);
++    if (!spatial && p->opt_require_spatial) {
++        MP_VERBOSE(ao, "The system decoder would not hand out objects here "
++                   "(no spatial sound format active?).\n");
++        uninit(ao);
++        return -1;
++    }
++
++    IMFClock *clock = NULL;
++    hr = IMFMediaSession_GetClock(p->session, &clock);
++    if (SUCCEEDED(hr)) {
++        hr = IMFClock_QueryInterface(clock, &IID_IMFPresentationClock,
++                                     (void **)&p->clock);
++        IMFClock_Release(clock);
++    }
++    if (FAILED(hr))
++        goto error;
++
++    // Volume is best effort: the renderer may not offer it for objects.
++    if (FAILED(mf.MFGetService((IUnknown *)p->session, &MR_STREAM_VOLUME_SERVICE,
++                               &IID_IMFAudioStreamVolume, (void **)&p->volume)))
++        p->volume = NULL;
++    p->gain = 1.0f;
++    MP_VERBOSE(ao, "Stream volume control: %s\n", p->volume ? "yes" : "no");
++
++    // Device changes, as ao_wasapi follows them. Without them playback still
++    // works; it just stays on this device.
++    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
++                          &IID_IMMDeviceEnumerator, (void **)&p->enumerator);
++    if (SUCCEEDED(hr)) {
++        core_addref(c);
++        hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(p->enumerator,
++                                                                      &c->notify);
++        p->notify_registered = SUCCEEDED(hr);
++        if (!p->notify_registered)
++            core_release(c);
++    }
++    if (FAILED(hr))
++        MP_WARN(ao, "Device changes will not be followed: %s\n", mp_HRESULT_to_str(hr));
++
++    // A failure that came in after the topology was ready did not reach the
++    // player (live was false): fail init with it instead.
++    AcquireSRWLockExclusive(&c->lock);
++    bool failed = c->failed;
++    hr = c->error;
++    if (!failed)
++        c->live = true;
++    ReleaseSRWLockExclusive(&c->lock);
++    if (failed)
++        goto error;
++
++    MP_INFO(ao, "Dolby Digital Plus goes to the system decoder%s.\n",
++            spatial ? ", rendered as spatial objects" : "");
++    return 0;
++
++error:
++    mp_msg(ao->log, level, "Could not set up the Media Foundation pipeline: %s\n",
++           mp_HRESULT_to_str(hr));
++    uninit(ao);
++    return -1;
++}
++
++static void reset(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    struct mf_core *c = p->core;
++
++    AcquireSRWLockExclusive(&c->lock);
++    c->flushing = true;
++    drop_units(c);
++    drop_tokens(c);
++    // Counted before the call: the session may stop the source before Stop()
++    // returns.
++    if (p->session_running)
++        c->stops_pending++;
++    ReleaseSRWLockExclusive(&c->lock);
++
++    if (p->session_running) {
++        HRESULT hr = IMFMediaSession_Stop(p->session);
++        if (FAILED(hr)) {
++            AcquireSRWLockExclusive(&c->lock);
++            c->stops_pending--;
++            fail_locked(c, "Stop failed", hr);
++            ReleaseSRWLockExclusive(&c->lock);
++        }
++    }
++    p->session_running = false;
++    p->started = p->paused = false;
++    p->clock_moved = false;
++    bursts_reset(&p->bursts);
++    p->written = 0;
++}
++
++static void start(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++
++    p->started = true;
++    p->paused = false;
++    p->last_clock_change = mp_time_ns();
++    if (p->session_running)
++        return;     // after an underrun: the pipeline is still waiting for data
++
++    PROPVARIANT position;
++    PropVariantInit(&position);
++    position.vt = VT_I8;
++    position.hVal.QuadPart = 0;
++    p->last_clock = 0;
++    p->clock_moved = false;
++    HRESULT hr = IMFMediaSession_Start(p->session, &null_guid, &position);
++    if (FAILED(hr)) {
++        fail(ao, "Start failed", hr);
++        return;
++    }
++    // Only accepted calls end in a MESessionStarted (or a failure event).
++    p->restart_call = ++p->starts_ok;
++    p->restart_time = mp_time_ns();
++    p->session_running = true;
++}
++
++static bool set_pause(struct ao *ao, bool paused)
++{
++    struct priv *p = ao->priv;
++
++    if (p->paused == paused)
++        return true;
++    if (p->session_running) {
++        if (paused) {
++            HRESULT hr = IMFMediaSession_Pause(p->session);
++            if (FAILED(hr)) {
++                // The core resets instead, which stops the session.
++                MP_VERBOSE(ao, "Pause failed: %s\n", mp_HRESULT_to_str(hr));
++                return false;
++            }
++        } else {
++            PROPVARIANT current;
++            PropVariantInit(&current);
++            HRESULT hr = IMFMediaSession_Start(p->session, &null_guid, &current);
++            if (FAILED(hr)) {
++                // Unpausing cannot fail for the core: without the session,
++                // the track is decoded instead.
++                fail(ao, "Resume failed", hr);
++            } else {
++                p->starts_ok++;
++            }
++        }
++    }
++    p->paused = paused;
++    p->last_clock_change = mp_time_ns();
++    return true;
++}
++
++static bool queue_unit(void *ctx, const uint8_t *payload, size_t size,
++                       int64_t offset)
++{
++    struct ao *ao = ctx;
++    struct priv *p = ao->priv;
++    struct mf_core *c = p->core;
++    int64_t bytes_per_second = (int64_t)ao->samplerate * ao->sstride;
++
++    uint8_t *data = malloc(size);
++    if (!data)
++        return false;
++    memcpy(data, payload, size);
++    LONGLONG time = offset * 10000000 / bytes_per_second;
++
++    AcquireSRWLockExclusive(&c->lock);
++    bool queued = c->num_units < MAX_UNITS && c->state != SOURCE_SHUTDOWN;
++    if (queued) {
++        struct unit *u = &c->units[(c->unit_pos + c->num_units) % MAX_UNITS];
++        *u = (struct unit){.data = data, .size = size, .time = time};
++        c->num_units++;
++        deliver(c);
++    }
++    ReleaseSRWLockExclusive(&c->lock);
++    if (!queued) {
++        MP_WARN(ao, "Dropped an access unit: the queue is full.\n");
++        free(data);
++    }
++    return true;
++}
++
++static bool audio_write(struct ao *ao, void **data, int samples)
++{
++    struct priv *p = ao->priv;
++    size_t max_payload = (size_t)BURST_FRAMES * ao->sstride - BURST_HEADER;
++
++    if (!bursts_feed(&p->bursts, data[0], (size_t)samples * ao->sstride,
++                     max_payload, queue_unit, ao))
++        return false;
++    if (p->bursts.skipped_other && !p->warned_type) {
++        MP_WARN(ao, "Skipping bursts that are not E-AC-3.\n");
++        p->warned_type = true;
++    }
++    p->written += samples;
++    return true;
++}
++
++static void update_volume(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    float gain = atomic_load(&ao->gain);
++
++    if (!p->volume || (p->volume_set && gain == p->gain))
++        return;
++    if (gain > 1 && !p->warned_gain) {
++        MP_VERBOSE(ao, "The renderer cannot amplify: above 100%% it plays at 100%%.\n");
++        p->warned_gain = true;
++    }
++    UINT32 channels = 0;
++    HRESULT hr = IMFAudioStreamVolume_GetChannelCount(p->volume, &channels);
++    for (UINT32 n = 0; n < channels && SUCCEEDED(hr); n++)
++        hr = IMFAudioStreamVolume_SetChannelVolume(p->volume, n, MPCLAMP(gain, 0, 1));
++    if (SUCCEEDED(hr) && channels) {
++        // Only now: a failure is tried again with the next state query.
++        p->gain = gain;
++        p->volume_set = true;
++        MP_VERBOSE(ao, "Volume %.3f on %u channel(s).\n", gain, (unsigned)channels);
++    } else if (!p->warned_volume) {
++        MP_WARN(ao, "Could not set the volume: %s\n", mp_HRESULT_to_str(hr));
++        p->warned_volume = true;
++    }
++}
++
++static void get_state(struct ao *ao, struct mp_pcm_state *state)
++{
++    struct priv *p = ao->priv;
++    struct mf_core *c = p->core;
++
++    AcquireSRWLockExclusive(&c->lock);
++    int units = c->num_units;
++    bool starving = c->num_tokens > 0 && !c->num_units;
++    bool failed = c->failed;
++    bool clock_restarted = c->started_events >= p->restart_call;
++    ReleaseSRWLockExclusive(&c->lock);
++
++    int pending = p->bursts.len / ao->sstride;
++    state->free_samples = MPMAX((QUEUE_UNITS - units) * BURST_FRAMES - pending, 0);
++    state->queued_samples = units * BURST_FRAMES + pending;
++
++    int64_t wall = mp_time_ns();
++    // After a gap with no query at all (the process was suspended) the
++    // clocks below start over instead of reading the gap as a stall.
++    if (wall - p->last_state_time > MP_TIME_MS_TO_NS(500)) {
++        p->last_clock_change = wall;
++        if (!clock_restarted)
++            p->restart_time = wall;
++    }
++    p->last_state_time = wall;
++
++    // Until the session reports the start, the clock still shows where the
++    // last run stopped. It cannot be past what was written since the reset
++    // either: such a value belongs to the run before it.
++    double written = p->written / (double)ao->samplerate;
++    MFTIME now = 0;
++    if (!p->session_running || !clock_restarted ||
++        FAILED(IMFPresentationClock_GetTime(p->clock, &now)) ||
++        now / 1e7 > written)
++        now = 0;
++    if (now != p->last_clock) {
++        p->last_clock = now;
++        p->last_clock_change = wall;
++        if (now > 0 && !p->clock_moved) {
++            p->clock_moved = true;
++            AcquireSRWLockExclusive(&c->lock);
++            c->played = true;
++            ReleaseSRWLockExclusive(&c->lock);
++        }
++    }
++    double delay = written - now / 1e7;
++    state->delay = MPMAX(delay, 0);
++    int64_t still = wall - p->last_clock_change;
++
++    // The session never reported the start of the run, or the renderer stopped
++    // taking audio while it had everything it asked for: either way the track
++    // goes to the decoder instead of hanging playback.
++    if (p->started && p->session_running && !p->paused && !failed) {
++        if (!clock_restarted &&
++            wall - p->restart_time > MP_TIME_MS_TO_NS(START_TIMEOUT_MS))
++        {
++            fail(ao, "The session did not start", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
++            failed = true;
++        } else if (clock_restarted && !starving &&
++                   still > MP_TIME_MS_TO_NS(STALL_TIMEOUT_MS))
++        {
++            fail(ao, "The renderer stopped taking audio",
++                 HRESULT_FROM_WIN32(ERROR_TIMEOUT));
++            failed = true;
++        }
++    }
++
++    // The pipeline asks for data and has none: an underrun or the end. It has
++    // played out what it had once the clock, after it started to run, stands
++    // still again (the decoder keeps the last unit, so that is one unit short
++    // of what was written). That does not depend on how much the endpoint
++    // buffers, and a pipeline still filling up at the start does not count.
++    bool dry = starving && !p->paused && clock_restarted && p->clock_moved &&
++               still > MP_TIME_MS_TO_NS(DRY_MS);
++    state->playing = p->started && !failed && !dry;
++
++    update_volume(ao);
++}
++
++#define OPT_BASE_STRUCT struct priv
++
++const struct ao_driver audio_out_mediafoundation = {
++    .description = "Dolby Digital Plus through the system decoder (Media Foundation)",
++    .name      = "mediafoundation",
++    .init      = init,
++    .uninit    = uninit,
++    .reset     = reset,
++    .start     = start,
++    .set_pause = set_pause,
++    .write     = audio_write,
++    .get_state = get_state,
++    .priv_size = sizeof(struct priv),
++    .priv_defaults = &(const struct priv) {
++        .opt_require_spatial = true,
++    },
++    .options = (const struct m_option[]) {
++        {"require-spatial", OPT_BOOL(opt_require_spatial)},
++        {0}
++    },
++    .options_prefix = "ao-mediafoundation",
++};
+diff --git a/audio/out/ao_wasapi.c b/audio/out/ao_wasapi.c
+index 7ad1e64..d17258c 100644
+--- a/audio/out/ao_wasapi.c
++++ b/audio/out/ao_wasapi.c
+@@ -21,6 +21,7 @@
+ #include <inttypes.h>
+ #include <libavutil/mathematics.h>
+ 
++#include "audio/format.h"
+ #include "options/m_option.h"
+ #include "osdep/threads.h"
+ #include "osdep/timer.h"
+@@ -343,7 +344,15 @@ static int init(struct ao *ao)
+     WaitForSingleObject(state->hInitDone, INFINITE); // wait on init complete
+     SAFE_DESTROY(state->hInitDone,CloseHandle(state->hInitDone));
+     if (!state->init_ok) {
+-        if (!ao->probing)
++#if HAVE_AO_MEDIAFOUNDATION
++        // A device that refuses the E-AC-3 bitstream may still play it
++        // through the system's Dolby decoder, as spatial objects.
++        if (ao->format == AF_FORMAT_S_EAC3) {
++            MP_VERBOSE(ao, "redirecting to mediafoundation\n");
++            ao->redirect = "mediafoundation";
++        }
++#endif
++        if (!ao->probing && !ao->redirect)
+             MP_FATAL(ao, "Received failure from audio thread\n");
+         uninit(ao);
+         return -1;
+diff --git a/meson.build b/meson.build
+index f53ce48..9f7eaf9 100644
+--- a/meson.build
++++ b/meson.build
+@@ -932,6 +932,15 @@ if features['wasapi']
+                      'audio/out/ao_wasapi_utils.c')
+ endif
+ 
++# E-AC-3 through the system's Media Foundation decoder (Dolby Atmos objects).
++# ao_wasapi hands it the stream and it finds devices as ao_wasapi does.
++# mf.dll and mfplat.dll are loaded at runtime, so only the headers are needed.
++features += {'ao-mediafoundation': features['win32-desktop'] and features['wasapi'] and
++                                   cc.has_header_symbol('mfidl.h', 'IMFMediaSession')}
++if features['ao-mediafoundation']
++    sources += files('audio/out/ao_mediafoundation.c')
++endif
++
+ 
+ # video output dependencies
+ caca_opt = get_option('caca').require(
