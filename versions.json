@@ -13,7 +13,7 @@
   "components": {
     "mpv": {
       "kind": "git",
-      "version": "v0.41.0",
+      "version": "v0.42.0",
       "url": "https://github.com/mpv-player/mpv",
       "ref": "v0.41.0",
       "commit": "41f6a645068483470267271e1d09966ca3b9f413",
@@ -28,7 +28,7 @@
     },
     "ffmpeg": {
       "kind": "git",
-      "version": "n8.0.1",
+      "version": "n9.0.2",
       "url": "https://github.com/FFmpeg/FFmpeg",
       "ref": "n8.0.1",
       "commit": "894da5ca7d742e4429ffb2af534fcda0103ef593",
