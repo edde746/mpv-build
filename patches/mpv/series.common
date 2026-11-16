@@ -74,3 +74,7 @@
 # Software screenshots download a hardware frame again (upstream b7b9ec2):
 # with VA-API under the render API on GLES every screenshot failed.
 0243-screenshot-correctly-detect-hardware-frame.patch
+# An output that cannot play its passthrough stream asks the player to decode
+# the track instead (ao_request_pcm_fallback()): the platform-independent half
+# of apple 0040, shared with windows 0300 (test_audio_passthrough_fallback.sh).
+0244-ao-let-an-output-report-that-it-cannot-play-its-passthrough-stream.patch

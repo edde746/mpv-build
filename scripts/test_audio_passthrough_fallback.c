@@ -1,6 +1,6 @@
-// Behavioral regression for patch 0040, extracted by
-// test_audio_passthrough_fallback.sh from player/audio.c: handle_ao_events(),
-// fall_back_to_pcm() and reload_audio_output().
+// Behavioral regression for patch 0244 (the player's half of apple 0040),
+// extracted by test_audio_passthrough_fallback.sh from player/audio.c:
+// handle_ao_events(), fall_back_to_pcm() and reload_audio_output().
 //
 // What must hold: an output that cannot play its passthrough stream reports
 // AO_EVENT_PASSTHROUGH_FAILED. The player closes it, decodes the track it fed

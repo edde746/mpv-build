@@ -1,9 +1,9 @@
 diff --git a/audio/out/ao.c b/audio/out/ao.c
-index 4e5e9e3..896dd6a 100644
+index e1007f4..8160852 100644
 --- a/audio/out/ao.c
 +++ b/audio/out/ao.c
-@@ -384,6 +384,12 @@ void ao_request_reload(struct ao *ao)
-     ao_add_events(ao, AO_EVENT_RELOAD);
+@@ -391,6 +391,12 @@ void ao_request_pcm_fallback(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_PASSTHROUGH_FAILED);
  }
  
 +// Report that the device stopped consuming audio for good. Fully thread-safe.
@@ -16,24 +16,24 @@ index 4e5e9e3..896dd6a 100644
  void ao_hotplug_event(struct ao *ao)
  {
 diff --git a/audio/out/ao.h b/audio/out/ao.h
-index ce044fd..fb697a5 100644
+index c3d4918..e6f9e7a 100644
 --- a/audio/out/ao.h
 +++ b/audio/out/ao.h
-@@ -43,6 +43,10 @@ enum aocontrol {
- enum {
-     AO_EVENT_RELOAD = 1,
-     AO_EVENT_HOTPLUG = 2,
+@@ -46,6 +46,10 @@ enum {
+     // The AO cannot play the passthrough stream it was opened for; the player
+     // closes it and decodes the track to PCM instead.
+     AO_EVENT_PASSTHROUGH_FAILED = 4,
 +    // The device stopped consuming audio and the driver's own bounded
 +    // recovery did not bring it back. The player stops with an error instead
 +    // of waiting on an audio clock that will never advance again.
-+    AO_EVENT_FAILURE = 4,
++    AO_EVENT_FAILURE = 8,
  };
  
  enum {
-@@ -105,6 +109,7 @@ struct mp_async_queue;
- struct mp_async_queue *ao_get_queue(struct ao *ao);
+@@ -109,6 +113,7 @@ struct mp_async_queue *ao_get_queue(struct ao *ao);
  int ao_query_and_reset_events(struct ao *ao, int events);
  void ao_request_reload(struct ao *ao);
+ void ao_request_pcm_fallback(struct ao *ao);
 +void ao_request_failure(struct ao *ao);
  void ao_hotplug_event(struct ao *ao);
  
@@ -742,10 +742,10 @@ index fff2f3d..bdf6b94 100644
      mp_cond_signal(&p->wakeup);
  }
 diff --git a/player/audio.c b/player/audio.c
-index c7e5650..ee8a083 100644
+index e581066..1aaf5ae 100644
 --- a/player/audio.c
 +++ b/player/audio.c
-@@ -875,6 +875,19 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
+@@ -916,6 +916,19 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
  {
      struct MPOpts *opts = mpctx->opts;
  
@@ -762,6 +762,6 @@ index c7e5650..ee8a083 100644
 +        return;
 +    }
 +
-     if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
-         reload_audio_output(mpctx);
+     handle_ao_events(mpctx);
  
+     update_throttle(mpctx);

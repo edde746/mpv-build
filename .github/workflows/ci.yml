@@ -116,9 +116,8 @@ jobs:
                 subprocess.run(['bash', 'scripts/test_player_video_restart.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_ass_pixel_ids.sh', str(dest)], check=True)
                 subprocess.run(['bash', 'scripts/test_sd_ass_seen_packets.sh', str(dest)], check=True)
-              if component == 'mpv' and group == 'apple':
-                # The player's half of the passthrough fallback: plain C, no
-                # Apple frameworks.
+                # The player's half of the passthrough fallback (0244, in
+                # series.common): plain C, no platform frameworks.
                 subprocess.run(['bash', 'scripts/test_audio_passthrough_fallback.sh', str(dest)], check=True)
               if component == 'mpv' and group == 'android':
                 subprocess.run(['bash', 'scripts/test_audiotrack_timing.sh', str(dest)], check=True)

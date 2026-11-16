@@ -1,0 +1,159 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:00:00 +0200
+Subject: [PATCH] ao: let an output report that it cannot play its passthrough
+ stream
+
+The platform-independent half of 0040, moved out of series.apple unchanged so
+that outputs of the other groups can use it (windows: 0300, ao_mediafoundation).
+0040 keeps the apple outputs' side.
+
+An output that cannot play its passthrough stream reports
+AO_EVENT_PASSTHROUGH_FAILED through ao_request_pcm_fallback(). The player
+closes the output and, when that output fed the current passthrough chain,
+switches the track's decoder to PCM with the chain's existing spdif_failed
+state, then issues an exact refresh seek to the playback position. The next
+track or file, or a later output reload, tries passthrough again. An event
+from an output that outlived its chain (a gapless file change or a track
+switch keeps it open) only closes it.
+
+ao_request_reload() alone cannot do this: the reload reopens the output with
+the same passthrough format, and an output whose failure only shows after
+init() fails the same way again, with no limit.
+
+diff --git a/audio/out/ao.c b/audio/out/ao.c
+index 4e5e9e3..e1007f4 100644
+--- a/audio/out/ao.c
++++ b/audio/out/ao.c
+@@ -384,6 +384,13 @@ void ao_request_reload(struct ao *ao)
+     ao_add_events(ao, AO_EVENT_RELOAD);
+ }
+ 
++// Report that the AO cannot play its passthrough stream: the player core
++// destroys the AO and decodes the track to PCM. Fully thread-safe.
++void ao_request_pcm_fallback(struct ao *ao)
++{
++    ao_add_events(ao, AO_EVENT_PASSTHROUGH_FAILED);
++}
++
+ // Notify the player that the device list changed. Fully thread-safe.
+ void ao_hotplug_event(struct ao *ao)
+ {
+diff --git a/audio/out/ao.h b/audio/out/ao.h
+index ce044fd..c3d4918 100644
+--- a/audio/out/ao.h
++++ b/audio/out/ao.h
+@@ -43,6 +43,9 @@ enum aocontrol {
+ enum {
+     AO_EVENT_RELOAD = 1,
+     AO_EVENT_HOTPLUG = 2,
++    // The AO cannot play the passthrough stream it was opened for; the player
++    // closes it and decodes the track to PCM instead.
++    AO_EVENT_PASSTHROUGH_FAILED = 4,
+ };
+ 
+ enum {
+@@ -105,6 +108,7 @@ struct mp_async_queue;
+ struct mp_async_queue *ao_get_queue(struct ao *ao);
+ int ao_query_and_reset_events(struct ao *ao, int events);
+ void ao_request_reload(struct ao *ao);
++void ao_request_pcm_fallback(struct ao *ao);
+ void ao_hotplug_event(struct ao *ao);
+ 
+ struct ao_hotplug;
+diff --git a/audio/out/internal.h b/audio/out/internal.h
+index 85fa777..9357189 100644
+--- a/audio/out/internal.h
++++ b/audio/out/internal.h
+@@ -61,7 +61,8 @@ struct ao {
+     // Used during init: if init fails, redirect to this ao
+     char *redirect;
+ 
+-    // Internal events (use ao_request_reload(), ao_hotplug_event())
++    // Internal events (use ao_request_reload(), ao_request_pcm_fallback(),
++    // ao_hotplug_event())
+     atomic_uint events_;
+ 
+     // Float gain multiplicator
+diff --git a/player/audio.c b/player/audio.c
+index c7e5650..e581066 100644
+--- a/player/audio.c
++++ b/player/audio.c
+@@ -355,6 +355,17 @@ static void ao_chain_set_ao(struct ao_chain *ao_c, struct ao *ao)
+     mp_filter_wakeup(ao_c->ao_filter);
+ }
+ 
++// Switch the chain's track from passthrough to decoding. The caller resets
++// the output chain. Returns false if the decoder could not be reinitialized.
++static bool fall_back_to_pcm(struct MPContext *mpctx, struct ao_chain *ao_c)
++{
++    MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
++    ao_c->spdif_passthrough = false;
++    ao_c->spdif_failed = true;
++    mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
++    return mp_decoder_wrapper_reinit(ao_c->track->dec);
++}
++
+ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+@@ -467,11 +478,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
+     if (!mpctx->ao) {
+         // If spdif was used, try to fallback to PCM.
+         if (spdif_fallback && ao_c->track && ao_c->track->dec) {
+-            MP_VERBOSE(mpctx, "Falling back to PCM output.\n");
+-            ao_c->spdif_passthrough = false;
+-            ao_c->spdif_failed = true;
+-            mp_decoder_wrapper_set_spdif_flag(ao_c->track->dec, false);
+-            if (!mp_decoder_wrapper_reinit(ao_c->track->dec))
++            if (!fall_back_to_pcm(mpctx, ao_c))
+                 goto init_error;
+             reset_audio_state(mpctx);
+             mp_output_chain_reset_harder(ao_c->filter);
+@@ -871,12 +878,45 @@ void audio_start_ao(struct MPContext *mpctx)
+     mp_wakeup_core(mpctx);
+ }
+ 
++static void handle_ao_events(struct MPContext *mpctx)
++{
++    if (!mpctx->ao)
++        return;
++    int events = ao_query_and_reset_events(mpctx->ao,
++                    AO_EVENT_RELOAD | AO_EVENT_PASSTHROUGH_FAILED);
++    if (!events)
++        return;
++
++    // A failure belongs to this AO, which can outlive the chain it failed
++    // for: gapless file changes and track switches keep it open. Only the
++    // passthrough chain it is attached to falls back; any other chain gets a
++    // fresh AO and tries passthrough itself. Decide before the reload
++    // detaches the AO. A chain still allowed passthrough has not failed
++    // before, so the reload's own spdif retry leaves it alone.
++    struct ao_chain *ao_c = mpctx->ao_chain;
++    bool fall_back = (events & AO_EVENT_PASSTHROUGH_FAILED) && ao_c &&
++                     ao_c->ao == mpctx->ao && ao_c->spdif_passthrough &&
++                     ao_c->track && ao_c->track->dec;
++
++    reload_audio_output(mpctx);
++    if (!fall_back)
++        return;
++
++    if (!fall_back_to_pcm(mpctx, ao_c)) {
++        MP_ERR(mpctx, "Error reinitializing audio.\n");
++        error_on_track(mpctx, ao_c->track);
++        return;
++    }
++    // The failed AO took audio it never played; the decoder would resume past
++    // it. Decode again from where playback is.
++    issue_refresh_seek(mpctx, MPSEEK_EXACT);
++}
++
+ void fill_audio_out_buffers(struct MPContext *mpctx)
+ {
+     struct MPOpts *opts = mpctx->opts;
+ 
+-    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
+-        reload_audio_output(mpctx);
++    handle_ao_events(mpctx);
+ 
+     update_throttle(mpctx);
+ 
