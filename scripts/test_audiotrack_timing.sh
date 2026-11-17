@@ -5,8 +5,9 @@
 # unwrapping, a stalled raw TrueHD track demoting to decode, the 3 s recreate
 # retry, audio-stream-silence feeding and stand-down, a playing track whose
 # core has no audio waiting (backing off to 50 ms) instead of writing nothing,
-# and pause/resume without a flush, with a passthrough resume held until the
-# playhead moves and the core's clock (buffer.c) restarted once it returns.
+# pause/resume without a flush, with a passthrough resume held until the
+# playhead moves and the core's clock (buffer.c) restarted once it returns,
+# and the audio priority the thread that opens a passthrough track runs at.
 # Pass an already-patched mpv tree for offline use; otherwise fetch and patch
 # the pinned source in a temporary directory. No Android device is needed.
 set -euo pipefail
@@ -80,7 +81,8 @@ python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_adoptDtsHdRate --fn write_pending --fn AudioTrack_write \
     --fn AudioTrack_beginRecovery --fn AudioTrack_recreateOrFail \
     --fn AudioTrack_deferredPlay --fn AudioTrack_kaStep --fn ao_thread --fn monitor_thread --fn stop --fn start \
-    --fn AudioTrack_readHead --fn AudioTrack_awaitResumedHead --fn set_pause
+    --fn AudioTrack_readHead --fn AudioTrack_awaitResumedHead --fn set_pause \
+    --fn AudioTrack_raisePriority --fn AudioTrack_restorePriority
 
 # The core's side of a resume: buffer.c's ao_set_paused, whose clock restarts
 # once the driver's set_pause has returned.

@@ -1,0 +1,165 @@
+Subject: [PATCH] ao_audiotrack: run a passthrough track at audio priority
+
+media3 reads, queues and writes passthrough audio on its playback
+thread, at THREAD_PRIORITY_AUDIO (-16). Here the core queues it and the
+worker writes it, both at the core's THREAD_PRIORITY_VIDEO (-10): a raw
+track's worker does not raise itself, because one that outranks the
+core empties the core's queue in a burst and trips the short-read wire
+(ao_thread, patch 0121).
+
+A Swisscom IP1800 (Android 12) playing E-AC-3 through a raw track
+logged six playhead steps of 16-24 ms in an hour at that priority
+(Plezy #2302). With the core and the worker both at -16 it logged two,
+of 16 and 33 ms, in 73 minutes of the same film.
+
+The thread that opens the AO - the core's - is now raised to the audio
+priority for as long as a passthrough track is open, raw or on the IEC
+61937 carrier, before it starts the worker and the monitor. They
+inherit it, so core and worker stay level. uninit puts the thread back
+to the niceness it had, by thread id. Whatever else the core starts
+while the track is open inherits the priority too. A PCM track is
+untouched: its worker already raises itself.
+
+--audiotrack-audio-priority=no leaves the core where it was.
+
+--- a/DOCS/man/ao.rst
++++ b/DOCS/man/ao.rst
+@@ -240,6 +240,14 @@ Available audio output drivers are:
+         existed. The clock is the same either way. Read when the audio output
+         opens.
+ 
++    ``--audiotrack-audio-priority=<yes|no>``
++        With ``yes`` (default) the player's core thread runs at Android's audio
++        thread priority for as long as a passthrough (bitstream) track is
++        open, and the track's writer runs level with it: the priority the
++        platform's own players queue and write audio at. With ``no`` the core
++        keeps its own priority, as before the option existed. Read when the
++        audio output opens.
++
+     ``--audiotrack-stream-silence-limit=<0-86400>``
+         With ``--audio-stream-silence=yes``, a passthrough (bitstream) track is
+         kept running while the player has no audio for it - across pauses,
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -28,6 +28,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/resource.h>
++#include <unistd.h>
+ 
+ #include "ao.h"
+ #include "internal.h"
+@@ -334,6 +335,12 @@ struct priv {
+     bool cfg_raw_passthrough;
+     bool cfg_route_reload;
+     bool cfg_head_reuse;
++    bool cfg_audio_priority;
++    // --audiotrack-audio-priority: the thread AudioTrack_raisePriority raised
++    // and the niceness AudioTrack_restorePriority puts it back to.
++    bool prio_raised;
++    int prio_tid;
++    int prio_before;
+     int cfg_session_id;
+     bool cfg_normalize;
+     int cfg_silence_limit;      // seconds of silence per pause; 0 for no limit
+@@ -3566,10 +3573,11 @@ static MP_THREAD_VOID ao_thread(void *arg)
+     // them at once). A writer that outranks the core empties the queue
+     // inside that burst and trips the short-read wire; at the priority it
+     // inherits from the core, which opens the AO, it yields to the refill.
+-    // The depth is the raw track's own slack, so the priority buys nothing
+-    // there. With --audio-stream-silence the reads stop at KA_QUEUE_NS,
+-    // under the core's queue, but only while the head moves: a head that
+-    // stands still, as through that burst, still gets the whole budget.
++    // That is the audio priority as well: the core is raised with it for as
++    // long as a passthrough track is open (AudioTrack_raisePriority). With
++    // --audio-stream-silence the reads stop at KA_QUEUE_NS, under the core's
++    // queue, but only while the head moves: a head that stands still, as
++    // through that burst, still gets the whole budget.
+     if (!p->raw_passthrough &&
+         setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0)
+         MP_VERBOSE(ao, "audio thread priority refused: %s\n", mp_strerror(errno));
+@@ -3980,6 +3988,48 @@ static MP_THREAD_VOID monitor_thread(void *arg)
+     MP_THREAD_RETURN();
+ }
+ 
++// --audiotrack-audio-priority: a passthrough track's audio at
++// THREAD_PRIORITY_AUDIO. media3 reads, queues and writes it on its playback
++// thread, at that priority. Here the core queues it and the worker writes
++// it, both at the core's THREAD_PRIORITY_VIDEO (client.c), and a raw track's
++// worker cannot raise itself over the core (ao_thread). So the thread that
++// opens the AO - the core's - is raised for as long as the track is open,
++// before it starts the worker and the monitor, which inherit it: core and
++// worker stay level. A Swisscom IP1800 playing E-AC-3 logged six playhead
++// steps of 16-24 ms in an hour at the core's priority, and two (16 and
++// 33 ms) in 73 minutes at this one. Whatever else the core starts while the
++// track is open inherits it too. Best effort: a refusal changes nothing.
++static void AudioTrack_raisePriority(struct ao *ao)
++{
++    struct priv *p = ao->priv;
++    if (!p->cfg_audio_priority ||
++        (p->format != AudioFormat.ENCODING_IEC61937 && !p->raw_passthrough))
++        return;
++    errno = 0;
++    const int before = getpriority(PRIO_PROCESS, 0);
++    if (errno || before <= THREAD_PRIORITY_AUDIO)
++        return;
++    if (setpriority(PRIO_PROCESS, 0, THREAD_PRIORITY_AUDIO) != 0) {
++        MP_VERBOSE(ao, "audio priority refused: %s\n", mp_strerror(errno));
++        return;
++    }
++    p->prio_raised = true;
++    p->prio_tid = gettid();
++    p->prio_before = before;
++    MP_VERBOSE(ao, "audio priority: the core's niceness %d -> %d\n",
++               before, THREAD_PRIORITY_AUDIO);
++}
++
++// The raised thread's own niceness again, for whatever output follows. By
++// thread id: nothing says uninit runs on the thread that opened the AO.
++static void AudioTrack_restorePriority(struct priv *p)
++{
++    if (!p->prio_raised)
++        return;
++    setpriority(PRIO_PROCESS, (id_t)p->prio_tid, p->prio_before);
++    p->prio_raised = false;
++}
++
+ static void uninit(struct ao *ao)
+ {
+     struct priv *p = ao->priv;
+@@ -4013,6 +4063,8 @@ static void uninit(struct ao *ao)
+     if (p->monitor_created)
+         mp_thread_join(p->monitor);
+ 
++    AudioTrack_restorePriority(p);
++
+     AudioTrack_releaseNormalizer(ao);
+     if (p->audiotrack) {
+         MP_JNI_CALL_VOID(p->audiotrack, AudioTrack.release);
+@@ -4330,6 +4382,8 @@ static int init(struct ao *ao)
+         goto error;
+     }
+ 
++    AudioTrack_raisePriority(ao);
++
+     if (mp_thread_create(&p->thread, ao_thread, ao)) {
+         MP_ERR(ao, "pthread creation failed\n");
+         goto error;
+@@ -4545,6 +4599,7 @@ const struct ao_driver audio_out_audiotrack = {
+         .cfg_raw_passthrough = 1,
+         .cfg_route_reload = 1,
+         .cfg_head_reuse = 1,
++        .cfg_audio_priority = 1,
+         .cfg_silence_limit = 60,
+     },
+     .options   = (const struct m_option[]) {
+@@ -4555,6 +4610,9 @@ const struct ao_driver audio_out_audiotrack = {
+         // sample its clock takes and reuses it in between
+         // (AudioTrack_getPlaybackHeadPosition); "no" reads it on every pass.
+         {"head-reuse", OPT_BOOL(cfg_head_reuse)},
++        // AudioTrack_raisePriority; "no" leaves the core, and a raw track's
++        // worker with it, at the core's own priority. Read when the AO opens.
++        {"audio-priority", OPT_BOOL(cfg_audio_priority)},
+         {"session-id", OPT_INT(cfg_session_id)},
+         // With --audio-stream-silence on a passthrough track: seconds of
+         // silence in one feed before the track is stood down; 0 feeds for

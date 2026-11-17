@@ -33,3 +33,4 @@
 0152-builtin-conf-libmpv-leaves-the-builtin-scripts-unloaded.patch
 0153-vo-mediacodec-leave-the-osd-pipeline-asleep-while-nothing-can-change.patch
 0154-ao-audiotrack-read-a-passthrough-head-once-per-clock-sample.patch
+0155-ao-audiotrack-run-a-passthrough-track-at-audio-priority.patch
