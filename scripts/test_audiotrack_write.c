@@ -124,6 +124,39 @@ static void mp_mutex_unlock(mp_mutex *m)
 static void mp_cond_signal(mp_cond *c) { assert(!pthread_cond_signal(c)); }
 static void mp_thread_set_name(const char *name) { (void)name; }
 #define mp_strerror(e) strerror(e)
+// Thread niceness, which Linux keeps per thread. nice_now is the calling
+// thread's; nice_who is the thread id the latest change named, 0 for the
+// caller itself. A PCM or carrier track's worker raises itself through here
+// too (ao_thread), so a check reads these only while no fixture is alive.
+#define NICE_TID 4242
+static int nice_now, nice_who, nice_sets;
+static bool nice_refused;
+static int fake_getpriority(int which, id_t who)
+{
+    assert(which == PRIO_PROCESS && !who);
+    assert(!pthread_mutex_lock(&gate));
+    const int nice = nice_now;
+    assert(!pthread_mutex_unlock(&gate));
+    return nice;
+}
+static int fake_setpriority(int which, id_t who, int nice)
+{
+    assert(which == PRIO_PROCESS);
+    assert(!pthread_mutex_lock(&gate));
+    const bool refused = nice_refused;
+    if (!refused) {
+        nice_now = nice;
+        nice_who = (int)who;
+        nice_sets++;
+    }
+    assert(!pthread_mutex_unlock(&gate));
+    if (refused)
+        errno = EACCES;
+    return refused ? -1 : 0;
+}
+#define getpriority fake_getpriority
+#define setpriority fake_setpriority
+#define gettid() NICE_TID
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
@@ -3611,6 +3644,55 @@ static void check_pause_outlasts_the_stall_timeout(void)
     puts("PASS: a pause longer than the stall timeout trips no recovery after the resume");
 }
 
+// One AO open and close on a thread at niceness `before`: whether the open
+// raised the caller to the audio priority, and that the close then put the
+// thread the open ran on - not its own caller - back to `before`.
+static void open_and_close_at(int format, bool raw, bool option, int before,
+                              bool refused, bool raised)
+{
+    static struct priv p;
+    memset(&p, 0, sizeof(p));
+    struct ao ao = {.priv = &p};
+    p.format = format;
+    p.raw_passthrough = raw;
+    p.cfg_audio_priority = option;
+    nice_now = before;
+    nice_who = -1;
+    nice_sets = 0;
+    nice_refused = refused;
+
+    AudioTrack_raisePriority(&ao);
+    assert(nice_sets == (raised ? 1 : 0));
+    assert(nice_now == (raised ? THREAD_PRIORITY_AUDIO : before));
+    assert(!raised || nice_who == 0);
+
+    nice_refused = false;
+    AudioTrack_restorePriority(&p);
+    AudioTrack_restorePriority(&p); // closing twice puts it back once
+    assert(nice_sets == (raised ? 2 : 0));
+    assert(nice_now == before);
+    assert(!raised || nice_who == NICE_TID);
+}
+
+// The thread that opens a passthrough track runs at the audio priority for
+// as long as the track is open, raw or on the IEC 61937 carrier. A PCM
+// track's opener keeps its own niceness, as does one the option turns off,
+// one the system refuses and one that already runs at or above the audio
+// priority.
+static void check_passthrough_opens_at_audio_priority(void)
+{
+    open_and_close_at(7, true, true, -10, false, true);
+    open_and_close_at(AudioFormat.ENCODING_IEC61937, false, true, 0, false, true);
+    open_and_close_at(1, false, true, -10, false, false);
+    open_and_close_at(AudioFormat.ENCODING_PCM_FLOAT, false, true, -10, false, false);
+    open_and_close_at(7, true, false, -10, false, false);
+    open_and_close_at(7, true, true, -10, true, false);
+    open_and_close_at(7, true, true, THREAD_PRIORITY_AUDIO, false, false);
+    open_and_close_at(7, true, true, -19, false, false);
+    puts("PASS: a passthrough track's opening thread runs at the audio priority "
+         "until the track closes, and is put back by its thread id");
+}
+
 int main(void)
 {
     // Fail a regression that holds the reset lock, rather than hang CI. The
@@ -3688,6 +3770,7 @@ int main(void)
     check_resume_wait_is_bounded();
     check_pcm_resume_does_not_wait();
     check_pause_outlasts_the_stall_timeout();
+    check_passthrough_opens_at_audio_priority();
     check_truehd_stall_demotes(); // last: the demotion is process-wide
     return 0;
 }
