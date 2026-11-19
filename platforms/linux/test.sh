@@ -404,6 +404,16 @@ tail -n +3 "$ffmpeg_configure" | sed -n 's/^--enable-filter=//p' | tr ',' '\n' |
   grep -Fxq scale_vaapi ||
   fail "ffmpeg's configure does not enable the scale_vaapi filter"
 
+# The two filters a speech boost is made of. A player that asks for an `af`
+# chain naming a filter the build does not carry is refused the whole write —
+# not the one filter — so a list trimmed back here takes the feature out at
+# the far end, where the only symptom is an option error in a log.
+for filter in acompressor equalizer; do
+  tail -n +3 "$ffmpeg_configure" | sed -n 's/^--enable-filter=//p' | tr ',' '\n' |
+    grep -Fxq "$filter" ||
+    fail "ffmpeg's configure does not enable the $filter filter"
+done
+
 # FFmpeg's DWARF is what names its frames in libmpv crash reports, and losing
 # it fails as quietly as a lost hwdec: the build still plays, the symbols zip
 # just cannot place a crash inside FFmpeg. configure honours the last debug

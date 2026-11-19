@@ -33,7 +33,7 @@ cpuflags=
 	--disable-{stripping,doc,programs} \
 	--disable-{muxers,encoders,devices,filters} \
 	--enable-muxer=spdif \
-	--enable-filter=bwdif,decimate,fieldmatch,loudnorm,aresample,acompressor,alimiter \
+	--enable-filter=bwdif,decimate,fieldmatch,loudnorm,aresample,acompressor,alimiter,equalizer \
 	--disable-v4l2-m2m
 
 make -j$cores

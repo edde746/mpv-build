@@ -318,7 +318,7 @@ main() {
     --disable-bsfs \
     --enable-bsf=aac_adtstoasc,av1_metadata,extract_extradata,h264_metadata,h264_mp4toannexb,hevc_metadata,hevc_mp4toannexb,vp9_metadata \
     --disable-filters \
-    --enable-filter=aformat,aresample,bwdif,decimate,fieldmatch,format,loudnorm,null,scale,scale_vaapi \
+    --enable-filter=acompressor,aformat,aresample,bwdif,decimate,equalizer,fieldmatch,format,loudnorm,null,scale,scale_vaapi \
     --enable-gnutls \
     --enable-vaapi \
     --enable-ffnvcodec \
