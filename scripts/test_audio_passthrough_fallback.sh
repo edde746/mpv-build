@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compile the player's AO event handling (player/audio.c, patch 0040):
+# Compile the player's AO event handling (player/audio.c, patch 0244, the
+# platform-independent half of apple 0040):
 # handle_ao_events(), fall_back_to_pcm() and reload_audio_output(), and drive a
 # passthrough output failing under the chain it feeds, under a chain it
 # outlived, and together with a plain reload. Pass an already-patched mpv tree
@@ -11,7 +12,7 @@ workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 if [[ -z "$source_dir" ]]; then
     source_dir="$workdir/source"
-    # 0040 sits in series.apple: the outputs that report the failure are Apple's.
+    # 0244 sits in series.common: every group's tree carries it.
     (cd "$root" && python3 scripts/patches.py fetch-pinned mpv apple "$source_dir")
 fi
 E="$root/scripts/extract.py"
