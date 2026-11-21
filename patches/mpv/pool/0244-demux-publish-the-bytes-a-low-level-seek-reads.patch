@@ -1,0 +1,196 @@
+From: edde746 <86283021+edde746@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:00:00 +0100
+Subject: [PATCH] demux: publish the bytes a low level seek reads
+
+A seek in a Matroska file without an index (no Cues, or Cues behind the
+end of a truncated file) builds one inside the demuxer's seek callback,
+reading the file from its first cluster up to the target. For a resume
+deep into a large file over a network that is a long read during which
+demuxer-cache-state does not change: no packet is queued, so reader-pts
+and total-bytes stand still, and what the stream reads is collected only
+by update_cache(), which the demuxer thread reaches again once the seek
+returns. A client cannot tell that seek from one whose connection
+stopped. Plezy's open watchdog gave up on such a resume after 30 s
+without progress while mpv was still reading at 52 MB/s (plezy#3128).
+
+demuxer-cache-state now carries raw-input-bytes, the bytes the stream
+layer has read since the file was opened. The stream's read counter is
+atomic, and demux_get_reader_state() adds what it holds that
+update_bytes_read() has not collected yet. Collecting moves the count
+with the demuxer lock held, so under the lock the sum counts every byte
+once and never goes back. The core already refreshes the cache property
+every 0.25 s while the demuxer is busy; with a value that changes,
+observers now hear about it.
+
+Built with the series for macOS (Homebrew FFmpeg 9.0.2) and resuming at
+270 s into a 157 MB file cut off before its Cues, served over HTTP at
+5 MB/s: the first frame comes at 28.7 s with and without the patch.
+demuxer-cache-state changed once during the seek before and 113 times
+now, never more than 0.31 s apart. With the server stalled for 11 s
+during the seek, raw-input-bytes stood still for 10.9 s.
+
+Bytes that libavformat reads through its own protocols (HLS, demux_lavf
+without a stream) are reported with demux_report_unbuffered_read_bytes()
+and still show only once the seek returns.
+
+test_demux_raw_input_bytes.sh compiles stream_read_unbuffered(),
+update_bytes_read() and get_raw_input_bytes() from the patched tree.
+---
+ DOCS/man/input.rst |  9 +++++++++
+ demux/demux.c      | 24 ++++++++++++++++++++++--
+ demux/demux.h      |  1 +
+ player/command.c   |  1 +
+ stream/stream.c    |  3 ++-
+ stream/stream.h    |  7 +++++--
+ 6 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/DOCS/man/input.rst b/DOCS/man/input.rst
+index ee7aecf..3a7d915 100644
+--- a/DOCS/man/input.rst
++++ b/DOCS/man/input.rst
+@@ -2542,6 +2542,14 @@ Property list
+     other byte-oriented input layer) in bytes per second. May be inaccurate or
+     missing.
+ 
++    ``raw-input-bytes`` is the number of bytes the same input layer has read
++    since the file was opened. Unlike the other fields it also advances while a
++    low level seek blocks the demuxer, as when a seek in a Matroska file
++    without an index reads the file up to the target to build one, so a client
++    can tell a long seek that is still reading from one that stopped. Bytes a
++    demuxer reads without mpv's stream layer (FFmpeg protocols opened by
++    libavformat itself, such as HLS) are counted only once the seek returns.
++
+     ``ts-per-stream`` is an array containing an entry for each stream type: video,
+     audio, and subtitle. For each stream type, the details for the demuxer cache
+     for that stream type are available as ``cache-duration``, ``reader-pts`` and
+@@ -2566,6 +2574,7 @@ Property list
+             "reader-pts"        MPV_FORMAT_DOUBLE
+             "cache-duration"    MPV_FORMAT_DOUBLE
+             "raw-input-rate"    MPV_FORMAT_INT64
++            "raw-input-bytes"   MPV_FORMAT_INT64
+             "ts-per-stream"     MPV_FORMAT_NODE_ARRAY
+                 MPV_FORMAT_NODE_MAP
+                       "type"            MPV_FORMAT_STRING
+diff --git a/demux/demux.c b/demux/demux.c
+index 7032b87..3e7f617 100644
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -262,6 +262,9 @@ struct demux_internal {
+     int64_t last_speed_query;
+     double speed_query_prev_sample;
+     uint64_t bytes_per_second;
++    // Bytes the stream layer read and update_bytes_read() collected. Never
++    // reset; demux_get_reader_state() adds what the stream holds uncollected.
++    uint64_t raw_input_bytes;
+     int64_t next_cache_update;
+ 
+     // demux user state (user thread, somewhat similar to reader/decoder state)
+@@ -4182,12 +4185,13 @@ static void update_bytes_read(struct demux_internal *in)
+ 
+     struct stream *stream = demuxer->stream;
+     if (stream) {
+-        new += stream->total_unbuffered_read_bytes;
+-        stream->total_unbuffered_read_bytes = 0;
++        new += atomic_exchange_explicit(&stream->total_unbuffered_read_bytes, 0,
++                                        memory_order_relaxed);
+         new_seeks += stream->total_stream_seeks;
+         stream->total_stream_seeks = 0;
+     }
+ 
++    in->raw_input_bytes += new;
+     in->cache_unbuffered_read_bytes += new;
+     in->hack_unbuffered_read_bytes += new;
+     in->byte_level_seeks += new_seeks;
+@@ -4540,6 +4544,21 @@ void demux_get_bitrate_stats(struct demuxer *demuxer, double *rates)
+     mp_mutex_unlock(&in->lock);
+ }
+ 
++// Bytes read from the stream so far, for demux_reader_state.raw_input_bytes.
++// The stream counts on whatever thread reads it, a low level seek included
++// (that runs with the lock released, and may read for a long time when it has
++// to build an index), and update_bytes_read() moves the count into
++// raw_input_bytes with the lock held. Called with the lock held, the sum counts
++// every byte once and never goes back.
++static uint64_t get_raw_input_bytes(struct demux_internal *in)
++{
++    struct stream *stream = in->d_user->stream;
++    uint64_t uncollected = stream ?
++        atomic_load_explicit(&stream->total_unbuffered_read_bytes,
++                             memory_order_relaxed) : 0;
++    return in->raw_input_bytes + uncollected;
++}
++
+ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *r)
+ {
+     struct demux_internal *in = demuxer->in;
+@@ -4560,6 +4579,7 @@ void demux_get_reader_state(struct demuxer *demuxer, struct demux_reader_state *
+         .ts_last = in->demux_ts,
+         .bytes_per_second = in->bytes_per_second,
+         .byte_level_seeks = in->byte_level_seeks,
++        .raw_input_bytes = get_raw_input_bytes(in),
+         .file_cache_bytes = in->cache ? demux_cache_get_size(in->cache) : -1,
+     };
+     bool any_packets = false;
+diff --git a/demux/demux.h b/demux/demux.h
+index 6f2f38c..7b9a8bb 100644
+--- a/demux/demux.h
++++ b/demux/demux.h
+@@ -55,6 +55,7 @@ struct demux_reader_state {
+     uint64_t byte_level_seeks; // number of byte stream level seeks
+     double ts_last; // approx. timestamp of demuxer position
+     uint64_t bytes_per_second; // low level statistics
++    uint64_t raw_input_bytes; // bytes read so far, advancing during a seek too
+     // Positions that can be seeked to without incurring the latency of a low
+     // level seek.
+     int num_seek_ranges;
+diff --git a/player/command.c b/player/command.c
+index be75261..36b8971 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -1574,6 +1574,7 @@ static int mp_property_demuxer_cache_state(void *ctx, struct m_property *prop,
+         node_map_add_int64(r, "file-cache-bytes", s.file_cache_bytes);
+     if (s.bytes_per_second > 0)
+         node_map_add_int64(r, "raw-input-rate", s.bytes_per_second);
++    node_map_add_int64(r, "raw-input-bytes", s.raw_input_bytes);
+     if (s.seeking != MP_NOPTS_VALUE)
+         node_map_add_double(r, "debug-seeking", s.seeking);
+     node_map_add_int64(r, "debug-low-level-seeks", s.low_level_seeks);
+diff --git a/stream/stream.c b/stream/stream.c
+index 3551f16..75b2c84 100644
+--- a/stream/stream.c
++++ b/stream/stream.c
+@@ -514,7 +514,8 @@ static int stream_read_unbuffered(stream_t *s, void *buf, int len)
+     // When reading succeeded we are obviously not at eof.
+     s->eof = 0;
+     s->pos += res;
+-    s->total_unbuffered_read_bytes += res;
++    atomic_fetch_add_explicit(&s->total_unbuffered_read_bytes, res,
++                              memory_order_relaxed);
+     return res;
+ }
+ 
+diff --git a/stream/stream.h b/stream/stream.h
+index fb62fdd..5d375f4 100644
+--- a/stream/stream.h
++++ b/stream/stream.h
+@@ -19,6 +19,7 @@
+ #define MPLAYER_STREAM_H
+ 
+ #include "common/msg.h"
++#include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -171,8 +172,10 @@ typedef struct stream {
+     struct mp_cancel *cancel;   // cancellation notification
+ 
+     // Read statistic for fill_buffer calls. All bytes read by fill_buffer() are
+-    // added to this. The user can reset this as needed.
+-    uint64_t total_unbuffered_read_bytes;
++    // added to this. The user can reset this as needed (atomic_exchange()).
++    // Atomic so that another thread can read it while this stream's thread is
++    // blocked in a read loop, such as a demuxer's low level seek.
++    _Atomic uint64_t total_unbuffered_read_bytes;
+     // Seek statistics. The user can reset this as needed.
+     uint64_t total_stream_seeks;
+ 

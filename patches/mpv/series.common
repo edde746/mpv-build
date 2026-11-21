@@ -74,3 +74,8 @@
 # Software screenshots download a hardware frame again (upstream b7b9ec2):
 # with VA-API under the render API on GLES every screenshot failed.
 0243-screenshot-correctly-detect-hardware-frame.patch
+# demuxer-cache-state carries raw-input-bytes, the bytes read since the file
+# was opened, which also advances while a low level seek blocks the demuxer (a
+# Matroska file without Cues read up to a resume point): a client can tell a
+# long seek that is still reading from one that stopped (plezy#3128).
+0244-demux-publish-the-bytes-a-low-level-seek-reads.patch

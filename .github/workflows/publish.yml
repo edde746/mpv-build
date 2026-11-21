@@ -197,6 +197,9 @@ jobs:
       - name: Test what demux_mkv reads behind the clusters, and when
         run: bash ./scripts/test_demux_mkv_defer_tags.sh
 
+      - name: Test the bytes demuxer-cache-state reports during a low level seek
+        run: bash ./scripts/test_demux_raw_input_bytes.sh
+
       - name: Test FFmpeg log lines reaching the instance that logged them
         run: bash ./scripts/test_av_log_routing.sh
 
