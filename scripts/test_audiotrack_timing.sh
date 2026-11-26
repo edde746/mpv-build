@@ -90,7 +90,10 @@ python3 "$E" range "$source_dir/audio/out/buffer.c" "$workdir/buffer_pause.inc" 
     --first "void ao_set_paused(struct ao *ao, bool paused, bool eof)" \
     --last "// Whether audio is playing."
 
+# An out-of-range double-to-integer conversion is undefined: arm64 saturates
+# it, x86-64 happens to wrap it. The sanitizer fails it on every host.
 cc -O2 -std=c11 -Wall -Wextra -Werror -I"$workdir" \
+    -fsanitize=float-cast-overflow -fno-sanitize-recover=float-cast-overflow \
     -o "$workdir/test" "$root/scripts/test_audiotrack_timing.c" -lm
 "$workdir/test"
 

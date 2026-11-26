@@ -128,7 +128,7 @@ index 6505092..9190e37 100644
                  p->timestamp_set = true;
                  if (p->timestamp_stable < stable_count)
                      p->timestamp_stable++;
-@@ -675,61 +727,78 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -675,61 +727,84 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
      /* AudioTrack's framePosition and playbackHeadPosition return a signed integer,
       * but documentation states it should be interpreted as a 32-bit unsigned integer.
       */
@@ -150,8 +150,14 @@ index 6505092..9190e37 100644
 +            pos = 0;
 +        } else {
 +            pos -= p->ts_offset;
-+            if (state == AudioTrack.PLAYSTATE_PLAYING)
-+                pos += (double)(now - time) / 1e9 * ao->samplerate;
++            if (state == AudioTrack.PLAYSTATE_PLAYING) {
++                // Add the frames since the timestamp modulo 2^32, as the
++                // counter itself counts: a double sum converted back to
++                // uint32_t is undefined outside [0, 2^32), which a counter
++                // about to wrap or a timestamp stamped after now reaches.
++                int64_t elapsed = (int64_t)((double)(now - time) / 1e9 * ao->samplerate);
++                pos += (uint32_t)elapsed;
++            }
 +            // A timestamp ahead of everything ever written is stale, not
 +            // fast: distrust it and fall back to the head. The retry backoff
 +            // keeps a permanently skewed HAL from flapping the latency term.

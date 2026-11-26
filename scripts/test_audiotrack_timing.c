@@ -72,7 +72,7 @@ static int64_t jni_int(JNIEnv *env, int method)
 static int64_t jni_long(JNIEnv *env, int field)
 {
     (void)env;
-    return field == AudioTimestamp.framePosition ? hardware_rate / 2 : raw_epoch + 500000000;
+    return field == AudioTimestamp.framePosition ? frame_bias + hardware_rate / 2 : raw_epoch + 500000000;
 }
 
 #define MP_JNI_GET_ENV(ao) (&environment)
@@ -153,6 +153,9 @@ int main(void)
                       true, false, false, 4, UINT32_MAX - 48000, false);
     check_query_stall("PCM timestamp retains its extrapolation time and mpv epoch",
                       false, false, true, 1, 0, false);
+    // The timestamp sits just below the wrap and its extrapolation crosses it.
+    check_query_stall("PCM timestamp extrapolates across the 32-bit wrap",
+                      false, false, true, 1, UINT32_MAX - 30000, false);
     check_query_stall("PCM fallback retains head time across hidden-latency query",
                       false, false, false, 1, 0, false);
     check_query_stall("zero startup head still supplies a deadline reference",
