@@ -37,7 +37,7 @@ python3 "$E" define "$src" "$workdir/audiotrack_clock.inc" --append \
     --name KA_HEAD_STILL_NS --name KA_QUEUE_NS --name HEAD_SAMPLE_NS
 python3 "$E" symbol "$src" "$workdir/audiotrack_clock.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_smoothPlayhead \
-    --fn head_rate --fn head_jump_is_wrap \
+    --fn head_rate --fn head_jump_is_wrap --fn AudioTrack_distrustTimestamp \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
     --fn AudioTrack_getLatency --fn write_pending
 python3 "$E" range "$src" "$workdir/audiotrack_read.inc" \
@@ -67,7 +67,7 @@ python3 "$E" region "$src" "$workdir/audiotrack_write.inc" --append --start stre
 python3 "$E" symbol "$src" "$workdir/audiotrack_write.inc" --append \
     --fn AudioTrack_resetPlayheadSmoothing --fn AudioTrack_thdReset --fn AudioTrack_resetClock \
     --fn AudioTrack_Recreate --fn AudioTrack_smoothPlayhead \
-    --fn head_rate --fn head_jump_is_wrap \
+    --fn head_rate --fn head_jump_is_wrap --fn AudioTrack_distrustTimestamp \
     --fn AudioTrack_getPlaybackHeadPosition --fn AudioTrack_observePlayheadStep \
     --fn AudioTrack_getLatency \
     --fn thd_raw_failed --fn AudioTrack_thdDemote --fn AudioTrack_thdLoseSync \

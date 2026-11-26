@@ -44,12 +44,14 @@ struct object {
     // Simulated HAL counters. head is what getPlaybackHeadPosition reports;
     // head_resets models whether flush() zeroes it (false = the Xiaomi-style
     // HAL that keeps the render position across a flush). ts_fpos/ts_nanos
-    // are what getTimestamp publishes while timestamp_ok.
+    // are what getTimestamp publishes while timestamp_ok. latency_ms is what
+    // getLatency() reports; the fixture's track buffer counts 0 frames of it.
     uint32_t head;
     bool head_resets;
     uint32_t ts_fpos;
     int64_t ts_nanos;
     bool timestamp_ok;
+    int latency_ms;
 };
 typedef struct object *jobject, *jbyteArray, *jshortArray, *jfloatArray;
 struct jni;
@@ -332,7 +334,7 @@ static jint jni_int(JNIEnv *env, jobject track, int method, ...)
             head_queries++;
             pthread_cond_broadcast(&changed);
         }
-        int head = method == AudioTrack.getPlaybackHeadPosition ? track->head : 0;
+        int head = method == AudioTrack.getPlaybackHeadPosition ? (int)track->head : track->latency_ms;
         mp_mutex_unlock(&gate);
         return head;
     }
@@ -2889,9 +2891,10 @@ static void check_pcm_late_write_after_flush(void)
 }
 
 // Same broken HAL through the timestamp source: framePosition survives the
-// flush and keeps advancing. The pending anchor locks it to the head's
-// epoch (ts_offset = fpos - head_played), so the timestamp path engages
-// with the stale bias absorbed instead of being rejected or flapping.
+// flush and keeps advancing. A counter ahead of the head cannot be told from
+// the pipeline in flight, so it is not used: the head and the pipeline
+// AudioTrack.getLatency() reports keep the clock, through the backoff and
+// after it, as Kodi's sink does.
 static void check_pcm_stale_timestamp_after_flush(void)
 {
     struct fixture f;
@@ -2906,6 +2909,7 @@ static void check_pcm_stale_timestamp_after_flush(void)
     tracks[0].timestamp_ok = true;
     tracks[0].ts_fpos = 700; // stale framePosition, still advancing
     tracks[0].ts_nanos = atomic_load(&now_ns);
+    tracks[0].latency_ms = 1;
     mp_mutex_unlock(&gate);
     stop(&f.ao);
 
@@ -2915,24 +2919,22 @@ static void check_pcm_stale_timestamp_after_flush(void)
     response = 0; // a write while the test plays the track must credit nothing
     mp_mutex_unlock(&gate);
 
-    // Both counters advance together; the timestamp anchors to the head's
-    // epoch on the first fetch and is trusted from the second.
+    // Both counters advance together. The last step is past the 3 s
+    // backoff, where the counter is checked again and still turned away.
+    const uint32_t pipeline = 48; // getLatency()'s 1 ms at 48 kHz
     for (int n = 0; n < 4; n++) {
-        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        atomic_fetch_add(&now_ns, n < 3 ? MP_TIME_MS_TO_NS(60) : MP_TIME_S_TO_NS(3));
         mp_mutex_lock(&gate);
         tracks[0].head += 1;
         tracks[0].ts_fpos += 1;
         tracks[0].ts_nanos = atomic_load(&now_ns);
         tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
         mp_mutex_unlock(&gate);
-        expect_delay_played(&f, 4, n + 1);
+        expect_delay_played(&f, 4, n + 1 - pipeline);
     }
-    assert(f.p.timestamp_set);
-    assert(!f.p.ts_reset_pending);
-    assert(f.p.ts_offset == 700); // the stale bias, not the played frames
     park_worker(&f);
     teardown(&f);
-    puts("PASS: a framePosition that survives flush() re-anchors to the head epoch");
+    puts("PASS: a framePosition that survives flush() is not used; the head and the pipeline keep the clock");
 }
 
 static void check_pcm_healthy_counters_after_flush(void)
@@ -2971,7 +2973,6 @@ static void check_pcm_healthy_counters_after_flush(void)
     }
     assert(f.p.timestamp_set); // trusted again by the second fetch
     assert(!f.p.head_offset); // a reset counter anchors at zero
-    assert(!f.p.ts_offset); // a restarted counter is used as it stands
     park_worker(&f);
     teardown(&f);
     puts("PASS: counters that reset on flush() keep exact delays and timestamps");
@@ -3022,6 +3023,53 @@ static void check_pcm_timestamp_trailing_head_after_flush(void)
     park_worker(&f);
     teardown(&f);
     puts("PASS: a timestamp trailing the head after flush() keeps the pipeline in the delay");
+}
+
+// A HAL that serves the last epoch's timestamp again after flush(): it was
+// stamped before the flush, so it counts as no fetch at all. Taken for a
+// counter ahead of the head it would hold the epoch's own timestamps off
+// for the 3 s backoff.
+static void check_pcm_pre_flush_timestamp_ignored(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    mp_mutex_lock(&gate);
+    tracks[0].timestamp_ok = true;
+    tracks[0].ts_nanos = atomic_load(&now_ns); // stamped before the flush
+    tracks[0].latency_ms = 1;
+    mp_mutex_unlock(&gate);
+    atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(10));
+    stop(&f.ao); // head_resets: head and ts_fpos return to 0
+    mp_mutex_lock(&gate);
+    tracks[0].ts_fpos = 700; // and served again after it
+    mp_mutex_unlock(&gate);
+
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+    mp_mutex_lock(&gate);
+    response = 0; // a write while the test plays the track must credit nothing
+    mp_mutex_unlock(&gate);
+
+    const uint32_t pipeline = 48; // getLatency()'s 1 ms at 48 kHz
+    for (uint32_t played = 1; played <= 2; played++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        mp_mutex_lock(&gate);
+        tracks[0].head = played;
+        tracks[0].ts_fpos = played;
+        tracks[0].ts_nanos = atomic_load(&now_ns);
+        tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+        mp_mutex_unlock(&gate);
+        // The epoch's first timestamp is checked against the head, which
+        // keeps the clock with the pipeline estimate; the second is trusted.
+        expect_delay_played(&f, 4, played == 1 ? played - pipeline : played);
+    }
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a timestamp from before flush() is no fetch and holds nothing off");
 }
 
 // Passthrough through the smoother: a delayed head reset must reset the
@@ -3793,6 +3841,7 @@ int main(void)
     check_pcm_stale_timestamp_after_flush();
     check_pcm_healthy_counters_after_flush();
     check_pcm_timestamp_trailing_head_after_flush();
+    check_pcm_pre_flush_timestamp_ignored();
     check_iec_delayed_reset_smoothing();
     check_iec_playhead_step_line();
     check_passthrough_head_is_read_once_per_sample(false);

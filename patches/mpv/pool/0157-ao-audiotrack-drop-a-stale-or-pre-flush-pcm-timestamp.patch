@@ -1,0 +1,199 @@
+Subject: [PATCH] ao_audiotrack: drop a stale or pre-flush PCM timestamp
+
+After a flush, the epoch's first PCM timestamp was checked against the
+head: a counter that trails it restarted with the flush and is used as
+it stands, while one ahead of it kept counting through the flush and was
+anchored to the head (patch 0118). That anchor counts the pipeline still
+in flight as played, the error #3116 removed for restarted counters, so
+on a HAL whose framePosition survives the flush audio still played late
+by the pipeline after every seek. No other player anchors the counter:
+media3 releases the track on every flush, Kodi rejects a first
+timestamp past the frames written, and VLC and upstream mpv use it as
+it stands.
+
+A counter ahead of the head is now not used. The head and the pipeline
+AudioTrack.getLatency() reports keep the clock, as they do before any
+timestamp qualifies, and the check runs again on the next fetch after
+the 3 s backoff the overshoot check already uses. ts_offset, only ever
+0 now, goes, and with it the mid-epoch restart rule that only reset it.
+
+A timestamp stamped before the epoch began (resetClock records
+CLOCK_MONOTONIC) is the last epoch's, served again after the flush. It
+is now taken as a failed fetch, as media3 (AudioTimestampPoller's
+initialize time), Kodi (m_flushTime) and VLC 3 (i_play_time) do. Without
+that, a HAL serving it could have it rejected as ahead of the head and
+hold the timestamp off for the whole backoff.
+
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -194,21 +194,22 @@ struct priv {
+ 
+     uint32_t written_frames; /* requires uint32_t rollover semantics */
+ 
+-    // Position counters are anchored per source and per write epoch. Some
+-    // HALs (direct/offload tracks in particular) do not reset
++    // The head counter is anchored per write epoch. Some HALs
++    // (direct/offload tracks in particular) do not reset
+     // getPlaybackHeadPosition or AudioTimestamp.framePosition on flush();
+-    // the first read after a reset anchors the head's offset to whatever
+-    // the counter reports, and the timestamp's only when it runs ahead of
+-    // the head, so a stale counter reads as ~0 played instead of
++    // the first head read after a reset anchors its offset to whatever the
++    // counter reports, so a stale head reads as ~0 played instead of
+     // wrapping written - playhead. The anchor is only drift-free because
+     // ao_thread queries the latency before it writes: the first post-flush
+     // read precedes the first post-flush write, except for a late write
+     // stop() could not wait for, which biases the anchor by at most a chunk.
++    // A timestamp is not anchored: the epoch's first one is checked against
++    // the head instead (AudioTrack_getPlaybackHeadPosition).
+     uint32_t head_offset;      // getPlaybackHeadPosition value at the anchor
+     uint32_t last_head_raw;    // previous raw head, for reset/wrap detection
+-    uint32_t ts_offset;        // a stale framePosition's bias, else 0
++    int64_t ts_epoch_ns;       // CLOCK_MONOTONIC when this epoch began
+     bool head_reset_pending;   // anchor the head counter on its next read
+-    bool ts_reset_pending;     // anchor the timestamp counter on its next fetch
++    bool ts_reset_pending;     // check the timestamp against the head next fetch
+     int64_t latency_warn_ns;   // rate limit for the delay tripwire
+     int track_frames;          // the PCM track's frameCount, for getLatency()
+ 
+@@ -1164,6 +1165,16 @@ static void AudioTrack_thdReset(struct priv *p)
+     p->thd_group_units = 0;
+ }
+ 
++// AudioTimestamp.nanoTime is CLOCK_MONOTONIC (System.nanoTime), while
++// mp_raw_time_ns() is CLOCK_MONOTONIC_RAW wherever that exists. NTP slews
++// the one and not the other, so they drift apart over the uptime.
++static int64_t monotonic_now_ns(void)
++{
++    struct timespec ts = {0};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++}
++
+ // Forget everything derived from the current track's buffer and clock: what
+ // stop() needs after a flush, and what a replacement track needs from zero.
+ static void AudioTrack_resetClock(struct priv *p)
+@@ -1172,7 +1183,7 @@ static void AudioTrack_resetClock(struct priv *p)
+     p->written_frames = 0;
+     p->head_offset = 0;
+     p->last_head_raw = 0;
+-    p->ts_offset = 0;
++    p->ts_epoch_ns = monotonic_now_ns();
+     p->timestamp_fetched = 0;
+     p->timestamp_set = false;
+     p->timestamp_stable = 0;
+@@ -1330,14 +1341,15 @@ static bool head_jump_is_wrap(struct ao *ao, uint32_t last_raw)
+     return last_raw >= UINT32_MAX - 2 * (uint32_t)head_rate(ao);
+ }
+ 
+-// AudioTimestamp.nanoTime is CLOCK_MONOTONIC (System.nanoTime), while
+-// mp_raw_time_ns() is CLOCK_MONOTONIC_RAW wherever that exists. NTP slews
+-// the one and not the other, so they drift apart over the uptime.
+-static int64_t monotonic_now_ns(void)
++// Leave the timestamp unused for 3 s and check the next one against the
++// head. The backoff keeps a HAL whose timestamps stay wrong from flapping the
++// latency term between the two clocks.
++static void AudioTrack_distrustTimestamp(struct priv *p, int64_t now)
+ {
+-    struct timespec ts = {0};
+-    clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++    p->timestamp_set = false;
++    p->timestamp_stable = 0;
++    p->timestamp_retry_ns = now + MP_TIME_S_TO_NS(3);
++    p->ts_reset_pending = true;
+ }
+ 
+ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -1364,7 +1376,11 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+         if (!p->timestamp_fetched)
+             p->timestamp_stable = 0;
+ 
+-        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp)) {
++        // A timestamp stamped before this epoch began is the last epoch's,
++        // served again after the flush: take it as a failed fetch, as
++        // media3, Kodi and VLC 3 do.
++        if (MP_JNI_CALL_BOOL(p->audiotrack, AudioTrack.getTimestamp, p->timestamp) &&
++            MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime) >= p->ts_epoch_ns) {
+             uint32_t fpos = 0xFFFFFFFFL & MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.framePosition);
+             int64_t time2 = MP_JNI_GET_LONG(p->timestamp, AudioTimestamp.nanoTime);
+             // Some HALs (Shield after a flush) keep a frozen framePosition
+@@ -1373,15 +1389,6 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+                              p->timestamp_fetched != 0 && fpos != p->timestamp_last_fpos;
+             p->timestamp_fetched = now;
+             fetched = true;
+-            if (!p->ts_reset_pending &&
+-                fpos < p->timestamp_last_fpos &&
+-                p->timestamp_last_fpos < UINT32_MAX - 2 * (uint32_t)ao->samplerate) {
+-                // The timestamp counter restarted mid-epoch; count the new
+-                // epoch from zero rather than anchoring to a partly-advanced
+-                // value.
+-                p->ts_offset = 0;
+-                AudioTrack_resetPlayheadSmoothing(p);
+-            }
+             p->timestamp_last_fpos = fpos;
+             if (advancing && !p->ts_reset_pending) {
+                 p->timestamp_set = true;
+@@ -1404,7 +1411,6 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+         if (time == 0) {
+             pos = 0;
+         } else {
+-            pos -= p->ts_offset;
+             if (state == AudioTrack.PLAYSTATE_PLAYING) {
+                 // Add the frames since the timestamp modulo 2^32, as the
+                 // counter itself counts: a double sum converted back to
+@@ -1414,17 +1420,11 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+                 pos += (uint32_t)elapsed;
+             }
+             // A timestamp ahead of everything ever written is stale, not
+-            // fast: distrust it and fall back to the head. The retry backoff
+-            // keeps a permanently skewed HAL from flapping the latency term.
++            // fast: distrust it and fall back to the head.
+             uint32_t slack = p->chunksize / ao->sstride +
+                              p->size / ao->sstride;
+             if ((int32_t)(pos - p->written_frames) > (int32_t)slack) {
+-                p->timestamp_set = false;
+-                p->timestamp_stable = 0;
+-                p->timestamp_retry_ns = now + MP_TIME_S_TO_NS(3);
+-                // Re-anchor on the next fetch: a skewed timestamp recovers
+-                // against the head instead of flapping every retry.
+-                p->ts_reset_pending = true;
++                AudioTrack_distrustTimestamp(p, now);
+                 use_timestamp = false;
+             }
+         }
+@@ -1481,18 +1481,23 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+             // consumed. A counter the flush restarted trails the head:
+             // AudioTrack::getTimestamp counts it from the head's own zero
+             // and withholds it, or holds it at 0, until the first frame is
+-            // out. The gap is the pipeline in flight, which is latency, not
+-            // bias; anchoring it to the head reported that pipeline as
+-            // played for the rest of the epoch (Plezy #3116). Only a counter
+-            // ahead of the head kept counting through the flush, and that
+-            // one is anchored to the head's epoch. The chunk is the head
+-            // anchor's own tolerance: a late write stop() could not wait for.
++            // out. The gap is the pipeline in flight, latency the timestamp
++            // keeps in the delay (Plezy #3116). A counter ahead of the head
++            // kept counting through the flush, by a bias that cannot be told
++            // from that pipeline: it is not used, and the head with
++            // AudioTrack.getLatency()'s pipeline keeps the clock, as in Kodi.
++            // The chunk is the head anchor's own tolerance: a late write
++            // stop() could not wait for.
+             uint32_t fpos = p->timestamp_last_fpos;
+-            bool stale = fpos > (uint64_t)pos + p->chunksize / ao->sstride;
+-            p->ts_offset = stale ? fpos - pos : 0;
+-            p->ts_reset_pending = false;
+-            MP_VERBOSE(ao, "timestamp offset = %u (%s, fpos=%u head=%u)\n",
+-                       p->ts_offset, stale ? "stale" : "restarted", fpos, pos);
++            if (fpos > (uint64_t)pos + p->chunksize / ao->sstride) {
++                AudioTrack_distrustTimestamp(p, now);
++                MP_VERBOSE(ao, "timestamp %u frames ahead of the head: not used\n",
++                           fpos - pos);
++            } else {
++                p->ts_reset_pending = false;
++                MP_VERBOSE(ao, "timestamp %d frames behind the head\n",
++                           (int)(int32_t)(pos - fpos));
++            }
+         }
+         //MP_VERBOSE(ao, "playbackHeadPosition = %u (offset=%u)\n", raw, p->head_offset);
+     }
