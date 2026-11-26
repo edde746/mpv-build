@@ -1,0 +1,67 @@
+Subject: [PATCH] ao_audiotrack: extrapolate a PCM timestamp on its own clock
+
+A PCM AudioTimestamp is extrapolated to now by the time elapsed since
+its nanoTime. nanoTime is CLOCK_MONOTONIC (System.nanoTime), but now
+came from mp_raw_time_ns(), which is CLOCK_MONOTONIC_RAW wherever that
+exists. NTP slews CLOCK_MONOTONIC and not the raw clock, so the two
+drift apart over the uptime, and the difference went straight into the
+playback position and the AO delay. How far they drift on Android
+devices has not been measured.
+
+The worker now also reads CLOCK_MONOTONIC at the same instant as the raw
+clock, and extrapolates the timestamp on that. The playhead-step line's
+tsAgeMs mixed the same clocks and reads CLOCK_MONOTONIC too.
+
+--- a/audio/out/ao_audiotrack.c
++++ b/audio/out/ao_audiotrack.c
+@@ -28,6 +28,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/resource.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include "ao.h"
+@@ -1329,6 +1330,16 @@ static bool head_jump_is_wrap(struct ao *ao, uint32_t last_raw)
+     return last_raw >= UINT32_MAX - 2 * (uint32_t)head_rate(ao);
+ }
+ 
++// AudioTimestamp.nanoTime is CLOCK_MONOTONIC (System.nanoTime), while
++// mp_raw_time_ns() is CLOCK_MONOTONIC_RAW wherever that exists. NTP slews
++// the one and not the other, so they drift apart over the uptime.
++static int64_t monotonic_now_ns(void)
++{
++    struct timespec ts = {0};
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++}
++
+ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+                                                  int64_t *sample_time)
+ {
+@@ -1338,6 +1349,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+     JNIEnv *env = MP_JNI_GET_ENV(ao);
+     uint32_t pos = 0;
+     int64_t now = mp_raw_time_ns();
++    int64_t mono_now = monotonic_now_ns(); // now, on the timestamp's clock
+     *sample_time = mp_time_ns_from_raw_time(now);
+     int state = MP_JNI_CALL_INT(p->audiotrack, AudioTrack.getPlayState);
+ 
+@@ -1398,7 +1410,7 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+                 // counter itself counts: a double sum converted back to
+                 // uint32_t is undefined outside [0, 2^32), which a counter
+                 // about to wrap or a timestamp stamped after now reaches.
+-                int64_t elapsed = (int64_t)((double)(now - time) / 1e9 * ao->samplerate);
++                int64_t elapsed = (int64_t)((double)(mono_now - time) / 1e9 * ao->samplerate);
+                 pos += (uint32_t)elapsed;
+             }
+             // A timestamp ahead of everything ever written is stale, not
+@@ -1567,7 +1579,7 @@ static void AudioTrack_observePlayheadStep(struct ao *ao, uint32_t estimate)
+                p->step_polls, atomic_load(&p->head_read_seq) - p->step_read_seq,
+                p->step_limited, p->step_resets,
+                ts_ok, fpos, (long long)nano,
+-               ts_ok && nano ? (int)((mp_raw_time_ns() - nano) / 1000000) : -1,
++               ts_ok && nano ? (int)((monotonic_now_ns() - nano) / 1000000) : -1,
+                advancing);
+     p->step_logged_ns = now;
+     p->step_lines++;

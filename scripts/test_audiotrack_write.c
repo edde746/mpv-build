@@ -160,6 +160,8 @@ static int fake_setpriority(int which, id_t who, int nice)
 static int64_t mp_time_ns(void) { return atomic_load(&now_ns); }
 static int64_t mp_raw_time_ns(void) { return mp_time_ns(); }
 static int64_t mp_time_ns_from_raw_time(int64_t ns) { return ns; }
+// Timestamps carry now_ns too: one clock stands for CLOCK_MONOTONIC here.
+static int64_t monotonic_now_ns(void) { return mp_time_ns(); }
 // set_pause reads a resumed passthrough track's head between sleeps
 // (AudioTrack_awaitResumedHead). A sleep advances the fake clock by what it
 // asked for. On sleep number resume_moves_at the device starts rendering

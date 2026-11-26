@@ -27,8 +27,12 @@ struct ao { void *priv; int samplerate, sstride; bool stream_silence; };
 
 static int64_t now_ns, state_delay_ns, head_delay_ns, latency_delay_ns;
 // Deliberately different epochs: mixing Android nanoTime with mp_time_ns must
-// fail even when both clocks advance at precisely the same rate.
+// fail even when both clocks advance at precisely the same rate. nanoTime is
+// CLOCK_MONOTONIC, 10 ms off mp_raw_time_ns's CLOCK_MONOTONIC_RAW as NTP
+// slewing leaves it: inside the timestamp's distrust slack, so mixing those
+// two moves the deadline instead of falling back to the head.
 static const int64_t raw_epoch = 987654321000LL;
+static const int64_t mono_epoch = 987664321000LL;
 static int hardware_rate, hidden_latency_ms;
 static uint32_t frame_bias;
 static bool zero_head;
@@ -38,6 +42,7 @@ static JNIEnv environment;
 static int64_t mp_raw_time_ns(void) { return now_ns + raw_epoch; }
 static int64_t mp_time_ns_from_raw_time(int64_t raw) { return raw - raw_epoch; }
 static int64_t mp_time_ns(void) { return mp_time_ns_from_raw_time(mp_raw_time_ns()); }
+static int64_t monotonic_now_ns(void) { return now_ns + mono_epoch; }
 
 static const struct {
     int getPlayState, getPlaybackHeadPosition, getLatency, getTimestamp;
@@ -72,7 +77,7 @@ static int64_t jni_int(JNIEnv *env, int method)
 static int64_t jni_long(JNIEnv *env, int field)
 {
     (void)env;
-    return field == AudioTimestamp.framePosition ? frame_bias + hardware_rate / 2 : raw_epoch + 500000000;
+    return field == AudioTimestamp.framePosition ? frame_bias + hardware_rate / 2 : mono_epoch + 500000000;
 }
 
 #define MP_JNI_GET_ENV(ao) (&environment)
