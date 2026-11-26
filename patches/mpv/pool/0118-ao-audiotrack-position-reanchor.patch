@@ -2,7 +2,7 @@ diff --git a/audio/out/ao_audiotrack.c b/audio/out/ao_audiotrack.c
 index 6505092..9190e37 100644
 --- a/audio/out/ao_audiotrack.c
 +++ b/audio/out/ao_audiotrack.c
-@@ -81,11 +81,26 @@ struct priv {
+@@ -81,11 +81,27 @@ struct priv {
      bool timestamp_set;
      int timestamp_stable;
      uint32_t timestamp_last_fpos;
@@ -17,15 +17,16 @@ index 6505092..9190e37 100644
 +    // Position counters are anchored per source and per write epoch. Some
 +    // HALs (direct/offload tracks in particular) do not reset
 +    // getPlaybackHeadPosition or AudioTimestamp.framePosition on flush();
-+    // the first read after a reset anchors that source's offset to whatever
-+    // the counter reports, so a stale counter reads as ~0 played instead of
++    // the first read after a reset anchors the head's offset to whatever
++    // the counter reports, and the timestamp's only when it runs ahead of
++    // the head, so a stale counter reads as ~0 played instead of
 +    // wrapping written - playhead. The anchor is only drift-free because
 +    // ao_thread queries the latency before it writes: the first post-flush
 +    // read precedes the first post-flush write, except for a late write
 +    // stop() could not wait for, which biases the anchor by at most a chunk.
 +    uint32_t head_offset;      // getPlaybackHeadPosition value at the anchor
 +    uint32_t last_head_raw;    // previous raw head, for reset/wrap detection
-+    uint32_t ts_offset;        // framePosition value at the anchor
++    uint32_t ts_offset;        // a stale framePosition's bias, else 0
 +    bool head_reset_pending;   // anchor the head counter on its next read
 +    bool ts_reset_pending;     // anchor the timestamp counter on its next fetch
 +    int64_t latency_warn_ns;   // rate limit for the delay tripwire
@@ -127,7 +128,7 @@ index 6505092..9190e37 100644
                  p->timestamp_set = true;
                  if (p->timestamp_stable < stable_count)
                      p->timestamp_stable++;
-@@ -675,61 +727,69 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
+@@ -675,61 +727,78 @@ static uint32_t AudioTrack_getPlaybackHeadPosition(struct ao *ao,
      /* AudioTrack's framePosition and playbackHeadPosition return a signed integer,
       * but documentation states it should be interpreted as a 32-bit unsigned integer.
       */
@@ -224,13 +225,22 @@ index 6505092..9190e37 100644
 +        p->last_head_raw = raw;
 +        pos = raw - p->head_offset;
 +        if (p->ts_reset_pending && fetched) {
-+            // Anchor the timestamp counter against the head position just
-+            // read: a restarted counter lands at ~0, a stale one at its
-+            // pre-flush bias, and a late-arriving timestamp costs nothing.
-+            p->ts_offset = p->timestamp_last_fpos - pos;
++            // framePosition counts frames presented and the head frames
++            // consumed. A counter the flush restarted trails the head:
++            // AudioTrack::getTimestamp counts it from the head's own zero
++            // and withholds it, or holds it at 0, until the first frame is
++            // out. The gap is the pipeline in flight, which is latency, not
++            // bias; anchoring it to the head reported that pipeline as
++            // played for the rest of the epoch (Plezy #3116). Only a counter
++            // ahead of the head kept counting through the flush, and that
++            // one is anchored to the head's epoch. The chunk is the head
++            // anchor's own tolerance: a late write stop() could not wait for.
++            uint32_t fpos = p->timestamp_last_fpos;
++            bool stale = fpos > (uint64_t)pos + p->chunksize / ao->sstride;
++            p->ts_offset = stale ? fpos - pos : 0;
 +            p->ts_reset_pending = false;
-+            MP_VERBOSE(ao, "timestamp offset = %u (fpos=%u head=%u)\n",
-+                       p->ts_offset, p->timestamp_last_fpos, pos);
++            MP_VERBOSE(ao, "timestamp offset = %u (%s, fpos=%u head=%u)\n",
++                       p->ts_offset, stale ? "stale" : "restarted", fpos, pos);
 +        }
 +        //MP_VERBOSE(ao, "playbackHeadPosition = %u (offset=%u)\n", raw, p->head_offset);
      }

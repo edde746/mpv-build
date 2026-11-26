@@ -2969,10 +2969,57 @@ static void check_pcm_healthy_counters_after_flush(void)
     }
     assert(f.p.timestamp_set); // trusted again by the second fetch
     assert(!f.p.head_offset); // a reset counter anchors at zero
-    assert(f.p.ts_offset <= 4); // anchored against the head, not the fpos
+    assert(!f.p.ts_offset); // a restarted counter is used as it stands
     park_worker(&f);
     teardown(&f);
     puts("PASS: counters that reset on flush() keep exact delays and timestamps");
+}
+
+// A healthy mixed track restarts framePosition with the head on flush(), but
+// getTimestamp reports frames presented where the head counts frames
+// consumed: AudioTrack::getTimestamp withholds the epoch's first timestamp
+// until the head has run a pipeline ahead, then counts from the head's zero.
+// That gap is latency still in flight. Anchoring it to the head reported
+// the pipeline as played for the rest of the epoch, so audio after every
+// seek played late by it (Plezy #3116: fpos=0 head=6144, 128 ms).
+static void check_pcm_timestamp_trailing_head_after_flush(void)
+{
+    struct fixture f;
+    setup(&f, false, 1, true);
+    const uint8_t data[16] = {1, 2, 3, 4, 5, 6, 7, 8};
+    begin_write(&f, data, sizeof(data));
+    finish_write(&f, 8);
+
+    stop(&f.ao); // head_resets: head and ts_fpos return to 0
+    begin_write(&f, data, sizeof(data)); // no timestamp yet: the head anchors
+    finish_write(&f, 8);
+    mp_mutex_lock(&gate);
+    response = 0; // a write while the test plays the track must credit nothing
+    // The mixer has taken 3 of the 4 frames and none is out: the epoch's
+    // first timestamp arrives now, at position 0.
+    tracks[0].head = 3;
+    tracks[0].timestamp_ok = true;
+    tracks[0].ts_fpos = 0;
+    tracks[0].ts_nanos = atomic_load(&now_ns);
+    tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+    mp_mutex_unlock(&gate);
+    expect_delay_played(&f, 4, 3); // the head clock until the timestamp moves
+
+    for (uint32_t played = 1; played <= 2; played++) {
+        atomic_fetch_add(&now_ns, MP_TIME_MS_TO_NS(60));
+        mp_mutex_lock(&gate);
+        tracks[0].head = 4;
+        tracks[0].ts_fpos = played;
+        tracks[0].ts_nanos = atomic_load(&now_ns);
+        tracks[0].state = AudioTrack.PLAYSTATE_PLAYING;
+        mp_mutex_unlock(&gate);
+        // Only presented frames count as played; the pipeline is still owed.
+        expect_delay_played(&f, 4, played);
+    }
+    assert(f.p.timestamp_set);
+    park_worker(&f);
+    teardown(&f);
+    puts("PASS: a timestamp trailing the head after flush() keeps the pipeline in the delay");
 }
 
 // Passthrough through the smoother: a delayed head reset must reset the
@@ -3743,6 +3790,7 @@ int main(void)
     check_pcm_late_write_after_flush();
     check_pcm_stale_timestamp_after_flush();
     check_pcm_healthy_counters_after_flush();
+    check_pcm_timestamp_trailing_head_after_flush();
     check_iec_delayed_reset_smoothing();
     check_iec_playhead_step_line();
     check_passthrough_head_is_read_once_per_sample(false);
